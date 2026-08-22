@@ -1,7 +1,9 @@
 //! Versioned, session-bound relay-directory contract.
 //!
-//! JSON is only a transport representation. Signatures always cover the
-//! canonical binary representation produced by [`RelayDirectoryPayload::canonical_signing_bytes`].
+//! JSON is only a transport representation. Untrusted JSON must enter through
+//! [`SignedRelayDirectory::from_json`], which enforces a total input limit
+//! before parsing. Signatures always cover the canonical binary representation
+//! produced by [`RelayDirectoryPayload::canonical_signing_bytes`].
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,6 +18,16 @@ use thiserror::Error;
 pub const RELAY_DIRECTORY_CONTEXT: &[u8] = b"MRD_RELAY_DIRECTORY_V1";
 /// Only format version accepted by this implementation.
 pub const RELAY_DIRECTORY_FORMAT_VERSION: u16 = 1;
+/// Oldest signed policy revision accepted by v1 consumers.
+///
+/// Revision 17 is the first deployed selection policy that guarantees the
+/// region, capacity, and failure-domain semantics required by this contract.
+pub const RELAY_DIRECTORY_MIN_POLICY_REVISION: u64 = 17;
+/// Total transport limit, including JSON syntax and escaped string expansion.
+///
+/// This is eight times the 16 KiB canonical limit, leaving room for the
+/// worst-case six-byte JSON escapes plus object syntax.
+pub const MAX_RELAY_DIRECTORY_JSON_BYTES: usize = 128 * 1024;
 
 const MAX_CANDIDATES: usize = 8;
 const MAX_ENDPOINTS_PER_CANDIDATE: usize = 4;
@@ -23,7 +35,7 @@ const MAX_STRING_BYTES: usize = 256;
 const MAX_CANONICAL_BYTES: usize = 16 * 1024;
 
 /// TURN transport advertised by a signed relay directory.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RelayDirectoryTransport {
     Udp,
@@ -42,8 +54,7 @@ impl RelayDirectoryTransport {
 }
 
 /// One concrete TURN endpoint.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RelayDirectoryEndpoint {
     pub transport: RelayDirectoryTransport,
     pub host: String,
@@ -51,16 +62,14 @@ pub struct RelayDirectoryEndpoint {
 }
 
 /// Capacity reservation attached to one relay candidate.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RelayReservation {
     pub reservation_id: String,
     pub expires_at_ms: u64,
 }
 
 /// A signed candidate, including selection explanation and reservation.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RelayDirectoryCandidate {
     pub node_id: String,
     pub region: String,
@@ -73,8 +82,7 @@ pub struct RelayDirectoryCandidate {
 }
 
 /// The complete session- and peer-bound signed payload.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RelayDirectoryPayload {
     pub format_version: u16,
     pub policy_revision: u64,
@@ -87,8 +95,7 @@ pub struct RelayDirectoryPayload {
 }
 
 /// JSON-transportable outer signature envelope.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct SignedRelayDirectory {
     pub payload: RelayDirectoryPayload,
     pub signing_key_id: String,
@@ -123,6 +130,12 @@ pub enum RelayDirectoryError {
     UnsupportedFormatVersion { version: u16 },
     #[error("relay-directory policy revision is invalid")]
     InvalidPolicyRevision,
+    #[error("relay-directory policy revision {actual} is older than supported minimum {minimum}")]
+    StalePolicy { minimum: u64, actual: u64 },
+    #[error("relay-directory JSON exceeds the maximum of {max} bytes")]
+    JsonTooLarge { max: usize },
+    #[error("relay-directory JSON is invalid")]
+    InvalidJson,
     #[error("relay directory has too many candidates (maximum {max})")]
     TooManyCandidates { max: usize },
     #[error("relay candidate has too many endpoints (maximum {max})")]
@@ -298,6 +311,32 @@ impl RelayDirectoryPayload {
 }
 
 impl SignedRelayDirectory {
+    /// Parse untrusted JSON only after applying the total transport size cap.
+    ///
+    /// Public directory types intentionally do not implement `Deserialize`, so
+    /// consumers cannot bypass this bounded entry point with `serde_json`.
+    ///
+    /// ```compile_fail
+    /// use mrd_relay_control::SignedRelayDirectory;
+    /// let _: SignedRelayDirectory = serde_json::from_str("{}").unwrap();
+    /// ```
+    pub fn from_json(input: &[u8]) -> Result<Self, RelayDirectoryError> {
+        if input.len() > MAX_RELAY_DIRECTORY_JSON_BYTES {
+            return Err(RelayDirectoryError::JsonTooLarge {
+                max: MAX_RELAY_DIRECTORY_JSON_BYTES,
+            });
+        }
+        let raw: RawSignedRelayDirectory =
+            serde_json::from_slice(input).map_err(|_| RelayDirectoryError::InvalidJson)?;
+        let signed = Self::from(raw);
+        signed.payload.canonical_signing_bytes()?;
+        validate_string("signing_key_id", &signed.signing_key_id)?;
+        if signed.signature_b64.is_empty() || signed.signature_b64.len() > 128 {
+            return Err(RelayDirectoryError::InvalidSignatureEncoding);
+        }
+        Ok(signed)
+    }
+
     pub fn verify(
         &self,
         trusted_keys: &BTreeMap<String, Vec<u8>>,
@@ -306,6 +345,12 @@ impl SignedRelayDirectory {
     ) -> Result<VerifiedRelayDirectory, RelayDirectoryError> {
         let canonical_signing_bytes = self.payload.canonical_signing_bytes()?;
         validate_string("signing_key_id", &self.signing_key_id)?;
+        if self.payload.policy_revision < RELAY_DIRECTORY_MIN_POLICY_REVISION {
+            return Err(RelayDirectoryError::StalePolicy {
+                minimum: RELAY_DIRECTORY_MIN_POLICY_REVISION,
+                actual: self.payload.policy_revision,
+            });
+        }
         if self.payload.session_id != expected_session_id {
             return Err(RelayDirectoryError::SessionMismatch);
         }
@@ -350,6 +395,132 @@ impl SignedRelayDirectory {
             payload: self.payload.clone(),
             canonical_signing_bytes,
         })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSignedRelayDirectory {
+    payload: RawRelayDirectoryPayload,
+    signing_key_id: String,
+    signature_b64: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRelayDirectoryPayload {
+    format_version: u16,
+    policy_revision: u64,
+    directory_id: String,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+    session_id: String,
+    intended_peer_digest: String,
+    candidates: Vec<RawRelayDirectoryCandidate>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRelayDirectoryCandidate {
+    node_id: String,
+    region: String,
+    failure_domain: String,
+    endpoints: Vec<RawRelayDirectoryEndpoint>,
+    capabilities: u32,
+    load_class: u8,
+    selection_reason: String,
+    reservation: RawRelayReservation,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRelayDirectoryEndpoint {
+    transport: RawRelayDirectoryTransport,
+    host: String,
+    port: u16,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RawRelayDirectoryTransport {
+    Udp,
+    Tcp,
+    Tls,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRelayReservation {
+    reservation_id: String,
+    expires_at_ms: u64,
+}
+
+impl From<RawSignedRelayDirectory> for SignedRelayDirectory {
+    fn from(raw: RawSignedRelayDirectory) -> Self {
+        Self {
+            payload: raw.payload.into(),
+            signing_key_id: raw.signing_key_id,
+            signature_b64: raw.signature_b64,
+        }
+    }
+}
+
+impl From<RawRelayDirectoryPayload> for RelayDirectoryPayload {
+    fn from(raw: RawRelayDirectoryPayload) -> Self {
+        Self {
+            format_version: raw.format_version,
+            policy_revision: raw.policy_revision,
+            directory_id: raw.directory_id,
+            issued_at_ms: raw.issued_at_ms,
+            expires_at_ms: raw.expires_at_ms,
+            session_id: raw.session_id,
+            intended_peer_digest: raw.intended_peer_digest,
+            candidates: raw.candidates.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<RawRelayDirectoryCandidate> for RelayDirectoryCandidate {
+    fn from(raw: RawRelayDirectoryCandidate) -> Self {
+        Self {
+            node_id: raw.node_id,
+            region: raw.region,
+            failure_domain: raw.failure_domain,
+            endpoints: raw.endpoints.into_iter().map(Into::into).collect(),
+            capabilities: raw.capabilities,
+            load_class: raw.load_class,
+            selection_reason: raw.selection_reason,
+            reservation: raw.reservation.into(),
+        }
+    }
+}
+
+impl From<RawRelayDirectoryEndpoint> for RelayDirectoryEndpoint {
+    fn from(raw: RawRelayDirectoryEndpoint) -> Self {
+        Self {
+            transport: raw.transport.into(),
+            host: raw.host,
+            port: raw.port,
+        }
+    }
+}
+
+impl From<RawRelayDirectoryTransport> for RelayDirectoryTransport {
+    fn from(raw: RawRelayDirectoryTransport) -> Self {
+        match raw {
+            RawRelayDirectoryTransport::Udp => Self::Udp,
+            RawRelayDirectoryTransport::Tcp => Self::Tcp,
+            RawRelayDirectoryTransport::Tls => Self::Tls,
+        }
+    }
+}
+
+impl From<RawRelayReservation> for RelayReservation {
+    fn from(raw: RawRelayReservation) -> Self {
+        Self {
+            reservation_id: raw.reservation_id,
+            expires_at_ms: raw.expires_at_ms,
+        }
     }
 }
 

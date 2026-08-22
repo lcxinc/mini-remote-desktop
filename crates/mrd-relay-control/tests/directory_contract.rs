@@ -4,10 +4,11 @@ use std::path::PathBuf;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use ed25519_dalek::{Signer as _, SigningKey};
+use ed25519_dalek::{Signature, Signer as _, SigningKey};
 use mrd_relay_control::{
     RelayDirectoryCandidate, RelayDirectoryEndpoint, RelayDirectoryError, RelayDirectoryPayload,
     RelayDirectoryTransport, RelayReservation, SignedRelayDirectory,
+    MAX_RELAY_DIRECTORY_JSON_BYTES, RELAY_DIRECTORY_MIN_POLICY_REVISION,
 };
 use serde::Deserialize;
 
@@ -95,7 +96,7 @@ fn to_hex(bytes: &[u8]) -> String {
 #[serde(deny_unknown_fields)]
 struct GoldenFixture {
     test_only_public_key_b64: String,
-    directory: SignedRelayDirectory,
+    directory: serde_json::Value,
 }
 
 #[test]
@@ -131,6 +132,13 @@ fn signed_fields_and_canonical_order_are_bound() {
     assert_eq!(
         changed.verify(&trusted_keys(), "session-alpha", 1_777_000_010_000),
         Err(RelayDirectoryError::InvalidSignature)
+    );
+
+    let mut changed = valid.clone();
+    changed.payload.candidates[0].endpoints.swap(0, 1);
+    assert_eq!(
+        changed.verify(&trusted_keys(), "session-alpha", 1_777_000_010_000),
+        Err(RelayDirectoryError::NonCanonicalEndpointOrder)
     );
 
     assert_eq!(
@@ -224,6 +232,45 @@ fn malformed_untrusted_and_expired_directories_fail_closed() {
 }
 
 #[test]
+fn correctly_resigned_nonzero_stale_policy_is_rejected() {
+    let mut stale_payload = payload();
+    stale_payload.policy_revision = RELAY_DIRECTORY_MIN_POLICY_REVISION - 1;
+    let stale = signed(stale_payload);
+    let signature_bytes = STANDARD.decode(&stale.signature_b64).unwrap();
+    let signature = Signature::from_slice(&signature_bytes).unwrap();
+    SigningKey::from_bytes(&TEST_SEED)
+        .verifying_key()
+        .verify_strict(
+            &stale.payload.canonical_signing_bytes().unwrap(),
+            &signature,
+        )
+        .unwrap();
+
+    assert_eq!(
+        stale.verify(&trusted_keys(), "session-alpha", 1_777_000_010_000),
+        Err(RelayDirectoryError::StalePolicy {
+            minimum: RELAY_DIRECTORY_MIN_POLICY_REVISION,
+            actual: RELAY_DIRECTORY_MIN_POLICY_REVISION - 1,
+        })
+    );
+}
+
+#[test]
+fn oversized_escaped_json_is_rejected_before_deserialization() {
+    let oversized = format!(
+        "{{\"payload\":{{\"directory_id\":\"{}\"}}}}",
+        "\\u0061".repeat(MAX_RELAY_DIRECTORY_JSON_BYTES)
+    );
+    assert!(oversized.len() > MAX_RELAY_DIRECTORY_JSON_BYTES);
+    assert_eq!(
+        SignedRelayDirectory::from_json(oversized.as_bytes()),
+        Err(RelayDirectoryError::JsonTooLarge {
+            max: MAX_RELAY_DIRECTORY_JSON_BYTES,
+        })
+    );
+}
+
+#[test]
 fn candidate_and_endpoint_caps_are_enforced() {
     let mut invalid = payload();
     for index in 2..9 {
@@ -263,21 +310,27 @@ fn fixture_is_valid_tamper_vector_is_invalid_and_unknown_fields_are_rejected() {
         STANDARD.decode(&fixture.test_only_public_key_b64).unwrap(),
         trusted_keys()[TEST_KEY_ID]
     );
-    fixture
-        .directory
+    let directory_json = serde_json::to_vec(&fixture.directory).unwrap();
+    SignedRelayDirectory::from_json(&directory_json)
+        .unwrap()
         .verify(&trusted_keys(), "session-alpha", 1_777_000_010_000)
         .unwrap();
 
     let tampered_json = fs::read_to_string(fixtures.join("directory-v1-tampered.json")).unwrap();
     let tampered: GoldenFixture = serde_json::from_str(&tampered_json).unwrap();
+    let tampered_json = serde_json::to_vec(&tampered.directory).unwrap();
     assert_eq!(
-        tampered
-            .directory
+        SignedRelayDirectory::from_json(&tampered_json)
+            .unwrap()
             .verify(&trusted_keys(), "session-alpha", 1_777_000_010_000),
         Err(RelayDirectoryError::InvalidSignature)
     );
 
     let mut unknown: serde_json::Value = serde_json::from_str(&valid_json).unwrap();
     unknown["directory"]["payload"]["unknown_critical_field"] = serde_json::json!(true);
-    assert!(serde_json::from_value::<GoldenFixture>(unknown).is_err());
+    let unknown_directory = serde_json::to_vec(&unknown["directory"]).unwrap();
+    assert_eq!(
+        SignedRelayDirectory::from_json(&unknown_directory),
+        Err(RelayDirectoryError::InvalidJson)
+    );
 }
