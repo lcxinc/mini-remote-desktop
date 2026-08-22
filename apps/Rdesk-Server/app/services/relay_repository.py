@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import ipaddress
 import re
 import secrets
+import weakref
 from datetime import datetime, timedelta, timezone
-from typing import Protocol
+from typing import Callable, Protocol
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.relay_enrollment import RelayEnrollment
@@ -18,11 +21,16 @@ from app.models.relay_reservation import RelayReservation
 
 
 _TOKEN_CONTEXT = b"MRD_RELAY_ENROLLMENT_V1\x00"
+_SESSION_LOCK_CONTEXT = b"MRD_RELAY_SESSION_LOCK_V1\x00"
 _CIPHERTEXT_VERSION = b"\x01"
+_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,512}$")
 _ENDPOINT_PATTERN = re.compile(
     r"^(?:turn|turns):(?P<host>\[[0-9A-Fa-f:]+\]|[A-Za-z0-9.-]+):"
     r"(?P<port>[0-9]{1,5})(?:\?transport=(?:udp|tcp))?$"
 )
+_LOCAL_SESSION_LOCKS: weakref.WeakValueDictionary[
+    tuple[int, str], asyncio.Lock
+] = weakref.WeakValueDictionary()
 
 
 class RelayRepositoryError(Exception):
@@ -68,6 +76,7 @@ class RelayRepository:
         enrollment_token_pepper: bytes,
         secret_cipher: RelaySecretCipher,
         max_reservations_per_session: int = 2,
+        enrollment_token_source: Callable[[int], str] | None = None,
     ) -> None:
         if len(enrollment_token_pepper) < 32:
             raise ValueError("enrollment token pepper must contain at least 32 bytes")
@@ -77,6 +86,21 @@ class RelayRepository:
         self._token_pepper = enrollment_token_pepper
         self._secret_cipher = secret_cipher
         self._max_reservations = max_reservations_per_session
+        self._enrollment_token_source = (
+            enrollment_token_source or secrets.token_urlsafe
+        )
+
+    async def issue_enrollment_token(
+        self, *, expires_at: datetime, now: datetime
+    ) -> str:
+        """Mint a 256-bit CSPRNG token and persist only its keyed digest."""
+        token = self._enrollment_token_source(32)
+        await self.store_enrollment_token(
+            token=token,
+            expires_at=expires_at,
+            now=now,
+        )
+        return token
 
     async def store_enrollment_token(
         self, *, token: str, expires_at: datetime, now: datetime
@@ -96,7 +120,15 @@ class RelayRepository:
             created_at=now,
         )
         self._session.add(enrollment)
-        await self._session.flush()
+        try:
+            await self._session.flush()
+        except IntegrityError as error:
+            if _integrity_conflict_code(error) != "ENROLLMENT_TOKEN_EXISTS":
+                raise
+            await self._session.rollback()
+            raise RelayRepositoryError(
+                "ENROLLMENT_TOKEN_EXISTS", "enrollment token already exists"
+            ) from None
         return enrollment
 
     async def enroll_node(
@@ -183,7 +215,18 @@ class RelayRepository:
         enrollment.used_at = now
         enrollment.enrolled_node_id = node_id
         self._session.add(node)
-        await self._session.flush()
+        try:
+            await self._session.flush()
+        except IntegrityError as error:
+            code = _integrity_conflict_code(error)
+            if code not in {"NODE_ALREADY_EXISTS", "CERTIFICATE_ALREADY_BOUND"}:
+                raise
+            await self._session.rollback()
+            if code == "NODE_ALREADY_EXISTS":
+                message = "relay node already exists"
+            else:
+                message = "certificate is already bound"
+            raise RelayRepositoryError(code, message) from None
         return node
 
     async def record_heartbeat(
@@ -273,9 +316,46 @@ class RelayRepository:
         if not ordered_unique:
             return []
 
+        if _session_dialect_name(self._session) == "postgresql":
+            # A 64-bit hash collision only serializes unrelated sessions; it cannot
+            # weaken the reservation bound. PostgreSQL releases this at transaction end.
+            await self._session.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                {"lock_key": _session_advisory_lock_key(session_id)},
+            )
+            return await self._reserve_capacity_locked(
+                session_id=session_id,
+                user_id=user_id,
+                ordered_node_ids=ordered_unique,
+                now=now,
+                ttl_seconds=ttl_seconds,
+            )
+
+        # This lock is only an equivalent for single-process unit stores. It is not
+        # a cross-process production guarantee; PostgreSQL uses the transaction lock.
+        lock = _local_session_lock(session_id)
+        async with lock:
+            return await self._reserve_capacity_locked(
+                session_id=session_id,
+                user_id=user_id,
+                ordered_node_ids=ordered_unique,
+                now=now,
+                ttl_seconds=ttl_seconds,
+            )
+
+    async def _reserve_capacity_locked(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        ordered_node_ids: list[str],
+        now: datetime,
+        ttl_seconds: int,
+    ) -> list[RelayReservation]:
+
         locked_nodes = await self._session.scalars(
             select(RelayNode)
-            .where(RelayNode.node_id.in_(ordered_unique))
+            .where(RelayNode.node_id.in_(ordered_node_ids))
             .order_by(RelayNode.node_id)
             .with_for_update()
         )
@@ -283,7 +363,7 @@ class RelayRepository:
 
         await self._session.execute(
             delete(RelayReservation).where(
-                RelayReservation.node_id.in_(ordered_unique),
+                RelayReservation.node_id.in_(ordered_node_ids),
                 RelayReservation.expires_at <= now,
             )
         )
@@ -307,7 +387,7 @@ class RelayRepository:
             )
 
         result: list[RelayReservation] = []
-        for node_id in ordered_unique:
+        for node_id in ordered_node_ids:
             if len(result) >= self._max_reservations:
                 break
             if node_id in existing:
@@ -326,7 +406,19 @@ class RelayRepository:
                     RelayReservation.expires_at > now,
                 )
             )
-            if int(used or 0) >= node.max_allocations:
+            pending_reservations = int(used or 0)
+            # Subtract before comparing instead of adding reported active and pending
+            # counts. This is conservative for invalid/corrupt values and cannot wrap.
+            if (
+                node.max_allocations <= 0
+                or node.active_allocations < 0
+                or node.active_allocations >= node.max_allocations
+            ):
+                continue
+            remaining_after_active = (
+                node.max_allocations - node.active_allocations
+            )
+            if pending_reservations >= remaining_after_active:
                 continue
             reservation = RelayReservation(
                 session_id=session_id,
@@ -352,7 +444,9 @@ class RelayRepository:
         return node
 
     def _token_digest(self, token: str) -> str:
-        if len(token) < 20:
+        # This validates external token structure only. Entropy is guaranteed by
+        # issue_enrollment_token's 32-byte CSPRNG request, not by string length.
+        if not isinstance(token, str) or _TOKEN_PATTERN.fullmatch(token) is None:
             raise RelayRepositoryError(
                 "INVALID_ENROLLMENT_TOKEN", "enrollment token is invalid"
             )
@@ -410,3 +504,57 @@ def _valid_host(host: str) -> bool:
         and all(character.isalnum() or character == "-" for character in label)
         for label in labels
     )
+
+
+def _session_dialect_name(session: object) -> str | None:
+    bind = getattr(session, "bind", None)
+    if bind is None:
+        get_bind = getattr(session, "get_bind", None)
+        if get_bind is not None:
+            bind = get_bind()
+    dialect = getattr(bind, "dialect", None)
+    return getattr(dialect, "name", None)
+
+
+def _session_advisory_lock_key(session_id: str) -> int:
+    digest = hashlib.sha256(
+        _SESSION_LOCK_CONTEXT + session_id.encode()
+    ).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=True)
+
+
+def _local_session_lock(session_id: str) -> asyncio.Lock:
+    loop_key = id(asyncio.get_running_loop())
+    key = (loop_key, session_id)
+    lock = _LOCAL_SESSION_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _LOCAL_SESSION_LOCKS[key] = lock
+    return lock
+
+
+def _integrity_conflict_code(error: IntegrityError) -> str | None:
+    details: list[str] = []
+    current: object | None = error.orig
+    for _ in range(4):
+        if current is None:
+            break
+        constraint_name = getattr(current, "constraint_name", None)
+        if constraint_name:
+            details.append(str(constraint_name).lower())
+        details.append(str(current).lower())
+        current = getattr(current, "__cause__", None)
+    combined = " ".join(details)
+    if (
+        "relay_enrollments_token_digest_key" in combined
+        or "relay_enrollments.token_digest" in combined
+    ):
+        return "ENROLLMENT_TOKEN_EXISTS"
+    if "relay_nodes_pkey" in combined or "relay_nodes.node_id" in combined:
+        return "NODE_ALREADY_EXISTS"
+    if (
+        "relay_nodes_certificate_fingerprint_key" in combined
+        or "relay_nodes.certificate_fingerprint" in combined
+    ):
+        return "CERTIFICATE_ALREADY_BOUND"
+    return None

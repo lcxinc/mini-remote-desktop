@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -21,6 +23,8 @@ from app.services.relay_repository import (
 NOW = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
 CERTIFICATE = "sha256:01aabbcc"
 TURN_SECRET = "node-unique-turn-rest-secret"
+# Deterministic URL-safe values in this module are test fixtures only. Production
+# enrollment tokens are minted through the repository's injected CSPRNG source.
 ENDPOINTS = [
     "turn:relay.example.test:3478?transport=udp",
     "turns:relay.example.test:5349?transport=tcp",
@@ -62,6 +66,10 @@ class AsyncSessionShim:
 
     async def refresh(self, instance: object) -> None:
         self.session.refresh(instance)
+
+    @property
+    def bind(self) -> object:
+        return self.session.get_bind()
 
 
 @pytest.fixture
@@ -163,6 +171,64 @@ async def test_enrollment_tokens_are_hashed_one_use_and_never_repr_raw(
         )
     assert error.value.code == "ENROLLMENT_TOKEN_USED"
     assert raw not in str(error.value)
+
+
+@pytest.mark.anyio
+async def test_issue_enrollment_token_requests_256_bits_and_returns_raw_once(
+    db_session: AsyncSessionShim,
+    cipher: AesGcmRelaySecretCipher,
+) -> None:
+    entropy_requests: list[int] = []
+    raw = "A" * 43
+
+    def token_source(byte_count: int) -> str:
+        entropy_requests.append(byte_count)
+        return raw
+
+    repository = RelayRepository(
+        db_session,
+        enrollment_token_pepper=bytes.fromhex("22" * 32),
+        secret_cipher=cipher,
+        enrollment_token_source=token_source,
+    )
+    issued = await repository.issue_enrollment_token(
+        expires_at=NOW + timedelta(minutes=5),
+        now=NOW,
+    )
+    assert issued == raw
+    assert entropy_requests == [32]
+
+    stored = await db_session.scalar(select(RelayEnrollment))
+    assert stored is not None
+    assert raw not in stored.token_digest
+    assert raw not in repr(stored)
+
+    await repository.enroll_node(
+        token=issued,
+        node_id="relay-issued",
+        region="ap-east",
+        failure_domain="rack-issued",
+        certificate_fingerprint="sha256:issued",
+        endpoints=ENDPOINTS,
+        max_allocations=1,
+        max_egress_bps=1,
+        turn_secret="issued-node-secret",
+        now=NOW,
+    )
+    with pytest.raises(RelayRepositoryError) as reused:
+        await repository.enroll_node(
+            token=issued,
+            node_id="relay-issued-again",
+            region="ap-east",
+            failure_domain="rack-issued-again",
+            certificate_fingerprint="sha256:issued-again",
+            endpoints=ENDPOINTS,
+            max_allocations=1,
+            max_egress_bps=1,
+            turn_secret="issued-node-secret-again",
+            now=NOW,
+        )
+    assert reused.value.code == "ENROLLMENT_TOKEN_USED"
 
 
 @pytest.mark.anyio
@@ -387,6 +453,168 @@ async def test_reservations_preserve_order_are_bounded_idempotent_and_expire(
         now=NOW + timedelta(seconds=30),
     )
     assert [reservation.node_id for reservation in boundary] == ["relay-b", "relay-a"]
+
+
+@pytest.mark.anyio
+async def test_reported_active_allocations_and_pending_reservations_share_capacity(
+    repository: RelayRepository,
+) -> None:
+    node = await enroll(repository, node_id="relay-capacity", max_allocations=1)
+    await repository.record_heartbeat(
+        node_id=node.node_id,
+        certificate_fingerprint=node.certificate_fingerprint,
+        sequence=1,
+        active_allocations=1,
+        current_egress_bps=0,
+        now=NOW,
+    )
+    assert await repository.reserve_capacity(
+        session_id="session-full",
+        user_id="user-full",
+        ordered_node_ids=[node.node_id],
+        now=NOW,
+    ) == []
+
+    node.active_allocations = 0
+    existing = await repository.reserve_capacity(
+        session_id="session-existing",
+        user_id="user-existing",
+        ordered_node_ids=[node.node_id],
+        now=NOW,
+    )
+    assert len(existing) == 1
+    node.active_allocations = 1
+    repeated = await repository.reserve_capacity(
+        session_id="session-existing",
+        user_id="user-existing",
+        ordered_node_ids=[node.node_id],
+        now=NOW + timedelta(seconds=1),
+    )
+    assert [item.id for item in repeated] == [item.id for item in existing]
+    assert await repository.reserve_capacity(
+        session_id="session-rejected",
+        user_id="user-rejected",
+        ordered_node_ids=[node.node_id],
+        now=NOW + timedelta(seconds=1),
+    ) == []
+
+
+class IntegrityConflictSession:
+    def __init__(
+        self,
+        *,
+        constraint_message: str,
+        enrollment: RelayEnrollment | None = None,
+    ) -> None:
+        self._enrollment = enrollment
+        self._scalar_calls = 0
+        self.rolled_back = False
+        self.error = IntegrityError(
+            "INSERT INTO relay_nodes VALUES (...) ",
+            {
+                "certificate_fingerprint": "sha256:sensitive-fingerprint",
+                "encrypted_turn_secret": b"ciphertext-not-plaintext",
+            },
+            Exception(constraint_message),
+        )
+
+    def add(self, instance: object) -> None:
+        del instance
+
+    async def get(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        return None
+
+    async def scalar(self, *args: object, **kwargs: object) -> object:
+        del args, kwargs
+        self._scalar_calls += 1
+        if self._enrollment is not None and self._scalar_calls == 1:
+            return self._enrollment
+        return None
+
+    async def flush(self) -> None:
+        raise self.error
+
+    async def rollback(self) -> None:
+        self.rolled_back = True
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("constraint_message", "expected_code"),
+    [
+        ("UNIQUE constraint failed: relay_nodes.node_id", "NODE_ALREADY_EXISTS"),
+        (
+            "UNIQUE constraint failed: relay_nodes.certificate_fingerprint",
+            "CERTIFICATE_ALREADY_BOUND",
+        ),
+    ],
+)
+async def test_enrollment_integrity_conflicts_are_stable_and_rollback(
+    cipher: AesGcmRelaySecretCipher,
+    constraint_message: str,
+    expected_code: str,
+) -> None:
+    pepper = bytes.fromhex("22" * 32)
+    token = "concurrent-enrollment-token"
+    digest = hmac.new(
+        pepper,
+        b"MRD_RELAY_ENROLLMENT_V1\x00" + token.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    enrollment = RelayEnrollment(
+        token_digest=digest,
+        expires_at=NOW + timedelta(minutes=5),
+        created_at=NOW,
+    )
+    session = IntegrityConflictSession(
+        constraint_message=constraint_message,
+        enrollment=enrollment,
+    )
+    repository = RelayRepository(
+        session,
+        enrollment_token_pepper=pepper,
+        secret_cipher=cipher,
+    )
+    with pytest.raises(RelayRepositoryError) as conflict:
+        await repository.enroll_node(
+            token=token,
+            node_id="relay-conflict",
+            region="ap-east",
+            failure_domain="rack-conflict",
+            certificate_fingerprint="sha256:sensitive-fingerprint",
+            endpoints=ENDPOINTS,
+            max_allocations=1,
+            max_egress_bps=1,
+            turn_secret="sensitive-turn-secret",
+            now=NOW,
+        )
+    assert conflict.value.code == expected_code
+    assert session.rolled_back
+    assert "sensitive" not in str(conflict.value)
+
+
+@pytest.mark.anyio
+async def test_token_digest_integrity_conflict_is_stable_and_rolls_back(
+    cipher: AesGcmRelaySecretCipher,
+) -> None:
+    session = IntegrityConflictSession(
+        constraint_message="UNIQUE constraint failed: relay_enrollments.token_digest"
+    )
+    repository = RelayRepository(
+        session,
+        enrollment_token_pepper=bytes.fromhex("22" * 32),
+        secret_cipher=cipher,
+    )
+    with pytest.raises(RelayRepositoryError) as conflict:
+        await repository.store_enrollment_token(
+            token="sensitive-concurrent-token",
+            expires_at=NOW + timedelta(minutes=5),
+            now=NOW,
+        )
+    assert conflict.value.code == "ENROLLMENT_TOKEN_EXISTS"
+    assert session.rolled_back
+    assert "sensitive" not in str(conflict.value)
 
 
 @pytest.mark.anyio
