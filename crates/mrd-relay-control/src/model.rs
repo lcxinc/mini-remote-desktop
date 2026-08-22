@@ -121,5 +121,6 @@ pub struct RelayNodeSnapshot {
     pub current_egress_bps: u64,
     pub max_egress_bps: u64,
     pub recent_failure_bps: u16,
-    pub measured_rtt_ms: u32,
+    /// Last measured round-trip time, or `None` when no probe result is available.
+    pub measured_rtt_ms: Option<u32>,
 }

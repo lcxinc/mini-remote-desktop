@@ -36,7 +36,7 @@ fn node(node_id: &str) -> RelayNodeSnapshot {
         current_egress_bps: 200,
         max_egress_bps: 1_000,
         recent_failure_bps: 100,
-        measured_rtt_ms: 30,
+        measured_rtt_ms: Some(30),
     }
 }
 
@@ -124,25 +124,102 @@ fn hard_filters_emit_stable_reason_codes() {
     assert_eq!(
         reasons,
         vec![
-            ("stale", RelayRejectionCode::StaleLease, "stale_lease"),
             ("draining", RelayRejectionCode::Draining, "draining"),
-            (
-                "unavailable",
-                RelayRejectionCode::Unavailable,
-                "unavailable"
-            ),
-            ("revoked", RelayRejectionCode::Revoked, "revoked"),
-            (
-                "incompatible",
-                RelayRejectionCode::TransportIncompatible,
-                "transport_incompatible"
-            ),
             (
                 "hard-full",
                 RelayRejectionCode::HardCapacityReached,
                 "hard_capacity_reached"
             ),
+            (
+                "incompatible",
+                RelayRejectionCode::TransportIncompatible,
+                "transport_incompatible"
+            ),
+            ("revoked", RelayRejectionCode::Revoked, "revoked"),
+            ("stale", RelayRejectionCode::StaleLease, "stale_lease"),
+            (
+                "unavailable",
+                RelayRejectionCode::Unavailable,
+                "unavailable"
+            ),
         ]
+    );
+}
+
+#[test]
+fn rejections_are_sorted_by_node_id_and_stable_reason_code() {
+    let mut stale_alpha = node("relay-alpha");
+    stale_alpha.lease_expires_at_ms = NOW_MS;
+
+    let mut draining_alpha = node("relay-alpha");
+    draining_alpha.state = RelayNodeState::Draining;
+
+    let mut unavailable_zulu = node("relay-zulu");
+    unavailable_zulu.state = RelayNodeState::Unavailable;
+
+    let eligible = node("eligible");
+    let first = select_relays(
+        &policy(),
+        &[
+            unavailable_zulu.clone(),
+            stale_alpha.clone(),
+            eligible.clone(),
+            draining_alpha.clone(),
+        ],
+        NOW_MS,
+    )
+    .expect("eligible node remains");
+    let second = select_relays(
+        &policy(),
+        &[draining_alpha, eligible, stale_alpha, unavailable_zulu],
+        NOW_MS,
+    )
+    .expect("eligible node remains");
+
+    let signature = |decision: &mrd_relay_control::RelaySelectionDecision| {
+        decision
+            .rejections
+            .iter()
+            .map(|rejection| {
+                (
+                    rejection.node_id.as_str().to_owned(),
+                    rejection.reason.as_str(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(signature(&first), signature(&second));
+    assert_eq!(
+        signature(&first),
+        vec![
+            ("relay-alpha".to_owned(), "draining"),
+            ("relay-alpha".to_owned(), "stale_lease"),
+            ("relay-zulu".to_owned(), "unavailable"),
+        ]
+    );
+}
+
+#[test]
+fn selected_candidates_only_expose_accepted_transports() {
+    let decision = select_relays(&policy(), &[node("mixed-transports")], NOW_MS)
+        .expect("UDP endpoint is compatible");
+
+    assert_eq!(decision.primary.endpoints.len(), 1);
+    assert_eq!(decision.primary.endpoints[0].transport, RelayTransport::Udp);
+}
+
+#[test]
+fn empty_accepted_transports_rejects_nodes() {
+    let mut no_transports = policy();
+    no_transports.accepted_transports.clear();
+
+    let error = select_relays(&no_transports, &[node("relay-hkg-1")], NOW_MS)
+        .expect_err("an empty policy accepts no transports");
+
+    assert_eq!(error.rejections.len(), 1);
+    assert_eq!(
+        error.rejections[0].reason,
+        RelayRejectionCode::TransportIncompatible
     );
 }
 
@@ -191,21 +268,41 @@ fn scoring_combines_region_rtt_allocations_bandwidth_and_failures_as_integers() 
 }
 
 #[test]
+fn unknown_rtt_is_scored_conservatively_and_deterministically() {
+    let mut low_rtt = node("low-rtt");
+    low_rtt.failure_domain = failure_domain("fd-low");
+    low_rtt.measured_rtt_ms = Some(5);
+
+    let mut unknown_rtt = node("unknown-rtt");
+    unknown_rtt.failure_domain = failure_domain("fd-unknown");
+    unknown_rtt.measured_rtt_ms = None;
+
+    let first = select_relays(&policy(), &[unknown_rtt.clone(), low_rtt.clone()], NOW_MS)
+        .expect("both relays remain eligible");
+    let second = select_relays(&policy(), &[low_rtt, unknown_rtt], NOW_MS)
+        .expect("input order does not change the result");
+
+    assert_eq!(first, second);
+    assert_eq!(first.primary.node_id.as_str(), "low-rtt");
+    assert!(first.backups[0].score <= first.primary.score);
+}
+
+#[test]
 fn backups_are_selected_from_distinct_failure_domains() {
     let mut primary = node("relay-hkg-1");
-    primary.measured_rtt_ms = 5;
+    primary.measured_rtt_ms = Some(5);
     primary.failure_domain = failure_domain("az-a");
 
     let mut same_domain = node("relay-hkg-2");
-    same_domain.measured_rtt_ms = 10;
+    same_domain.measured_rtt_ms = Some(10);
     same_domain.failure_domain = failure_domain("az-a");
 
     let mut backup_one = node("relay-sin-1");
-    backup_one.measured_rtt_ms = 20;
+    backup_one.measured_rtt_ms = Some(20);
     backup_one.failure_domain = failure_domain("az-b");
 
     let mut backup_two = node("relay-nrt-1");
-    backup_two.measured_rtt_ms = 30;
+    backup_two.measured_rtt_ms = Some(30);
     backup_two.failure_domain = failure_domain("az-c");
 
     let decision = select_relays(
@@ -226,6 +323,25 @@ fn backups_are_selected_from_distinct_failure_domains() {
         decision.backups[0].failure_domain,
         decision.backups[1].failure_domain
     );
+}
+
+#[test]
+fn extreme_max_backups_is_bounded_by_available_candidates() {
+    let mut primary = node("relay-primary");
+    primary.measured_rtt_ms = Some(5);
+    primary.failure_domain = failure_domain("fd-primary");
+
+    let mut backup = node("relay-backup");
+    backup.measured_rtt_ms = Some(10);
+    backup.failure_domain = failure_domain("fd-backup");
+
+    let mut unbounded_policy = policy();
+    unbounded_policy.max_backups = usize::MAX;
+
+    let decision = select_relays(&unbounded_policy, &[backup, primary], NOW_MS)
+        .expect("the policy limit must not become an allocation request");
+    assert_eq!(decision.backups.len(), 1);
+    assert_eq!(decision.backups[0].node_id.as_str(), "relay-backup");
 }
 
 #[test]
@@ -272,7 +388,7 @@ fn lease_expiry_has_an_exact_fifteen_second_boundary() {
 #[test]
 fn scoring_saturates_instead_of_overflowing() {
     let mut extreme = node("extreme");
-    extreme.measured_rtt_ms = u32::MAX;
+    extreme.measured_rtt_ms = Some(u32::MAX);
     extreme.recent_failure_bps = 10_000;
     let mut extreme_policy = policy();
     extreme_policy.weights = RelayScoreWeights {
