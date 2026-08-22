@@ -206,7 +206,7 @@ def test_sqlite_node_lock_is_held_until_api_transaction_finishes(
 def test_pickup_is_pending_then_idempotently_delivers_approved_certificate(
     api: tuple[TestClient, object],
 ) -> None:
-    client, _ = api
+    client, engine = api
     _, enrollment_id, receipt = _enroll_with_receipt(client)
     pending = _pickup(client, enrollment_id, receipt)
     assert pending.status_code == 200
@@ -217,6 +217,7 @@ def test_pickup_is_pending_then_idempotently_delivers_approved_certificate(
         "certificate_pem": None,
         "ca_certificate_pem": None,
         "expires_at": None,
+        "turn_rest_secret": None,
     }
 
     approved = client.post(f"/api/v1/relays/{NODE_ID}/approve")
@@ -229,6 +230,12 @@ def test_pickup_is_pending_then_idempotently_delivers_approved_certificate(
     assert delivered.json()["status"] == "approved"
     assert "BEGIN CERTIFICATE" in delivered.json()["certificate_pem"]
     assert "BEGIN CERTIFICATE" in delivered.json()["ca_certificate_pem"]
+    turn_rest_secret = delivered.json()["turn_rest_secret"]
+    assert isinstance(turn_rest_secret, str) and len(turn_rest_secret) >= 40
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        assert turn_rest_secret.encode() not in bytes(node.encrypted_turn_secret)
 
 
 def test_approval_does_not_issue_until_first_pickup_and_concurrent_pickup_signs_once(

@@ -15,6 +15,11 @@ from app.services.turn_credentials import (
 router = APIRouter(prefix="/turn", tags=["turn"])
 
 
+def require_legacy_turn_credentials_enabled() -> None:
+    if not settings.legacy_turn_credentials_enabled:
+        raise HTTPException(status_code=404, detail="Not found")
+
+
 class TurnCredentialRequest(BaseModel):
     session_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
     credential_deadline_unix_seconds: int = Field(gt=0)
@@ -42,7 +47,12 @@ def get_turn_credential_service() -> TurnCredentialService:
         ttl_seconds=settings.turn_credential_ttl_seconds,
     )
 
-@router.post("/credentials", response_model=TurnCredentialResponse)
+@router.post(
+    "/credentials",
+    response_model=TurnCredentialResponse,
+    deprecated=True,
+    dependencies=[Depends(require_legacy_turn_credentials_enabled)],
+)
 async def create_turn_credentials(
     payload: TurnCredentialRequest,
     current_user: User = Depends(get_current_user),

@@ -42,6 +42,15 @@ class RelayNode(Base):
             "healthy_heartbeat_streak >= 0 AND healthy_heartbeat_streak <= 3",
             name="ck_relay_nodes_healthy_heartbeat_streak",
         ),
+        CheckConstraint(
+            "measured_rtt_ms IS NULL OR "
+            "(measured_rtt_ms >= 0 AND measured_rtt_ms <= 4294967295)",
+            name="ck_relay_nodes_measured_rtt",
+        ),
+        CheckConstraint(
+            "recent_failure_bps >= 0 AND recent_failure_bps <= 10000",
+            name="ck_relay_nodes_recent_failure",
+        ),
         Index("ix_relay_nodes_region", "region"),
         Index("ix_relay_nodes_state", "state"),
         Index("ix_relay_nodes_lease", "lease_expires_at"),
@@ -75,6 +84,12 @@ class RelayNode(Base):
         BigInteger, nullable=False, default=0, server_default=text("0")
     )
     healthy_heartbeat_streak: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    measured_rtt_ms: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    recent_failure_bps: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
     )
     lease_expires_at: Mapped[datetime | None] = mapped_column(

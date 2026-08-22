@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     turn_urls: str = "turn:127.0.0.1:3478?transport=udp,turn:127.0.0.1:3478?transport=tcp,turns:127.0.0.1:5349?transport=tcp"
     turn_auth_secret: SecretStr = SecretStr("")
     turn_credential_ttl_seconds: int = 600
+    legacy_turn_credentials_enabled: bool = False
+    relay_directory_ttl_seconds: int = 30
+    relay_directory_signing_key_id: str = ""
+    relay_directory_signing_private_key: SecretStr = SecretStr("")
+    relay_turn_secret_encryption_key: SecretStr = SecretStr("")
+    relay_turn_secret_encryption_key_id: str = "active"
     # Empty means fail closed: relay management traffic is accepted only from
     # explicit IP addresses/networks of the terminating mTLS proxy.
     trusted_mtls_proxy: str = ""

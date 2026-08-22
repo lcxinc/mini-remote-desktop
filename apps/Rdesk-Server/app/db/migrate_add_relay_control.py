@@ -17,7 +17,7 @@ _CHECK_CAST = re.compile(
     flags=re.IGNORECASE,
 )
 _MIGRATION_LOCK_CONTEXT = b"MRD_RELAY_SCHEMA_MIGRATION_V1\x00"
-_RELAY_SCHEMA_VERSIONS = (1, 2, 3, 4)
+_RELAY_SCHEMA_VERSIONS = (1, 2, 3, 4, 5)
 
 
 class RelaySchemaMismatchError(RuntimeError):
@@ -41,7 +41,7 @@ async def migrate(
     *,
     schema: str | None = None,
 ) -> None:
-    """Apply and verify relay schema through v4 in the caller's transaction."""
+    """Apply and verify relay schema through v5 in the caller's transaction."""
     if isinstance(bind, AsyncEngine):
         async with bind.begin() as connection:
             await _migrate_connection(connection, schema=schema)
@@ -104,6 +104,8 @@ async def _migrate_connection(
             current_egress_bps BIGINT NOT NULL DEFAULT 0,
             heartbeat_sequence BIGINT NOT NULL DEFAULT 0,
             healthy_heartbeat_streak INTEGER NOT NULL DEFAULT 0,
+            measured_rtt_ms BIGINT,
+            recent_failure_bps INTEGER NOT NULL DEFAULT 0,
             lease_expires_at TIMESTAMPTZ,
             revoked_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL,
@@ -122,6 +124,13 @@ async def _migrate_connection(
             CONSTRAINT ck_relay_nodes_heartbeat_sequence CHECK (heartbeat_sequence >= 0),
             CONSTRAINT ck_relay_nodes_healthy_heartbeat_streak CHECK (
                 healthy_heartbeat_streak >= 0 AND healthy_heartbeat_streak <= 3
+            ),
+            CONSTRAINT ck_relay_nodes_measured_rtt CHECK (
+                measured_rtt_ms IS NULL OR
+                (measured_rtt_ms >= 0 AND measured_rtt_ms <= 4294967295)
+            ),
+            CONSTRAINT ck_relay_nodes_recent_failure CHECK (
+                recent_failure_bps >= 0 AND recent_failure_bps <= 10000
             )
         )
         """,
@@ -221,11 +230,14 @@ async def _migrate_connection(
         )
     )
 
-    # v3 is deliberately additive so an already deployed v2 schema upgrades in
+    # Later versions are deliberately additive so deployed schemas upgrade in
     # place while the advisory transaction lock serializes concurrent starters.
     for statement in (
         f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS "
         "healthy_heartbeat_streak INTEGER NOT NULL DEFAULT 0",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS measured_rtt_ms BIGINT",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS "
+        "recent_failure_bps INTEGER NOT NULL DEFAULT 0",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS receipt_digest VARCHAR(64)",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS request_digest VARCHAR(64)",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS receipt_expires_at TIMESTAMPTZ",
@@ -281,6 +293,27 @@ async def _migrate_connection(
             """
         )
     )
+    for name, expression in (
+        (
+            "ck_relay_nodes_measured_rtt",
+            "measured_rtt_ms IS NULL OR "
+            "(measured_rtt_ms >= 0 AND measured_rtt_ms <= 4294967295)",
+        ),
+        (
+            "ck_relay_nodes_recent_failure",
+            "recent_failure_bps >= 0 AND recent_failure_bps <= 10000",
+        ),
+    ):
+        await connection.execute(
+            text(
+                f"""
+                DO $$ BEGIN
+                    ALTER TABLE {nodes} ADD CONSTRAINT {name} CHECK ({expression});
+                EXCEPTION WHEN duplicate_object THEN NULL;
+                END $$
+                """
+            )
+        )
 
     await connection.run_sync(
         lambda sync_connection: _assert_schema_conforms(sync_connection, schema)
@@ -345,11 +378,11 @@ def _preflight_existing_schema(sync_connection: object, schema: str | None) -> N
                 "renewal_record_expires_at",
             },
         }.get(table_name, set())
-        if actual not in (
-            expected,
-            expected | v3_additions,
-            expected | v3_additions | v4_additions,
-        ):
+        v5_additions = {
+            "relay_nodes": {"measured_rtt_ms", "recent_failure_bps"},
+        }.get(table_name, set())
+        allowed = expected | v3_additions | v4_additions | v5_additions
+        if not expected.issubset(actual) or not actual.issubset(allowed):
             raise RelaySchemaMismatchError(
                 f"relay schema mismatch for {table_name}: column set differs"
             )
@@ -389,7 +422,8 @@ def _normalize_check_expression(expression: object) -> str:
     if not isinstance(expression, str):
         return ""
     without_casts = _CHECK_CAST.sub("", expression.lower())
-    return re.sub(r'[\s()"]+', "", without_casts)
+    without_numeric_quotes = re.sub(r"'([0-9]+)'", r"\1", without_casts)
+    return re.sub(r'[\s()"]+', "", without_numeric_quotes)
 
 
 def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None:
@@ -409,6 +443,8 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             "current_egress_bps": (BigInteger, None, False),
             "heartbeat_sequence": (BigInteger, None, False),
             "healthy_heartbeat_streak": (Integer, None, False),
+            "measured_rtt_ms": (BigInteger, None, True),
+            "recent_failure_bps": (Integer, None, False),
             "lease_expires_at": (DateTime, None, True),
             "revoked_at": (DateTime, None, True),
             "created_at": (DateTime, None, False),
@@ -513,7 +549,7 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
         raise RelaySchemaMismatchError("relay node state default differs")
     for name in (
         "active_allocations", "current_egress_bps", "heartbeat_sequence",
-        "healthy_heartbeat_streak",
+        "healthy_heartbeat_streak", "recent_failure_bps",
     ):
         if str(node_columns[name]["default"]).strip("()") != "0":
             raise RelaySchemaMismatchError(f"relay node {name} default differs")
@@ -540,6 +576,13 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
         "ck_relay_nodes_heartbeat_sequence": "heartbeat_sequence >= 0",
         "ck_relay_nodes_healthy_heartbeat_streak": (
             "healthy_heartbeat_streak >= 0 AND healthy_heartbeat_streak <= 3"
+        ),
+        "ck_relay_nodes_measured_rtt": (
+            "measured_rtt_ms IS NULL OR "
+            "(measured_rtt_ms >= 0 AND measured_rtt_ms <= 4294967295)"
+        ),
+        "ck_relay_nodes_recent_failure": (
+            "recent_failure_bps >= 0 AND recent_failure_bps <= 10000"
         ),
     }
     checks = {

@@ -669,6 +669,7 @@ async def test_pickup_and_revoke_serialize_without_deadlock() -> None:
     node_id = "relay-pickup-revoke-race"
     ca_certificate, ca_private_key, _, _ = _ca_material()
     csr_pem, _ = _csr(node_id)
+    cipher = AesGcmRelaySecretCipher(bytes.fromhex("55" * 32))
     async with isolated_postgres_engine() as engine:
         sessions = async_sessionmaker(engine, expire_on_commit=False)
         async with sessions() as setup_session:
@@ -699,7 +700,11 @@ async def test_pickup_and_revoke_serialize_without_deadlock() -> None:
 
         async def pickup() -> str:
             async with sessions() as session:
-                registry = RelayRegistry(session, enrollment_token_pepper=pepper)
+                registry = RelayRegistry(
+                    session,
+                    enrollment_token_pepper=pepper,
+                    turn_secret_cipher=cipher,
+                )
                 await start.wait()
                 try:
                     result = await registry.pickup_enrollment(
@@ -797,6 +802,7 @@ async def test_migration_schema_matches_orm_and_required_indexes() -> None:
             "active_allocations",
             "current_egress_bps",
             "heartbeat_sequence",
+            "recent_failure_bps",
         ):
             assert str(columns[name]["default"]).strip("()") == "0"
         assert {
@@ -806,6 +812,8 @@ async def test_migration_schema_matches_orm_and_required_indexes() -> None:
             "ck_relay_nodes_max_egress",
             "ck_relay_nodes_current_egress",
             "ck_relay_nodes_heartbeat_sequence",
+            "ck_relay_nodes_measured_rtt",
+            "ck_relay_nodes_recent_failure",
         }.issubset(snapshot["nodes_checks"])
         assert (
             "ix_relay_reservations_node_expiry",
@@ -1103,7 +1111,7 @@ async def test_v4_behaviorally_upgrades_v2_schema_and_serializes_concurrent_upgr
             assert "healthy_heartbeat_streak" in node_columns
             assert set(registration_v3_columns).issubset(registration_columns)
             assert set(registration_v4_columns).issubset(registration_columns)
-            assert versions == [1, 2, 3, 4]
+            assert versions == [1, 2, 3, 4, 5]
     finally:
         await first.dispose()
         await second.dispose()

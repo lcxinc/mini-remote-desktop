@@ -14,6 +14,14 @@ RelayId = Annotated[
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
     ),
 ]
+CredentialSafeRelayId = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+    ),
+]
 Region = Annotated[
     str,
     StringConstraints(
@@ -36,7 +44,7 @@ class RelayEnrollmentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     token: SecretStr = Field(repr=False)
-    node_id: RelayId
+    node_id: CredentialSafeRelayId
     region: Region
     failure_domain: RelayId
     endpoints: list[Endpoint] = Field(min_length=1, max_length=4)
@@ -59,6 +67,7 @@ class RelayEnrollmentPickupResponse(BaseModel):
     certificate_pem: str | None = None
     ca_certificate_pem: str | None = None
     expires_at: datetime | None = None
+    turn_rest_secret: str | None = Field(default=None, repr=False)
 
 
 class RelayRenewalRequest(BaseModel):
@@ -87,6 +96,10 @@ class RelayHeartbeatRequest(BaseModel):
 
     active_allocations: int = Field(strict=True, ge=0, le=2**31 - 1)
     current_egress_bps: int = Field(strict=True, ge=0, le=2**63 - 1)
+    measured_rtt_ms: int | None = Field(
+        default=None, strict=True, ge=0, le=2**32 - 1
+    )
+    recent_failure_bps: int = Field(default=0, strict=True, ge=0, le=10_000)
     endpoints: list[Endpoint] = Field(min_length=1, max_length=4)
 
 

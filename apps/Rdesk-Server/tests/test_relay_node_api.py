@@ -16,6 +16,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519, rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -25,10 +26,53 @@ from app.core.security import get_current_user_optional
 from app.db.session import Base, get_db
 from app.models.user import User
 from app.middleware.relay_node_boundary import RelayNodeBoundaryMiddleware
+from app.schemas.relay import (
+    RelayEnrollmentRequest,
+    RelayHeartbeatResponse,
+    RelayNodeResponse,
+)
 
 
 TLS_HEADERS = {"X-Rdesk-Client-TLS": "verified"}
 NODE_ID = "relay-ap-east-1"
+
+
+def test_new_enrollment_rejects_colon_node_id_but_legacy_outputs_remain_valid() -> None:
+    with pytest.raises(ValidationError):
+        RelayEnrollmentRequest(
+            token="x" * 40,
+            node_id="relay:new",
+            region="ap-east",
+            failure_domain="rack-a",
+            endpoints=["turn:relay.example.test:3478?transport=udp"],
+            max_allocations=10,
+            max_egress_bps=1_000,
+            csr_pem="x" * 100,
+        )
+
+    heartbeat = RelayHeartbeatResponse(
+        node_id="relay:legacy",
+        state="available",
+        sequence=1,
+        lease_expires_at=datetime.now(UTC),
+    )
+    node = RelayNodeResponse(
+        node_id="relay:legacy",
+        region="ap-east",
+        failure_domain="rack:a",
+        state="available",
+        endpoints=["turn:relay.example.test:3478?transport=udp"],
+        max_allocations=10,
+        active_allocations=0,
+        max_egress_bps=1_000,
+        current_egress_bps=0,
+        lease_expires_at=datetime.now(UTC),
+        revoked_at=None,
+    )
+
+    assert heartbeat.node_id == "relay:legacy"
+    assert node.node_id == "relay:legacy"
+    assert node.failure_domain == "rack:a"
 
 
 class AsyncSessionShim:
@@ -214,6 +258,11 @@ def api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, ob
     monkeypatch.setitem(settings.__dict__, "relay_ca_private_key_pem", ca_key)
     monkeypatch.setitem(
         settings.__dict__, "relay_enrollment_token_pepper", "22" * 32
+    )
+    monkeypatch.setitem(
+        settings.__dict__,
+        "relay_turn_secret_encryption_key",
+        base64.b64encode(bytes.fromhex("33" * 32)).decode(),
     )
     monkeypatch.setitem(settings.__dict__, "relay_max_clock_skew_seconds", 30)
 
@@ -558,6 +607,36 @@ def test_node_requires_three_consecutive_healthy_heartbeats_to_recover(
         assert node.healthy_heartbeat_streak == 3
 
 
+def test_authenticated_heartbeat_persists_selection_metrics(
+    api: tuple[TestClient, object],
+) -> None:
+    from app.models.relay_node import RelayNode
+
+    client, engine = api
+    key, _ = _enroll(client)
+    _, fingerprint = _approve(client)
+    body, headers = _heartbeat_request(
+        key,
+        fingerprint,
+        payload={
+            "active_allocations": 1,
+            "current_egress_bps": 1024,
+            "measured_rtt_ms": 37,
+            "recent_failure_bps": 1250,
+            "endpoints": ["turn:relay.example.test:3478?transport=udp"],
+        },
+    )
+    response = client.post(
+        f"/api/v1/relays/{NODE_ID}/heartbeat", content=body, headers=headers
+    )
+    assert response.status_code == 200, response.text
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        assert node.measured_rtt_ms == 37
+        assert node.recent_failure_bps == 1250
+
+
 def test_expired_lease_resume_and_drain_have_explicit_recovery_semantics(
     api: tuple[TestClient, object],
 ) -> None:
@@ -723,6 +802,18 @@ def test_heartbeat_signature_binds_method_path_node_time_sequence_and_body(
         {
             "active_allocations": 0,
             "current_egress_bps": "100",
+            "endpoints": ["turn:relay.example.test:3478"],
+        },
+        {
+            "active_allocations": 0,
+            "current_egress_bps": 0,
+            "measured_rtt_ms": 2**32,
+            "endpoints": ["turn:relay.example.test:3478"],
+        },
+        {
+            "active_allocations": 0,
+            "current_egress_bps": 0,
+            "recent_failure_bps": 10_001,
             "endpoints": ["turn:relay.example.test:3478"],
         },
         {

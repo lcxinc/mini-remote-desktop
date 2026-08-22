@@ -10,7 +10,7 @@ from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import AsyncIterator
+from typing import AsyncIterator, NoReturn
 
 from pydantic import SecretStr
 from sqlalchemy import and_, case, event, select, text, update
@@ -26,7 +26,11 @@ from app.services.relay_node_auth import (
     issue_relay_certificate,
     validate_relay_csr,
 )
-from app.services.relay_repository import RelayRepositoryError, _validate_endpoints
+from app.services.relay_repository import (
+    RelayRepositoryError,
+    RelaySecretCipher,
+    _validate_endpoints,
+)
 
 
 _ENROLLMENT_CONTEXT = b"MRD_RELAY_ENROLLMENT_V1\x00"
@@ -75,6 +79,7 @@ class RelayEnrollmentPickup:
     certificate_pem: str | None
     ca_certificate_pem: str | None
     expires_at: datetime | None
+    turn_rest_secret: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -85,7 +90,11 @@ class RevokedRelay:
 
 class RelayRegistry:
     def __init__(
-        self, session: AsyncSession, *, enrollment_token_pepper: str | SecretStr
+        self,
+        session: AsyncSession,
+        *,
+        enrollment_token_pepper: str | SecretStr,
+        turn_secret_cipher: RelaySecretCipher | None = None,
     ) -> None:
         self._session = session
         if isinstance(enrollment_token_pepper, SecretStr):
@@ -95,6 +104,7 @@ class RelayRegistry:
         except (TypeError, ValueError):
             pepper = b""
         self._pepper = pepper if len(pepper) >= 32 else b""
+        self._turn_secret_cipher = turn_secret_cipher
 
     async def issue_enrollment_token(
         self, *, ttl_seconds: int, actor_id: str, now: datetime
@@ -376,6 +386,7 @@ class RelayRegistry:
                 )
             if registration.status != "approved":
                 self._error("relay_enrollment_invalid", 401, "relay enrollment invalid")
+            turn_rest_secret: str | None = None
             if registration.certificate_pem is None:
                 certificate = issue_relay_certificate(
                     csr_pem=registration.csr_pem,
@@ -387,9 +398,19 @@ class RelayRegistry:
                     validity_seconds=validity_seconds,
                 )
                 if node is None:
+                    turn_secret_cipher = self._turn_secret_cipher
+                    if turn_secret_cipher is None:
+                        self._error(
+                            "relay_access_unavailable", 503, "relay access unavailable"
+                        )
+                    turn_rest_secret = secrets.token_urlsafe(32)
+                    encrypted_turn_secret = turn_secret_cipher.encrypt(
+                        turn_rest_secret.encode("utf-8"),
+                        associated_data=registration.node_id.encode("utf-8"),
+                    )
                     node = RelayNode(
                         node_id=registration.node_id,
-                        encrypted_turn_secret=b"\x00",
+                        encrypted_turn_secret=encrypted_turn_secret,
                         created_at=now,
                     )
                     self._session.add(node)
@@ -422,6 +443,8 @@ class RelayRegistry:
                     now=now,
                 )
                 await self._session.flush()
+            if turn_rest_secret is None:
+                turn_rest_secret = self._decrypt_turn_secret(node)
             if (
                 registration.certificate_pem is None
                 or registration.ca_certificate_pem is None
@@ -444,7 +467,23 @@ class RelayRegistry:
                 certificate_pem=registration.certificate_pem.decode(),
                 ca_certificate_pem=registration.ca_certificate_pem.decode(),
                 expires_at=self._as_utc(registration.certificate_expires_at),
+                turn_rest_secret=turn_rest_secret,
             )
+
+    def _decrypt_turn_secret(self, node: RelayNode | None) -> str | None:
+        if node is None:
+            return None
+        turn_secret_cipher = self._turn_secret_cipher
+        if turn_secret_cipher is None:
+            self._error("relay_access_unavailable", 503, "relay access unavailable")
+        try:
+            plaintext = turn_secret_cipher.decrypt(
+                bytes(node.encrypted_turn_secret),
+                associated_data=node.node_id.encode("utf-8"),
+            )
+            return plaintext.decode("utf-8")
+        except Exception:
+            self._error("relay_access_unavailable", 503, "relay access unavailable")
 
     async def renew(
         self,
@@ -628,6 +667,8 @@ class RelayRegistry:
         sequence: int,
         active_allocations: int,
         current_egress_bps: int,
+        measured_rtt_ms: int | None = None,
+        recent_failure_bps: int = 0,
         endpoints: list[str],
         now: datetime,
     ) -> RelayNode:
@@ -637,7 +678,17 @@ class RelayRegistry:
             self._error("relay_certificate_invalid", 401, "relay certificate invalid")
         if node.state == "revoked":
             self._error("relay_node_revoked", 403, "relay node revoked")
-        if active_allocations > node.max_allocations:
+        invalid_selection_metrics = (
+            measured_rtt_ms is not None
+            and (
+                type(measured_rtt_ms) is not int
+                or not 0 <= measured_rtt_ms <= 2**32 - 1
+            )
+        ) or (
+            type(recent_failure_bps) is not int
+            or not 0 <= recent_failure_bps <= 10_000
+        )
+        if active_allocations > node.max_allocations or invalid_selection_metrics:
             self._error("relay_metrics_invalid", 400, "relay metrics invalid")
         lease_expires_at = now + timedelta(seconds=15)
         fresh_ready = and_(
@@ -670,6 +721,8 @@ class RelayRegistry:
                 heartbeat_sequence=sequence,
                 active_allocations=active_allocations,
                 current_egress_bps=current_egress_bps,
+                measured_rtt_ms=measured_rtt_ms,
+                recent_failure_bps=recent_failure_bps,
                 endpoints=canonical_endpoints,
                 lease_expires_at=lease_expires_at,
                 updated_at=now,
@@ -1045,5 +1098,5 @@ class RelayRegistry:
         return value.astimezone(UTC)
 
     @staticmethod
-    def _error(code: str, status_code: int, message: str) -> None:
+    def _error(code: str, status_code: int, message: str) -> NoReturn:
         raise RelayRegistryError(code, status_code, message)

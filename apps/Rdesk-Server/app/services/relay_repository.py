@@ -30,7 +30,7 @@ _TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,512}$")
 _CERTIFICATE_FINGERPRINT_PATTERN = re.compile(
     r"^sha256:[0-9a-f]{64}$"
 )
-_GENERAL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_GENERAL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _REGION_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _KEY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _POSTGRES_INTEGER_MAX = 2**31 - 1
@@ -609,6 +609,9 @@ class RelayRepository:
                 node.max_allocations <= 0
                 or node.active_allocations < 0
                 or node.active_allocations >= node.max_allocations
+                or node.max_egress_bps <= 0
+                or node.current_egress_bps < 0
+                or node.current_egress_bps >= node.max_egress_bps
             ):
                 continue
             remaining_after_active = (

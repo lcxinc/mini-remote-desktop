@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 from datetime import UTC, datetime
 from typing import Annotated, Callable, Coroutine
 
@@ -17,9 +19,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from sqlalchemy.ext.asyncio import AsyncSession
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from app.core.config import settings
 from app.core.security import (
+    get_current_user,
     get_verified_relay_node,
     get_verified_relay_renewal_node,
     require_admin,
@@ -49,6 +53,13 @@ from app.services.relay_registry import (
     RelayRegistry,
     RelayRegistryError,
 )
+from app.services.relay_directory import RelayAccessError, RelayAccessService
+from app.services.relay_repository import AesGcmRelaySecretCipher, RelayRepository
+from app.services.relay_signing import (
+    Ed25519RelayDirectorySigner,
+    SignedRelayDirectoryOut,
+)
+from app.services.turn_credentials import NodeTurnCredentialService
 
 
 class RelayAPIRoute(APIRoute):
@@ -61,11 +72,12 @@ class RelayAPIRoute(APIRoute):
             try:
                 return await original(request)
             except RequestValidationError:
-                code = (
-                    "relay_metrics_invalid"
-                    if request.url.path.endswith("/heartbeat")
-                    else "relay_enrollment_invalid"
-                )
+                if request.url.path.endswith("/heartbeat"):
+                    code = "relay_metrics_invalid"
+                elif request.url.path.endswith("/access"):
+                    code = "relay_access_invalid"
+                else:
+                    code = "relay_enrollment_invalid"
                 return JSONResponse(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     content={"detail": {"code": code, "message": "relay request invalid"}},
@@ -163,8 +175,16 @@ def install_relay_openapi(app: FastAPI) -> None:
 
 
 def _registry(db: AsyncSession) -> RelayRegistry:
+    try:
+        cipher = _relay_turn_secret_cipher()
+    except (ValueError, TypeError, binascii.Error):
+        raise RelayRegistryError(
+            "relay_access_unavailable", 503, "relay access unavailable"
+        ) from None
     return RelayRegistry(
-        db, enrollment_token_pepper=settings.relay_enrollment_token_pepper
+        db,
+        enrollment_token_pepper=settings.relay_enrollment_token_pepper,
+        turn_secret_cipher=cipher,
     )
 
 
@@ -177,6 +197,99 @@ def _raise_domain(error: RelayRegistryError | RelayAuthError) -> None:
         status_code=error.status_code,
         detail={"code": error.code, "message": str(error)},
     ) from None
+
+
+class RelayAccessRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+    )
+    policy_revision: int = Field(gt=0, le=2**63 - 1)
+    intended_peer_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+    )
+
+
+class NodeTurnCredentialOut(BaseModel):
+    node_id: str
+    urls: list[str]
+    username: str
+    credential: str = Field(repr=False)
+    expires_at_unix_seconds: int
+
+
+class RelayAccessResponse(BaseModel):
+    directory: SignedRelayDirectoryOut
+    credentials: list[NodeTurnCredentialOut]
+
+
+def get_relay_access_service(
+    db: AsyncSession = Depends(get_db),
+) -> RelayAccessService:
+    try:
+        signing_seed = _decode_secret_b64(
+            settings.relay_directory_signing_private_key, expected_length=32
+        )
+        pepper = bytes.fromhex(
+            _secret_value(settings.relay_enrollment_token_pepper)
+        )
+        if len(pepper) < 32:
+            raise ValueError("relay repository pepper unavailable")
+        cipher = _relay_turn_secret_cipher()
+        repository = RelayRepository(
+            db,
+            enrollment_token_pepper=pepper,
+            secret_cipher=cipher,
+            max_reservations_per_session=2,
+        )
+        signer = Ed25519RelayDirectorySigner(
+            key_id=settings.relay_directory_signing_key_id,
+            private_key_seed=signing_seed,
+        )
+        issuer = NodeTurnCredentialService(
+            cipher=cipher,
+            ttl_seconds=settings.turn_credential_ttl_seconds,
+        )
+        return RelayAccessService(
+            session=db,
+            repository=repository,
+            signer=signer,
+            credential_issuer=issuer,
+            directory_ttl_seconds=settings.relay_directory_ttl_seconds,
+        )
+    except (ValueError, TypeError, binascii.Error):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "relay_signing_unavailable",
+                "message": "relay access unavailable",
+            },
+        ) from None
+
+
+def _secret_value(value: str | SecretStr) -> str:
+    return value.get_secret_value() if isinstance(value, SecretStr) else value
+
+
+def _decode_secret_b64(value: str | SecretStr, *, expected_length: int) -> bytes:
+    decoded = base64.b64decode(_secret_value(value), validate=True)
+    if len(decoded) != expected_length:
+        raise ValueError("secret has invalid length")
+    return decoded
+
+
+def _relay_turn_secret_cipher() -> AesGcmRelaySecretCipher:
+    encryption_key = _decode_secret_b64(
+        settings.relay_turn_secret_encryption_key, expected_length=32
+    )
+    return AesGcmRelaySecretCipher(
+        encryption_key, key_id=settings.relay_turn_secret_encryption_key_id
+    )
 
 
 async def _commit(db: AsyncSession) -> None:
@@ -367,6 +480,8 @@ async def record_relay_heartbeat(
             sequence=request.state.relay_sequence,
             active_allocations=payload.active_allocations,
             current_egress_bps=payload.current_egress_bps,
+            measured_rtt_ms=payload.measured_rtt_ms,
+            recent_failure_bps=payload.recent_failure_bps,
             endpoints=payload.endpoints,
             now=_now(),
         )
@@ -492,3 +607,43 @@ async def revoke_relay_node(
     except RelayRegistryError as error:
         _raise_domain(error)
     return RelayRevocationResponse(node_id=revoked.node_id, state="revoked")
+
+
+@router.post(
+    "/access",
+    response_model=RelayAccessResponse,
+    responses={
+        403: {"model": RelayErrorResponse, "description": "Relay access denied."},
+        503: {"model": RelayErrorResponse, "description": "Relay access unavailable."},
+    },
+)
+async def issue_relay_access(
+    payload: RelayAccessRequest,
+    current_user: User = Depends(get_current_user),
+    service: RelayAccessService = Depends(get_relay_access_service),
+) -> RelayAccessResponse:
+    try:
+        result = await service.issue_access(
+            current_user_id=current_user.id,
+            session_id=payload.session_id,
+            policy_revision=payload.policy_revision,
+            intended_peer_id=payload.intended_peer_id,
+        )
+    except RelayAccessError as error:
+        raise HTTPException(
+            status_code=error.status_code,
+            detail={"code": error.code, "message": str(error)},
+        ) from None
+    return RelayAccessResponse(
+        directory=result.directory,
+        credentials=[
+            NodeTurnCredentialOut(
+                node_id=item.node_id,
+                urls=list(item.urls),
+                username=item.username,
+                credential=item.credential,
+                expires_at_unix_seconds=item.expires_at_unix_seconds,
+            )
+            for item in result.credentials
+        ],
+    )
