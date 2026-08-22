@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -19,10 +20,17 @@ from app.services.relay_repository import (
     RelayRepository,
     RelayRepositoryError,
 )
+import app.services.relay_repository as relay_repository_module
 
 
 NOW = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
-CERTIFICATE = "sha256:01aabbcc"
+
+
+def fingerprint(label: str) -> str:
+    return "sha256:" + hashlib.sha256(label.encode()).hexdigest()
+
+
+CERTIFICATE = fingerprint("default-certificate")
 TURN_SECRET = "node-unique-turn-rest-secret"
 # Deterministic URL-safe values in this module are test fixtures only. Production
 # enrollment tokens are minted through the repository's injected CSPRNG source.
@@ -68,9 +76,23 @@ class AsyncSessionShim:
     async def refresh(self, instance: object) -> None:
         self.session.refresh(instance)
 
+    async def begin_nested(self) -> "AsyncTransactionShim":
+        return AsyncTransactionShim(self.session.begin_nested())
+
     @property
     def bind(self) -> object:
         return self.session.get_bind()
+
+
+class AsyncTransactionShim:
+    def __init__(self, transaction: object) -> None:
+        self.transaction = transaction
+
+    async def commit(self) -> None:
+        self.transaction.commit()
+
+    async def rollback(self) -> None:
+        self.transaction.rollback()
 
 
 @pytest.fixture
@@ -110,24 +132,35 @@ async def enroll(
     node_id: str = "relay-a",
     token: str = "one-use-high-entropy-token-a",
     max_allocations: int = 2,
+    ready: bool = False,
 ) -> RelayNode:
     await repository.store_enrollment_token(
         token=token,
         expires_at=NOW + timedelta(minutes=5),
         now=NOW,
     )
-    return await repository.enroll_node(
+    node = await repository.enroll_node(
         token=token,
         node_id=node_id,
         region="ap-east",
         failure_domain=f"rack-{node_id}",
-        certificate_fingerprint=CERTIFICATE + node_id,
+        certificate_fingerprint=fingerprint(f"certificate:{node_id}"),
         endpoints=ENDPOINTS,
         max_allocations=max_allocations,
         max_egress_bps=1_000_000,
         turn_secret=TURN_SECRET + node_id,
         now=NOW,
     )
+    if ready:
+        await repository.record_heartbeat(
+            node_id=node.node_id,
+            certificate_fingerprint=node.certificate_fingerprint,
+            sequence=1,
+            active_allocations=0,
+            current_egress_bps=0,
+            now=NOW,
+        )
+    return node
 
 
 @pytest.mark.anyio
@@ -163,11 +196,11 @@ async def test_enrollment_tokens_are_hashed_one_use_and_never_repr_raw(
             node_id="relay-b",
             region="ap-east",
             failure_domain="rack-b",
-            certificate_fingerprint="sha256:other",
+            certificate_fingerprint=fingerprint("other"),
             endpoints=ENDPOINTS,
             max_allocations=10,
             max_egress_bps=1_000_000,
-            turn_secret="another-secret",
+            turn_secret="another-node-secret",
             now=NOW,
         )
     assert error.value.code == "ENROLLMENT_TOKEN_USED"
@@ -209,7 +242,7 @@ async def test_issue_enrollment_token_requests_256_bits_and_returns_raw_once(
         node_id="relay-issued",
         region="ap-east",
         failure_domain="rack-issued",
-        certificate_fingerprint="sha256:issued",
+        certificate_fingerprint=fingerprint("issued"),
         endpoints=ENDPOINTS,
         max_allocations=1,
         max_egress_bps=1,
@@ -222,7 +255,7 @@ async def test_issue_enrollment_token_requests_256_bits_and_returns_raw_once(
             node_id="relay-issued-again",
             region="ap-east",
             failure_domain="rack-issued-again",
-            certificate_fingerprint="sha256:issued-again",
+            certificate_fingerprint=fingerprint("issued-again"),
             endpoints=ENDPOINTS,
             max_allocations=1,
             max_egress_bps=1,
@@ -253,7 +286,7 @@ async def test_turn_secret_is_encrypted_at_rest_and_not_in_repr_or_errors(
             node_id="relay-secret-error",
             region="ap-east",
             failure_domain="rack-z",
-            certificate_fingerprint="sha256:z",
+            certificate_fingerprint=fingerprint("z"),
             endpoints=ENDPOINTS,
             max_allocations=1,
             max_egress_bps=1,
@@ -263,15 +296,36 @@ async def test_turn_secret_is_encrypted_at_rest_and_not_in_repr_or_errors(
     assert "must-not-leak" not in repr(error.value)
 
 
+def test_secret_envelope_supports_key_rotation_and_rejects_unknown_keys() -> None:
+    old_key = bytes.fromhex("51" * 32)
+    new_key = bytes.fromhex("52" * 32)
+    old_cipher = AesGcmRelaySecretCipher(old_key, key_id="old-2026")
+    encrypted = old_cipher.encrypt(b"rotating-secret", associated_data=b"relay-a")
+    assert b"rotating-secret" not in encrypted
+
+    rotated = AesGcmRelaySecretCipher(
+        new_key,
+        key_id="new-2026",
+        read_keys={"old-2026": old_key},
+    )
+    assert rotated.decrypt(encrypted, associated_data=b"relay-a") == b"rotating-secret"
+
+    without_old_key = AesGcmRelaySecretCipher(new_key, key_id="new-2026")
+    with pytest.raises(relay_repository_module.RelaySecretCipherError) as unknown:
+        without_old_key.decrypt(encrypted, associated_data=b"relay-a")
+    assert unknown.value.code == "UNKNOWN_KEY_ID"
+    assert "rotating-secret" not in str(unknown.value)
+
+
 @pytest.mark.anyio
 async def test_heartbeat_is_monotonic_bound_to_certificate_and_lease_is_exact(
     repository: RelayRepository,
 ) -> None:
     node = await enroll(repository)
-    fingerprint = node.certificate_fingerprint
+    node_fingerprint = node.certificate_fingerprint
     heartbeat = await repository.record_heartbeat(
         node_id=node.node_id,
-        certificate_fingerprint=fingerprint,
+        certificate_fingerprint=node_fingerprint,
         sequence=1,
         active_allocations=1,
         current_egress_bps=500,
@@ -282,7 +336,7 @@ async def test_heartbeat_is_monotonic_bound_to_certificate_and_lease_is_exact(
     with pytest.raises(RelayRepositoryError) as replay:
         await repository.record_heartbeat(
             node_id=node.node_id,
-            certificate_fingerprint=fingerprint,
+            certificate_fingerprint=node_fingerprint,
             sequence=1,
             active_allocations=1,
             current_egress_bps=500,
@@ -293,7 +347,7 @@ async def test_heartbeat_is_monotonic_bound_to_certificate_and_lease_is_exact(
     with pytest.raises(RelayRepositoryError) as wrong_certificate:
         await repository.record_heartbeat(
             node_id=node.node_id,
-            certificate_fingerprint="sha256:attacker",
+            certificate_fingerprint=fingerprint("attacker"),
             sequence=2,
             active_allocations=1,
             current_egress_bps=500,
@@ -337,7 +391,7 @@ async def test_revocation_cannot_be_undone_by_heartbeat_or_reenrollment(
             node_id=node.node_id,
             region="ap-east",
             failure_domain="rack-new",
-            certificate_fingerprint="sha256:replacement",
+            certificate_fingerprint=fingerprint("replacement"),
             endpoints=ENDPOINTS,
             max_allocations=10,
             max_egress_bps=1_000_000,
@@ -379,7 +433,7 @@ async def test_invalid_endpoints_are_rejected_before_persistence(
             node_id="bad-node",
             region="ap-east",
             failure_domain="rack-bad",
-            certificate_fingerprint="sha256:bad",
+            certificate_fingerprint=fingerprint("bad"),
             endpoints=endpoints,
             max_allocations=1,
             max_egress_bps=1,
@@ -391,6 +445,86 @@ async def test_invalid_endpoints_are_rejected_before_persistence(
 
 
 @pytest.mark.anyio
+async def test_endpoints_are_canonicalized_before_duplicate_detection(
+    repository: RelayRepository,
+) -> None:
+    token = "canonical-endpoint-token"
+    await repository.store_enrollment_token(
+        token=token,
+        expires_at=NOW + timedelta(minutes=5),
+        now=NOW,
+    )
+    node = await repository.enroll_node(
+        token=token,
+        node_id="canonical-node",
+        region="ap-east",
+        failure_domain="rack-canonical",
+        certificate_fingerprint=fingerprint("canonical"),
+        endpoints=[
+            "turn:Relay.Example.Test.:3478",
+            "turns:[2001:0DB8::1]:5349",
+        ],
+        max_allocations=1,
+        max_egress_bps=1,
+        turn_secret="canonical-turn-secret",
+        now=NOW,
+    )
+    assert node.endpoints == [
+        "turn:relay.example.test:3478?transport=udp",
+        "turns:[2001:db8::1]:5349?transport=tcp",
+    ]
+
+    duplicate_token = "canonical-duplicate-token"
+    await repository.store_enrollment_token(
+        token=duplicate_token,
+        expires_at=NOW + timedelta(minutes=5),
+        now=NOW,
+    )
+    with pytest.raises(RelayRepositoryError) as duplicate:
+        await repository.enroll_node(
+            token=duplicate_token,
+            node_id="canonical-duplicate-node",
+            region="ap-east",
+            failure_domain="rack-canonical-duplicate",
+            certificate_fingerprint=fingerprint("canonical-duplicate"),
+            endpoints=[
+                "turn:Relay.Example.Test.:3478",
+                "turn:relay.example.test:3478?transport=udp",
+            ],
+            max_allocations=1,
+            max_egress_bps=1,
+            turn_secret="canonical-duplicate-secret",
+            now=NOW,
+        )
+    assert duplicate.value.code == "INVALID_ENDPOINTS"
+
+
+@pytest.mark.anyio
+async def test_turns_udp_is_rejected(
+    repository: RelayRepository,
+) -> None:
+    await repository.store_enrollment_token(
+        token="turns-udp-invalid-token",
+        expires_at=NOW + timedelta(minutes=5),
+        now=NOW,
+    )
+    with pytest.raises(RelayRepositoryError) as error:
+        await repository.enroll_node(
+            token="turns-udp-invalid-token",
+            node_id="turns-udp-node",
+            region="ap-east",
+            failure_domain="rack-turns-udp",
+            certificate_fingerprint=fingerprint("turns-udp"),
+            endpoints=["turns:relay.example.test:5349?transport=udp"],
+            max_allocations=1,
+            max_egress_bps=1,
+            turn_secret="turns-udp-secret",
+            now=NOW,
+        )
+    assert error.value.code == "INVALID_ENDPOINTS"
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     "fingerprint",
     [
@@ -398,6 +532,9 @@ async def test_invalid_endpoints_are_rejected_before_persistence(
         "sha256:",
         "sha256:contains spaces",
         "sha256:unicode-指纹",
+        "sha256:relay_enrollments_token_digest_key",
+        "sha256:" + "A" * 64,
+        "sha256:" + "a" * 63,
         "sha256:" + "a" * 129,
     ],
 )
@@ -430,21 +567,97 @@ async def test_certificate_fingerprint_is_bounded_and_structurally_valid(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("overrides", "expected_code"),
+    [
+        ({"node_id": "n" * 129}, "INVALID_NODE_ID"),
+        ({"node_id": "node with spaces"}, "INVALID_NODE_ID"),
+        ({"region": "r" * 65}, "INVALID_NODE_LOCATION"),
+        ({"region": "Region Upper"}, "INVALID_NODE_LOCATION"),
+        ({"failure_domain": "f" * 129}, "INVALID_NODE_LOCATION"),
+        ({"max_allocations": 2**31}, "INVALID_CAPACITY"),
+        ({"max_egress_bps": 2**63}, "INVALID_CAPACITY"),
+        ({"turn_secret": "short"}, "INVALID_TURN_SECRET"),
+        ({"turn_secret": "s" * 513}, "INVALID_TURN_SECRET"),
+        ({"turn_secret": "\ud800" * 16}, "INVALID_TURN_SECRET"),
+    ],
+)
+async def test_enrollment_validates_database_widths_and_numeric_ranges(
+    repository: RelayRepository,
+    overrides: dict[str, object],
+    expected_code: str,
+) -> None:
+    token = "bounded-enrollment-token"
+    await repository.store_enrollment_token(
+        token=token,
+        expires_at=NOW + timedelta(minutes=5),
+        now=NOW,
+    )
+    arguments = {
+        "token": token,
+        "node_id": "bounded-enrollment-node",
+        "region": "ap-east",
+        "failure_domain": "rack-bounded",
+        "certificate_fingerprint": fingerprint("bounded-enrollment"),
+        "endpoints": ENDPOINTS,
+        "max_allocations": 1,
+        "max_egress_bps": 1,
+        "turn_secret": "bounded-turn-secret",
+        "now": NOW,
+    }
+    arguments.update(overrides)
+    with pytest.raises(RelayRepositoryError) as error:
+        await repository.enroll_node(**arguments)
+    assert error.value.code == expected_code
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("sequence", "active", "egress"),
+    [
+        (2**63, 0, 0),
+        (1, -1, 0),
+        (1, 0, -1),
+        (1, 0, 2**63),
+    ],
+)
+async def test_heartbeat_validates_bigint_and_metric_ranges(
+    repository: RelayRepository,
+    sequence: int,
+    active: int,
+    egress: int,
+) -> None:
+    node = await enroll(repository, node_id="heartbeat-bounds-node")
+    with pytest.raises(RelayRepositoryError) as error:
+        await repository.record_heartbeat(
+            node_id=node.node_id,
+            certificate_fingerprint=node.certificate_fingerprint,
+            sequence=sequence,
+            active_allocations=active,
+            current_egress_bps=egress,
+            now=NOW,
+        )
+    assert error.value.code in {"HEARTBEAT_SEQUENCE_REPLAY", "INVALID_METRICS"}
+
+
+@pytest.mark.anyio
 async def test_reservations_preserve_order_are_bounded_idempotent_and_expire(
     repository: RelayRepository,
 ) -> None:
-    await enroll(repository, node_id="relay-a", max_allocations=1)
+    await enroll(repository, node_id="relay-a", max_allocations=1, ready=True)
     await enroll(
         repository,
         node_id="relay-b",
         token="one-use-high-entropy-token-b",
         max_allocations=1,
+        ready=True,
     )
     await enroll(
         repository,
         node_id="relay-c",
         token="one-use-high-entropy-token-c",
         max_allocations=1,
+        ready=True,
     )
 
     first = await repository.reserve_capacity(
@@ -486,6 +699,16 @@ async def test_reservations_preserve_order_are_bounded_idempotent_and_expire(
     )
     assert full == []
 
+    for node_id in ("relay-a", "relay-b"):
+        await repository.record_heartbeat(
+            node_id=node_id,
+            certificate_fingerprint=fingerprint(f"certificate:{node_id}"),
+            sequence=2,
+            active_allocations=0,
+            current_egress_bps=0,
+            now=NOW + timedelta(seconds=29),
+        )
+
     boundary = await repository.reserve_capacity(
         session_id="session-2",
         user_id="user-2",
@@ -493,6 +716,101 @@ async def test_reservations_preserve_order_are_bounded_idempotent_and_expire(
         now=NOW + timedelta(seconds=30),
     )
     assert [reservation.node_id for reservation in boundary] == ["relay-b", "relay-a"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("state", "lease_offset_seconds", "eligible"),
+    [
+        ("available", 15, True),
+        ("degraded", 15, True),
+        ("draining", 15, False),
+        ("unavailable", 15, False),
+        ("revoked", 15, False),
+        ("available", 0, False),
+        ("degraded", -1, False),
+    ],
+)
+async def test_reservation_rechecks_locked_node_state_and_exact_lease_boundary(
+    repository: RelayRepository,
+    state: str,
+    lease_offset_seconds: int,
+    eligible: bool,
+) -> None:
+    node = await enroll(repository, node_id="eligibility-node", ready=True)
+    node.state = state
+    node.lease_expires_at = NOW + timedelta(seconds=lease_offset_seconds)
+    result = await repository.reserve_capacity(
+        session_id="eligibility-session",
+        user_id="eligibility-user",
+        ordered_node_ids=[node.node_id],
+        now=NOW,
+    )
+    assert bool(result) is eligible
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("state", ["draining", "unavailable", "revoked"])
+async def test_existing_pending_reservation_is_not_returned_after_node_ineligible(
+    repository: RelayRepository,
+    state: str,
+) -> None:
+    node = await enroll(repository, node_id="pending-state-node", ready=True)
+    first = await repository.reserve_capacity(
+        session_id="pending-state-session",
+        user_id="pending-state-user",
+        ordered_node_ids=[node.node_id],
+        now=NOW,
+    )
+    assert len(first) == 1
+    node.state = state
+    repeated = await repository.reserve_capacity(
+        session_id="pending-state-session",
+        user_id="pending-state-user",
+        ordered_node_ids=[node.node_id],
+        now=NOW + timedelta(seconds=1),
+    )
+    assert repeated == []
+
+
+@pytest.mark.anyio
+async def test_repository_validates_identifier_numeric_ttl_and_candidate_bounds(
+    repository: RelayRepository,
+) -> None:
+    node = await enroll(repository, node_id="bounded-node", ready=True)
+    invalid_reservations = [
+        ({"session_id": "s" * 129}, "INVALID_SESSION_ID"),
+        ({"user_id": "u" * 129}, "INVALID_USER_ID"),
+        ({"ttl_seconds": 301}, "INVALID_RESERVATION_TTL"),
+        (
+            {"ordered_node_ids": [f"node-{index}" for index in range(9)]},
+            "TOO_MANY_CANDIDATES",
+        ),
+        ({"ordered_node_ids": ["bad node"]}, "INVALID_NODE_ID"),
+    ]
+    for overrides, expected_code in invalid_reservations:
+        arguments = {
+            "session_id": "bounded-session",
+            "user_id": "bounded-user",
+            "ordered_node_ids": [node.node_id],
+            "now": NOW,
+            "ttl_seconds": 30,
+        }
+        arguments.update(overrides)
+        with pytest.raises(RelayRepositoryError) as error:
+            await repository.reserve_capacity(**arguments)
+        assert error.value.code == expected_code
+
+    node.lease_expires_at = datetime.max.replace(tzinfo=UTC)
+    with pytest.raises(RelayRepositoryError) as overflow:
+        await repository.reserve_capacity(
+            session_id="overflow-session",
+            user_id="overflow-user",
+            ordered_node_ids=[node.node_id],
+            now=datetime.max.replace(tzinfo=UTC) - timedelta(seconds=1),
+            ttl_seconds=30,
+        )
+    assert overflow.value.code == "INVALID_RESERVATION_TTL"
 
 
 @pytest.mark.anyio
@@ -545,17 +863,20 @@ class IntegrityConflictSession:
         *,
         constraint_message: str,
         enrollment: RelayEnrollment | None = None,
+        driver_error: Exception | None = None,
     ) -> None:
         self._enrollment = enrollment
         self._scalar_calls = 0
-        self.rolled_back = False
+        self.outer_work = ["unrelated-work"]
+        self.full_rolled_back = False
+        self.nested_rolled_back = False
         self.error = IntegrityError(
             "INSERT INTO relay_nodes VALUES (...) ",
             {
-                "certificate_fingerprint": "sha256:sensitive-fingerprint",
+                "certificate_fingerprint": fingerprint("sensitive-fingerprint"),
                 "encrypted_turn_secret": b"ciphertext-not-plaintext",
             },
-            sqlite3.IntegrityError(constraint_message),
+            driver_error or sqlite3.IntegrityError(constraint_message),
         )
 
     def add(self, instance: object) -> None:
@@ -575,8 +896,75 @@ class IntegrityConflictSession:
     async def flush(self) -> None:
         raise self.error
 
+    async def begin_nested(self) -> "IntegrityConflictSavepoint":
+        return IntegrityConflictSavepoint(self)
+
     async def rollback(self) -> None:
-        self.rolled_back = True
+        self.full_rolled_back = True
+        self.outer_work.clear()
+
+
+class IntegrityConflictSavepoint:
+    def __init__(self, session: IntegrityConflictSession) -> None:
+        self.session = session
+
+    async def rollback(self) -> None:
+        self.session.nested_rolled_back = True
+
+    async def commit(self) -> None:
+        raise AssertionError("conflicting savepoint must not commit")
+
+
+class StructuredConstraintError(Exception):
+    constraint_name = "relay_nodes_certificate_fingerprint_key"
+
+    def __str__(self) -> str:
+        return (
+            "user value contains relay_enrollments_token_digest_key but the "
+            "structured constraint is authoritative"
+        )
+
+
+@pytest.mark.anyio
+async def test_structured_constraint_name_ignores_deceptive_error_detail(
+    cipher: AesGcmRelaySecretCipher,
+) -> None:
+    pepper = bytes.fromhex("22" * 32)
+    token = "structured-constraint-token"
+    digest = hmac.new(
+        pepper,
+        b"MRD_RELAY_ENROLLMENT_V1\x00" + token.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    session = IntegrityConflictSession(
+        constraint_message="ignored",
+        enrollment=RelayEnrollment(
+            token_digest=digest,
+            expires_at=NOW + timedelta(minutes=5),
+            created_at=NOW,
+        ),
+        driver_error=StructuredConstraintError(),
+    )
+    repository = RelayRepository(
+        session,
+        enrollment_token_pepper=pepper,
+        secret_cipher=cipher,
+    )
+    with pytest.raises(RelayRepositoryError) as error:
+        await repository.enroll_node(
+            token=token,
+            node_id="structured-node",
+            region="ap-east",
+            failure_domain="rack-structured",
+            certificate_fingerprint=fingerprint("structured"),
+            endpoints=ENDPOINTS,
+            max_allocations=1,
+            max_egress_bps=1,
+            turn_secret="structured-secret",
+            now=NOW,
+        )
+    assert error.value.code == "CERTIFICATE_ALREADY_BOUND"
+    assert "relay_enrollments" not in str(error.value)
 
 
 @pytest.mark.anyio
@@ -622,7 +1010,7 @@ async def test_enrollment_integrity_conflicts_are_stable_and_rollback(
             node_id="relay-conflict",
             region="ap-east",
             failure_domain="rack-conflict",
-            certificate_fingerprint="sha256:sensitive-fingerprint",
+            certificate_fingerprint=fingerprint("sensitive-fingerprint"),
             endpoints=ENDPOINTS,
             max_allocations=1,
             max_egress_bps=1,
@@ -630,7 +1018,9 @@ async def test_enrollment_integrity_conflicts_are_stable_and_rollback(
             now=NOW,
         )
     assert conflict.value.code == expected_code
-    assert session.rolled_back
+    assert session.nested_rolled_back
+    assert not session.full_rolled_back
+    assert session.outer_work == ["unrelated-work"]
     assert "sensitive" not in str(conflict.value)
 
 
@@ -653,7 +1043,9 @@ async def test_token_digest_integrity_conflict_is_stable_and_rolls_back(
             now=NOW,
         )
     assert conflict.value.code == "ENROLLMENT_TOKEN_EXISTS"
-    assert session.rolled_back
+    assert session.nested_rolled_back
+    assert not session.full_rolled_back
+    assert session.outer_work == ["unrelated-work"]
     assert "sensitive" not in str(conflict.value)
 
 
@@ -678,7 +1070,9 @@ async def test_unknown_integrity_error_rolls_back_without_misclassification(
             now=NOW,
         )
     assert unknown.value is session.error
-    assert session.rolled_back
+    assert session.nested_rolled_back
+    assert not session.full_rolled_back
+    assert session.outer_work == ["unrelated-work"]
 
 
 @pytest.mark.anyio
@@ -701,16 +1095,20 @@ async def test_constraints_and_utc_aware_time_are_enforced(
             failure_domain="rack-invalid",
             state="available",
             endpoints=ENDPOINTS,
-            certificate_fingerprint="sha256:invalid",
+            certificate_fingerprint=fingerprint("invalid"),
             encrypted_turn_secret=b"ciphertext",
             max_allocations=0,
-            active_allocations=-1,
-            max_egress_bps=0,
-            current_egress_bps=-1,
-            heartbeat_sequence=-1,
+            active_allocations=0,
+            max_egress_bps=1,
+            current_egress_bps=0,
+            heartbeat_sequence=0,
+            lease_expires_at=NOW,
+            revoked_at=None,
+            created_at=NOW,
+            updated_at=NOW,
         )
     )
-    with pytest.raises(IntegrityError):
+    with pytest.raises(IntegrityError, match="ck_relay_nodes_max_allocations"):
         await db_session.commit()
     await db_session.rollback()
 
@@ -726,3 +1124,15 @@ def test_model_repr_does_not_expose_credential_fields() -> None:
     assert "super-secret-digest" not in repr(enrollment)
     assert "token_digest" not in repr(enrollment)
     assert "password" not in repr(reservation).lower()
+
+
+def test_startup_runs_relay_migration_before_legacy_metadata_bootstrap() -> None:
+    main_source = (
+        Path(__file__).parents[1] / "app" / "main.py"
+    ).read_text(encoding="utf-8")
+    migration_call = "await migrate_relay_control(conn)"
+    legacy_bootstrap = "await conn.run_sync(Base.metadata.create_all)"
+    assert migration_call in main_source
+    assert legacy_bootstrap in main_source
+    assert main_source.index(migration_call) < main_source.index(legacy_bootstrap)
+    assert "legacy/dev bootstrap" in main_source

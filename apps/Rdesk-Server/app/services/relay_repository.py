@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Protocol
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.exceptions import InvalidTag
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,19 +24,29 @@ from app.models.relay_reservation import RelayReservation
 
 _TOKEN_CONTEXT = b"MRD_RELAY_ENROLLMENT_V1\x00"
 _SESSION_LOCK_CONTEXT = b"MRD_RELAY_SESSION_LOCK_V1\x00"
-_CIPHERTEXT_VERSION = b"\x01"
+_LEGACY_CIPHERTEXT_VERSION = b"\x01"
+_CIPHERTEXT_VERSION = b"\x02"
 _TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,512}$")
 _CERTIFICATE_FINGERPRINT_PATTERN = re.compile(
-    r"^sha256:[A-Za-z0-9._-]{1,128}$"
+    r"^sha256:[0-9a-f]{64}$"
 )
+_GENERAL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_REGION_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+_KEY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_POSTGRES_INTEGER_MAX = 2**31 - 1
+_POSTGRES_BIGINT_MAX = 2**63 - 1
+_MAX_RESERVATION_TTL_SECONDS = 300
 _SQLITE_UNIQUE_CONSTRAINT_PATTERN = re.compile(
     r"^UNIQUE constraint failed: "
     r"(?P<columns>[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*"
     r"(?:, [a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*)*)$"
 )
 _ENDPOINT_PATTERN = re.compile(
-    r"^(?:turn|turns):(?P<host>\[[0-9A-Fa-f:]+\]|[A-Za-z0-9.-]+):"
-    r"(?P<port>[0-9]{1,5})(?:\?transport=(?:udp|tcp))?$"
+    r"^(?P<scheme>turn|turns):"
+    r"(?P<host>\[[0-9A-Fa-f:]+\]|[A-Za-z0-9.-]+):"
+    r"(?P<port>[0-9]{1,5})"
+    r"(?:\?transport=(?P<transport>udp|tcp))?$",
+    flags=re.IGNORECASE | re.ASCII,
 )
 _LOCAL_SESSION_LOCKS: weakref.WeakValueDictionary[
     tuple[int, str], asyncio.Lock
@@ -43,6 +54,12 @@ _LOCAL_SESSION_LOCKS: weakref.WeakValueDictionary[
 
 
 class RelayRepositoryError(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(message)
+
+
+class RelaySecretCipherError(Exception):
     def __init__(self, code: str, message: str) -> None:
         self.code = code
         super().__init__(message)
@@ -57,24 +74,85 @@ class RelaySecretCipher(Protocol):
 class AesGcmRelaySecretCipher:
     """Versioned AES-GCM boundary; callers must inject an application-managed key."""
 
-    def __init__(self, key: bytes) -> None:
-        if len(key) not in {16, 24, 32}:
-            raise ValueError("relay secret encryption key must be 16, 24, or 32 bytes")
-        self._aes_gcm = AESGCM(key)
+    def __init__(
+        self,
+        key: bytes,
+        *,
+        key_id: str = "active",
+        read_keys: dict[str, bytes] | None = None,
+    ) -> None:
+        _validate_encryption_key(key)
+        if _KEY_ID_PATTERN.fullmatch(key_id) is None:
+            raise ValueError("relay secret key id is invalid")
+        keys = dict(read_keys or {})
+        for read_key_id, read_key in keys.items():
+            if _KEY_ID_PATTERN.fullmatch(read_key_id) is None:
+                raise ValueError("relay secret read key id is invalid")
+            _validate_encryption_key(read_key)
+        keys[key_id] = key
+        self._active_key_id = key_id
+        self._keys = keys
+        self._active_aes_gcm = AESGCM(key)
 
     def encrypt(self, plaintext: bytes, *, associated_data: bytes) -> bytes:
         nonce = secrets.token_bytes(12)
+        encoded_key_id = self._active_key_id.encode("ascii")
         return (
             _CIPHERTEXT_VERSION
+            + bytes([len(encoded_key_id)])
+            + encoded_key_id
             + nonce
-            + self._aes_gcm.encrypt(nonce, plaintext, associated_data)
+            + self._active_aes_gcm.encrypt(nonce, plaintext, associated_data)
         )
 
     def decrypt(self, ciphertext: bytes, *, associated_data: bytes) -> bytes:
-        if len(ciphertext) < 30 or ciphertext[:1] != _CIPHERTEXT_VERSION:
-            raise ValueError("unsupported relay secret ciphertext")
-        nonce = ciphertext[1:13]
-        return self._aes_gcm.decrypt(nonce, ciphertext[13:], associated_data)
+        if not ciphertext:
+            raise RelaySecretCipherError(
+                "INVALID_ENVELOPE", "relay secret envelope is invalid"
+            )
+        if ciphertext[:1] == _LEGACY_CIPHERTEXT_VERSION:
+            if len(ciphertext) < 29:
+                raise RelaySecretCipherError(
+                    "INVALID_ENVELOPE", "relay secret envelope is invalid"
+                )
+            nonce = ciphertext[1:13]
+            encrypted = ciphertext[13:]
+            aes_gcm = self._active_aes_gcm
+        elif ciphertext[:1] == _CIPHERTEXT_VERSION:
+            if len(ciphertext) < 30:
+                raise RelaySecretCipherError(
+                    "INVALID_ENVELOPE", "relay secret envelope is invalid"
+                )
+            key_id_length = ciphertext[1]
+            nonce_offset = 2 + key_id_length
+            if key_id_length == 0 or len(ciphertext) < nonce_offset + 28:
+                raise RelaySecretCipherError(
+                    "INVALID_ENVELOPE", "relay secret envelope is invalid"
+                )
+            try:
+                key_id = ciphertext[2:nonce_offset].decode("ascii")
+            except UnicodeDecodeError:
+                raise RelaySecretCipherError(
+                    "INVALID_ENVELOPE", "relay secret envelope is invalid"
+                ) from None
+            key = self._keys.get(key_id)
+            if key is None:
+                raise RelaySecretCipherError(
+                    "UNKNOWN_KEY_ID", "relay secret key id is unavailable"
+                )
+            nonce = ciphertext[nonce_offset : nonce_offset + 12]
+            encrypted = ciphertext[nonce_offset + 12 :]
+            aes_gcm = AESGCM(key)
+        else:
+            raise RelaySecretCipherError(
+                "INVALID_ENVELOPE", "relay secret envelope is invalid"
+            )
+        try:
+            return aes_gcm.decrypt(nonce, encrypted, associated_data)
+        except InvalidTag:
+            raise RelaySecretCipherError(
+                "AUTHENTICATION_FAILED", "relay secret authentication failed"
+            ) from None
 
 
 class RelayRepository:
@@ -87,9 +165,14 @@ class RelayRepository:
         max_reservations_per_session: int = 2,
         enrollment_token_source: Callable[[int], str] | None = None,
     ) -> None:
-        if len(enrollment_token_pepper) < 32:
+        if (
+            not isinstance(enrollment_token_pepper, bytes)
+            or len(enrollment_token_pepper) < 32
+        ):
             raise ValueError("enrollment token pepper must contain at least 32 bytes")
-        if not 1 <= max_reservations_per_session <= 8:
+        if not _integer_in_range(
+            max_reservations_per_session, minimum=1, maximum=8
+        ):
             raise ValueError("max reservations per session must be between 1 and 8")
         self._session = session
         self._token_pepper = enrollment_token_pepper
@@ -128,17 +211,19 @@ class RelayRepository:
             expires_at=expires_at,
             created_at=now,
         )
-        self._session.add(enrollment)
+        savepoint = await self._session.begin_nested()
         try:
+            self._session.add(enrollment)
             await self._session.flush()
         except IntegrityError as error:
             code = _integrity_conflict_code(error)
-            await self._session.rollback()
+            await savepoint.rollback()
             if code != "ENROLLMENT_TOKEN_EXISTS":
                 raise
             raise RelayRepositoryError(
                 "ENROLLMENT_TOKEN_EXISTS", "enrollment token already exists"
             ) from None
+        await savepoint.commit()
         return enrollment
 
     async def enroll_node(
@@ -157,18 +242,24 @@ class RelayRepository:
     ) -> RelayNode:
         _require_utc(now)
         validated_endpoints = _validate_endpoints(endpoints)
-        if not node_id or len(node_id) > 128:
+        if not _valid_general_id(node_id):
             raise RelayRepositoryError("INVALID_NODE_ID", "invalid relay node id")
-        if not region or not failure_domain:
+        if (
+            not isinstance(region, str)
+            or _REGION_PATTERN.fullmatch(region) is None
+            or not _valid_general_id(failure_domain)
+        ):
             raise RelayRepositoryError("INVALID_NODE_LOCATION", "invalid node location")
-        if max_allocations <= 0 or max_egress_bps <= 0:
+        if (
+            not _integer_in_range(max_allocations, minimum=1, maximum=_POSTGRES_INTEGER_MAX)
+            or not _integer_in_range(max_egress_bps, minimum=1, maximum=_POSTGRES_BIGINT_MAX)
+        ):
             raise RelayRepositoryError("INVALID_CAPACITY", "capacity must be positive")
         if not _valid_certificate_fingerprint(certificate_fingerprint):
             raise RelayRepositoryError(
                 "INVALID_CERTIFICATE", "certificate fingerprint is invalid"
             )
-        if not turn_secret:
-            raise RelayRepositoryError("INVALID_TURN_SECRET", "TURN secret required")
+        turn_secret_bytes = _validated_turn_secret(turn_secret)
 
         digest = self._token_digest(token)
         enrollment = await self._session.scalar(
@@ -214,7 +305,7 @@ class RelayRepository:
             endpoints=validated_endpoints,
             certificate_fingerprint=certificate_fingerprint,
             encrypted_turn_secret=self._secret_cipher.encrypt(
-                turn_secret.encode(), associated_data=node_id.encode()
+                turn_secret_bytes, associated_data=node_id.encode()
             ),
             max_allocations=max_allocations,
             active_allocations=0,
@@ -224,14 +315,15 @@ class RelayRepository:
             created_at=now,
             updated_at=now,
         )
-        enrollment.used_at = now
-        enrollment.enrolled_node_id = node_id
-        self._session.add(node)
+        savepoint = await self._session.begin_nested()
         try:
+            enrollment.used_at = now
+            enrollment.enrolled_node_id = node_id
+            self._session.add(node)
             await self._session.flush()
         except IntegrityError as error:
             code = _integrity_conflict_code(error)
-            await self._session.rollback()
+            await savepoint.rollback()
             if code not in {"NODE_ALREADY_EXISTS", "CERTIFICATE_ALREADY_BOUND"}:
                 raise
             if code == "NODE_ALREADY_EXISTS":
@@ -239,6 +331,7 @@ class RelayRepository:
             else:
                 message = "certificate is already bound"
             raise RelayRepositoryError(code, message) from None
+        await savepoint.commit()
         return node
 
     async def record_heartbeat(
@@ -265,19 +358,37 @@ class RelayRepository:
             raise RelayRepositoryError(
                 "CERTIFICATE_MISMATCH", "certificate does not match relay node"
             )
-        if sequence <= node.heartbeat_sequence:
+        if (
+            not _integer_in_range(sequence, minimum=0, maximum=_POSTGRES_BIGINT_MAX)
+            or sequence <= node.heartbeat_sequence
+        ):
             raise RelayRepositoryError(
                 "HEARTBEAT_SEQUENCE_REPLAY", "heartbeat sequence must increase"
             )
-        if not 0 <= active_allocations <= node.max_allocations:
+        if (
+            not _integer_in_range(
+                active_allocations,
+                minimum=0,
+                maximum=_POSTGRES_INTEGER_MAX,
+            )
+            or active_allocations > node.max_allocations
+        ):
             raise RelayRepositoryError("INVALID_METRICS", "invalid allocation metric")
-        if current_egress_bps < 0:
+        if not _integer_in_range(
+            current_egress_bps,
+            minimum=0,
+            maximum=_POSTGRES_BIGINT_MAX,
+        ):
             raise RelayRepositoryError("INVALID_METRICS", "invalid egress metric")
 
         node.heartbeat_sequence = sequence
         node.active_allocations = active_allocations
         node.current_egress_bps = current_egress_bps
-        node.lease_expires_at = now + timedelta(seconds=15)
+        node.lease_expires_at = _checked_add_seconds(
+            now,
+            seconds=15,
+            code="INVALID_HEARTBEAT_TIME",
+        )
         node.updated_at = now
         if node.state == "unavailable":
             node.state = "available"
@@ -324,13 +435,32 @@ class RelayRepository:
         deleted before admission.
         """
         _require_utc(now)
-        if not session_id or not user_id:
-            raise RelayRepositoryError("INVALID_RESERVATION_SCOPE", "scope required")
-        if ttl_seconds <= 0:
+        if not _valid_general_id(session_id):
+            raise RelayRepositoryError("INVALID_SESSION_ID", "invalid session id")
+        if not _valid_general_id(user_id):
+            raise RelayRepositoryError("INVALID_USER_ID", "invalid user id")
+        if not _integer_in_range(
+            ttl_seconds,
+            minimum=1,
+            maximum=_MAX_RESERVATION_TTL_SECONDS,
+        ):
             raise RelayRepositoryError("INVALID_RESERVATION_TTL", "TTL must be positive")
+        if not isinstance(ordered_node_ids, list):
+            raise RelayRepositoryError("INVALID_NODE_ID", "invalid candidate nodes")
+        if len(ordered_node_ids) > 8:
+            raise RelayRepositoryError(
+                "TOO_MANY_CANDIDATES", "at most eight relay candidates are allowed"
+            )
+        if any(not _valid_general_id(node_id) for node_id in ordered_node_ids):
+            raise RelayRepositoryError("INVALID_NODE_ID", "invalid candidate node id")
         ordered_unique = list(dict.fromkeys(ordered_node_ids))
         if not ordered_unique:
             return []
+        reservation_expires_at = _checked_add_seconds(
+            now,
+            seconds=ttl_seconds,
+            code="INVALID_RESERVATION_TTL",
+        )
 
         if _session_dialect_name(self._session) == "postgresql":
             # A 64-bit hash collision only serializes unrelated sessions; it cannot
@@ -344,7 +474,7 @@ class RelayRepository:
                 user_id=user_id,
                 ordered_node_ids=ordered_unique,
                 now=now,
-                ttl_seconds=ttl_seconds,
+                expires_at=reservation_expires_at,
             )
 
         # This lock is only an equivalent for single-process unit stores. It is not
@@ -356,7 +486,7 @@ class RelayRepository:
                 user_id=user_id,
                 ordered_node_ids=ordered_unique,
                 now=now,
-                ttl_seconds=ttl_seconds,
+                expires_at=reservation_expires_at,
             )
 
     async def _reserve_capacity_locked(
@@ -366,7 +496,7 @@ class RelayRepository:
         user_id: str,
         ordered_node_ids: list[str],
         now: datetime,
-        ttl_seconds: int,
+        expires_at: datetime,
     ) -> list[RelayReservation]:
 
         locked_nodes = await self._session.scalars(
@@ -374,6 +504,7 @@ class RelayRepository:
             .where(RelayNode.node_id.in_(ordered_node_ids))
             .order_by(RelayNode.node_id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         nodes_by_id = {node.node_id: node for node in locked_nodes}
 
@@ -406,13 +537,20 @@ class RelayRepository:
         for node_id in ordered_node_ids:
             if len(result) >= self._max_reservations:
                 break
+            node = nodes_by_id.get(node_id)
+            if node is None:
+                continue
+            if not _node_accepts_pending_reservation(node, now=now):
+                invalid_existing = existing.pop(node_id, None)
+                if invalid_existing is not None:
+                    await self._session.delete(invalid_existing)
+                    current_reservations.remove(invalid_existing)
+                    await self._session.flush()
+                continue
             if node_id in existing:
                 result.append(existing[node_id])
                 continue
             if len(current_reservations) >= self._max_reservations:
-                continue
-            node = nodes_by_id.get(node_id)
-            if node is None or node.state == "revoked":
                 continue
             used = await self._session.scalar(
                 select(func.count())
@@ -440,7 +578,7 @@ class RelayRepository:
                 session_id=session_id,
                 user_id=user_id,
                 node_id=node_id,
-                expires_at=now + timedelta(seconds=ttl_seconds),
+                expires_at=expires_at,
                 created_at=now,
             )
             self._session.add(reservation)
@@ -450,10 +588,13 @@ class RelayRepository:
         return result
 
     async def _locked_node(self, node_id: str) -> RelayNode:
+        if not _valid_general_id(node_id):
+            raise RelayRepositoryError("INVALID_NODE_ID", "invalid relay node id")
         node = await self._session.scalar(
             select(RelayNode)
             .where(RelayNode.node_id == node_id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if node is None:
             raise RelayRepositoryError("NODE_NOT_FOUND", "relay node was not found")
@@ -474,7 +615,11 @@ class RelayRepository:
 
 
 def _require_utc(value: datetime) -> None:
-    if value.tzinfo is None or value.utcoffset() != timedelta(0):
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() != timedelta(0)
+    ):
         raise RelayRepositoryError("UTC_REQUIRED", "UTC-aware datetime required")
 
 
@@ -489,46 +634,116 @@ def _validate_endpoints(endpoints: list[str]) -> list[str]:
         not isinstance(endpoints, list)
         or not 1 <= len(endpoints) <= 4
         or any(not isinstance(endpoint, str) for endpoint in endpoints)
-        or len(set(endpoints)) != len(endpoints)
     ):
         raise RelayRepositoryError("INVALID_ENDPOINTS", "invalid relay endpoints")
+    canonical: list[str] = []
     for endpoint in endpoints:
         matched = _ENDPOINT_PATTERN.fullmatch(endpoint)
-        if (
-            matched is None
-            or not 1 <= int(matched.group("port")) <= 65535
-            or not _valid_host(matched.group("host"))
-        ):
+        if matched is None or not 1 <= int(matched.group("port")) <= 65535:
             raise RelayRepositoryError("INVALID_ENDPOINTS", "invalid relay endpoints")
-    return list(endpoints)
+        scheme = matched.group("scheme").lower()
+        transport = (matched.group("transport") or "").lower()
+        if not transport:
+            transport = "udp" if scheme == "turn" else "tcp"
+        if scheme == "turns" and transport != "tcp":
+            raise RelayRepositoryError("INVALID_ENDPOINTS", "invalid relay endpoints")
+        host = _canonical_host(matched.group("host"))
+        if host is None:
+            raise RelayRepositoryError("INVALID_ENDPOINTS", "invalid relay endpoints")
+        port = int(matched.group("port"))
+        # turns over transport=tcp is TLS; plain turn maps directly to UDP/TCP.
+        canonical.append(f"{scheme}:{host}:{port}?transport={transport}")
+    if len(set(canonical)) != len(canonical):
+        raise RelayRepositoryError("INVALID_ENDPOINTS", "invalid relay endpoints")
+    return canonical
 
 
-def _valid_host(host: str) -> bool:
+def _canonical_host(host: str) -> str | None:
     if host.startswith("["):
         try:
-            return ipaddress.ip_address(host[1:-1]).version == 6
+            address = ipaddress.ip_address(host[1:-1])
+            if address.version != 6:
+                return None
+            return f"[{address.compressed}]"
         except ValueError:
-            return False
-    if len(host) > 253:
-        return False
-    labels = host.split(".")
-    return all(
+            return None
+    ascii_host = host.rstrip(".").lower()
+    if not ascii_host or len(ascii_host) > 253 or not ascii_host.isascii():
+        return None
+    try:
+        address = ipaddress.ip_address(ascii_host)
+        if address.version == 4:
+            return address.compressed
+    except ValueError:
+        pass
+    labels = ascii_host.split(".")
+    if not all(
         label
         and len(label) <= 63
         and label[0].isalnum()
         and label[-1].isalnum()
         and all(character.isalnum() or character == "-" for character in label)
         for label in labels
-    )
+    ):
+        return None
+    return ascii_host
 
 
 def _valid_certificate_fingerprint(fingerprint: str) -> bool:
-    # The prefix is canonical lowercase. The bounded suffix preserves the existing
-    # agent identifier convention while excluding whitespace/control characters.
+    # Canonical representation: lowercase sha256 prefix and exactly 64 lowercase hex.
     return (
         isinstance(fingerprint, str)
         and _CERTIFICATE_FINGERPRINT_PATTERN.fullmatch(fingerprint) is not None
     )
+
+
+def _valid_general_id(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and _GENERAL_ID_PATTERN.fullmatch(value) is not None
+    )
+
+
+def _validated_turn_secret(value: object) -> bytes:
+    if not isinstance(value, str) or len(value) > 512:
+        raise RelayRepositoryError("INVALID_TURN_SECRET", "TURN secret required")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise RelayRepositoryError(
+            "INVALID_TURN_SECRET", "TURN secret required"
+        ) from None
+    if not 16 <= len(encoded) <= 512:
+        raise RelayRepositoryError("INVALID_TURN_SECRET", "TURN secret required")
+    return encoded
+
+
+def _integer_in_range(value: object, *, minimum: int, maximum: int) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and minimum <= value <= maximum
+    )
+
+
+def _checked_add_seconds(now: datetime, *, seconds: int, code: str) -> datetime:
+    try:
+        return now + timedelta(seconds=seconds)
+    except OverflowError:
+        raise RelayRepositoryError(code, "timestamp exceeds supported range") from None
+
+
+def _node_accepts_pending_reservation(node: RelayNode, *, now: datetime) -> bool:
+    return (
+        node.state in {"available", "degraded"}
+        and node.lease_expires_at is not None
+        and _as_utc(node.lease_expires_at) > now
+    )
+
+
+def _validate_encryption_key(key: bytes) -> None:
+    if not isinstance(key, bytes) or len(key) not in {16, 24, 32}:
+        raise ValueError("relay secret encryption key must be 16, 24, or 32 bytes")
 
 
 def _session_dialect_name(session: object) -> str | None:

@@ -7,6 +7,7 @@ import uvicorn
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.db.init_db import seed_initial_data
+from app.db.migrate_add_relay_control import migrate as migrate_relay_control
 from app.db.session import AsyncSessionLocal, Base, engine
 from app.services.realtime_manager import RealtimeSidecarManager
 import app.models  # noqa: F401
@@ -15,6 +16,9 @@ import app.models  # noqa: F401
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     async with engine.begin() as conn:
+        await migrate_relay_control(conn)
+        # legacy/dev bootstrap only. Relay tables are created and verified by the
+        # explicit versioned migration above, never by metadata.create_all.
         await conn.run_sync(Base.metadata.create_all)
     async with AsyncSessionLocal() as db:
         await seed_initial_data(db)

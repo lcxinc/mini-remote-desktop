@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import re
 from contextlib import asynccontextmanager
@@ -9,10 +10,13 @@ from typing import AsyncIterator
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import func, select, text
+from sqlalchemy import func, inspect, select, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from app.db.migrate_add_relay_control import migrate
+import app.db.migrate_add_relay_control as relay_migration
+from app.models.relay_node import RelayNode
 from app.models.relay_reservation import RelayReservation
 from app.services.relay_repository import (
     AesGcmRelaySecretCipher,
@@ -40,6 +44,10 @@ def asyncpg_url(url: str) -> str:
     if url.startswith("postgresql://"):
         return "postgresql+asyncpg://" + url.removeprefix("postgresql://")
     return url
+
+
+def fingerprint(label: str) -> str:
+    return "sha256:" + hashlib.sha256(label.encode()).hexdigest()
 
 
 @asynccontextmanager
@@ -72,13 +80,14 @@ async def enroll_postgres_node(
     certificate_fingerprint: str,
     now: datetime,
     max_allocations: int = 10,
+    ready: bool = True,
 ) -> None:
     await repository.store_enrollment_token(
         token=token,
         expires_at=now + timedelta(minutes=5),
         now=now,
     )
-    await repository.enroll_node(
+    node = await repository.enroll_node(
         token=token,
         node_id=node_id,
         region="ap-east",
@@ -90,6 +99,15 @@ async def enroll_postgres_node(
         turn_secret=f"turn-secret-{node_id}",
         now=now,
     )
+    if ready:
+        await repository.record_heartbeat(
+            node_id=node.node_id,
+            certificate_fingerprint=node.certificate_fingerprint,
+            sequence=1,
+            active_allocations=0,
+            current_egress_bps=0,
+            now=now,
+        )
 
 
 @pytest.mark.anyio
@@ -122,16 +140,24 @@ async def test_concurrent_admission_uses_row_locks_and_never_oversubscribes() ->
                 expires_at=now + timedelta(minutes=5),
                 now=now,
             )
-            await repository.enroll_node(
+            node = await repository.enroll_node(
                 token="postgres-one-use-enrollment-token",
                 node_id="relay-only",
                 region="ap-east",
                 failure_domain="rack-only",
-                certificate_fingerprint="sha256:postgres-only",
+                certificate_fingerprint=fingerprint("postgres-only"),
                 endpoints=["turn:relay.example.test:3478?transport=udp"],
                 max_allocations=1,
                 max_egress_bps=1_000_000,
                 turn_secret="postgres-turn-secret",
+                now=now,
+            )
+            await repository.record_heartbeat(
+                node_id=node.node_id,
+                certificate_fingerprint=node.certificate_fingerprint,
+                sequence=1,
+                active_allocations=0,
+                current_egress_bps=0,
                 now=now,
             )
             await setup_session.commit()
@@ -193,13 +219,14 @@ async def test_active_allocations_plus_pending_never_exceed_node_capacity() -> N
                 repository,
                 token="postgres-active-capacity-token",
                 node_id="relay-active",
-                certificate_fingerprint="sha256:postgres-active",
+                certificate_fingerprint=fingerprint("postgres-active"),
                 now=now,
                 max_allocations=1,
+                ready=False,
             )
             node = await repository.record_heartbeat(
                 node_id="relay-active",
-                certificate_fingerprint="sha256:postgres-active",
+                certificate_fingerprint=fingerprint("postgres-active"),
                 sequence=1,
                 active_allocations=1,
                 current_egress_bps=0,
@@ -250,7 +277,9 @@ async def test_session_advisory_lock_bounds_disjoint_candidate_transactions() ->
                     repository,
                     token=f"postgres-disjoint-enrollment-token-{index}",
                     node_id=f"relay-disjoint-{index}",
-                    certificate_fingerprint=f"sha256:postgres-disjoint-{index}",
+                    certificate_fingerprint=fingerprint(
+                        f"postgres-disjoint-{index}"
+                    ),
                     now=now,
                 )
             await setup_session.commit()
@@ -296,6 +325,75 @@ async def test_session_advisory_lock_bounds_disjoint_candidate_transactions() ->
 
 
 @pytest.mark.anyio
+async def test_reservation_rechecks_state_after_waiting_for_node_lock() -> None:
+    now = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
+    cipher = AesGcmRelaySecretCipher(bytes.fromhex("33" * 32))
+    async with isolated_postgres_engine() as engine:
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as setup_session:
+            repository = RelayRepository(
+                setup_session,
+                enrollment_token_pepper=bytes.fromhex("44" * 32),
+                secret_cipher=cipher,
+            )
+            await enroll_postgres_node(
+                repository,
+                token="postgres-lock-state-enrollment-token",
+                node_id="relay-lock-state",
+                certificate_fingerprint=fingerprint("postgres-lock-state"),
+                now=now,
+            )
+            await setup_session.commit()
+
+        state_locked = asyncio.Event()
+        release_update = asyncio.Event()
+        cache_loaded = asyncio.Event()
+
+        async def transition_to_draining() -> None:
+            async with sessions() as session:
+                async with session.begin():
+                    node = await session.scalar(
+                        select(RelayNode)
+                        .where(RelayNode.node_id == "relay-lock-state")
+                        .with_for_update()
+                    )
+                    assert node is not None
+                    node.state = "draining"
+                    await session.flush()
+                    state_locked.set()
+                    await release_update.wait()
+
+        async def reserve_after_transition() -> list[RelayReservation]:
+            async with sessions() as session:
+                cached = await session.get(RelayNode, "relay-lock-state")
+                assert cached is not None and cached.state == "available"
+                cache_loaded.set()
+                await state_locked.wait()
+                repository = RelayRepository(
+                    session,
+                    enrollment_token_pepper=bytes.fromhex("44" * 32),
+                    secret_cipher=cipher,
+                )
+                result = await repository.reserve_capacity(
+                    session_id="lock-state-session",
+                    user_id="lock-state-user",
+                    ordered_node_ids=["relay-lock-state"],
+                    now=now,
+                )
+                await session.commit()
+                return result
+
+        reservation = asyncio.create_task(reserve_after_transition())
+        await cache_loaded.wait()
+        transition = asyncio.create_task(transition_to_draining())
+        await state_locked.wait()
+        await asyncio.sleep(0)
+        release_update.set()
+        await transition
+        assert await reservation == []
+
+
+@pytest.mark.anyio
 async def test_concurrent_enrollment_conflicts_are_stable_and_transactions_recover() -> None:
     now = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
     pepper = bytes.fromhex("44" * 32)
@@ -303,12 +401,17 @@ async def test_concurrent_enrollment_conflicts_are_stable_and_transactions_recov
     async with isolated_postgres_engine() as engine:
         sessions = async_sessionmaker(engine, expire_on_commit=False)
 
-        async def store_same_token() -> tuple[str, str]:
+        async def store_same_token(label: str) -> tuple[str, str]:
             async with sessions() as session:
                 repository = RelayRepository(
                     session,
                     enrollment_token_pepper=pepper,
                     secret_cipher=cipher,
+                )
+                await repository.store_enrollment_token(
+                    token=f"outer-unrelated-work-token-{label}",
+                    expires_at=now + timedelta(minutes=5),
+                    now=now,
                 )
                 try:
                     await repository.store_enrollment_token(
@@ -328,7 +431,9 @@ async def test_concurrent_enrollment_conflicts_are_stable_and_transactions_recov
                     await session.commit()
                     return error.code, str(error)
 
-        token_results = await asyncio.gather(store_same_token(), store_same_token())
+        token_results = await asyncio.gather(
+            store_same_token("a"), store_same_token("b")
+        )
         assert sorted(code for code, _ in token_results) == [
             "ENROLLMENT_TOKEN_EXISTS",
             "ok",
@@ -357,6 +462,11 @@ async def test_concurrent_enrollment_conflicts_are_stable_and_transactions_recov
                     session,
                     enrollment_token_pepper=pepper,
                     secret_cipher=cipher,
+                )
+                await repository.store_enrollment_token(
+                    token=f"outer-work-{token}",
+                    expires_at=now + timedelta(minutes=5),
+                    now=now,
                 )
                 try:
                     await repository.enroll_node(
@@ -387,18 +497,20 @@ async def test_concurrent_enrollment_conflicts_are_stable_and_transactions_recov
             concurrent_enroll(
                 token="concurrent-enrollment-token-node-a",
                 node_id="relay-shared-node",
-                fingerprint="sha256:sensitive-node-a",
+                fingerprint=fingerprint("sensitive-node-a"),
             ),
             concurrent_enroll(
                 token="concurrent-enrollment-token-node-b",
                 node_id="relay-shared-node",
-                fingerprint="sha256:sensitive-node-b",
+                fingerprint=fingerprint("sensitive-node-b"),
             ),
         )
         assert sorted(code for code, _ in node_results) == ["NODE_ALREADY_EXISTS", "ok"]
         assert all("sensitive" not in message for _, message in node_results)
 
-        adversarial_fingerprint = "sha256:relay_enrollments_token_digest_key"
+        adversarial_fingerprint = fingerprint(
+            "legal-duplicate-containing-no-user-controlled-constraint-name"
+        )
         certificate_results = await asyncio.gather(
             concurrent_enroll(
                 token="concurrent-enrollment-token-cert-a",
@@ -420,3 +532,133 @@ async def test_concurrent_enrollment_conflicts_are_stable_and_transactions_recov
             and "duplicate key" not in message.lower()
             for _, message in certificate_results
         )
+
+        async with sessions() as verification_session:
+            repository = RelayRepository(
+                verification_session,
+                enrollment_token_pepper=pepper,
+                secret_cipher=cipher,
+            )
+            for token in (
+                "concurrent-enrollment-token-node-a",
+                "concurrent-enrollment-token-node-b",
+                "concurrent-enrollment-token-cert-a",
+                "concurrent-enrollment-token-cert-b",
+            ):
+                with pytest.raises(RelayRepositoryError) as retained:
+                    await repository.store_enrollment_token(
+                        token=f"outer-work-{token}",
+                        expires_at=now + timedelta(minutes=5),
+                        now=now,
+                    )
+                assert retained.value.code == "ENROLLMENT_TOKEN_EXISTS"
+            for label in ("a", "b"):
+                with pytest.raises(RelayRepositoryError) as retained:
+                    await repository.store_enrollment_token(
+                        token=f"outer-unrelated-work-token-{label}",
+                        expires_at=now + timedelta(minutes=5),
+                        now=now,
+                    )
+                assert retained.value.code == "ENROLLMENT_TOKEN_EXISTS"
+
+
+@pytest.mark.anyio
+async def test_migration_schema_matches_orm_and_required_indexes() -> None:
+    async with isolated_postgres_engine() as engine:
+        def inspect_schema(sync_connection: object) -> dict[str, object]:
+            inspector = inspect(sync_connection)
+            return {
+                "nodes_columns": {
+                    column["name"]: column
+                    for column in inspector.get_columns("relay_nodes")
+                },
+                "nodes_checks": {
+                    constraint["name"]
+                    for constraint in inspector.get_check_constraints("relay_nodes")
+                },
+                "reservation_indexes": {
+                    (
+                        index["name"],
+                        tuple(index["column_names"]),
+                    )
+                    for index in inspector.get_indexes("relay_reservations")
+                },
+            }
+
+        async with engine.connect() as connection:
+            snapshot = await connection.run_sync(inspect_schema)
+            versions = await connection.scalar(
+                text("SELECT COUNT(*) FROM relay_schema_migrations WHERE version = 1")
+            )
+        assert versions == 1
+        columns = snapshot["nodes_columns"]
+        assert str(columns["endpoints"]["type"]).upper() == "JSONB"
+        assert columns["state"]["nullable"] is False
+        assert "unavailable" in str(columns["state"]["default"])
+        for name in (
+            "active_allocations",
+            "current_egress_bps",
+            "heartbeat_sequence",
+        ):
+            assert str(columns[name]["default"]).strip("()") == "0"
+        assert {
+            "ck_relay_nodes_state",
+            "ck_relay_nodes_max_allocations",
+            "ck_relay_nodes_active_allocations",
+            "ck_relay_nodes_max_egress",
+            "ck_relay_nodes_current_egress",
+            "ck_relay_nodes_heartbeat_sequence",
+        }.issubset(snapshot["nodes_checks"])
+        assert (
+            "ix_relay_reservations_node_expiry",
+            ("node_id", "expires_at"),
+        ) in snapshot["reservation_indexes"]
+        assert (
+            "ix_relay_reservations_session_expiry",
+            ("session_id", "expires_at"),
+        ) in snapshot["reservation_indexes"]
+
+        endpoint_type = RelayNode.__table__.c.endpoints.type.dialect_impl(
+            engine.sync_engine.dialect
+        )
+        assert isinstance(endpoint_type, JSONB)
+        assert RelayNode.__table__.c.state.server_default is not None
+
+
+@pytest.mark.anyio
+async def test_migration_accepts_existing_connection_and_fails_closed_on_partial_table() -> None:
+    assert DATABASE_URL is not None
+    malformed_tables = (
+        "CREATE TABLE relay_nodes (node_id VARCHAR(128) PRIMARY KEY)",
+        """
+        CREATE TABLE relay_enrollments (
+            id VARCHAR(36) NOT NULL,
+            token_digest VARCHAR(64) NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL,
+            used_at TIMESTAMPTZ,
+            enrolled_node_id VARCHAR(128),
+            created_at TIMESTAMPTZ NOT NULL,
+            CONSTRAINT relay_enrollments_token_digest_key UNIQUE (token_digest)
+        )
+        """,
+    )
+    for create_malformed_table in malformed_tables:
+        schema = "relay_partial_" + re.sub(r"[^a-z0-9]", "", uuid4().hex)
+        admin_engine = create_async_engine(asyncpg_url(DATABASE_URL))
+        async with admin_engine.begin() as connection:
+            await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        engine = create_async_engine(
+            asyncpg_url(DATABASE_URL),
+            connect_args={"server_settings": {"search_path": schema}},
+        )
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(text(create_malformed_table))
+            with pytest.raises(relay_migration.RelaySchemaMismatchError):
+                async with engine.begin() as connection:
+                    await migrate(connection)
+        finally:
+            await engine.dispose()
+            async with admin_engine.begin() as connection:
+                await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+            await admin_engine.dispose()
