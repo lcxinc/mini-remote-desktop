@@ -43,6 +43,7 @@ members = [
   "crates/mrd-identity",
   "crates/mrd-quality-gate",
   "crates/mrd-file-transfer",
+  "crates/mrd-relay-control",
   "heartbeat-rs",
   "tests/capture-render-demo",
   "tests/integration",
