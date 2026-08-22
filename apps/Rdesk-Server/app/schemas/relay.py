@@ -85,3 +85,12 @@ class RelayNodeResponse(BaseModel):
     current_egress_bps: int
     lease_expires_at: datetime | None
     revoked_at: datetime | None
+
+
+class RelayErrorDetail(BaseModel):
+    code: str
+    message: str
+
+
+class RelayErrorResponse(BaseModel):
+    detail: RelayErrorDetail

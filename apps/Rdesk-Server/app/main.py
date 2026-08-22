@@ -21,7 +21,9 @@ async def lifespan(_: FastAPI):
         # explicit versioned migration above, never by metadata.create_all.
         await conn.run_sync(Base.metadata.create_all)
     async with AsyncSessionLocal() as db:
-        await seed_initial_data(db)
+        # Administrator creation is disabled unless every opt-in bootstrap
+        # setting is explicitly supplied; no built-in credential exists.
+        await seed_initial_data(db, configuration=settings)
     yield
 
 

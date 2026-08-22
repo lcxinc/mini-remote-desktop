@@ -1,3 +1,4 @@
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,8 +13,12 @@ class Settings(BaseSettings):
     server_host: str = "0.0.0.0"
     server_port: int = 9530
     db_url: str = "postgresql+asyncpg://postgres:519223@127.0.0.1:5432/rdesk_server"
-    jwt_secret: str = "change_me_for_production"
+    jwt_secret: SecretStr = SecretStr("")
     jwt_expire_minutes: int = 60 * 24 * 7
+    bootstrap_admin_enabled: bool = False
+    bootstrap_admin_username: str = ""
+    bootstrap_admin_email: str = ""
+    bootstrap_admin_password: SecretStr = SecretStr("")
     signaling_ws_url: str = "ws://127.0.0.1:9532/ws"
     realtime_server_health_url: str = "http://127.0.0.1:9532/health"
     realtime_server_command: str = "cargo"

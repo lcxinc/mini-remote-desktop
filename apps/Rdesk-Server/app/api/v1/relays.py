@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Callable, Coroutine
+from typing import Annotated, Callable, Coroutine
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Security, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.security import get_verified_relay_node, require_admin
+from app.core.security import (
+    get_verified_relay_node,
+    require_admin,
+    trusted_mtls_proxy_scheme,
+)
 from app.db.session import get_db
 from app.models.relay_node import RelayNode
 from app.models.user import User
@@ -20,6 +24,7 @@ from app.schemas.relay import (
     RelayApprovalResponse,
     RelayEnrollmentRequest,
     RelayEnrollmentResponse,
+    RelayErrorResponse,
     RelayHeartbeatRequest,
     RelayHeartbeatResponse,
     RelayNodeResponse,
@@ -55,8 +60,20 @@ class RelayAPIRoute(APIRoute):
         return stable_validation_handler
 
 
+_RELAY_ERROR_RESPONSES = {
+    code: {
+        "model": RelayErrorResponse,
+        "description": "Stable relay-domain error response.",
+    }
+    for code in (400, 401, 403, 409, 503)
+}
+
+
 router = APIRouter(
-    prefix="/relays", tags=["relays"], route_class=RelayAPIRoute
+    prefix="/relays",
+    tags=["relays"],
+    route_class=RelayAPIRoute,
+    responses=_RELAY_ERROR_RESPONSES,
 )
 
 
@@ -125,10 +142,30 @@ async def issue_enrollment_token(
     "/enroll",
     response_model=RelayEnrollmentResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    description=(
+        "Submit a CSR through the configured trusted TLS proxy. "
+        "`X-Rdesk-Client-TLS` is a proxy-only verified-transport marker; the "
+        "backend trusts it only when the direct peer is allowlisted and clients "
+        "must not set it themselves."
+    ),
+    # A tuple intentionally replaces FastAPI's generated security list during
+    # its deep merge (JSON still renders an array).  A list would be appended
+    # and incorrectly document the alternatives as OR.
+    openapi_extra={"security": ({"TrustedMTLSProxy": []},)},
 )
 async def enroll_relay_node(
     request: Request,
     payload: RelayEnrollmentRequest,
+    _proxy_tls_header: Annotated[
+        str | None,
+        Header(
+            alias="X-Rdesk-Client-TLS",
+            description="Proxy-only TLS verification marker from the trusted direct peer.",
+        ),
+    ] = None,
+    _trusted_proxy_marker: Annotated[
+        str | None, Security(trusted_mtls_proxy_scheme)
+    ] = None,
     db: AsyncSession = Depends(get_db),
 ) -> RelayEnrollmentResponse:
     try:
@@ -177,7 +214,17 @@ async def approve_relay_node(
     )
 
 
-@router.post("/{node_id}/heartbeat", response_model=RelayHeartbeatResponse)
+@router.post(
+    "/{node_id}/heartbeat",
+    response_model=RelayHeartbeatResponse,
+    description=(
+        "Accept a heartbeat only when a trusted mTLS proxy fingerprint and the "
+        "node's body-bound Ed25519 authentication both verify."
+    ),
+    openapi_extra={
+        "security": ({"TrustedMTLSProxy": [], "RelayEd25519": []},)
+    },
+)
 async def record_relay_heartbeat(
     node_id: str,
     request: Request,

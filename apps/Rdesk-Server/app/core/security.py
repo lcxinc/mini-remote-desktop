@@ -3,11 +3,12 @@ import base64
 import hashlib
 import hmac
 import os
-from typing import Optional
+from typing import Annotated, Optional
 
-from fastapi import Depends, HTTPException, Request, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import Depends, Header, HTTPException, Request, Security, status
+from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 from jose import jwt
+from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,6 +51,13 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 
 def create_access_token(user_id: str, username: str, role: str) -> str:
+    secret = _configured_jwt_secret()
+    if secret is None:
+        raise _relay_http_exception(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "authentication_unavailable",
+            "authentication service is not configured",
+        )
     now = datetime.now(timezone.utc)
     exp = now + timedelta(minutes=settings.jwt_expire_minutes)
     payload = {
@@ -59,10 +67,27 @@ def create_access_token(user_id: str, username: str, role: str) -> str:
         "iat": int(now.timestamp()),
         "exp": int(exp.timestamp()),
     }
-    return jwt.encode(payload, settings.jwt_secret, algorithm="HS256")
+    return jwt.encode(payload, secret, algorithm="HS256")
 
 
 security = HTTPBearer()
+trusted_mtls_proxy_scheme = APIKeyHeader(
+    name="X-Rdesk-Client-TLS",
+    scheme_name="TrustedMTLSProxy",
+    description=(
+        "Proxy-only marker asserted by a configured trusted mTLS terminator; "
+        "clients must never supply or be trusted for this value directly."
+    ),
+    auto_error=False,
+)
+relay_ed25519_scheme = APIKeyHeader(
+    name="X-Relay-Signature",
+    scheme_name="RelayEd25519",
+    description=(
+        "Base64 Ed25519 signature over the MRD_RELAY_REQUEST_V1 canonical request."
+    ),
+    auto_error=False,
+)
 
 
 async def get_current_user(
@@ -76,8 +101,11 @@ async def get_current_user(
     )
 
     try:
+        secret = _configured_jwt_secret()
+        if secret is None:
+            raise credentials_exception
         payload = jwt.decode(
-            credentials.credentials, settings.jwt_secret, algorithms=["HS256"]
+            credentials.credentials, secret, algorithms=["HS256"]
         )
         user_id: str = payload.get("sub")
         if user_id is None:
@@ -100,8 +128,11 @@ async def get_current_user_optional(
         return None
 
     try:
+        secret = _configured_jwt_secret()
+        if secret is None:
+            return None
         payload = jwt.decode(
-            credentials.credentials, settings.jwt_secret, algorithms=["HS256"]
+            credentials.credentials, secret, algorithms=["HS256"]
         )
         user_id: str = payload.get("sub")
         if user_id is None:
@@ -129,6 +160,47 @@ async def require_admin(
 
 async def get_verified_relay_node(
     request: Request,
+    x_rdesk_client_certificate: Annotated[
+        str | None,
+        Header(
+            alias="X-Rdesk-Client-Cert-Sha256",
+            description="Canonical SHA-256 client-certificate fingerprint set by the trusted proxy.",
+        ),
+    ] = None,
+    x_relay_node_id: Annotated[
+        str | None,
+        Header(
+            alias="X-Relay-Node-Id",
+            description="Relay node ID; it must exactly match the route node_id.",
+        ),
+    ] = None,
+    x_relay_signature: Annotated[
+        str | None,
+        Header(
+            alias="X-Relay-Signature",
+            description="Bounded canonical Base64 Ed25519 request signature.",
+        ),
+    ] = None,
+    x_relay_timestamp: Annotated[
+        str | None,
+        Header(
+            alias="X-Relay-Timestamp",
+            description="Fresh Unix timestamp in decimal seconds.",
+        ),
+    ] = None,
+    x_relay_sequence: Annotated[
+        str | None,
+        Header(
+            alias="X-Relay-Sequence",
+            description="Strictly increasing unsigned heartbeat sequence.",
+        ),
+    ] = None,
+    _trusted_proxy_marker: Annotated[
+        str | None, Security(trusted_mtls_proxy_scheme)
+    ] = None,
+    _relay_signature_marker: Annotated[
+        str | None, Security(relay_ed25519_scheme)
+    ] = None,
     db: AsyncSession = Depends(get_db),
 ) -> RelayIdentity:
     """Verify proxy mTLS metadata and the node's body-bound Ed25519 signature.
@@ -138,6 +210,18 @@ async def get_verified_relay_node(
     removing the signature-check/update TOCTOU replay window.
     """
 
+    # Header values are declared explicitly for OpenAPI, while the raw Request
+    # remains the single canonical parsing source so duplicate/bounds handling
+    # cannot diverge between documentation and cryptographic verification.
+    _ = (
+        x_rdesk_client_certificate,
+        x_relay_node_id,
+        x_relay_signature,
+        x_relay_timestamp,
+        x_relay_sequence,
+        _trusted_proxy_marker,
+        _relay_signature_marker,
+    )
     try:
         require_trusted_proxy(request, settings.trusted_mtls_proxy)
         headers = parse_relay_auth_headers(request)
@@ -166,6 +250,10 @@ async def get_verified_relay_node(
             now=datetime.now(timezone.utc),
             max_clock_skew_seconds=settings.relay_max_clock_skew_seconds,
         )
+        if identity.state == "revoked":
+            raise RelayRegistryError(
+                "relay_node_revoked", 403, "relay node revoked"
+            )
         request.state.relay_sequence = headers.sequence
         return identity
     except (RelayAuthError, RelayRegistryError) as error:
@@ -179,3 +267,22 @@ def _relay_http_exception(
         status_code=status_code,
         detail={"code": code, "message": message},
     )
+
+
+def _configured_jwt_secret() -> str | None:
+    configured = settings.jwt_secret
+    secret = (
+        configured.get_secret_value()
+        if isinstance(configured, SecretStr)
+        else configured
+    )
+    if not isinstance(secret, str):
+        return None
+    encoded = secret.encode("utf-8")
+    if len(encoded) < 32 or len(set(secret)) < 16 or secret in {
+        "change_me_for_production",
+        "change-me",
+        "secret",
+    }:
+        return None
+    return secret

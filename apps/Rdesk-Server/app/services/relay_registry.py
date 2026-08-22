@@ -219,12 +219,10 @@ class RelayRegistry:
     ) -> RelayIdentity:
         node = await self._session.get(RelayNode, node_id)
         registration = await self._session.get(RelayNodeRegistration, node_id)
-        if node is not None and node.state == "revoked":
-            self._error("relay_node_revoked", 403, "relay node revoked")
         if (
             node is None
             or registration is None
-            or registration.status != "approved"
+            or registration.status not in {"approved", "revoked"}
             or registration.certificate_expires_at is None
             or self._as_utc(registration.certificate_expires_at) <= datetime.now(UTC)
             or not hmac.compare_digest(

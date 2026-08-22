@@ -65,21 +65,41 @@ class AsyncSessionShim:
         self.session.refresh(instance)
 
 
-def _ca_material() -> tuple[str, str, x509.Certificate, ed25519.Ed25519PrivateKey]:
+def _ca_material(
+    *,
+    not_before: datetime | None = None,
+    not_after: datetime | None = None,
+    key_cert_sign: bool | None = None,
+) -> tuple[str, str, x509.Certificate, ed25519.Ed25519PrivateKey]:
     key = ed25519.Ed25519PrivateKey.generate()
     now = datetime.now(UTC)
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "MRD test CA")])
-    certificate = (
+    builder = (
         x509.CertificateBuilder()
         .subject_name(subject)
         .issuer_name(subject)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(now - timedelta(minutes=1))
-        .not_valid_after(now + timedelta(days=1))
+        .not_valid_before(not_before or now - timedelta(minutes=1))
+        .not_valid_after(not_after or now + timedelta(days=1))
         .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
-        .sign(key, algorithm=None)
     )
+    if key_cert_sign is not None:
+        builder = builder.add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=key_cert_sign,
+                crl_sign=key_cert_sign,
+                encipher_only=None,
+                decipher_only=None,
+            ),
+            critical=True,
+        )
+    certificate = builder.sign(key, algorithm=None)
     return (
         certificate.public_bytes(serialization.Encoding.PEM).decode(),
         key.private_bytes(
@@ -356,9 +376,15 @@ def test_approval_issues_node_bound_short_lived_client_certificate(
 ) -> None:
     client, _ = api
     key, _ = _enroll(client)
-    certificate_pem, fingerprint = _approve(client)
+    approval = client.post(f"/api/v1/relays/{NODE_ID}/approve")
+    assert approval.status_code == 200, approval.text
+    certificate_pem = approval.json()["certificate_pem"]
+    fingerprint = approval.json()["fingerprint"]
 
     certificate = x509.load_pem_x509_certificate(certificate_pem.encode())
+    ca_certificate = x509.load_pem_x509_certificate(
+        approval.json()["ca_certificate_pem"].encode()
+    )
     assert certificate.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value == NODE_ID
     san = certificate.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
     assert san.get_values_for_type(x509.UniformResourceIdentifier) == [
@@ -368,6 +394,8 @@ def test_approval_issues_node_bound_short_lived_client_certificate(
     assert ExtendedKeyUsageOID.CLIENT_AUTH in eku
     assert certificate.serial_number > 0
     assert certificate.not_valid_after_utc - certificate.not_valid_before_utc <= timedelta(hours=2)
+    assert certificate.not_valid_before_utc >= ca_certificate.not_valid_before_utc
+    assert certificate.not_valid_after_utc <= ca_certificate.not_valid_after_utc
     assert certificate.public_key().public_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw
     ) == key.public_key().public_bytes(
@@ -393,6 +421,44 @@ def test_approval_fails_closed_without_or_with_mismatched_ca(
     mismatch = client.post(f"/api/v1/relays/{NODE_ID}/approve")
     assert mismatch.status_code == 503
     assert _error_code(mismatch) == "relay_ca_unavailable"
+
+
+@pytest.mark.parametrize(
+    "ca_kind", ["expired", "not_yet_valid", "no_key_cert_sign", "near_expiry"]
+)
+def test_approval_rejects_invalid_ca_time_usage_and_remaining_lifetime(
+    api: tuple[TestClient, object],
+    monkeypatch: pytest.MonkeyPatch,
+    ca_kind: str,
+) -> None:
+    client, _ = api
+    _enroll(client)
+    now = datetime.now(UTC)
+    if ca_kind == "expired":
+        material = _ca_material(
+            not_before=now - timedelta(days=2),
+            not_after=now - timedelta(days=1),
+            key_cert_sign=True,
+        )
+    elif ca_kind == "not_yet_valid":
+        material = _ca_material(
+            not_before=now + timedelta(hours=1),
+            not_after=now + timedelta(days=1),
+            key_cert_sign=True,
+        )
+    elif ca_kind == "no_key_cert_sign":
+        material = _ca_material(key_cert_sign=False)
+    else:
+        material = _ca_material(
+            not_before=now - timedelta(minutes=1),
+            not_after=now + timedelta(minutes=30),
+            key_cert_sign=True,
+        )
+    monkeypatch.setattr(settings, "relay_ca_certificate_pem", material[0])
+    monkeypatch.setattr(settings, "relay_ca_private_key_pem", material[1])
+    response = client.post(f"/api/v1/relays/{NODE_ID}/approve")
+    assert response.status_code == 503
+    assert _error_code(response) == "relay_ca_unavailable"
 
 
 def test_heartbeat_requires_proxy_certificate_and_ed25519_signature(
@@ -562,6 +628,51 @@ def test_revoked_node_cannot_heartbeat_or_resume(
     assert _error_code(resume) == "relay_node_revoked"
 
 
+@pytest.mark.parametrize(
+    ("auth_kind", "status_code", "reason_code"),
+    [
+        ("wrong_fingerprint", 401, "relay_certificate_invalid"),
+        ("wrong_signature", 401, "relay_signature_invalid"),
+        ("fully_valid", 403, "relay_node_revoked"),
+    ],
+)
+def test_revoked_state_is_disclosed_only_after_full_authentication(
+    api: tuple[TestClient, object],
+    auth_kind: str,
+    status_code: int,
+    reason_code: str,
+) -> None:
+    from app.models.relay_audit_event import RelayAuditEvent
+    from app.models.relay_node import RelayNode
+
+    client, engine = api
+    key, _ = _enroll(client)
+    _, fingerprint = _approve(client)
+    assert client.post(f"/api/v1/relays/{NODE_ID}/revoke").status_code == 200
+    body, headers = _heartbeat_request(key, fingerprint)
+    if auth_kind == "wrong_fingerprint":
+        headers["X-Rdesk-Client-Cert-Sha256"] = "sha256:" + "ab" * 32
+    elif auth_kind == "wrong_signature":
+        headers["X-Relay-Signature"] = base64.b64encode(b"x" * 64).decode()
+    response = client.post(
+        f"/api/v1/relays/{NODE_ID}/heartbeat", content=body, headers=headers
+    )
+    assert response.status_code == status_code
+    assert _error_code(response) == reason_code
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        assert node.heartbeat_sequence == 0
+        heartbeat_events = list(
+            session.scalars(
+                select(RelayAuditEvent).where(
+                    RelayAuditEvent.action == "relay_heartbeat_recorded"
+                )
+            )
+        )
+    assert heartbeat_events == []
+
+
 def test_expired_node_certificate_is_rejected(
     api: tuple[TestClient, object],
 ) -> None:
@@ -611,3 +722,48 @@ def test_untrusted_direct_peer_cannot_spoof_proxy_headers(
         )
     assert response.status_code == 403
     assert _error_code(response) == "relay_proxy_required"
+
+
+def test_openapi_documents_relay_authentication_headers_and_stable_errors(
+    api: tuple[TestClient, object],
+) -> None:
+    client, _ = api
+    schema = client.get("/openapi.json").json()
+    heartbeat = schema["paths"][f"/api/v1/relays/{{node_id}}/heartbeat"]["post"]
+    header_names = {
+        parameter["name"]
+        for parameter in heartbeat.get("parameters", [])
+        if parameter["in"] == "header"
+    }
+    assert {
+        "X-Rdesk-Client-Cert-Sha256",
+        "X-Relay-Node-Id",
+        "X-Relay-Signature",
+        "X-Relay-Timestamp",
+        "X-Relay-Sequence",
+    }.issubset(header_names)
+    security_schemes = schema["components"]["securitySchemes"]
+    assert security_schemes["TrustedMTLSProxy"]["in"] == "header"
+    assert security_schemes["RelayEd25519"]["in"] == "header"
+    assert heartbeat["security"] == [
+        {"TrustedMTLSProxy": [], "RelayEd25519": []}
+    ]
+
+    enrollment = schema["paths"]["/api/v1/relays/enroll"]["post"]
+    assert enrollment["security"] == [{"TrustedMTLSProxy": []}]
+    assert "proxy-only" in enrollment["description"].lower()
+    assert "X-Rdesk-Client-TLS" in enrollment["description"]
+
+    stable_responses = {"400", "401", "403", "409", "503"}
+    for path, operations in schema["paths"].items():
+        if not path.startswith("/api/v1/relays"):
+            continue
+        for method, operation in operations.items():
+            if method not in {"get", "post", "put", "patch", "delete"}:
+                continue
+            assert stable_responses.issubset(operation["responses"])
+            for code in stable_responses:
+                response_schema = operation["responses"][code]["content"][
+                    "application/json"
+                ]["schema"]
+                assert response_schema["$ref"].endswith("/RelayErrorResponse")

@@ -1,20 +1,44 @@
-from sqlalchemy import select
+import re
+
+from pydantic import SecretStr
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings, settings
 from app.core.security import hash_password
 from app.models.device import Device, DeviceStatus
 from app.models.user import User
 
 
-async def seed_initial_data(session: AsyncSession) -> None:
-    user_exists = await session.scalar(select(User).limit(1))
-    if user_exists:
+async def seed_initial_data(
+    session: AsyncSession, *, configuration: Settings = settings
+) -> None:
+    """Run an explicit, opt-in development bootstrap without default credentials."""
+
+    if not configuration.bootstrap_admin_enabled:
+        return
+
+    username = configuration.bootstrap_admin_username.strip()
+    email = configuration.bootstrap_admin_email.strip().lower()
+    configured_password = configuration.bootstrap_admin_password
+    password = (
+        configured_password.get_secret_value()
+        if isinstance(configured_password, SecretStr)
+        else configured_password
+    )
+    if not _valid_bootstrap_admin(username, email, password):
+        return
+
+    admin_exists = await session.scalar(
+        select(User).where(or_(User.username == username, User.email == email))
+    )
+    if admin_exists:
         return
 
     admin = User(
-        username="admin",
-        email="admin@rdesk.local",
-        password_hash=hash_password("admin123"),
+        username=username,
+        email=email,
+        password_hash=hash_password(password),
         role="admin",
     )
     session.add(admin)
@@ -56,3 +80,23 @@ async def seed_initial_data(session: AsyncSession) -> None:
     ]
     session.add_all(devices)
     await session.commit()
+
+
+def _valid_bootstrap_admin(username: str, email: str, password: object) -> bool:
+    if (
+        re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{2,63}", username) is None
+        or len(email) > 255
+        or "@" not in email
+        or "." not in email.rsplit("@", 1)[-1]
+        or not isinstance(password, str)
+        or len(password) < 20
+        or len(set(password)) < 12
+    ):
+        return False
+    character_classes = (
+        any(character.islower() for character in password),
+        any(character.isupper() for character in password),
+        any(character.isdigit() for character in password),
+        any(not character.isalnum() for character in password),
+    )
+    return all(character_classes) and username.lower() not in password.lower()

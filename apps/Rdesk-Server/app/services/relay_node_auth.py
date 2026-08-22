@@ -232,10 +232,29 @@ def issue_relay_certificate(
         ).value
         if not constraints.ca:
             raise ValueError("certificate is not a CA")
+        try:
+            key_usage = ca_certificate.extensions.get_extension_for_class(
+                x509.KeyUsage
+            ).value
+        except x509.ExtensionNotFound:
+            key_usage = None
+        if key_usage is not None and not key_usage.key_cert_sign:
+            raise ValueError("CA certificate cannot sign certificates")
+        ca_not_before = _certificate_time(
+            ca_certificate, "not_valid_before_utc", "not_valid_before"
+        )
+        ca_not_after = _certificate_time(
+            ca_certificate, "not_valid_after_utc", "not_valid_after"
+        )
+        if not ca_not_before <= now <= ca_not_after:
+            raise ValueError("CA certificate is outside its validity window")
     except (ValueError, TypeError, x509.ExtensionNotFound):
         _auth_error("relay_ca_unavailable", 503, "relay certificate authority unavailable")
 
     expires_at = now + timedelta(seconds=validity_seconds)
+    leaf_not_before = max(now - timedelta(minutes=1), ca_not_before)
+    if expires_at > ca_not_after:
+        _auth_error("relay_ca_unavailable", 503, "relay certificate authority unavailable")
     certificate_builder = (
         x509.CertificateBuilder()
         .subject_name(
@@ -249,7 +268,7 @@ def issue_relay_certificate(
         .issuer_name(ca_certificate.subject)
         .public_key(csr.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_before(leaf_not_before)
         .not_valid_after(expires_at)
         .add_extension(
             x509.SubjectAlternativeName(
@@ -283,6 +302,17 @@ def canonical_certificate_fingerprint(value: str) -> str | None:
     if _FINGERPRINT.fullmatch(normalized) is None:
         return None
     return "sha256:" + normalized
+
+
+def _certificate_time(
+    certificate: x509.Certificate, aware_name: str, legacy_name: str
+) -> datetime:
+    value = getattr(certificate, aware_name, None)
+    if value is None:
+        value = getattr(certificate, legacy_name)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _bounded_header(request: Request, name: str, maximum: int) -> str:
