@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 
 from sqlalchemy import BigInteger, DateTime, Integer, LargeBinary, String, inspect, text
@@ -11,10 +12,19 @@ from app.db.session import engine as default_engine
 
 
 _IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+_CHECK_CAST = re.compile(
+    r"::(?:character\s+varying|text|integer|bigint)(?:\[\])?",
+    flags=re.IGNORECASE,
+)
+_MIGRATION_LOCK_CONTEXT = b"MRD_RELAY_SCHEMA_MIGRATION_V1\x00"
 _RELAY_SCHEMA_VERSION = 1
 
 
 class RelaySchemaMismatchError(RuntimeError):
+    pass
+
+
+class RelayMigrationBackendError(RuntimeError):
     pass
 
 
@@ -42,8 +52,29 @@ async def migrate(
 async def _migrate_connection(
     connection: AsyncConnection, *, schema: str | None
 ) -> None:
+    if connection.dialect.name != "postgresql":
+        raise RelayMigrationBackendError(
+            "relay schema migration requires PostgreSQL advisory transaction locks"
+        )
     if schema is not None and _IDENTIFIER.fullmatch(schema) is None:
         raise ValueError("invalid database schema identifier")
+    effective_schema = schema
+    if effective_schema is None:
+        effective_schema = await connection.scalar(text("SELECT current_schema()"))
+    if (
+        not isinstance(effective_schema, str)
+        or _IDENTIFIER.fullmatch(effective_schema) is None
+    ):
+        raise RelaySchemaMismatchError(
+            "relay schema migration requires a normalized database schema"
+        )
+
+    # This lock is acquired before inspecting or mutating the target schema. A rare
+    # 64-bit hash collision can only serialize unrelated schema migrations.
+    await connection.execute(
+        text("SELECT pg_advisory_xact_lock(:lock_key)"),
+        {"lock_key": _migration_advisory_lock_key(effective_schema)},
+    )
     nodes = _table(schema, "relay_nodes")
     enrollments = _table(schema, "relay_enrollments")
     reservations = _table(schema, "relay_reservations")
@@ -184,6 +215,20 @@ def _type_matches(value: object, expected: tuple[type[object], int | None]) -> b
     return True
 
 
+def _migration_advisory_lock_key(schema: str) -> int:
+    digest = hashlib.sha256(
+        _MIGRATION_LOCK_CONTEXT + schema.encode("ascii")
+    ).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=True)
+
+
+def _normalize_check_expression(expression: object) -> str:
+    if not isinstance(expression, str):
+        return ""
+    without_casts = _CHECK_CAST.sub("", expression.lower())
+    return re.sub(r'[\s()"]+', "", without_casts)
+
+
 def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None:
     inspector = inspect(sync_connection)
     specs: dict[str, dict[str, tuple[type[object], int | None, bool]]] = {
@@ -267,24 +312,25 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
 
     required_checks = {
         "ck_relay_nodes_state": (
-            "available", "degraded", "draining", "unavailable", "revoked",
+            "state = ANY (ARRAY['available', 'degraded', 'draining', "
+            "'unavailable', 'revoked'])"
         ),
-        "ck_relay_nodes_max_allocations": ("max_allocations > 0",),
+        "ck_relay_nodes_max_allocations": "max_allocations > 0",
         "ck_relay_nodes_active_allocations": (
-            "active_allocations >= 0", "active_allocations <= max_allocations",
+            "active_allocations >= 0 AND active_allocations <= max_allocations"
         ),
-        "ck_relay_nodes_max_egress": ("max_egress_bps > 0",),
-        "ck_relay_nodes_current_egress": ("current_egress_bps >= 0",),
-        "ck_relay_nodes_heartbeat_sequence": ("heartbeat_sequence >= 0",),
+        "ck_relay_nodes_max_egress": "max_egress_bps > 0",
+        "ck_relay_nodes_current_egress": "current_egress_bps >= 0",
+        "ck_relay_nodes_heartbeat_sequence": "heartbeat_sequence >= 0",
     }
     checks = {
-        constraint["name"]: " ".join(constraint["sqltext"].lower().split())
+        constraint["name"]: _normalize_check_expression(constraint["sqltext"])
         for constraint in inspector.get_check_constraints("relay_nodes", schema=schema)
     }
     if any(
         name not in checks
-        or any(fragment not in checks[name] for fragment in fragments)
-        for name, fragments in required_checks.items()
+        or checks[name] != _normalize_check_expression(expression)
+        for name, expression in required_checks.items()
     ):
         raise RelaySchemaMismatchError("relay node check constraints differ")
 
@@ -312,13 +358,27 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             )
 
     foreign_keys = inspector.get_foreign_keys("relay_reservations", schema=schema)
-    if not any(
-        tuple(key["constrained_columns"]) == ("node_id",)
-        and key["referred_table"] == "relay_nodes"
-        and tuple(key["referred_columns"]) == ("node_id",)
-        and (key.get("options") or {}).get("ondelete") == "CASCADE"
-        for key in foreign_keys
-    ):
+    expected_referred_schema = schema
+    if expected_referred_schema is None:
+        expected_referred_schema = sync_connection.scalar(
+            text("SELECT current_schema()")
+        )
+    matching_foreign_keys = []
+    for key in foreign_keys:
+        options = key.get("options") or {}
+        referred_schema = key.get("referred_schema") or expected_referred_schema
+        if (
+            key.get("name") == "relay_reservations_node_id_fkey"
+            and tuple(key["constrained_columns"]) == ("node_id",)
+            and referred_schema == expected_referred_schema
+            and key["referred_table"] == "relay_nodes"
+            and tuple(key["referred_columns"]) == ("node_id",)
+            and options.get("ondelete") == "CASCADE"
+            and options.get("deferrable") in {None, False}
+            and options.get("initially") is None
+        ):
+            matching_foreign_keys.append(key)
+    if len(foreign_keys) != 1 or len(matching_foreign_keys) != 1:
         raise RelaySchemaMismatchError("relay reservation foreign key differs")
 
     expected_indexes = {

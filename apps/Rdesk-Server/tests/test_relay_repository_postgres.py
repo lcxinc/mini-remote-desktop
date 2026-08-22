@@ -662,3 +662,146 @@ async def test_migration_accepts_existing_connection_and_fails_closed_on_partial
             async with admin_engine.begin() as connection:
                 await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
             await admin_engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_concurrent_migrations_serialize_with_a_schema_scoped_transaction_lock() -> None:
+    assert DATABASE_URL is not None
+    schema = "relay_concurrent_" + re.sub(r"[^a-z0-9]", "", uuid4().hex)
+    admin_engine = create_async_engine(asyncpg_url(DATABASE_URL))
+    first_engine = create_async_engine(asyncpg_url(DATABASE_URL))
+    second_engine = create_async_engine(asyncpg_url(DATABASE_URL))
+    async with admin_engine.begin() as connection:
+        await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+
+    first_ready = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+    second_finished = asyncio.Event()
+    lock_observations: list[bool] = []
+
+    async def first_migration() -> None:
+        async with first_engine.begin() as connection:
+            await migrate(connection, schema=schema)
+            lock_observations.append(
+                bool(
+                    await connection.scalar(
+                        text(
+                            "SELECT EXISTS ("
+                            "SELECT 1 FROM pg_locks "
+                            "WHERE locktype = 'advisory' "
+                            "AND pid = pg_backend_pid() AND granted"
+                            ")"
+                        )
+                    )
+                )
+            )
+            first_ready.set()
+            await release_first.wait()
+
+    async def second_migration() -> None:
+        await first_ready.wait()
+        second_started.set()
+        async with second_engine.begin() as connection:
+            await migrate(connection, schema=schema)
+        second_finished.set()
+
+    try:
+        first_task = asyncio.create_task(first_migration())
+        await asyncio.wait_for(first_ready.wait(), timeout=5)
+        second_task = asyncio.create_task(second_migration())
+        await asyncio.wait_for(second_started.wait(), timeout=5)
+        await asyncio.sleep(0.05)
+        assert not second_finished.is_set()
+        release_first.set()
+        await asyncio.gather(first_task, second_task)
+
+        assert lock_observations == [True]
+        async with first_engine.connect() as connection:
+            assert not bool(
+                await connection.scalar(
+                    text(
+                        "SELECT EXISTS ("
+                        "SELECT 1 FROM pg_locks "
+                        "WHERE locktype = 'advisory' "
+                        "AND pid = pg_backend_pid() AND granted"
+                        ")"
+                    )
+                )
+            )
+        await migrate(first_engine, schema=schema)
+        async with first_engine.connect() as connection:
+            assert await connection.scalar(
+                text(
+                    f'SELECT COUNT(*) FROM "{schema}".relay_schema_migrations '
+                    "WHERE version = 1"
+                )
+            ) == 1
+    finally:
+        release_first.set()
+        await first_engine.dispose()
+        await second_engine.dispose()
+        async with admin_engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        await admin_engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_migration_rejects_semantically_weakened_check_constraint() -> None:
+    async with isolated_postgres_engine() as engine:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "ALTER TABLE relay_nodes "
+                    "DROP CONSTRAINT ck_relay_nodes_max_allocations"
+                )
+            )
+            await connection.execute(
+                text(
+                    "ALTER TABLE relay_nodes ADD CONSTRAINT "
+                    "ck_relay_nodes_max_allocations "
+                    "CHECK (max_allocations > 0 OR TRUE)"
+                )
+            )
+        with pytest.raises(relay_migration.RelaySchemaMismatchError):
+            await migrate(engine)
+
+
+@pytest.mark.anyio
+async def test_migration_rejects_cross_schema_deferrable_reservation_fk() -> None:
+    assert DATABASE_URL is not None
+    other_schema = "relay_wrong_fk_" + re.sub(r"[^a-z0-9]", "", uuid4().hex)
+    admin_engine = create_async_engine(asyncpg_url(DATABASE_URL))
+    async with admin_engine.begin() as connection:
+        await connection.execute(text(f'CREATE SCHEMA "{other_schema}"'))
+    try:
+        async with isolated_postgres_engine() as engine:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        f'CREATE TABLE "{other_schema}".relay_nodes '
+                        "(node_id VARCHAR(128) PRIMARY KEY)"
+                    )
+                )
+                await connection.execute(
+                    text(
+                        "ALTER TABLE relay_reservations DROP CONSTRAINT "
+                        "relay_reservations_node_id_fkey"
+                    )
+                )
+                await connection.execute(
+                    text(
+                        "ALTER TABLE relay_reservations ADD CONSTRAINT "
+                        "relay_reservations_node_id_fkey FOREIGN KEY (node_id) "
+                        f'REFERENCES "{other_schema}".relay_nodes (node_id) '
+                        "ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED"
+                    )
+                )
+            with pytest.raises(relay_migration.RelaySchemaMismatchError):
+                await migrate(engine)
+    finally:
+        async with admin_engine.begin() as connection:
+            await connection.execute(
+                text(f'DROP SCHEMA "{other_schema}" CASCADE')
+            )
+        await admin_engine.dispose()

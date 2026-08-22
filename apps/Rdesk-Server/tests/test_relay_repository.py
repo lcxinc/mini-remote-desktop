@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from sqlalchemy import create_engine, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -315,6 +316,45 @@ def test_secret_envelope_supports_key_rotation_and_rejects_unknown_keys() -> Non
         without_old_key.decrypt(encrypted, associated_data=b"relay-a")
     assert unknown.value.code == "UNKNOWN_KEY_ID"
     assert "rotating-secret" not in str(unknown.value)
+
+
+def test_legacy_secret_envelope_requires_an_explicit_read_key() -> None:
+    old_key = bytes.fromhex("61" * 32)
+    new_key = bytes.fromhex("62" * 32)
+    nonce = bytes.fromhex("63" * 12)
+    associated_data = b"relay-legacy"
+    plaintext = b"legacy-rotating-secret"
+    legacy_envelope = (
+        b"\x01"
+        + nonce
+        + AESGCM(old_key).encrypt(nonce, plaintext, associated_data)
+    )
+
+    rotated = AesGcmRelaySecretCipher(
+        new_key,
+        key_id="new-2026",
+        read_keys={"old-2025": old_key},
+        legacy_key_id="old-2025",
+    )
+    assert rotated.decrypt(legacy_envelope, associated_data=associated_data) == plaintext
+
+    for cipher in (
+        AesGcmRelaySecretCipher(
+            new_key,
+            key_id="new-2026",
+            read_keys={"old-2025": old_key},
+        ),
+        AesGcmRelaySecretCipher(
+            new_key,
+            key_id="new-2026",
+            read_keys={"old-2025": old_key},
+            legacy_key_id="missing-key",
+        ),
+    ):
+        with pytest.raises(relay_repository_module.RelaySecretCipherError) as error:
+            cipher.decrypt(legacy_envelope, associated_data=associated_data)
+        assert error.value.code == "LEGACY_KEY_UNAVAILABLE"
+        assert plaintext.decode() not in str(error.value)
 
 
 @pytest.mark.anyio
@@ -800,6 +840,17 @@ async def test_repository_validates_identifier_numeric_ttl_and_candidate_bounds(
         with pytest.raises(RelayRepositoryError) as error:
             await repository.reserve_capacity(**arguments)
         assert error.value.code == expected_code
+
+    with pytest.raises(RelayRepositoryError) as ttl_error:
+        await repository.reserve_capacity(
+            session_id="bounded-session",
+            user_id="bounded-user",
+            ordered_node_ids=[node.node_id],
+            now=NOW,
+            ttl_seconds=301,
+        )
+    assert ttl_error.value.code == "INVALID_RESERVATION_TTL"
+    assert str(ttl_error.value) == "TTL must be between 1 and 300 seconds"
 
     node.lease_expires_at = datetime.max.replace(tzinfo=UTC)
     with pytest.raises(RelayRepositoryError) as overflow:

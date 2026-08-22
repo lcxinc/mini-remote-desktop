@@ -80,6 +80,7 @@ class AesGcmRelaySecretCipher:
         *,
         key_id: str = "active",
         read_keys: dict[str, bytes] | None = None,
+        legacy_key_id: str | None = None,
     ) -> None:
         _validate_encryption_key(key)
         if _KEY_ID_PATTERN.fullmatch(key_id) is None:
@@ -89,8 +90,14 @@ class AesGcmRelaySecretCipher:
             if _KEY_ID_PATTERN.fullmatch(read_key_id) is None:
                 raise ValueError("relay secret read key id is invalid")
             _validate_encryption_key(read_key)
+        if (
+            legacy_key_id is not None
+            and _KEY_ID_PATTERN.fullmatch(legacy_key_id) is None
+        ):
+            raise ValueError("relay legacy secret key id is invalid")
         keys[key_id] = key
         self._active_key_id = key_id
+        self._legacy_key_id = legacy_key_id
         self._keys = keys
         self._active_aes_gcm = AESGCM(key)
 
@@ -117,7 +124,17 @@ class AesGcmRelaySecretCipher:
                 )
             nonce = ciphertext[1:13]
             encrypted = ciphertext[13:]
-            aes_gcm = self._active_aes_gcm
+            legacy_key = (
+                self._keys.get(self._legacy_key_id)
+                if self._legacy_key_id is not None
+                else None
+            )
+            if legacy_key is None:
+                raise RelaySecretCipherError(
+                    "LEGACY_KEY_UNAVAILABLE",
+                    "legacy relay secret key is unavailable",
+                )
+            aes_gcm = AESGCM(legacy_key)
         elif ciphertext[:1] == _CIPHERTEXT_VERSION:
             if len(ciphertext) < 30:
                 raise RelaySecretCipherError(
@@ -444,7 +461,10 @@ class RelayRepository:
             minimum=1,
             maximum=_MAX_RESERVATION_TTL_SECONDS,
         ):
-            raise RelayRepositoryError("INVALID_RESERVATION_TTL", "TTL must be positive")
+            raise RelayRepositoryError(
+                "INVALID_RESERVATION_TTL",
+                f"TTL must be between 1 and {_MAX_RESERVATION_TTL_SECONDS} seconds",
+            )
         if not isinstance(ordered_node_ids, list):
             raise RelayRepositoryError("INVALID_NODE_ID", "invalid candidate nodes")
         if len(ordered_node_ids) > 8:
