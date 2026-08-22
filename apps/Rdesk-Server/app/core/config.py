@@ -23,6 +23,14 @@ class Settings(BaseSettings):
     turn_urls: str = "turn:127.0.0.1:3478?transport=udp,turn:127.0.0.1:3478?transport=tcp,turns:127.0.0.1:5349?transport=tcp"
     turn_auth_secret: str = ""
     turn_credential_ttl_seconds: int = 600
+    # Empty means fail closed: relay management traffic is accepted only from
+    # explicit IP addresses/networks of the terminating mTLS proxy.
+    trusted_mtls_proxy: str = ""
+    relay_max_clock_skew_seconds: int = 30
+    relay_enrollment_token_pepper: str = ""
+    relay_ca_certificate_pem: str = ""
+    relay_ca_private_key_pem: str = ""
+    relay_certificate_validity_seconds: int = 3600
 
 
 settings = Settings()

@@ -17,7 +17,7 @@ _CHECK_CAST = re.compile(
     flags=re.IGNORECASE,
 )
 _MIGRATION_LOCK_CONTEXT = b"MRD_RELAY_SCHEMA_MIGRATION_V1\x00"
-_RELAY_SCHEMA_VERSION = 1
+_RELAY_SCHEMA_VERSIONS = (1, 2)
 
 
 class RelaySchemaMismatchError(RuntimeError):
@@ -41,7 +41,7 @@ async def migrate(
     *,
     schema: str | None = None,
 ) -> None:
-    """Apply and verify relay schema v1 in the caller's transaction when provided."""
+    """Apply and verify relay schema through v2 in the caller's transaction."""
     if isinstance(bind, AsyncEngine):
         async with bind.begin() as connection:
             await _migrate_connection(connection, schema=schema)
@@ -78,6 +78,8 @@ async def _migrate_connection(
     nodes = _table(schema, "relay_nodes")
     enrollments = _table(schema, "relay_enrollments")
     reservations = _table(schema, "relay_reservations")
+    registrations = _table(schema, "relay_node_registrations")
+    audit_events = _table(schema, "relay_audit_events")
     versions = _table(schema, "relay_schema_migrations")
 
     if schema is not None:
@@ -147,6 +149,38 @@ async def _migrate_connection(
             applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {registrations} (
+            node_id VARCHAR(128) PRIMARY KEY,
+            enrollment_id VARCHAR(36) NOT NULL REFERENCES {enrollments}(id) ON DELETE RESTRICT,
+            region VARCHAR(64) NOT NULL,
+            failure_domain VARCHAR(128) NOT NULL,
+            endpoints JSONB NOT NULL,
+            max_allocations INTEGER NOT NULL,
+            max_egress_bps BIGINT NOT NULL,
+            csr_pem BYTEA NOT NULL,
+            signing_public_key BYTEA NOT NULL,
+            status VARCHAR(16) NOT NULL DEFAULT 'pending',
+            certificate_pem BYTEA,
+            certificate_expires_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL,
+            approved_at TIMESTAMPTZ,
+            CONSTRAINT relay_node_registrations_enrollment_id_key UNIQUE (enrollment_id),
+            CONSTRAINT ck_relay_node_registrations_status CHECK (
+                status IN ('pending', 'approved', 'revoked')
+            )
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {audit_events} (
+            id VARCHAR(36) PRIMARY KEY,
+            action VARCHAR(64) NOT NULL,
+            node_id VARCHAR(128),
+            actor_id VARCHAR(128),
+            details JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL
+        )
+        """,
         f"CREATE INDEX IF NOT EXISTS ix_relay_nodes_region ON {nodes} (region)",
         f"CREATE INDEX IF NOT EXISTS ix_relay_nodes_state ON {nodes} (state)",
         f"CREATE INDEX IF NOT EXISTS ix_relay_nodes_lease ON {nodes} (lease_expires_at)",
@@ -157,6 +191,10 @@ async def _migrate_connection(
         f"CREATE INDEX IF NOT EXISTS ix_relay_reservations_expiry ON {reservations} (expires_at)",
         f"CREATE INDEX IF NOT EXISTS ix_relay_reservations_node_expiry ON {reservations} (node_id, expires_at)",
         f"CREATE INDEX IF NOT EXISTS ix_relay_reservations_session_expiry ON {reservations} (session_id, expires_at)",
+        f"CREATE INDEX IF NOT EXISTS ix_relay_audit_events_node "
+        f"ON {audit_events} (node_id)",
+        f"CREATE INDEX IF NOT EXISTS ix_relay_audit_events_created "
+        f"ON {audit_events} (created_at)",
     ]
     for statement in statements:
         await connection.execute(text(statement))
@@ -164,13 +202,14 @@ async def _migrate_connection(
     await connection.run_sync(
         lambda sync_connection: _assert_schema_conforms(sync_connection, schema)
     )
-    await connection.execute(
-        text(
-            f"INSERT INTO {versions} (version) VALUES (:version) "
-            "ON CONFLICT (version) DO NOTHING"
-        ),
-        {"version": _RELAY_SCHEMA_VERSION},
-    )
+    for version in _RELAY_SCHEMA_VERSIONS:
+        await connection.execute(
+            text(
+                f"INSERT INTO {versions} (version) VALUES (:version) "
+                "ON CONFLICT (version) DO NOTHING"
+            ),
+            {"version": version},
+        )
 
 
 def _preflight_existing_schema(sync_connection: object, schema: str | None) -> None:
@@ -189,6 +228,15 @@ def _preflight_existing_schema(sync_connection: object, schema: str | None) -> N
         },
         "relay_reservations": {
             "id", "session_id", "user_id", "node_id", "expires_at", "created_at",
+        },
+        "relay_node_registrations": {
+            "node_id", "enrollment_id", "region", "failure_domain", "endpoints",
+            "max_allocations", "max_egress_bps", "csr_pem", "signing_public_key",
+            "status", "certificate_pem", "certificate_expires_at", "created_at",
+            "approved_at",
+        },
+        "relay_audit_events": {
+            "id", "action", "node_id", "actor_id", "details", "created_at",
         },
     }
     for table_name, expected in required_columns.items():
@@ -266,6 +314,30 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             "expires_at": (DateTime, None, False),
             "created_at": (DateTime, None, False),
         },
+        "relay_node_registrations": {
+            "node_id": (String, 128, False),
+            "enrollment_id": (String, 36, False),
+            "region": (String, 64, False),
+            "failure_domain": (String, 128, False),
+            "endpoints": (JSONB, None, False),
+            "max_allocations": (Integer, None, False),
+            "max_egress_bps": (BigInteger, None, False),
+            "csr_pem": (LargeBinary, None, False),
+            "signing_public_key": (LargeBinary, None, False),
+            "status": (String, 16, False),
+            "certificate_pem": (LargeBinary, None, True),
+            "certificate_expires_at": (DateTime, None, True),
+            "created_at": (DateTime, None, False),
+            "approved_at": (DateTime, None, True),
+        },
+        "relay_audit_events": {
+            "id": (String, 36, False),
+            "action": (String, 64, False),
+            "node_id": (String, 128, True),
+            "actor_id": (String, 128, True),
+            "details": (JSONB, None, False),
+            "created_at": (DateTime, None, False),
+        },
     }
     for table_name, expected_columns in specs.items():
         columns = {
@@ -289,6 +361,10 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
         "relay_nodes": ("relay_nodes_pkey", ("node_id",)),
         "relay_enrollments": ("relay_enrollments_pkey", ("id",)),
         "relay_reservations": ("relay_reservations_pkey", ("id",)),
+        "relay_node_registrations": (
+            "relay_node_registrations_pkey", ("node_id",)
+        ),
+        "relay_audit_events": ("relay_audit_events_pkey", ("id",)),
     }
     for table_name, (constraint_name, column_names) in expected_primary_keys.items():
         primary_key = inspector.get_pk_constraint(table_name, schema=schema)
@@ -309,6 +385,14 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
     for name in ("active_allocations", "current_egress_bps", "heartbeat_sequence"):
         if str(node_columns[name]["default"]).strip("()") != "0":
             raise RelaySchemaMismatchError(f"relay node {name} default differs")
+    registration_columns = {
+        column["name"]: column
+        for column in inspector.get_columns(
+            "relay_node_registrations", schema=schema
+        )
+    }
+    if "pending" not in str(registration_columns["status"]["default"]):
+        raise RelaySchemaMismatchError("relay registration status default differs")
 
     required_checks = {
         "ck_relay_nodes_state": (
@@ -333,6 +417,20 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
         for name, expression in required_checks.items()
     ):
         raise RelaySchemaMismatchError("relay node check constraints differ")
+    registration_checks = {
+        constraint["name"]: _normalize_check_expression(constraint["sqltext"])
+        for constraint in inspector.get_check_constraints(
+            "relay_node_registrations", schema=schema
+        )
+    }
+    expected_registration_check = _normalize_check_expression(
+        "status = ANY (ARRAY['pending', 'approved', 'revoked'])"
+    )
+    if (
+        registration_checks.get("ck_relay_node_registrations_status")
+        != expected_registration_check
+    ):
+        raise RelaySchemaMismatchError("relay registration check constraints differ")
 
     expected_unique = {
         "relay_nodes": {
@@ -344,6 +442,10 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
         "relay_reservations": {
             "uq_relay_reservations_session_node": ("session_id", "node_id"),
         },
+        "relay_node_registrations": {
+            "relay_node_registrations_enrollment_id_key": ("enrollment_id",),
+        },
+        "relay_audit_events": {},
     }
     for table_name, required in expected_unique.items():
         actual = {
@@ -381,6 +483,23 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
     if len(foreign_keys) != 1 or len(matching_foreign_keys) != 1:
         raise RelaySchemaMismatchError("relay reservation foreign key differs")
 
+    registration_foreign_keys = inspector.get_foreign_keys(
+        "relay_node_registrations", schema=schema
+    )
+    if len(registration_foreign_keys) != 1:
+        raise RelaySchemaMismatchError("relay registration foreign key differs")
+    registration_key = registration_foreign_keys[0]
+    registration_options = registration_key.get("options") or {}
+    registration_schema = registration_key.get("referred_schema") or expected_referred_schema
+    if (
+        tuple(registration_key.get("constrained_columns") or ()) != ("enrollment_id",)
+        or registration_schema != expected_referred_schema
+        or registration_key.get("referred_table") != "relay_enrollments"
+        or tuple(registration_key.get("referred_columns") or ()) != ("id",)
+        or registration_options.get("ondelete") != "RESTRICT"
+    ):
+        raise RelaySchemaMismatchError("relay registration foreign key differs")
+
     expected_indexes = {
         "relay_nodes": {
             "ix_relay_nodes_region": ("region",),
@@ -397,6 +516,11 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             "ix_relay_reservations_expiry": ("expires_at",),
             "ix_relay_reservations_node_expiry": ("node_id", "expires_at"),
             "ix_relay_reservations_session_expiry": ("session_id", "expires_at"),
+        },
+        "relay_node_registrations": {},
+        "relay_audit_events": {
+            "ix_relay_audit_events_node": ("node_id",),
+            "ix_relay_audit_events_created": ("created_at",),
         },
     }
     for table_name, required in expected_indexes.items():
