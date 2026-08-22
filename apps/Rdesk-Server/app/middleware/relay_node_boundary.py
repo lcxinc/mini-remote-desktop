@@ -111,7 +111,6 @@ class RelayNodeBoundaryMiddleware:
         while True:
             message = await receive()
             if message.get("type") == "http.disconnect":
-                await _error(send, 400, "relay_request_invalid", "relay request invalid")
                 return
             if message.get("type") != "http.request":
                 await _error(send, 400, "relay_request_invalid", "relay request invalid")

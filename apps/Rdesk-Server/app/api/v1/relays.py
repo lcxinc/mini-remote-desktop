@@ -39,6 +39,7 @@ from app.schemas.relay import (
     RelayHeartbeatRequest,
     RelayHeartbeatResponse,
     RelayNodeResponse,
+    RelayRevocationResponse,
     RelayRenewalRequest,
     RelayRenewalResponse,
 )
@@ -477,10 +478,17 @@ async def resume_relay_node(
     return await _transition(node_id=node_id, action="resume", admin=admin, db=db)
 
 
-@router.post("/{node_id}/revoke", response_model=RelayNodeResponse)
+@router.post("/{node_id}/revoke", response_model=RelayRevocationResponse)
 async def revoke_relay_node(
     node_id: str,
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-) -> RelayNodeResponse:
-    return await _transition(node_id=node_id, action="revoke", admin=admin, db=db)
+) -> RelayRevocationResponse:
+    try:
+        revoked = await _registry(db).revoke(
+            node_id=node_id, actor_id=admin.id, now=_now()
+        )
+        await _commit(db)
+    except RelayRegistryError as error:
+        _raise_domain(error)
+    return RelayRevocationResponse(node_id=revoked.node_id, state="revoked")

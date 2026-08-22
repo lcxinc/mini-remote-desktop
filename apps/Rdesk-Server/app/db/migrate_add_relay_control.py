@@ -215,6 +215,11 @@ async def _migrate_connection(
     ]
     for statement in statements:
         await connection.execute(text(statement))
+    v4_already_applied = bool(
+        await connection.scalar(
+            text(f"SELECT 1 FROM {versions} WHERE version = 4")
+        )
+    )
 
     # v3 is deliberately additive so an already deployed v2 schema upgrades in
     # place while the advisory transaction lock serializes concurrent starters.
@@ -241,6 +246,30 @@ async def _migrate_connection(
         "renewal_record_expires_at TIMESTAMPTZ",
     ):
         await connection.execute(text(statement))
+    # v3 used previous_auth_expires_at for both old-certificate retry and
+    # renewal-response retention. Preserve that exact (possibly already
+    # expired) boundary for complete in-flight records when adding v4's split
+    # clocks. Partial records stay fail-closed instead of becoming retryable.
+    if not v4_already_applied:
+        await connection.execute(
+            text(
+                f"""
+                UPDATE {registrations}
+                SET previous_certificate_expires_at = previous_auth_expires_at,
+                    renewal_record_expires_at = previous_auth_expires_at
+                WHERE previous_certificate_expires_at IS NULL
+                  AND renewal_record_expires_at IS NULL
+                  AND previous_auth_expires_at IS NOT NULL
+                  AND renewal_request_id IS NOT NULL
+                  AND renewal_csr_sha256 IS NOT NULL
+                  AND renewal_certificate_pem IS NOT NULL
+                  AND renewal_certificate_expires_at IS NOT NULL
+                  AND ca_certificate_pem IS NOT NULL
+                  AND previous_certificate_fingerprint IS NOT NULL
+                  AND previous_signing_public_key IS NOT NULL
+                """
+            )
+        )
     await connection.execute(
         text(
             f"""

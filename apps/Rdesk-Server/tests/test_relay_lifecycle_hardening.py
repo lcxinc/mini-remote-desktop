@@ -158,6 +158,51 @@ def test_concurrent_identical_enrollment_requests_return_one_identity(
     assert responses[0].json() == responses[1].json()
 
 
+def test_sqlite_node_lock_is_held_until_api_transaction_finishes(
+    api: tuple[TestClient, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.api.v1 import relays as relay_api
+
+    client, _ = api
+    first_token = _issue_token(client)
+    second_token = _issue_token(client)
+    first_csr, _ = _csr(NODE_ID)
+    second_csr, _ = _csr(NODE_ID)
+    payloads = (
+        _enrollment_payload(first_token, first_csr),
+        _enrollment_payload(second_token, second_csr),
+    )
+    original_commit = relay_api._commit
+    commit_entered = threading.Event()
+    release_commit = threading.Event()
+
+    async def delayed_commit(db: object) -> None:
+        commit_entered.set()
+        await asyncio.to_thread(release_commit.wait)
+        await original_commit(db)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(relay_api, "_commit", delayed_commit)
+    start = threading.Barrier(2)
+
+    def enroll(payload: dict[str, object]) -> object:
+        start.wait()
+        return client.post(
+            "/api/v1/relays/enroll", headers=TLS_HEADERS, json=payload
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(enroll, payload) for payload in payloads]
+        assert commit_entered.wait(timeout=5)
+        # The loser must still be waiting on the process transaction lock; it
+        # cannot return based on a pre-commit snapshot.
+        assert all(not future.done() for future in futures)
+        release_commit.set()
+        responses = [future.result(timeout=5) for future in futures]
+    assert sorted(response.status_code for response in responses) == [202, 409]
+    rejected = next(response for response in responses if response.status_code == 409)
+    assert _error_code(rejected) == "relay_enrollment_pending"
+
+
 def test_pickup_is_pending_then_idempotently_delivers_approved_certificate(
     api: tuple[TestClient, object],
 ) -> None:
@@ -218,6 +263,64 @@ def test_approval_does_not_issue_until_first_pickup_and_concurrent_pickup_signs_
         registration = session.get(RelayNodeRegistration, NODE_ID)
         assert registration is not None
         assert registration.receipt_expires_at == immutable_receipt_expiry
+
+
+def test_approved_registration_can_be_irreversibly_revoked_before_pickup(
+    api: tuple[TestClient, object],
+) -> None:
+    client, engine = api
+    token = _issue_token(client)
+    csr_pem, _ = _csr(NODE_ID)
+    payload = _enrollment_payload(token, csr_pem)
+    enrolled = client.post(
+        "/api/v1/relays/enroll", headers=TLS_HEADERS, json=payload
+    )
+    assert enrolled.status_code == 202
+    enrollment_id = enrolled.json()["enrollment_id"]
+    receipt = enrolled.json()["receipt"]
+    assert client.post(f"/api/v1/relays/{NODE_ID}/approve").status_code == 200
+
+    revoked = client.post(f"/api/v1/relays/{NODE_ID}/revoke")
+    assert revoked.status_code == 200, revoked.text
+    assert revoked.json()["state"] == "revoked"
+    revoked_again = client.post(f"/api/v1/relays/{NODE_ID}/revoke")
+    assert revoked_again.status_code == 200
+    assert revoked_again.json() == revoked.json()
+    exact_retry = client.post(
+        "/api/v1/relays/enroll", headers=TLS_HEADERS, json=payload
+    )
+    assert (exact_retry.status_code, _error_code(exact_retry)) == (
+        403,
+        "relay_node_revoked",
+    )
+    pickup = _pickup(client, enrollment_id, receipt)
+    assert (pickup.status_code, _error_code(pickup)) == (
+        401,
+        "relay_enrollment_invalid",
+    )
+    with Session(engine) as session:
+        registration = session.get(RelayNodeRegistration, NODE_ID)
+        assert registration is not None
+        assert registration.status == "revoked"
+        assert registration.certificate_pem is None
+        assert session.get(RelayNode, NODE_ID) is None
+
+    approve_again = client.post(f"/api/v1/relays/{NODE_ID}/approve")
+    assert (approve_again.status_code, _error_code(approve_again)) == (
+        403,
+        "relay_node_revoked",
+    )
+    replacement_token = _issue_token(client)
+    replacement_csr, _ = _csr(NODE_ID)
+    reenroll = client.post(
+        "/api/v1/relays/enroll",
+        headers=TLS_HEADERS,
+        json=_enrollment_payload(replacement_token, replacement_csr),
+    )
+    assert (reenroll.status_code, _error_code(reenroll)) == (
+        403,
+        "relay_node_revoked",
+    )
 
 
 def test_expired_receipt_cannot_be_revived_by_approval_and_new_token_recovers(
@@ -817,9 +920,42 @@ async def test_disconnect_midstream_returns_stable_error_without_downstream() ->
             {"type": "http.disconnect"},
         ],
     )
-    assert sent[0]["status"] == 400
-    assert b"relay_request_invalid" in sent[1]["body"]
+    assert sent == []
     assert downstream == []
+
+
+@pytest.mark.anyio
+async def test_disconnect_midstream_never_sends_on_closed_transport() -> None:
+    receive_calls = 0
+
+    async def receive() -> dict[str, object]:
+        nonlocal receive_calls
+        receive_calls += 1
+        if receive_calls == 1:
+            return {"type": "http.request", "body": b"{", "more_body": True}
+        return {"type": "http.disconnect"}
+
+    async def closed_send(_: dict[str, object]) -> None:
+        raise OSError("transport is closed")
+
+    async def downstream(*_: object) -> None:
+        raise AssertionError("disconnected request reached downstream")
+
+    middleware = RelayNodeBoundaryMiddleware(
+        downstream, trusted_proxy="127.0.0.1"
+    )
+    await middleware(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/v1/relays/enroll",
+            "headers": [(b"x-rdesk-client-tls", b"verified")],
+            "client": ("127.0.0.1", 41000),
+            "state": {},
+        },
+        receive,
+        closed_send,
+    )
 
 
 def test_admin_routes_are_not_blocked_by_relay_node_boundary(

@@ -16,13 +16,23 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async
 
 from app.db.migrate_add_relay_control import migrate
 import app.db.migrate_add_relay_control as relay_migration
+from app.models.relay_audit_event import RelayAuditEvent
+from app.models.relay_enrollment import RelayEnrollment
 from app.models.relay_node import RelayNode
+from app.models.relay_node_registration import RelayNodeRegistration
 from app.models.relay_reservation import RelayReservation
+from app.services.relay_node_auth import validate_relay_csr
 from app.services.relay_repository import (
     AesGcmRelaySecretCipher,
     RelayRepository,
     RelayRepositoryError,
 )
+from app.services.relay_registry import (
+    RelayIdentity,
+    RelayRegistry,
+    RelayRegistryError,
+)
+from test_relay_node_api import _ca_material, _csr
 
 
 DATABASE_URL = os.getenv("MRD_TEST_DATABASE_URL")
@@ -565,6 +575,192 @@ async def test_concurrent_enrollment_conflicts_are_stable_and_transactions_recov
 
 
 @pytest.mark.anyio
+async def test_different_tokens_cannot_concurrently_replace_the_same_registration() -> None:
+    now = datetime.now(UTC)
+    pepper = "44" * 32
+    node_id = "relay-concurrent-reenrollment"
+    async with isolated_postgres_engine() as engine:
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as setup_session:
+            registry = RelayRegistry(
+                setup_session, enrollment_token_pepper=pepper
+            )
+            first_token, _ = await registry.issue_enrollment_token(
+                ttl_seconds=300, actor_id="admin", now=now
+            )
+            second_token, _ = await registry.issue_enrollment_token(
+                ttl_seconds=300, actor_id="admin", now=now
+            )
+            await setup_session.commit()
+
+        first_csr, _ = _csr(node_id)
+        second_csr, _ = _csr(node_id)
+        start = asyncio.Event()
+
+        async def enroll(
+            token: str, csr_pem: str
+        ) -> tuple[str, str, str | None]:
+            async with sessions() as session:
+                registry = RelayRegistry(session, enrollment_token_pepper=pepper)
+                await start.wait()
+                try:
+                    requested = await registry.request_enrollment(
+                        token=token,
+                        node_id=node_id,
+                        region="ap-east",
+                        failure_domain="rack-concurrent",
+                        endpoints=[
+                            "turn:relay.example.test:3478?transport=udp"
+                        ],
+                        max_allocations=10,
+                        max_egress_bps=1_000_000,
+                        csr_pem=csr_pem,
+                        receipt_ttl_seconds=3600,
+                        now=now,
+                    )
+                    await session.commit()
+                    return (
+                        "ok",
+                        requested.registration.enrollment_id,
+                        requested.receipt,
+                    )
+                except RelayRegistryError as error:
+                    await session.rollback()
+                    return error.code, str(error.status_code), None
+
+        first = asyncio.create_task(enroll(first_token, first_csr))
+        second = asyncio.create_task(enroll(second_token, second_csr))
+        start.set()
+        results = await asyncio.wait_for(
+            asyncio.gather(first, second), timeout=10
+        )
+        successful = [result for result in results if result[0] == "ok"]
+        rejected = [result for result in results if result[0] != "ok"]
+        assert len(successful) == len(rejected) == 1
+        assert rejected[0][:2] == ("relay_enrollment_pending", "409")
+
+        enrollment_id, receipt = successful[0][1], successful[0][2]
+        assert receipt is not None
+        async with sessions() as verification_session:
+            registry = RelayRegistry(
+                verification_session, enrollment_token_pepper=pepper
+            )
+            pending = await registry.pickup_enrollment(
+                enrollment_id=enrollment_id,
+                receipt=receipt,
+                ca_certificate_pem="unused",
+                ca_private_key_pem="unused",
+                ca_private_key_password="",
+                validity_seconds=3600,
+                now=now,
+            )
+            assert pending.status == "pending"
+            registration = await verification_session.get(
+                RelayNodeRegistration, node_id
+            )
+            assert registration is not None
+            assert registration.enrollment_id == enrollment_id
+
+
+@pytest.mark.anyio
+async def test_pickup_and_revoke_serialize_without_deadlock() -> None:
+    now = datetime.now(UTC)
+    pepper = "44" * 32
+    node_id = "relay-pickup-revoke-race"
+    ca_certificate, ca_private_key, _, _ = _ca_material()
+    csr_pem, _ = _csr(node_id)
+    async with isolated_postgres_engine() as engine:
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as setup_session:
+            registry = RelayRegistry(
+                setup_session, enrollment_token_pepper=pepper
+            )
+            token, _ = await registry.issue_enrollment_token(
+                ttl_seconds=300, actor_id="admin", now=now
+            )
+            requested = await registry.request_enrollment(
+                token=token,
+                node_id=node_id,
+                region="ap-east",
+                failure_domain="rack-race",
+                endpoints=["turn:relay.example.test:3478?transport=udp"],
+                max_allocations=10,
+                max_egress_bps=1_000_000,
+                csr_pem=csr_pem,
+                receipt_ttl_seconds=3600,
+                now=now,
+            )
+            enrollment_id = requested.registration.enrollment_id
+            receipt = requested.receipt
+            await registry.approve(node_id=node_id, actor_id="admin", now=now)
+            await setup_session.commit()
+
+        start = asyncio.Event()
+
+        async def pickup() -> str:
+            async with sessions() as session:
+                registry = RelayRegistry(session, enrollment_token_pepper=pepper)
+                await start.wait()
+                try:
+                    result = await registry.pickup_enrollment(
+                        enrollment_id=enrollment_id,
+                        receipt=receipt,
+                        ca_certificate_pem=ca_certificate,
+                        ca_private_key_pem=ca_private_key,
+                        ca_private_key_password="",
+                        validity_seconds=3600,
+                        now=now,
+                    )
+                    await session.commit()
+                    return result.status
+                except RelayRegistryError as error:
+                    await session.rollback()
+                    return error.code
+
+        async def revoke() -> str:
+            async with sessions() as session:
+                registry = RelayRegistry(session, enrollment_token_pepper=pepper)
+                await start.wait()
+                result = await registry.revoke(
+                    node_id=node_id, actor_id="admin", now=now
+                )
+                await session.commit()
+                return result.state
+
+        pickup_task = asyncio.create_task(pickup())
+        revoke_task = asyncio.create_task(revoke())
+        start.set()
+        pickup_result, revoke_result = await asyncio.wait_for(
+            asyncio.gather(pickup_task, revoke_task), timeout=10
+        )
+        assert pickup_result in {"approved", "relay_enrollment_invalid"}
+        assert revoke_result == "revoked"
+
+        async with sessions() as verification_session:
+            registration = await verification_session.get(
+                RelayNodeRegistration, node_id
+            )
+            node = await verification_session.get(RelayNode, node_id)
+            assert registration is not None
+            assert registration.status == "revoked"
+            assert node is None or node.state == "revoked"
+            registry = RelayRegistry(
+                verification_session, enrollment_token_pepper=pepper
+            )
+            with pytest.raises(RelayRegistryError) as replayed:
+                await registry.pickup_enrollment(
+                    enrollment_id=enrollment_id,
+                    receipt=receipt,
+                    ca_certificate_pem=ca_certificate,
+                    ca_private_key_pem=ca_private_key,
+                    ca_private_key_password="",
+                    validity_seconds=3600,
+                    now=now + timedelta(seconds=1),
+                )
+            assert replayed.value.code == "relay_enrollment_invalid"
+
+
+@pytest.mark.anyio
 async def test_migration_schema_matches_orm_and_required_indexes() -> None:
     async with isolated_postgres_engine() as engine:
         def inspect_schema(sync_connection: object) -> dict[str, object]:
@@ -914,3 +1110,208 @@ async def test_v4_behaviorally_upgrades_v2_schema_and_serializes_concurrent_upgr
         async with admin_engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
         await admin_engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_v4_backfills_only_complete_v3_inflight_renewals_without_extending_grace() -> None:
+    now = datetime.now(UTC)
+    pepper = "44" * 32
+    active_node_id = "relay-v3-renewal-active"
+    expired_node_id = "relay-v3-renewal-expired"
+    partial_node_id = "relay-v3-renewal-partial"
+    active_csr, _ = _csr(active_node_id)
+    expired_csr, _ = _csr(expired_node_id)
+    partial_csr, _ = _csr(partial_node_id)
+    active_canonical, _ = validate_relay_csr(active_csr, active_node_id)
+    expired_canonical, _ = validate_relay_csr(expired_csr, expired_node_id)
+    partial_canonical, _ = validate_relay_csr(partial_csr, partial_node_id)
+    active_grace = now + timedelta(minutes=5)
+    expired_grace = now - timedelta(seconds=1)
+
+    async with isolated_postgres_engine() as engine:
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as setup_session:
+            for node_id, old_grace, canonical_csr, complete in (
+                (active_node_id, active_grace, active_canonical, True),
+                (expired_node_id, expired_grace, expired_canonical, True),
+                (partial_node_id, active_grace, partial_canonical, False),
+            ):
+                enrollment_id = str(uuid4())
+                setup_session.add(
+                    RelayEnrollment(
+                        id=enrollment_id,
+                        token_digest=hashlib.sha256(node_id.encode()).hexdigest(),
+                        expires_at=now + timedelta(hours=1),
+                        used_at=now,
+                        enrolled_node_id=node_id,
+                        created_at=now,
+                    )
+                )
+                setup_session.add(
+                    RelayNode(
+                        node_id=node_id,
+                        region="ap-east",
+                        failure_domain="rack-v3",
+                        state="unavailable",
+                        endpoints=[
+                            "turn:relay.example.test:3478?transport=udp"
+                        ],
+                        certificate_fingerprint=fingerprint(f"current-{node_id}"),
+                        encrypted_turn_secret=b"v3",
+                        max_allocations=10,
+                        active_allocations=0,
+                        max_egress_bps=1_000_000,
+                        current_egress_bps=0,
+                        heartbeat_sequence=0,
+                        healthy_heartbeat_streak=0,
+                        lease_expires_at=None,
+                        revoked_at=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                setup_session.add(
+                    RelayNodeRegistration(
+                        node_id=node_id,
+                        enrollment_id=enrollment_id,
+                        region="ap-east",
+                        failure_domain="rack-v3",
+                        endpoints=[
+                            "turn:relay.example.test:3478?transport=udp"
+                        ],
+                        max_allocations=10,
+                        max_egress_bps=1_000_000,
+                        csr_pem=canonical_csr,
+                        signing_public_key=b"c" * 32,
+                        status="approved",
+                        certificate_pem=b"CURRENT CERTIFICATE",
+                        certificate_expires_at=now + timedelta(hours=1),
+                        request_digest=None,
+                        receipt_digest=hashlib.sha256(node_id.encode()).hexdigest(),
+                        receipt_expires_at=now + timedelta(hours=1),
+                        ca_certificate_pem=(b"CACHED CA" if complete else None),
+                        previous_certificate_fingerprint=fingerprint(
+                            f"previous-{node_id}"
+                        ),
+                        previous_signing_public_key=b"p" * 32,
+                        previous_auth_expires_at=old_grace,
+                        previous_certificate_expires_at=None,
+                        renewal_request_id=f"renewal-{node_id}",
+                        renewal_csr_sha256=hashlib.sha256(canonical_csr).hexdigest(),
+                        renewal_certificate_pem=b"CACHED RENEWED CERTIFICATE",
+                        renewal_certificate_expires_at=now + timedelta(hours=1),
+                        renewal_record_expires_at=None,
+                        created_at=now,
+                        approved_at=now,
+                    )
+                )
+            await setup_session.commit()
+
+        async with engine.begin() as connection:
+            for column in (
+                "request_digest",
+                "previous_certificate_expires_at",
+                "renewal_record_expires_at",
+            ):
+                await connection.execute(
+                    text(
+                        "ALTER TABLE relay_node_registrations "
+                        f"DROP COLUMN {column}"
+                    )
+                )
+            await connection.execute(
+                text("DELETE FROM relay_schema_migrations WHERE version = 4")
+            )
+
+        await migrate(engine)
+        async with sessions() as verification_session:
+            active_registration = await verification_session.get(
+                RelayNodeRegistration, active_node_id
+            )
+            expired_registration = await verification_session.get(
+                RelayNodeRegistration, expired_node_id
+            )
+            partial_registration = await verification_session.get(
+                RelayNodeRegistration, partial_node_id
+            )
+            assert active_registration is not None
+            assert expired_registration is not None
+            assert partial_registration is not None
+            assert active_registration.previous_certificate_expires_at == active_grace
+            assert active_registration.renewal_record_expires_at == active_grace
+            assert expired_registration.previous_certificate_expires_at == expired_grace
+            assert expired_registration.renewal_record_expires_at == expired_grace
+            assert partial_registration.previous_certificate_expires_at is None
+            assert partial_registration.renewal_record_expires_at is None
+
+            registry = RelayRegistry(
+                verification_session, enrollment_token_pepper=pepper
+            )
+            active_node = await verification_session.get(RelayNode, active_node_id)
+            expired_node = await verification_session.get(RelayNode, expired_node_id)
+            assert active_node is not None and expired_node is not None
+            current_identity = RelayIdentity(
+                node_id=active_node_id,
+                certificate_fingerprint=active_node.certificate_fingerprint,
+                signing_public_key=b"c" * 32,
+                state=active_node.state,
+            )
+            previous_identity = RelayIdentity(
+                node_id=active_node_id,
+                certificate_fingerprint=fingerprint(f"previous-{active_node_id}"),
+                signing_public_key=b"p" * 32,
+                state=active_node.state,
+                is_previous=True,
+            )
+            renewal_kwargs = {
+                "renewal_id": f"renewal-{active_node_id}",
+                "csr_pem": active_csr,
+                "ca_certificate_pem": "must-not-be-used",
+                "ca_private_key_pem": "must-not-be-used",
+                "ca_private_key_password": "",
+                "validity_seconds": 3600,
+                "renew_before_seconds": 3600,
+                "previous_auth_grace_seconds": 300,
+                "renewal_record_retention_seconds": 3600,
+                "now": now,
+            }
+            current_retry = await registry.renew(
+                identity=current_identity, **renewal_kwargs
+            )
+            previous_retry = await registry.renew(
+                identity=previous_identity, **renewal_kwargs
+            )
+            assert current_retry.certificate.certificate_pem == (
+                "CACHED RENEWED CERTIFICATE"
+            )
+            assert previous_retry.certificate.certificate_pem == (
+                current_retry.certificate.certificate_pem
+            )
+            renewed_audits = await verification_session.scalar(
+                select(func.count())
+                .select_from(RelayAuditEvent)
+                .where(RelayAuditEvent.action == "relay_certificate_renewed")
+            )
+            assert renewed_audits == 0
+
+            expired_current = RelayIdentity(
+                node_id=expired_node_id,
+                certificate_fingerprint=expired_node.certificate_fingerprint,
+                signing_public_key=b"c" * 32,
+                state=expired_node.state,
+            )
+            with pytest.raises(RelayRegistryError) as expired_retry:
+                await registry.renew(
+                    identity=expired_current,
+                    renewal_id=f"renewal-{expired_node_id}",
+                    csr_pem=expired_csr,
+                    ca_certificate_pem="must-not-be-used",
+                    ca_private_key_pem="must-not-be-used",
+                    ca_private_key_password="",
+                    validity_seconds=3600,
+                    renew_before_seconds=3600,
+                    previous_auth_grace_seconds=300,
+                    renewal_record_retention_seconds=3600,
+                    now=now,
+                )
+            assert expired_retry.value.code == "relay_renewal_conflict"

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, StringConstraints
 
@@ -109,6 +109,11 @@ class RelayNodeResponse(BaseModel):
     current_egress_bps: int
     lease_expires_at: datetime | None
     revoked_at: datetime | None
+
+
+class RelayRevocationResponse(BaseModel):
+    node_id: RelayId
+    state: Literal["revoked"]
 
 
 class RelayErrorDetail(BaseModel):
