@@ -85,9 +85,18 @@ router = APIRouter(
     responses=_RELAY_ERROR_RESPONSES,
 )
 
+_HEARTBEAT_OPENAPI_PATH = "/api/v1/relays/{node_id}/heartbeat"
+_HEARTBEAT_AUTH_HEADERS = {
+    "X-Rdesk-Client-Cert-Sha256",
+    "X-Relay-Node-Id",
+    "X-Relay-Signature",
+    "X-Relay-Timestamp",
+    "X-Relay-Sequence",
+}
+
 
 def install_relay_openapi(app: FastAPI) -> None:
-    """Remove impossible 422 responses from relay operations only."""
+    """Align relay-only OpenAPI metadata with the stable runtime contract."""
 
     original_openapi = app.openapi
     if getattr(original_openapi, "__relay_openapi_installed__", False):
@@ -114,6 +123,18 @@ def install_relay_openapi(app: FastAPI) -> None:
                 responses = operation.get("responses")
                 if isinstance(responses, dict):
                     responses.pop("422", None)
+                if path != _HEARTBEAT_OPENAPI_PATH or method != "post":
+                    continue
+                parameters = operation.get("parameters")
+                if not isinstance(parameters, list):
+                    continue
+                for parameter in parameters:
+                    if (
+                        isinstance(parameter, dict)
+                        and parameter.get("in") == "header"
+                        and parameter.get("name") in _HEARTBEAT_AUTH_HEADERS
+                    ):
+                        parameter["required"] = True
         return schema
 
     relay_openapi.__relay_openapi_installed__ = True  # type: ignore[attr-defined]

@@ -486,17 +486,24 @@ def test_heartbeat_requires_proxy_certificate_and_ed25519_signature(
 
 
 @pytest.mark.parametrize(
-    "missing_header",
+    ("missing_header", "status_code", "reason_code"),
     [
-        "X-Rdesk-Client-Cert-Sha256",
-        "X-Relay-Node-Id",
-        "X-Relay-Signature",
-        "X-Relay-Timestamp",
-        "X-Relay-Sequence",
+        (
+            "X-Rdesk-Client-Cert-Sha256",
+            401,
+            "relay_certificate_invalid",
+        ),
+        ("X-Relay-Node-Id", 401, "relay_signature_invalid"),
+        ("X-Relay-Signature", 401, "relay_signature_invalid"),
+        ("X-Relay-Timestamp", 401, "relay_signature_invalid"),
+        ("X-Relay-Sequence", 401, "relay_signature_invalid"),
     ],
 )
-def test_missing_required_heartbeat_header_returns_stable_validation_error(
-    api: tuple[TestClient, object], missing_header: str
+def test_missing_heartbeat_auth_header_has_stable_authentication_error(
+    api: tuple[TestClient, object],
+    missing_header: str,
+    status_code: int,
+    reason_code: str,
 ) -> None:
     client, _ = api
     key, _ = _enroll(client)
@@ -510,8 +517,8 @@ def test_missing_required_heartbeat_header_returns_stable_validation_error(
     response = client.post(
         f"/api/v1/relays/{NODE_ID}/heartbeat", content=body, headers=headers
     )
-    assert response.status_code == 400
-    assert _error_code(response) == "relay_metrics_invalid"
+    assert response.status_code == status_code
+    assert _error_code(response) == reason_code
 
 
 def test_missing_heartbeat_body_fields_return_stable_validation_error(
@@ -764,6 +771,25 @@ def test_untrusted_direct_peer_cannot_spoof_proxy_headers(
     assert _error_code(response) == "relay_proxy_required"
 
 
+def test_untrusted_direct_peer_without_auth_headers_still_fails_proxy_boundary(
+    api: tuple[TestClient, object],
+) -> None:
+    client, _ = api
+    with TestClient(
+        client.app, client=("203.0.113.7", 41000)
+    ) as public_client:
+        response = public_client.post(
+            f"/api/v1/relays/{NODE_ID}/heartbeat",
+            json={
+                "active_allocations": 0,
+                "current_egress_bps": 0,
+                "endpoints": ["turn:relay.example.test:3478"],
+            },
+        )
+    assert response.status_code == 403
+    assert _error_code(response) == "relay_proxy_required"
+
+
 def test_openapi_documents_relay_authentication_headers_and_stable_errors(
     api: tuple[TestClient, object],
 ) -> None:
@@ -860,3 +886,65 @@ def test_relay_openapi_filter_is_idempotent_and_scoped() -> None:
     assert heartbeat["security"] == [
         {"TrustedMTLSProxy": [], "RelayEd25519": []}
     ]
+
+
+def test_relay_openapi_filter_marks_only_heartbeat_auth_headers_required() -> None:
+    from app.api.v1.relays import install_relay_openapi
+
+    authentication_headers = {
+        "X-Rdesk-Client-Cert-Sha256",
+        "X-Relay-Node-Id",
+        "X-Relay-Signature",
+        "X-Relay-Timestamp",
+        "X-Relay-Sequence",
+    }
+    heartbeat_parameters = [
+        {"name": name, "in": "header", "required": False}
+        for name in authentication_headers
+    ]
+    heartbeat_parameters.append(
+        {"name": "X-Unrelated", "in": "header", "required": False}
+    )
+    schema = {
+        "paths": {
+            "/api/v1/relays/{node_id}/heartbeat": {
+                "post": {
+                    "parameters": heartbeat_parameters,
+                    "responses": {"200": {}, "422": {}},
+                }
+            },
+            "/api/v1/relays/{node_id}/other": {
+                "post": {
+                    "parameters": [
+                        {
+                            "name": "X-Relay-Signature",
+                            "in": "header",
+                            "required": False,
+                        }
+                    ],
+                    "responses": {"200": {}, "422": {}},
+                }
+            },
+        },
+        "components": {"schemas": {"Preserved": {"type": "object"}}},
+    }
+    app = FastAPI()
+    app.openapi = lambda: schema  # type: ignore[method-assign]
+    install_relay_openapi(app)
+
+    filtered = app.openapi()
+    heartbeat = filtered["paths"][
+        "/api/v1/relays/{node_id}/heartbeat"
+    ]["post"]
+    documented = {
+        parameter["name"]: parameter
+        for parameter in heartbeat["parameters"]
+    }
+    for name in authentication_headers:
+        assert documented[name]["required"] is True
+    assert documented["X-Unrelated"]["required"] is False
+    other_signature = filtered["paths"][
+        "/api/v1/relays/{node_id}/other"
+    ]["post"]["parameters"][0]
+    assert other_signature["required"] is False
+    assert filtered["components"] == schema["components"]
