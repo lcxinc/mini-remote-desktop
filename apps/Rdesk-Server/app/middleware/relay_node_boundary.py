@@ -88,6 +88,16 @@ class RelayNodeBoundaryMiddleware:
         if len(content_lengths) > 1 or any(b"," in value for value in content_lengths):
             await _error(send, 400, "relay_request_invalid", "relay request invalid")
             return
+        transfer_encodings = by_name.get(b"transfer-encoding", [])
+        if (
+            len(transfer_encodings) > 1
+            or any(b"," in value for value in transfer_encodings)
+            or (transfer_encodings and transfer_encodings[0].lower() != b"chunked")
+            or (content_lengths and transfer_encodings)
+        ):
+            await _error(send, 400, "relay_request_invalid", "relay request invalid")
+            return
+        declared: int | None = None
         if content_lengths:
             if _CONTENT_LENGTH.fullmatch(content_lengths[0]) is None:
                 await _error(send, 400, "relay_request_invalid", "relay request invalid")
@@ -101,23 +111,31 @@ class RelayNodeBoundaryMiddleware:
         while True:
             message = await receive()
             if message.get("type") == "http.disconnect":
+                await _error(send, 400, "relay_request_invalid", "relay request invalid")
                 return
             if message.get("type") != "http.request":
-                continue
+                await _error(send, 400, "relay_request_invalid", "relay request invalid")
+                return
             body.extend(message.get("body", b""))
             if len(body) > _MAX_BODY_BYTES:
                 await _error(send, 413, "relay_request_too_large", "relay request too large")
                 return
+            if declared is not None and len(body) > declared:
+                await _error(send, 400, "relay_request_invalid", "relay request invalid")
+                return
             if not message.get("more_body", False):
                 break
         exact_body = bytes(body)
+        if declared is not None and len(exact_body) != declared:
+            await _error(send, 400, "relay_request_invalid", "relay request invalid")
+            return
         scope.setdefault("state", {})["relay_raw_body"] = exact_body
         delivered = False
 
         async def replay() -> dict[str, Any]:
             nonlocal delivered
             if delivered:
-                return {"type": "http.request", "body": b"", "more_body": False}
+                return await receive()
             delivered = True
             return {"type": "http.request", "body": exact_body, "more_body": False}
 

@@ -5,6 +5,7 @@ import hashlib
 import logging
 import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -166,6 +167,42 @@ def test_sensitive_relay_and_ca_settings_are_secret_types_and_redacted() -> None
         value = getattr(configured, name)
         assert isinstance(value, SecretStr)
         assert secret not in repr(configured)
+
+
+def test_env_example_documents_security_controls_without_shipping_secrets() -> None:
+    example = Path(__file__).parents[1] / ".env.example"
+    content = example.read_text(encoding="utf-8")
+    configured = {
+        key: value
+        for line in content.splitlines()
+        if line and not line.startswith("#") and "=" in line
+        for key, value in (line.split("=", 1),)
+    }
+    for name in (
+        "RDESK_DB_URL",
+        "RDESK_JWT_SECRET",
+        "RDESK_BOOTSTRAP_ADMIN_PASSWORD",
+        "RDESK_TURN_AUTH_SECRET",
+        "RDESK_RELAY_ENROLLMENT_TOKEN_PEPPER",
+        "RDESK_RELAY_CA_PRIVATE_KEY_PEM",
+        "RDESK_RELAY_CA_PRIVATE_KEY_PASSWORD",
+    ):
+        assert configured[name] == ""
+    assert {
+        "RDESK_JWT_ISSUER",
+        "RDESK_JWT_AUDIENCE",
+        "RDESK_JWT_FUTURE_IAT_SKEW_SECONDS",
+        "RDESK_PASSWORD_PBKDF2_ITERATIONS",
+        "RDESK_TRUSTED_MTLS_PROXY",
+        "RDESK_RELAY_MAX_CLOCK_SKEW_SECONDS",
+        "RDESK_RELAY_CERTIFICATE_VALIDITY_SECONDS",
+        "RDESK_RELAY_CERTIFICATE_RENEW_BEFORE_SECONDS",
+        "RDESK_RELAY_ENROLLMENT_RECEIPT_TTL_SECONDS",
+        "RDESK_RELAY_PREVIOUS_AUTH_GRACE_SECONDS",
+        "RDESK_RELAY_RENEWAL_RECORD_RETENTION_SECONDS",
+    }.issubset(configured)
+    assert "519223" not in content
+    assert "change_me_for_production" not in content
 
 
 def test_jwt_issuance_requires_explicit_issuer_and_audience(

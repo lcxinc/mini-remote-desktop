@@ -810,7 +810,7 @@ async def test_migration_rejects_cross_schema_deferrable_reservation_fk() -> Non
 
 
 @pytest.mark.anyio
-async def test_v3_behaviorally_upgrades_v2_schema_and_serializes_concurrent_upgrade() -> None:
+async def test_v4_behaviorally_upgrades_v2_schema_and_serializes_concurrent_upgrade() -> None:
     assert DATABASE_URL is not None
     schema = "relay_v3_upgrade_" + re.sub(r"[^a-z0-9]", "", uuid4().hex)
     admin_engine = create_async_engine(asyncpg_url(DATABASE_URL))
@@ -832,6 +832,11 @@ async def test_v3_behaviorally_upgrades_v2_schema_and_serializes_concurrent_upgr
             "renewal_certificate_pem",
             "renewal_certificate_expires_at",
         )
+        registration_v4_columns = (
+            "request_digest",
+            "previous_certificate_expires_at",
+            "renewal_record_expires_at",
+        )
         async with first.begin() as connection:
             await connection.execute(
                 text(
@@ -846,7 +851,7 @@ async def test_v3_behaviorally_upgrades_v2_schema_and_serializes_concurrent_upgr
                     "DROP COLUMN IF EXISTS healthy_heartbeat_streak"
                 )
             )
-            for column in registration_v3_columns:
+            for column in (*registration_v3_columns, *registration_v4_columns):
                 await connection.execute(
                     text(
                         f'ALTER TABLE "{schema}".relay_node_registrations '
@@ -856,7 +861,7 @@ async def test_v3_behaviorally_upgrades_v2_schema_and_serializes_concurrent_upgr
             await connection.execute(
                 text(
                     f'DELETE FROM "{schema}".relay_schema_migrations '
-                    "WHERE version = 3"
+                    "WHERE version IN (3, 4)"
                 )
             )
 
@@ -901,7 +906,8 @@ async def test_v3_behaviorally_upgrades_v2_schema_and_serializes_concurrent_upgr
             )
             assert "healthy_heartbeat_streak" in node_columns
             assert set(registration_v3_columns).issubset(registration_columns)
-            assert versions == [1, 2, 3]
+            assert set(registration_v4_columns).issubset(registration_columns)
+            assert versions == [1, 2, 3, 4]
     finally:
         await first.dispose()
         await second.dispose()

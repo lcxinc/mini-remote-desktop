@@ -280,6 +280,41 @@ async def get_verified_relay_node(
 
 async def get_verified_relay_renewal_node(
     request: Request,
+    x_rdesk_client_certificate: Annotated[
+        str | None,
+        Header(
+            alias="X-Rdesk-Client-Cert-Sha256",
+            description="Canonical SHA-256 client-certificate fingerprint set by the trusted proxy.",
+        ),
+    ] = None,
+    x_relay_node_id: Annotated[
+        str | None,
+        Header(
+            alias="X-Relay-Node-Id",
+            description="Relay node ID; it must exactly match the route node_id.",
+        ),
+    ] = None,
+    x_relay_signature: Annotated[
+        str | None,
+        Header(
+            alias="X-Relay-Signature",
+            description="Bounded canonical Base64 Ed25519 request signature.",
+        ),
+    ] = None,
+    x_relay_timestamp: Annotated[
+        str | None,
+        Header(
+            alias="X-Relay-Timestamp",
+            description="Fresh Unix timestamp in decimal seconds.",
+        ),
+    ] = None,
+    x_relay_sequence: Annotated[
+        str | None,
+        Header(
+            alias="X-Relay-Sequence",
+            description="Strictly increasing unsigned request sequence.",
+        ),
+    ] = None,
     _trusted_proxy_marker: Annotated[
         str | None, Security(trusted_mtls_proxy_scheme)
     ] = None,
@@ -288,7 +323,15 @@ async def get_verified_relay_renewal_node(
     ] = None,
     db: AsyncSession = Depends(get_db),
 ) -> RelayIdentity:
-    _ = (_trusted_proxy_marker, _relay_signature_marker)
+    _ = (
+        x_rdesk_client_certificate,
+        x_relay_node_id,
+        x_relay_signature,
+        x_relay_timestamp,
+        x_relay_sequence,
+        _trusted_proxy_marker,
+        _relay_signature_marker,
+    )
     return await _verify_relay_request(request, db, allow_previous=True)
 
 

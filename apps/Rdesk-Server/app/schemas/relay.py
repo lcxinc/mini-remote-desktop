@@ -79,10 +79,7 @@ class RelayRenewalResponse(BaseModel):
 
 class RelayApprovalResponse(BaseModel):
     node_id: RelayId
-    certificate_pem: str
-    ca_certificate_pem: str
-    fingerprint: str
-    expires_at: datetime
+    status: str
 
 
 class RelayHeartbeatRequest(BaseModel):

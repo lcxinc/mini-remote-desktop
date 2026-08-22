@@ -128,6 +128,8 @@ def test_enrollment_heartbeat_and_admin_transitions_are_durably_audited(
         "relay_enrollment_token_issued",
         "relay_enrollment_requested",
         "relay_node_approved",
+        "relay_certificate_issued",
+        "relay_certificate_picked_up",
         "relay_heartbeat_recorded",
         "relay_node_drained",
         "relay_node_resumed",
@@ -160,6 +162,11 @@ def test_secrets_and_raw_auth_material_are_not_logged(
         },
     )
     assert response.status_code == 202
+    setattr(
+        client,
+        "_relay_enrollment_delivery",
+        (response.json()["enrollment_id"], response.json()["receipt"]),
+    )
     _, fingerprint = _approve(client)
     body, headers = _heartbeat_request(key, fingerprint)
     raw_signature = headers["X-Relay-Signature"]

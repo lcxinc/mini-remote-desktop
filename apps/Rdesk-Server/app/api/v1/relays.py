@@ -90,12 +90,19 @@ router = APIRouter(
 )
 
 _HEARTBEAT_OPENAPI_PATH = "/api/v1/relays/{node_id}/heartbeat"
+_RENEWAL_OPENAPI_PATH = "/api/v1/relays/{node_id}/renew"
+_PICKUP_OPENAPI_PATH = "/api/v1/relays/enrollments/{enrollment_id}/pickup"
 _HEARTBEAT_AUTH_HEADERS = {
     "X-Rdesk-Client-Cert-Sha256",
     "X-Relay-Node-Id",
     "X-Relay-Signature",
     "X-Relay-Timestamp",
     "X-Relay-Sequence",
+}
+_RENEWAL_AUTH_HEADERS = _HEARTBEAT_AUTH_HEADERS | {"X-Relay-Renewal-Id"}
+_PICKUP_AUTH_HEADERS = {
+    "X-Rdesk-Client-TLS",
+    "X-Relay-Enrollment-Receipt",
 }
 
 
@@ -129,7 +136,12 @@ def install_relay_openapi(app: FastAPI) -> None:
                 responses = operation.get("responses")
                 if isinstance(responses, dict):
                     responses.pop("422", None)
-                if path != _HEARTBEAT_OPENAPI_PATH or method != "post":
+                required_headers = {
+                    _HEARTBEAT_OPENAPI_PATH: _HEARTBEAT_AUTH_HEADERS,
+                    _RENEWAL_OPENAPI_PATH: _RENEWAL_AUTH_HEADERS,
+                    _PICKUP_OPENAPI_PATH: _PICKUP_AUTH_HEADERS,
+                }.get(path)
+                if required_headers is None or method != "post":
                     continue
                 parameters = operation.get("parameters")
                 if not isinstance(parameters, list):
@@ -138,7 +150,7 @@ def install_relay_openapi(app: FastAPI) -> None:
                     if (
                         isinstance(parameter, dict)
                         and parameter.get("in") == "header"
-                        and parameter.get("name") in _HEARTBEAT_AUTH_HEADERS
+                        and parameter.get("name") in required_headers
                     ):
                         parameter["required"] = True
         app.openapi_schema = schema
@@ -251,6 +263,7 @@ async def enroll_relay_node(
             max_allocations=payload.max_allocations,
             max_egress_bps=payload.max_egress_bps,
             csr_pem=payload.csr_pem,
+            receipt_ttl_seconds=settings.relay_enrollment_receipt_ttl_seconds,
             now=_now(),
         )
         await _commit(db)
@@ -297,7 +310,13 @@ async def pickup_relay_certificate(
                 "relay_enrollment_invalid", 401, "relay enrollment invalid"
             )
         pickup = await _registry(db).pickup_enrollment(
-            enrollment_id=enrollment_id, receipt=receipts[0], now=_now()
+            enrollment_id=enrollment_id,
+            receipt=receipts[0],
+            ca_certificate_pem=settings.relay_ca_certificate_pem,
+            ca_private_key_pem=settings.relay_ca_private_key_pem,
+            ca_private_key_password=settings.relay_ca_private_key_password,
+            validity_seconds=settings.relay_certificate_validity_seconds,
+            now=_now(),
         )
         await _commit(db)
     except (RelayRegistryError, RelayAuthError) as error:
@@ -315,22 +334,12 @@ async def approve_relay_node(
         approved = await _registry(db).approve(
             node_id=node_id,
             actor_id=admin.id,
-            ca_certificate_pem=settings.relay_ca_certificate_pem,
-            ca_private_key_pem=settings.relay_ca_private_key_pem,
-            ca_private_key_password=settings.relay_ca_private_key_password,
-            validity_seconds=settings.relay_certificate_validity_seconds,
             now=_now(),
         )
         await _commit(db)
     except (RelayRegistryError, RelayAuthError) as error:
         _raise_domain(error)
-    return RelayApprovalResponse(
-        node_id=node_id,
-        certificate_pem=approved.certificate.certificate_pem,
-        ca_certificate_pem=approved.certificate.ca_certificate_pem,
-        fingerprint=approved.certificate.fingerprint,
-        expires_at=approved.certificate.expires_at,
-    )
+    return RelayApprovalResponse(node_id=node_id, status=approved.status)
 
 
 @router.post(
@@ -410,6 +419,9 @@ async def renew_relay_certificate(
             validity_seconds=settings.relay_certificate_validity_seconds,
             renew_before_seconds=settings.relay_certificate_renew_before_seconds,
             previous_auth_grace_seconds=settings.relay_previous_auth_grace_seconds,
+            renewal_record_retention_seconds=(
+                settings.relay_renewal_record_retention_seconds
+            ),
             now=_now(),
         )
         await _commit(db)

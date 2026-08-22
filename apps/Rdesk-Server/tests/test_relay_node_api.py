@@ -294,13 +294,30 @@ def _enroll(
     assert response.json()["status"] == "pending"
     assert len(response.json()["enrollment_id"]) == 36
     assert len(response.json()["receipt"]) >= 40
+    setattr(
+        client,
+        "_relay_enrollment_delivery",
+        (response.json()["enrollment_id"], response.json()["receipt"]),
+    )
     return key, token
 
 
 def _approve(client: TestClient, node_id: str = NODE_ID) -> tuple[str, str]:
     response = client.post(f"/api/v1/relays/{node_id}/approve")
     assert response.status_code == 200, response.text
-    return response.json()["certificate_pem"], response.json()["fingerprint"]
+    assert response.json() == {"node_id": node_id, "status": "approved"}
+    enrollment_id, receipt = getattr(client, "_relay_enrollment_delivery")
+    pickup = client.post(
+        f"/api/v1/relays/enrollments/{enrollment_id}/pickup",
+        headers={**TLS_HEADERS, "X-Relay-Enrollment-Receipt": receipt},
+    )
+    assert pickup.status_code == 200, pickup.text
+    certificate_pem = pickup.json()["certificate_pem"]
+    certificate = x509.load_pem_x509_certificate(certificate_pem.encode())
+    fingerprint = "sha256:" + hashlib.sha256(
+        certificate.public_bytes(serialization.Encoding.DER)
+    ).hexdigest()
+    return certificate_pem, fingerprint
 
 
 def test_relay_routes_are_registered(api: tuple[TestClient, object]) -> None:
@@ -344,8 +361,16 @@ def test_enrollment_is_tls_proxy_bound_one_use_pending_and_csr_bound(
         headers=TLS_HEADERS,
         json=payload,
     )
-    assert reused.status_code == 409
-    assert _error_code(reused) == "relay_enrollment_already_used"
+    assert reused.status_code == 202
+    assert reused.json() == accepted.json()
+
+    changed = dict(payload)
+    changed["failure_domain"] = "rack-b"
+    conflict = client.post(
+        "/api/v1/relays/enroll", headers=TLS_HEADERS, json=changed
+    )
+    assert conflict.status_code == 409
+    assert _error_code(conflict) == "relay_enrollment_already_used"
 
 
 @pytest.mark.parametrize("kind", ["wrong_identity", "rsa_key", "tampered"])
@@ -384,14 +409,11 @@ def test_approval_issues_node_bound_short_lived_client_certificate(
 ) -> None:
     client, _ = api
     key, _ = _enroll(client)
-    approval = client.post(f"/api/v1/relays/{NODE_ID}/approve")
-    assert approval.status_code == 200, approval.text
-    certificate_pem = approval.json()["certificate_pem"]
-    fingerprint = approval.json()["fingerprint"]
+    certificate_pem, fingerprint = _approve(client)
 
     certificate = x509.load_pem_x509_certificate(certificate_pem.encode())
     ca_certificate = x509.load_pem_x509_certificate(
-        approval.json()["ca_certificate_pem"].encode()
+        settings.relay_ca_certificate_pem.encode()
     )
     assert certificate.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value == NODE_ID
     san = certificate.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
@@ -422,14 +444,23 @@ def test_approval_fails_closed_without_or_with_mismatched_ca(
 ) -> None:
     client, _ = api
     _enroll(client)
+    approval = client.post(f"/api/v1/relays/{NODE_ID}/approve")
+    assert approval.status_code == 200
+    enrollment_id, receipt = getattr(client, "_relay_enrollment_delivery")
     monkeypatch.setattr(settings, "relay_ca_private_key_pem", "")
-    absent = client.post(f"/api/v1/relays/{NODE_ID}/approve")
+    absent = client.post(
+        f"/api/v1/relays/enrollments/{enrollment_id}/pickup",
+        headers={**TLS_HEADERS, "X-Relay-Enrollment-Receipt": receipt},
+    )
     assert absent.status_code == 503
     assert _error_code(absent) == "relay_ca_unavailable"
 
     _, other_key, _, _ = _ca_material()
     monkeypatch.setattr(settings, "relay_ca_private_key_pem", other_key)
-    mismatch = client.post(f"/api/v1/relays/{NODE_ID}/approve")
+    mismatch = client.post(
+        f"/api/v1/relays/enrollments/{enrollment_id}/pickup",
+        headers={**TLS_HEADERS, "X-Relay-Enrollment-Receipt": receipt},
+    )
     assert mismatch.status_code == 503
     assert _error_code(mismatch) == "relay_ca_unavailable"
 
@@ -444,6 +475,9 @@ def test_approval_rejects_invalid_ca_time_usage_and_remaining_lifetime(
 ) -> None:
     client, _ = api
     _enroll(client)
+    approval = client.post(f"/api/v1/relays/{NODE_ID}/approve")
+    assert approval.status_code == 200
+    enrollment_id, receipt = getattr(client, "_relay_enrollment_delivery")
     now = datetime.now(UTC)
     if ca_kind == "expired":
         material = _ca_material(
@@ -467,7 +501,10 @@ def test_approval_rejects_invalid_ca_time_usage_and_remaining_lifetime(
         )
     monkeypatch.setattr(settings, "relay_ca_certificate_pem", material[0])
     monkeypatch.setattr(settings, "relay_ca_private_key_pem", material[1])
-    response = client.post(f"/api/v1/relays/{NODE_ID}/approve")
+    response = client.post(
+        f"/api/v1/relays/enrollments/{enrollment_id}/pickup",
+        headers={**TLS_HEADERS, "X-Relay-Enrollment-Receipt": receipt},
+    )
     assert response.status_code == 503
     assert _error_code(response) == "relay_ca_unavailable"
 
@@ -903,6 +940,30 @@ def test_openapi_documents_relay_authentication_headers_and_stable_errors(
         {"TrustedMTLSProxy": [], "RelayEd25519": []}
     ]
 
+    renewal = schema["paths"]["/api/v1/relays/{node_id}/renew"]["post"]
+    renewal_headers = {
+        parameter["name"]: parameter
+        for parameter in renewal["parameters"]
+        if parameter.get("in") == "header"
+    }
+    for name in (*authentication_headers, "X-Relay-Renewal-Id"):
+        assert renewal_headers[name]["required"] is True
+    assert renewal["security"] == [
+        {"TrustedMTLSProxy": [], "RelayEd25519": []}
+    ]
+
+    pickup = schema["paths"][
+        "/api/v1/relays/enrollments/{enrollment_id}/pickup"
+    ]["post"]
+    pickup_headers = {
+        parameter["name"]: parameter
+        for parameter in pickup["parameters"]
+        if parameter.get("in") == "header"
+    }
+    for name in ("X-Rdesk-Client-TLS", "X-Relay-Enrollment-Receipt"):
+        assert pickup_headers[name]["required"] is True
+    assert pickup["security"] == [{"TrustedMTLSProxy": []}]
+
     enrollment = schema["paths"]["/api/v1/relays/enroll"]["post"]
     assert enrollment["security"] == [{"TrustedMTLSProxy": []}]
     assert "proxy-only" in enrollment["description"].lower()
@@ -967,7 +1028,7 @@ def test_relay_openapi_filter_is_idempotent_and_scoped() -> None:
     ]
 
 
-def test_relay_openapi_filter_marks_only_heartbeat_auth_headers_required() -> None:
+def test_relay_openapi_filter_marks_exact_node_auth_headers_required() -> None:
     from app.api.v1.relays import install_relay_openapi
 
     authentication_headers = {
@@ -1004,6 +1065,39 @@ def test_relay_openapi_filter_marks_only_heartbeat_auth_headers_required() -> No
                     "responses": {"200": {}, "422": {}},
                 }
             },
+            "/api/v1/relays/{node_id}/renew": {
+                "post": {
+                    "parameters": [
+                        *[
+                            {"name": name, "in": "header", "required": False}
+                            for name in authentication_headers
+                        ],
+                        {
+                            "name": "X-Relay-Renewal-Id",
+                            "in": "header",
+                            "required": False,
+                        },
+                    ],
+                    "responses": {"200": {}, "422": {}},
+                }
+            },
+            "/api/v1/relays/enrollments/{enrollment_id}/pickup": {
+                "post": {
+                    "parameters": [
+                        {
+                            "name": "X-Rdesk-Client-TLS",
+                            "in": "header",
+                            "required": False,
+                        },
+                        {
+                            "name": "X-Relay-Enrollment-Receipt",
+                            "in": "header",
+                            "required": False,
+                        },
+                    ],
+                    "responses": {"200": {}, "422": {}},
+                }
+            },
         },
         "components": {"schemas": {"Preserved": {"type": "object"}}},
     }
@@ -1026,4 +1120,12 @@ def test_relay_openapi_filter_marks_only_heartbeat_auth_headers_required() -> No
         "/api/v1/relays/{node_id}/other"
     ]["post"]["parameters"][0]
     assert other_signature["required"] is False
+    renewal_parameters = filtered["paths"][
+        "/api/v1/relays/{node_id}/renew"
+    ]["post"]["parameters"]
+    assert all(parameter["required"] for parameter in renewal_parameters)
+    pickup_parameters = filtered["paths"][
+        "/api/v1/relays/enrollments/{enrollment_id}/pickup"
+    ]["post"]["parameters"]
+    assert all(parameter["required"] for parameter in pickup_parameters)
     assert filtered["components"] == schema["components"]

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import secrets
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
@@ -25,6 +27,8 @@ from app.services.relay_repository import RelayRepositoryError, _validate_endpoi
 
 _ENROLLMENT_CONTEXT = b"MRD_RELAY_ENROLLMENT_V1\x00"
 _RECEIPT_CONTEXT = b"MRD_RELAY_RECEIPT_V1\x00"
+_RECEIPT_DERIVE_CONTEXT = b"MRD_RELAY_RECEIPT_DERIVE_V1\x00"
+_ENROLLMENT_REQUEST_CONTEXT = b"MRD_RELAY_ENROLLMENT_REQUEST_V1\x00"
 
 
 class RelayRegistryError(Exception):
@@ -113,11 +117,25 @@ class RelayRegistry:
         max_allocations: int,
         max_egress_bps: int,
         csr_pem: str,
+        receipt_ttl_seconds: int,
         now: datetime,
     ) -> RequestedRelayEnrollment:
         self._require_pepper()
         canonical_csr, signing_public_key = validate_relay_csr(csr_pem, node_id)
         canonical_endpoints = self._endpoints(endpoints, "relay_enrollment_invalid")
+        if not 60 <= receipt_ttl_seconds <= 7 * 86_400:
+            self._error(
+                "relay_enrollment_invalid", 503, "relay enrollment is not configured"
+            )
+        request_digest = self._enrollment_request_digest(
+            node_id=node_id,
+            region=region,
+            failure_domain=failure_domain,
+            endpoints=canonical_endpoints,
+            max_allocations=max_allocations,
+            max_egress_bps=max_egress_bps,
+            canonical_csr=canonical_csr,
+        )
         digest = self._token_digest(token)
         enrollment = await self._session.scalar(
             select(RelayEnrollment)
@@ -129,49 +147,95 @@ class RelayRegistry:
         ):
             self._error("relay_enrollment_invalid", 400, "relay enrollment invalid")
         if enrollment.used_at is not None:
-            self._error(
-                "relay_enrollment_already_used", 409, "relay enrollment token already used"
+            return await self._idempotent_enrollment_retry(
+                enrollment=enrollment,
+                token=token,
+                request_digest=request_digest,
+                now=now,
             )
         if self._as_utc(enrollment.expires_at) <= now:
             self._error("relay_enrollment_invalid", 400, "relay enrollment invalid")
         existing_node = await self._session.get(RelayNode, node_id)
+        existing_registration = await self._session.get(RelayNodeRegistration, node_id)
         if existing_node is not None:
             if existing_node.state == "revoked":
                 self._error("relay_node_revoked", 403, "relay node revoked")
-            self._error("relay_enrollment_pending", 409, "relay node already enrolled")
-        existing_registration = await self._session.get(RelayNodeRegistration, node_id)
-        if existing_registration is not None:
-            self._error("relay_enrollment_pending", 409, "relay enrollment pending")
-
-        receipt = secrets.token_urlsafe(32)
-        registration = RelayNodeRegistration(
-            node_id=node_id,
-            enrollment_id=enrollment.id,
-            region=region,
-            failure_domain=failure_domain,
-            endpoints=canonical_endpoints,
-            max_allocations=max_allocations,
-            max_egress_bps=max_egress_bps,
-            csr_pem=canonical_csr,
-            signing_public_key=signing_public_key,
-            status="pending",
-            receipt_digest=self._receipt_digest(receipt),
-            receipt_expires_at=now + timedelta(hours=24),
-            created_at=now,
+        recoverable = self._registration_recoverable(
+            existing_registration, existing_node, now
         )
+        if existing_registration is not None and not recoverable:
+            self._error("relay_enrollment_pending", 409, "relay enrollment pending")
+        if existing_node is not None and existing_registration is None:
+            self._error("relay_enrollment_pending", 409, "relay node already enrolled")
+        if existing_node is not None and recoverable:
+            existing_node.state = "unavailable"
+            existing_node.healthy_heartbeat_streak = 0
+            existing_node.lease_expires_at = None
+            existing_node.updated_at = now
+
+        receipt = self._derive_receipt(token, enrollment.id, request_digest)
+        receipt_expires_at = now + timedelta(seconds=receipt_ttl_seconds)
+        if existing_registration is None:
+            registration = RelayNodeRegistration(node_id=node_id)
+            self._session.add(registration)
+            audit_action = "relay_enrollment_requested"
+        else:
+            registration = existing_registration
+            audit_action = "relay_enrollment_reissued"
+        registration.enrollment_id = enrollment.id
+        registration.region = region
+        registration.failure_domain = failure_domain
+        registration.endpoints = canonical_endpoints
+        registration.max_allocations = max_allocations
+        registration.max_egress_bps = max_egress_bps
+        registration.csr_pem = canonical_csr
+        registration.signing_public_key = signing_public_key
+        registration.status = "pending"
+        registration.request_digest = request_digest
+        registration.receipt_digest = self._receipt_digest(receipt)
+        registration.receipt_expires_at = receipt_expires_at
+        registration.certificate_pem = None
+        registration.ca_certificate_pem = None
+        registration.certificate_expires_at = None
+        registration.approved_at = None
+        registration.previous_certificate_fingerprint = None
+        registration.previous_signing_public_key = None
+        registration.previous_auth_expires_at = None
+        registration.previous_certificate_expires_at = None
+        registration.renewal_request_id = None
+        registration.renewal_csr_sha256 = None
+        registration.renewal_certificate_pem = None
+        registration.renewal_certificate_expires_at = None
+        registration.renewal_record_expires_at = None
+        registration.created_at = now
         enrollment.used_at = now
         enrollment.enrolled_node_id = node_id
-        self._session.add(registration)
         self._audit(
-            action="relay_enrollment_requested",
+            action=audit_action,
             node_id=node_id,
             actor_id=None,
             details={"region": region, "failure_domain": failure_domain},
             now=now,
         )
-        await self._flush_conflict(
-            "relay_enrollment_pending", "relay enrollment already pending"
-        )
+        try:
+            await self._session.flush()
+        except IntegrityError:
+            await self._session.rollback()
+            concurrent_enrollment = await self._session.scalar(
+                select(RelayEnrollment).where(
+                    RelayEnrollment.token_digest == digest
+                )
+            )
+            if concurrent_enrollment is not None:
+                return await self._idempotent_enrollment_retry(
+                    enrollment=concurrent_enrollment,
+                    token=token,
+                    request_digest=request_digest,
+                    now=now,
+                )
+            self._error(
+                "relay_enrollment_pending", 409, "relay enrollment already pending"
+            )
         return RequestedRelayEnrollment(registration=registration, receipt=receipt)
 
     async def approve(
@@ -179,12 +243,8 @@ class RelayRegistry:
         *,
         node_id: str,
         actor_id: str,
-        ca_certificate_pem: str,
-        ca_private_key_pem: str | SecretStr,
-        ca_private_key_password: str | SecretStr = "",
-        validity_seconds: int,
         now: datetime,
-    ) -> ApprovedRelay:
+    ) -> RelayNodeRegistration:
         registration = await self._session.scalar(
             select(RelayNodeRegistration)
             .where(RelayNodeRegistration.node_id == node_id)
@@ -192,58 +252,26 @@ class RelayRegistry:
         )
         if registration is None or registration.status != "pending":
             self._error("relay_enrollment_pending", 409, "relay enrollment not pending")
+        if (
+            registration.receipt_expires_at is None
+            or self._as_utc(registration.receipt_expires_at) <= now
+        ):
+            self._error("relay_enrollment_invalid", 409, "relay enrollment invalid")
         existing = await self._session.get(RelayNode, node_id)
         if existing is not None:
             if existing.state == "revoked":
                 self._error("relay_node_revoked", 403, "relay node revoked")
-            self._error("relay_enrollment_already_used", 409, "relay node already approved")
-
-        certificate = issue_relay_certificate(
-            csr_pem=registration.csr_pem,
-            node_id=node_id,
-            ca_certificate_pem=ca_certificate_pem,
-            ca_private_key_pem=ca_private_key_pem,
-            ca_private_key_password=ca_private_key_password,
-            now=now,
-            validity_seconds=validity_seconds,
-        )
-        node = RelayNode(
-            node_id=node_id,
-            region=registration.region,
-            failure_domain=registration.failure_domain,
-            state="unavailable",
-            endpoints=registration.endpoints,
-            certificate_fingerprint=certificate.fingerprint,
-            # TURN credential material is provisioned by Task 5.  This marker is
-            # neither a usable credential nor a hard-coded production secret.
-            encrypted_turn_secret=b"\x00",
-            max_allocations=registration.max_allocations,
-            active_allocations=0,
-            max_egress_bps=registration.max_egress_bps,
-            current_egress_bps=0,
-            heartbeat_sequence=0,
-            healthy_heartbeat_streak=0,
-            created_at=now,
-            updated_at=now,
-        )
         registration.status = "approved"
         registration.approved_at = now
-        registration.certificate_pem = certificate.certificate_pem.encode()
-        registration.ca_certificate_pem = certificate.ca_certificate_pem.encode()
-        registration.certificate_expires_at = certificate.expires_at
-        registration.receipt_expires_at = certificate.expires_at
-        self._session.add(node)
         self._audit(
             action="relay_node_approved",
             node_id=node_id,
             actor_id=actor_id,
-            details={"certificate_expires_at": certificate.expires_at.isoformat()},
+            details={},
             now=now,
         )
-        await self._flush_conflict(
-            "relay_enrollment_already_used", "relay node already approved"
-        )
-        return ApprovedRelay(node=node, certificate=certificate)
+        await self._session.flush()
+        return registration
 
     async def identity(
         self,
@@ -260,19 +288,24 @@ class RelayRegistry:
             node is None
             or registration is None
             or registration.status not in {"approved", "revoked"}
-            or registration.certificate_expires_at is None
-            or self._as_utc(registration.certificate_expires_at) <= now
         ):
             self._error("relay_certificate_invalid", 401, "relay certificate invalid")
         if hmac.compare_digest(node.certificate_fingerprint, certificate_fingerprint):
+            if (
+                registration.certificate_expires_at is None
+                or self._as_utc(registration.certificate_expires_at) <= now
+            ):
+                self._error(
+                    "relay_certificate_invalid", 401, "relay certificate invalid"
+                )
             signing_public_key = registration.signing_public_key
             is_previous = False
         elif (
             allow_previous
             and registration.previous_certificate_fingerprint is not None
             and registration.previous_signing_public_key is not None
-            and registration.previous_auth_expires_at is not None
-            and self._as_utc(registration.previous_auth_expires_at) > now
+            and registration.previous_certificate_expires_at is not None
+            and self._as_utc(registration.previous_certificate_expires_at) > now
             and hmac.compare_digest(
                 registration.previous_certificate_fingerprint,
                 certificate_fingerprint,
@@ -293,7 +326,15 @@ class RelayRegistry:
         )
 
     async def pickup_enrollment(
-        self, *, enrollment_id: str, receipt: str, now: datetime
+        self,
+        *,
+        enrollment_id: str,
+        receipt: str,
+        ca_certificate_pem: str,
+        ca_private_key_pem: str | SecretStr,
+        ca_private_key_password: str | SecretStr,
+        validity_seconds: int,
+        now: datetime,
     ) -> RelayEnrollmentPickup:
         self._require_pepper()
         digest = self._receipt_digest(receipt)
@@ -320,6 +361,51 @@ class RelayRegistry:
                 ca_certificate_pem=None,
                 expires_at=None,
             )
+        if registration.certificate_pem is None:
+            certificate = issue_relay_certificate(
+                csr_pem=registration.csr_pem,
+                node_id=registration.node_id,
+                ca_certificate_pem=ca_certificate_pem,
+                ca_private_key_pem=ca_private_key_pem,
+                ca_private_key_password=ca_private_key_password,
+                now=now,
+                validity_seconds=validity_seconds,
+            )
+            node = await self._session.get(RelayNode, registration.node_id)
+            if node is not None and node.state == "revoked":
+                self._error("relay_enrollment_invalid", 401, "relay enrollment invalid")
+            if node is None:
+                node = RelayNode(
+                    node_id=registration.node_id,
+                    encrypted_turn_secret=b"\x00",
+                    created_at=now,
+                )
+                self._session.add(node)
+            node.region = registration.region
+            node.failure_domain = registration.failure_domain
+            node.state = "unavailable"
+            node.endpoints = registration.endpoints
+            node.certificate_fingerprint = certificate.fingerprint
+            node.max_allocations = registration.max_allocations
+            node.active_allocations = 0
+            node.max_egress_bps = registration.max_egress_bps
+            node.current_egress_bps = 0
+            node.heartbeat_sequence = 0
+            node.healthy_heartbeat_streak = 0
+            node.lease_expires_at = None
+            node.revoked_at = None
+            node.updated_at = now
+            registration.certificate_pem = certificate.certificate_pem.encode()
+            registration.ca_certificate_pem = certificate.ca_certificate_pem.encode()
+            registration.certificate_expires_at = certificate.expires_at
+            self._audit(
+                action="relay_certificate_issued",
+                node_id=registration.node_id,
+                actor_id=None,
+                details={"certificate_expires_at": certificate.expires_at.isoformat()},
+                now=now,
+            )
+            await self._session.flush()
         if (
             registration.certificate_pem is None
             or registration.ca_certificate_pem is None
@@ -341,7 +427,7 @@ class RelayRegistry:
             status="approved",
             certificate_pem=registration.certificate_pem.decode(),
             ca_certificate_pem=registration.ca_certificate_pem.decode(),
-            expires_at=registration.certificate_expires_at,
+            expires_at=self._as_utc(registration.certificate_expires_at),
         )
 
     async def renew(
@@ -356,6 +442,7 @@ class RelayRegistry:
         validity_seconds: int,
         renew_before_seconds: int,
         previous_auth_grace_seconds: int,
+        renewal_record_retention_seconds: int,
         now: datetime,
     ) -> ApprovedRelay:
         canonical_csr, signing_public_key = validate_relay_csr(
@@ -378,16 +465,15 @@ class RelayRegistry:
             self._error("relay_certificate_invalid", 401, "relay certificate invalid")
         if node.state == "revoked" or registration.status == "revoked":
             self._error("relay_node_revoked", 403, "relay node revoked")
-        previous_until = (
-            self._as_utc(registration.previous_auth_expires_at)
-            if registration.previous_auth_expires_at is not None
+        record_until = (
+            self._as_utc(registration.renewal_record_expires_at)
+            if registration.renewal_record_expires_at is not None
             else None
         )
-        if (
-            registration.renewal_request_id is not None
-            and previous_until is not None
-            and previous_until > now
-        ):
+        if record_until is not None and record_until <= now:
+            self._clear_renewal_record(registration)
+            record_until = None
+        if registration.renewal_request_id is not None and record_until is not None:
             if (
                 registration.renewal_request_id == renewal_id
                 and registration.renewal_csr_sha256 == csr_digest
@@ -404,7 +490,8 @@ class RelayRegistry:
                     ),
                 )
                 return ApprovedRelay(node=node, certificate=certificate)
-            self._error("relay_renewal_conflict", 409, "relay renewal conflicts")
+            if registration.renewal_request_id == renewal_id or identity.is_previous:
+                self._error("relay_renewal_conflict", 409, "relay renewal conflicts")
         if identity.is_previous:
             self._error("relay_renewal_conflict", 409, "relay renewal conflicts")
         if not hmac.compare_digest(
@@ -418,6 +505,7 @@ class RelayRegistry:
             or not 300 <= renew_before_seconds <= 86_400
             or self._as_utc(current_expiry) - now > timedelta(seconds=renew_before_seconds)
             or not 30 <= previous_auth_grace_seconds <= 3600
+            or not 300 <= renewal_record_retention_seconds <= 7 * 86_400
         ):
             self._error("relay_renewal_conflict", 409, "relay renewal unavailable")
         certificate = issue_relay_certificate(
@@ -429,10 +517,15 @@ class RelayRegistry:
             now=now,
             validity_seconds=validity_seconds,
         )
+        previous_certificate_expires_at = self._as_utc(current_expiry)
         registration.previous_certificate_fingerprint = node.certificate_fingerprint
         registration.previous_signing_public_key = registration.signing_public_key
-        registration.previous_auth_expires_at = now + timedelta(
-            seconds=previous_auth_grace_seconds
+        registration.previous_auth_expires_at = min(
+            now + timedelta(seconds=previous_auth_grace_seconds),
+            previous_certificate_expires_at,
+        )
+        registration.previous_certificate_expires_at = (
+            previous_certificate_expires_at
         )
         registration.csr_pem = canonical_csr
         registration.signing_public_key = signing_public_key
@@ -443,6 +536,10 @@ class RelayRegistry:
         registration.renewal_csr_sha256 = csr_digest
         registration.renewal_certificate_pem = certificate.certificate_pem.encode()
         registration.renewal_certificate_expires_at = certificate.expires_at
+        registration.renewal_record_expires_at = max(
+            now + timedelta(seconds=renewal_record_retention_seconds),
+            previous_certificate_expires_at,
+        )
         node.certificate_fingerprint = certificate.fingerprint
         node.heartbeat_sequence = 0
         node.healthy_heartbeat_streak = 0
@@ -616,6 +713,131 @@ class RelayRegistry:
         return hmac.new(
             self._pepper, _RECEIPT_CONTEXT + receipt.encode("ascii"), hashlib.sha256
         ).hexdigest()
+
+    def _derive_receipt(
+        self, token: str, enrollment_id: str, request_digest: str
+    ) -> str:
+        material = self._length_prefixed(
+            (enrollment_id.encode("ascii"), bytes.fromhex(request_digest))
+        )
+        digest = hmac.new(
+            token.encode("ascii"),
+            _RECEIPT_DERIVE_CONTEXT + material,
+            hashlib.sha256,
+        ).digest()
+        return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+    @classmethod
+    def _enrollment_request_digest(
+        cls,
+        *,
+        node_id: str,
+        region: str,
+        failure_domain: str,
+        endpoints: list[str],
+        max_allocations: int,
+        max_egress_bps: int,
+        canonical_csr: bytes,
+    ) -> str:
+        fields = (
+            node_id.encode("utf-8"),
+            region.encode("utf-8"),
+            failure_domain.encode("utf-8"),
+            len(endpoints).to_bytes(4, "big"),
+            *(endpoint.encode("ascii") for endpoint in endpoints),
+            max_allocations.to_bytes(8, "big"),
+            max_egress_bps.to_bytes(8, "big"),
+            canonical_csr,
+        )
+        return hashlib.sha256(
+            _ENROLLMENT_REQUEST_CONTEXT + cls._length_prefixed(fields)
+        ).hexdigest()
+
+    async def _idempotent_enrollment_retry(
+        self,
+        *,
+        enrollment: RelayEnrollment,
+        token: str,
+        request_digest: str,
+        now: datetime,
+    ) -> RequestedRelayEnrollment:
+        del now
+        registration = await self._session.scalar(
+            select(RelayNodeRegistration).where(
+                RelayNodeRegistration.enrollment_id == enrollment.id
+            )
+        )
+        if (
+            registration is None
+            or registration.request_digest is None
+            or not hmac.compare_digest(registration.request_digest, request_digest)
+        ):
+            self._error(
+                "relay_enrollment_already_used",
+                409,
+                "relay enrollment already used",
+            )
+        receipt = self._derive_receipt(token, enrollment.id, request_digest)
+        if (
+            registration.receipt_digest is None
+            or not hmac.compare_digest(
+                registration.receipt_digest, self._receipt_digest(receipt)
+            )
+        ):
+            self._error(
+                "relay_enrollment_already_used",
+                409,
+                "relay enrollment already used",
+            )
+        return RequestedRelayEnrollment(registration=registration, receipt=receipt)
+
+    @classmethod
+    def _registration_recoverable(
+        cls,
+        registration: RelayNodeRegistration | None,
+        node: RelayNode | None,
+        now: datetime,
+    ) -> bool:
+        if registration is None:
+            return False
+        if registration.status == "revoked" or (
+            node is not None and node.state == "revoked"
+        ):
+            return False
+        certificate_is_valid = (
+            registration.certificate_pem is not None
+            and registration.certificate_expires_at is not None
+            and cls._as_utc(registration.certificate_expires_at) > now
+        )
+        if certificate_is_valid:
+            return False
+        certificate_is_expired = (
+            registration.certificate_expires_at is not None
+            and cls._as_utc(registration.certificate_expires_at) <= now
+        )
+        receipt_is_expired = (
+            registration.receipt_expires_at is None
+            or cls._as_utc(registration.receipt_expires_at) <= now
+        )
+        return certificate_is_expired or receipt_is_expired
+
+    @staticmethod
+    def _clear_renewal_record(registration: RelayNodeRegistration) -> None:
+        registration.renewal_request_id = None
+        registration.renewal_csr_sha256 = None
+        registration.renewal_certificate_pem = None
+        registration.renewal_certificate_expires_at = None
+        registration.renewal_record_expires_at = None
+
+    @staticmethod
+    def _length_prefixed(fields: Iterable[bytes]) -> bytes:
+        encoded = bytearray()
+        for field in fields:
+            if len(field) > 2**32 - 1:
+                raise ValueError("relay enrollment field is too large")
+            encoded.extend(len(field).to_bytes(4, "big"))
+            encoded.extend(field)
+        return bytes(encoded)
 
     def _require_pepper(self) -> None:
         if not self._pepper:

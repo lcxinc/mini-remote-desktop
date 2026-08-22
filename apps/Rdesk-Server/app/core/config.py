@@ -42,8 +42,10 @@ class Settings(BaseSettings):
     relay_ca_private_key_pem: SecretStr = SecretStr("")
     relay_ca_private_key_password: SecretStr = SecretStr("")
     relay_certificate_validity_seconds: int = 3600
+    relay_enrollment_receipt_ttl_seconds: int = 86_400
     relay_certificate_renew_before_seconds: int = 86_400
     relay_previous_auth_grace_seconds: int = 300
+    relay_renewal_record_retention_seconds: int = 86_400
 
 
 settings = Settings()

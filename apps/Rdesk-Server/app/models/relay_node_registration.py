@@ -51,6 +51,7 @@ class RelayNodeRegistration(Base):
         DateTime(timezone=True), nullable=True
     )
     # Raw enrollment receipts and renewal credentials are never persisted.
+    request_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     receipt_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     receipt_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -65,12 +66,18 @@ class RelayNodeRegistration(Base):
     previous_auth_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    previous_certificate_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     renewal_request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     renewal_csr_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     renewal_certificate_pem: Mapped[bytes | None] = mapped_column(
         LargeBinary, nullable=True
     )
     renewal_certificate_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    renewal_record_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

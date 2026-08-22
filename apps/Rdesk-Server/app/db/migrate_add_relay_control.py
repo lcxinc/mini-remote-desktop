@@ -17,7 +17,7 @@ _CHECK_CAST = re.compile(
     flags=re.IGNORECASE,
 )
 _MIGRATION_LOCK_CONTEXT = b"MRD_RELAY_SCHEMA_MIGRATION_V1\x00"
-_RELAY_SCHEMA_VERSIONS = (1, 2, 3)
+_RELAY_SCHEMA_VERSIONS = (1, 2, 3, 4)
 
 
 class RelaySchemaMismatchError(RuntimeError):
@@ -41,7 +41,7 @@ async def migrate(
     *,
     schema: str | None = None,
 ) -> None:
-    """Apply and verify relay schema through v3 in the caller's transaction."""
+    """Apply and verify relay schema through v4 in the caller's transaction."""
     if isinstance(bind, AsyncEngine):
         async with bind.begin() as connection:
             await _migrate_connection(connection, schema=schema)
@@ -167,16 +167,19 @@ async def _migrate_connection(
             status VARCHAR(16) NOT NULL DEFAULT 'pending',
             certificate_pem BYTEA,
             certificate_expires_at TIMESTAMPTZ,
+            request_digest VARCHAR(64),
             receipt_digest VARCHAR(64),
             receipt_expires_at TIMESTAMPTZ,
             ca_certificate_pem BYTEA,
             previous_certificate_fingerprint VARCHAR(71),
             previous_signing_public_key BYTEA,
             previous_auth_expires_at TIMESTAMPTZ,
+            previous_certificate_expires_at TIMESTAMPTZ,
             renewal_request_id VARCHAR(128),
             renewal_csr_sha256 VARCHAR(64),
             renewal_certificate_pem BYTEA,
             renewal_certificate_expires_at TIMESTAMPTZ,
+            renewal_record_expires_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL,
             approved_at TIMESTAMPTZ,
             CONSTRAINT relay_node_registrations_enrollment_id_key UNIQUE (enrollment_id),
@@ -219,6 +222,7 @@ async def _migrate_connection(
         f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS "
         "healthy_heartbeat_streak INTEGER NOT NULL DEFAULT 0",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS receipt_digest VARCHAR(64)",
+        f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS request_digest VARCHAR(64)",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS receipt_expires_at TIMESTAMPTZ",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS ca_certificate_pem BYTEA",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS "
@@ -226,11 +230,15 @@ async def _migrate_connection(
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS previous_signing_public_key BYTEA",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS "
         "previous_auth_expires_at TIMESTAMPTZ",
+        f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS "
+        "previous_certificate_expires_at TIMESTAMPTZ",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS renewal_request_id VARCHAR(128)",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS renewal_csr_sha256 VARCHAR(64)",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS renewal_certificate_pem BYTEA",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS "
         "renewal_certificate_expires_at TIMESTAMPTZ",
+        f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS "
+        "renewal_record_expires_at TIMESTAMPTZ",
     ):
         await connection.execute(text(statement))
     await connection.execute(
@@ -301,7 +309,18 @@ def _preflight_existing_schema(sync_connection: object, schema: str | None) -> N
                 "renewal_certificate_pem", "renewal_certificate_expires_at",
             },
         }.get(table_name, set())
-        if actual not in (expected, expected | v3_additions):
+        v4_additions = {
+            "relay_node_registrations": {
+                "request_digest",
+                "previous_certificate_expires_at",
+                "renewal_record_expires_at",
+            },
+        }.get(table_name, set())
+        if actual not in (
+            expected,
+            expected | v3_additions,
+            expected | v3_additions | v4_additions,
+        ):
             raise RelaySchemaMismatchError(
                 f"relay schema mismatch for {table_name}: column set differs"
             )
@@ -395,16 +414,19 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             "status": (String, 16, False),
             "certificate_pem": (LargeBinary, None, True),
             "certificate_expires_at": (DateTime, None, True),
+            "request_digest": (String, 64, True),
             "receipt_digest": (String, 64, True),
             "receipt_expires_at": (DateTime, None, True),
             "ca_certificate_pem": (LargeBinary, None, True),
             "previous_certificate_fingerprint": (String, 71, True),
             "previous_signing_public_key": (LargeBinary, None, True),
             "previous_auth_expires_at": (DateTime, None, True),
+            "previous_certificate_expires_at": (DateTime, None, True),
             "renewal_request_id": (String, 128, True),
             "renewal_csr_sha256": (String, 64, True),
             "renewal_certificate_pem": (LargeBinary, None, True),
             "renewal_certificate_expires_at": (DateTime, None, True),
+            "renewal_record_expires_at": (DateTime, None, True),
             "created_at": (DateTime, None, False),
             "approved_at": (DateTime, None, True),
         },

@@ -331,11 +331,14 @@ def issue_relay_certificate(
     )
     certificate = certificate_builder.sign(ca_private_key, algorithm)
     certificate_der = certificate.public_bytes(serialization.Encoding.DER)
+    certificate_expires_at = _certificate_time(
+        certificate, "not_valid_after_utc", "not_valid_after"
+    )
     return IssuedRelayCertificate(
         certificate_pem=certificate.public_bytes(serialization.Encoding.PEM).decode(),
         ca_certificate_pem=ca_certificate.public_bytes(serialization.Encoding.PEM).decode(),
         fingerprint="sha256:" + hashlib.sha256(certificate_der).hexdigest(),
-        expires_at=expires_at,
+        expires_at=certificate_expires_at,
     )
 
 
