@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -390,6 +391,45 @@ async def test_invalid_endpoints_are_rejected_before_persistence(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "fingerprint",
+    [
+        "raw-fingerprint",
+        "sha256:",
+        "sha256:contains spaces",
+        "sha256:unicode-指纹",
+        "sha256:" + "a" * 129,
+    ],
+)
+async def test_certificate_fingerprint_is_bounded_and_structurally_valid(
+    repository: RelayRepository,
+    db_session: AsyncSessionShim,
+    fingerprint: str,
+) -> None:
+    token = "invalid-certificate-token"
+    await repository.store_enrollment_token(
+        token=token,
+        expires_at=NOW + timedelta(minutes=5),
+        now=NOW,
+    )
+    with pytest.raises(RelayRepositoryError) as error:
+        await repository.enroll_node(
+            token=token,
+            node_id="invalid-certificate-node",
+            region="ap-east",
+            failure_domain="rack-invalid-certificate",
+            certificate_fingerprint=fingerprint,
+            endpoints=ENDPOINTS,
+            max_allocations=1,
+            max_egress_bps=1,
+            turn_secret="not-persisted",
+            now=NOW,
+        )
+    assert error.value.code == "INVALID_CERTIFICATE"
+    assert await db_session.get(RelayNode, "invalid-certificate-node") is None
+
+
+@pytest.mark.anyio
 async def test_reservations_preserve_order_are_bounded_idempotent_and_expire(
     repository: RelayRepository,
 ) -> None:
@@ -515,7 +555,7 @@ class IntegrityConflictSession:
                 "certificate_fingerprint": "sha256:sensitive-fingerprint",
                 "encrypted_turn_secret": b"ciphertext-not-plaintext",
             },
-            Exception(constraint_message),
+            sqlite3.IntegrityError(constraint_message),
         )
 
     def add(self, instance: object) -> None:
@@ -615,6 +655,30 @@ async def test_token_digest_integrity_conflict_is_stable_and_rolls_back(
     assert conflict.value.code == "ENROLLMENT_TOKEN_EXISTS"
     assert session.rolled_back
     assert "sensitive" not in str(conflict.value)
+
+
+@pytest.mark.anyio
+async def test_unknown_integrity_error_rolls_back_without_misclassification(
+    cipher: AesGcmRelaySecretCipher,
+) -> None:
+    session = IntegrityConflictSession(
+        constraint_message=(
+            "UNIQUE constraint failed: unrelated_table.unrelated_column"
+        )
+    )
+    repository = RelayRepository(
+        session,
+        enrollment_token_pepper=bytes.fromhex("22" * 32),
+        secret_cipher=cipher,
+    )
+    with pytest.raises(IntegrityError) as unknown:
+        await repository.store_enrollment_token(
+            token="unknown-constraint-token",
+            expires_at=NOW + timedelta(minutes=5),
+            now=NOW,
+        )
+    assert unknown.value is session.error
+    assert session.rolled_back
 
 
 @pytest.mark.anyio

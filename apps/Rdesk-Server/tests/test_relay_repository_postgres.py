@@ -320,6 +320,12 @@ async def test_concurrent_enrollment_conflicts_are_stable_and_transactions_recov
                     return "ok", ""
                 except RelayRepositoryError as error:
                     await session.execute(select(1))
+                    await repository.store_enrollment_token(
+                        token="recovery-after-token-conflict",
+                        expires_at=now + timedelta(minutes=5),
+                        now=now,
+                    )
+                    await session.commit()
                     return error.code, str(error)
 
         token_results = await asyncio.gather(store_same_token(), store_same_token())
@@ -369,6 +375,12 @@ async def test_concurrent_enrollment_conflicts_are_stable_and_transactions_recov
                     return "ok", ""
                 except RelayRepositoryError as error:
                     await session.execute(select(1))
+                    await repository.store_enrollment_token(
+                        token=f"recovery-{token}",
+                        expires_at=now + timedelta(minutes=5),
+                        now=now,
+                    )
+                    await session.commit()
                     return error.code, str(error)
 
         node_results = await asyncio.gather(
@@ -386,20 +398,25 @@ async def test_concurrent_enrollment_conflicts_are_stable_and_transactions_recov
         assert sorted(code for code, _ in node_results) == ["NODE_ALREADY_EXISTS", "ok"]
         assert all("sensitive" not in message for _, message in node_results)
 
+        adversarial_fingerprint = "sha256:relay_enrollments_token_digest_key"
         certificate_results = await asyncio.gather(
             concurrent_enroll(
                 token="concurrent-enrollment-token-cert-a",
                 node_id="relay-cert-a",
-                fingerprint="sha256:sensitive-shared-cert",
+                fingerprint=adversarial_fingerprint,
             ),
             concurrent_enroll(
                 token="concurrent-enrollment-token-cert-b",
                 node_id="relay-cert-b",
-                fingerprint="sha256:sensitive-shared-cert",
+                fingerprint=adversarial_fingerprint,
             ),
         )
         assert sorted(code for code, _ in certificate_results) == [
             "CERTIFICATE_ALREADY_BOUND",
             "ok",
         ]
-        assert all("sensitive" not in message for _, message in certificate_results)
+        assert all(
+            adversarial_fingerprint not in message
+            and "duplicate key" not in message.lower()
+            for _, message in certificate_results
+        )

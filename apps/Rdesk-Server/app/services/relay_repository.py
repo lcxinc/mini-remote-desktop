@@ -6,6 +6,7 @@ import hmac
 import ipaddress
 import re
 import secrets
+import sqlite3
 import weakref
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Protocol
@@ -24,6 +25,14 @@ _TOKEN_CONTEXT = b"MRD_RELAY_ENROLLMENT_V1\x00"
 _SESSION_LOCK_CONTEXT = b"MRD_RELAY_SESSION_LOCK_V1\x00"
 _CIPHERTEXT_VERSION = b"\x01"
 _TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,512}$")
+_CERTIFICATE_FINGERPRINT_PATTERN = re.compile(
+    r"^sha256:[A-Za-z0-9._-]{1,128}$"
+)
+_SQLITE_UNIQUE_CONSTRAINT_PATTERN = re.compile(
+    r"^UNIQUE constraint failed: "
+    r"(?P<columns>[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*"
+    r"(?:, [a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*)*)$"
+)
 _ENDPOINT_PATTERN = re.compile(
     r"^(?:turn|turns):(?P<host>\[[0-9A-Fa-f:]+\]|[A-Za-z0-9.-]+):"
     r"(?P<port>[0-9]{1,5})(?:\?transport=(?:udp|tcp))?$"
@@ -123,9 +132,10 @@ class RelayRepository:
         try:
             await self._session.flush()
         except IntegrityError as error:
-            if _integrity_conflict_code(error) != "ENROLLMENT_TOKEN_EXISTS":
-                raise
+            code = _integrity_conflict_code(error)
             await self._session.rollback()
+            if code != "ENROLLMENT_TOKEN_EXISTS":
+                raise
             raise RelayRepositoryError(
                 "ENROLLMENT_TOKEN_EXISTS", "enrollment token already exists"
             ) from None
@@ -153,8 +163,10 @@ class RelayRepository:
             raise RelayRepositoryError("INVALID_NODE_LOCATION", "invalid node location")
         if max_allocations <= 0 or max_egress_bps <= 0:
             raise RelayRepositoryError("INVALID_CAPACITY", "capacity must be positive")
-        if not certificate_fingerprint:
-            raise RelayRepositoryError("INVALID_CERTIFICATE", "certificate required")
+        if not _valid_certificate_fingerprint(certificate_fingerprint):
+            raise RelayRepositoryError(
+                "INVALID_CERTIFICATE", "certificate fingerprint is invalid"
+            )
         if not turn_secret:
             raise RelayRepositoryError("INVALID_TURN_SECRET", "TURN secret required")
 
@@ -219,9 +231,9 @@ class RelayRepository:
             await self._session.flush()
         except IntegrityError as error:
             code = _integrity_conflict_code(error)
+            await self._session.rollback()
             if code not in {"NODE_ALREADY_EXISTS", "CERTIFICATE_ALREADY_BOUND"}:
                 raise
-            await self._session.rollback()
             if code == "NODE_ALREADY_EXISTS":
                 message = "relay node already exists"
             else:
@@ -243,6 +255,10 @@ class RelayRepository:
         node = await self._locked_node(node_id)
         if node.state == "revoked":
             raise RelayRepositoryError("NODE_REVOKED", "relay node is revoked")
+        if not _valid_certificate_fingerprint(certificate_fingerprint):
+            raise RelayRepositoryError(
+                "INVALID_CERTIFICATE", "certificate fingerprint is invalid"
+            )
         if not hmac.compare_digest(
             node.certificate_fingerprint, certificate_fingerprint
         ):
@@ -506,6 +522,15 @@ def _valid_host(host: str) -> bool:
     )
 
 
+def _valid_certificate_fingerprint(fingerprint: str) -> bool:
+    # The prefix is canonical lowercase. The bounded suffix preserves the existing
+    # agent identifier convention while excluding whitespace/control characters.
+    return (
+        isinstance(fingerprint, str)
+        and _CERTIFICATE_FINGERPRINT_PATTERN.fullmatch(fingerprint) is not None
+    )
+
+
 def _session_dialect_name(session: object) -> str | None:
     bind = getattr(session, "bind", None)
     if bind is None:
@@ -534,27 +559,47 @@ def _local_session_lock(session_id: str) -> asyncio.Lock:
 
 
 def _integrity_conflict_code(error: IntegrityError) -> str | None:
-    details: list[str] = []
-    current: object | None = error.orig
-    for _ in range(4):
-        if current is None:
-            break
-        constraint_name = getattr(current, "constraint_name", None)
-        if constraint_name:
-            details.append(str(constraint_name).lower())
-        details.append(str(current).lower())
-        current = getattr(current, "__cause__", None)
-    combined = " ".join(details)
-    if (
-        "relay_enrollments_token_digest_key" in combined
-        or "relay_enrollments.token_digest" in combined
-    ):
-        return "ENROLLMENT_TOKEN_EXISTS"
-    if "relay_nodes_pkey" in combined or "relay_nodes.node_id" in combined:
-        return "NODE_ALREADY_EXISTS"
-    if (
-        "relay_nodes_certificate_fingerprint_key" in combined
-        or "relay_nodes.certificate_fingerprint" in combined
-    ):
-        return "CERTIFICATE_ALREADY_BOUND"
+    constraint_codes = {
+        "relay_enrollments_token_digest_key": "ENROLLMENT_TOKEN_EXISTS",
+        "relay_nodes_pkey": "NODE_ALREADY_EXISTS",
+        "relay_nodes_certificate_fingerprint_key": "CERTIFICATE_ALREADY_BOUND",
+    }
+    sqlite_column_codes = {
+        ("relay_enrollments.token_digest",): "ENROLLMENT_TOKEN_EXISTS",
+        ("relay_nodes.node_id",): "NODE_ALREADY_EXISTS",
+        ("relay_nodes.certificate_fingerprint",): "CERTIFICATE_ALREADY_BOUND",
+    }
+
+    pending: list[tuple[object, int]] = [(error.orig, 0)]
+    visited: set[int] = set()
+    while pending:
+        current, depth = pending.pop()
+        identity = id(current)
+        if identity in visited or depth > 8:
+            continue
+        visited.add(identity)
+
+        names = [getattr(current, "constraint_name", None)]
+        diagnostic = getattr(current, "diag", None)
+        if diagnostic is not None:
+            names.append(getattr(diagnostic, "constraint_name", None))
+        for name in names:
+            if isinstance(name, str):
+                code = constraint_codes.get(name)
+                if code is not None:
+                    return code
+
+        if isinstance(current, sqlite3.IntegrityError):
+            matched = _SQLITE_UNIQUE_CONSTRAINT_PATTERN.fullmatch(str(current))
+            if matched is not None:
+                columns = tuple(matched.group("columns").split(", "))
+                code = sqlite_column_codes.get(columns)
+                if code is not None:
+                    return code
+
+        if depth < 8:
+            for attribute in ("orig", "__cause__", "__context__"):
+                linked = getattr(current, attribute, None)
+                if linked is not None:
+                    pending.append((linked, depth + 1))
     return None
