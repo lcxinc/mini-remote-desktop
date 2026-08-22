@@ -33,6 +33,12 @@ Copy-Item .env.example .env
 python -m app.main
 ```
 
+Relay node endpoints require a dedicated mTLS-terminating proxy listed in
+`RDESK_TRUSTED_MTLS_PROXY`. Keep Uvicorn proxy-header rewriting disabled
+(`--no-proxy-headers` when not using `python -m app.main`) and configure the
+terminator to strip every client-supplied `Forwarded`, `X-Forwarded-*`, and
+relay authentication header before adding its verified metadata.
+
 ## Tests
 
 Install the development dependency set when running backend tests. It includes

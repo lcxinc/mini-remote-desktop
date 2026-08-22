@@ -46,8 +46,35 @@ class RelayEnrollmentRequest(BaseModel):
 
 
 class RelayEnrollmentResponse(BaseModel):
+    enrollment_id: str
     node_id: RelayId
     status: str
+    receipt: str = Field(min_length=40, max_length=512, repr=False)
+
+
+class RelayEnrollmentPickupResponse(BaseModel):
+    enrollment_id: str
+    node_id: RelayId
+    status: str
+    certificate_pem: str | None = None
+    ca_certificate_pem: str | None = None
+    expires_at: datetime | None = None
+
+
+class RelayRenewalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    renewal_id: RelayId
+    csr_pem: str = Field(min_length=100, max_length=16_384, repr=False)
+
+
+class RelayRenewalResponse(BaseModel):
+    renewal_id: RelayId
+    node_id: RelayId
+    certificate_pem: str
+    ca_certificate_pem: str
+    fingerprint: str
+    expires_at: datetime
 
 
 class RelayApprovalResponse(BaseModel):

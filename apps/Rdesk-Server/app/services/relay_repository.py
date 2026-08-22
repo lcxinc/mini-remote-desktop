@@ -329,6 +329,7 @@ class RelayRepository:
             max_egress_bps=max_egress_bps,
             current_egress_bps=0,
             heartbeat_sequence=0,
+            healthy_heartbeat_streak=0,
             created_at=now,
             updated_at=now,
         )
@@ -398,6 +399,12 @@ class RelayRepository:
         ):
             raise RelayRepositoryError("INVALID_METRICS", "invalid egress metric")
 
+        was_fresh_ready = (
+            node.state in {"available", "degraded"}
+            and node.lease_expires_at is not None
+            and _as_utc(node.lease_expires_at) > now
+        )
+        previous_state = node.state
         node.heartbeat_sequence = sequence
         node.active_allocations = active_allocations
         node.current_egress_bps = current_egress_bps
@@ -407,8 +414,22 @@ class RelayRepository:
             code="INVALID_HEARTBEAT_TIME",
         )
         node.updated_at = now
-        if node.state == "unavailable":
-            node.state = "available"
+        if previous_state == "draining":
+            pass
+        elif was_fresh_ready:
+            node.healthy_heartbeat_streak = 3
+        elif previous_state == "unavailable":
+            node.healthy_heartbeat_streak = min(
+                node.healthy_heartbeat_streak + 1, 3
+            )
+            node.state = (
+                "available"
+                if node.healthy_heartbeat_streak >= 3
+                else "unavailable"
+            )
+        else:
+            node.healthy_heartbeat_streak = 1
+            node.state = "unavailable"
         await self._session.flush()
         return node
 
@@ -432,6 +453,7 @@ class RelayRepository:
             node.state = "revoked"
             node.revoked_at = now
             node.lease_expires_at = now
+            node.healthy_heartbeat_streak = 0
             node.updated_at = now
             await self._session.flush()
         return node

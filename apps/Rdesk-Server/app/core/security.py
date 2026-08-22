@@ -27,11 +27,27 @@ from app.services.relay_registry import (
     RelayRegistryError,
 )
 
+_PASSWORD_SCHEME = "pbkdf2_sha256"
+_PASSWORD_VERSION = "v2"
+_PASSWORD_MIN_ITERATIONS = 600_000
+_PASSWORD_MAX_VERIFY_ITERATIONS = 2_000_000
+_LEGACY_PASSWORD_ITERATIONS = 100_000
+
 
 def hash_password(password: str) -> str:
+    iterations = settings.password_pbkdf2_iterations
+    if not isinstance(iterations, int) or not (
+        _PASSWORD_MIN_ITERATIONS <= iterations <= _PASSWORD_MAX_VERIFY_ITERATIONS
+    ):
+        raise ValueError("password hashing configuration is unavailable")
     salt = os.urandom(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
-    return "pbkdf2$%s$%s" % (
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, iterations
+    )
+    return "%s$%s$%d$%s$%s" % (
+        _PASSWORD_SCHEME,
+        _PASSWORD_VERSION,
+        iterations,
         base64.b64encode(salt).decode("utf-8"),
         base64.b64encode(digest).decode("utf-8"),
     )
@@ -39,31 +55,72 @@ def hash_password(password: str) -> str:
 
 def verify_password(password: str, password_hash: str) -> bool:
     try:
-        scheme, salt_b64, digest_b64 = password_hash.split("$", 2)
-        if scheme != "pbkdf2":
+        parts = password_hash.split("$")
+        if len(parts) == 3 and parts[0] == "pbkdf2":
+            iterations = _LEGACY_PASSWORD_ITERATIONS
+            salt_b64, digest_b64 = parts[1:]
+        elif (
+            len(parts) == 5
+            and parts[0] == _PASSWORD_SCHEME
+            and parts[1] == _PASSWORD_VERSION
+        ):
+            iterations = int(parts[2])
+            salt_b64, digest_b64 = parts[3:]
+        else:
             return False
-        salt = base64.b64decode(salt_b64.encode("utf-8"))
-        expected = base64.b64decode(digest_b64.encode("utf-8"))
-    except Exception:
+        if not 1 <= iterations <= _PASSWORD_MAX_VERIFY_ITERATIONS:
+            return False
+        salt = base64.b64decode(salt_b64.encode("ascii"), validate=True)
+        expected = base64.b64decode(digest_b64.encode("ascii"), validate=True)
+        if not 8 <= len(salt) <= 64 or len(expected) != 32:
+            return False
+    except (ValueError, TypeError, UnicodeEncodeError):
         return False
-    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
+    actual = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, iterations
+    )
     return hmac.compare_digest(actual, expected)
 
 
+def password_needs_rehash(password_hash: str) -> bool:
+    try:
+        scheme, version, iterations, _, _ = password_hash.split("$", 4)
+        return (
+            scheme != _PASSWORD_SCHEME
+            or version != _PASSWORD_VERSION
+            or int(iterations) != settings.password_pbkdf2_iterations
+        )
+    except (ValueError, TypeError):
+        return True
+
+
 def create_access_token(user_id: str, username: str, role: str) -> str:
-    secret = _configured_jwt_secret()
-    if secret is None:
+    configured = _configured_jwt()
+    if configured is None:
+        raise _relay_http_exception(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "authentication_unavailable",
+            "authentication service is not configured",
+        )
+    secret, issuer, audience, max_lifetime_seconds = configured
+    configured_minutes = settings.jwt_expire_minutes
+    if not isinstance(configured_minutes, int) or isinstance(configured_minutes, bool):
+        configured_minutes = 0
+    lifetime_seconds = configured_minutes * 60
+    if not 0 < lifetime_seconds <= max_lifetime_seconds:
         raise _relay_http_exception(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "authentication_unavailable",
             "authentication service is not configured",
         )
     now = datetime.now(timezone.utc)
-    exp = now + timedelta(minutes=settings.jwt_expire_minutes)
+    exp = now + timedelta(minutes=configured_minutes)
     payload = {
         "sub": user_id,
         "username": username,
         "role": role,
+        "iss": issuer,
+        "aud": audience,
         "iat": int(now.timestamp()),
         "exp": int(exp.timestamp()),
     }
@@ -101,12 +158,10 @@ async def get_current_user(
     )
 
     try:
-        secret = _configured_jwt_secret()
-        if secret is None:
+        configured = _configured_jwt()
+        if configured is None:
             raise credentials_exception
-        payload = jwt.decode(
-            credentials.credentials, secret, algorithms=["HS256"]
-        )
+        payload = _decode_access_token(credentials.credentials, configured)
         user_id: str = payload.get("sub")
         if user_id is None:
             raise credentials_exception
@@ -128,12 +183,10 @@ async def get_current_user_optional(
         return None
 
     try:
-        secret = _configured_jwt_secret()
-        if secret is None:
+        configured = _configured_jwt()
+        if configured is None:
             return None
-        payload = jwt.decode(
-            credentials.credentials, secret, algorithms=["HS256"]
-        )
+        payload = _decode_access_token(credentials.credentials, configured)
         user_id: str = payload.get("sub")
         if user_id is None:
             return None
@@ -222,6 +275,26 @@ async def get_verified_relay_node(
         _trusted_proxy_marker,
         _relay_signature_marker,
     )
+    return await _verify_relay_request(request, db, allow_previous=False)
+
+
+async def get_verified_relay_renewal_node(
+    request: Request,
+    _trusted_proxy_marker: Annotated[
+        str | None, Security(trusted_mtls_proxy_scheme)
+    ] = None,
+    _relay_signature_marker: Annotated[
+        str | None, Security(relay_ed25519_scheme)
+    ] = None,
+    db: AsyncSession = Depends(get_db),
+) -> RelayIdentity:
+    _ = (_trusted_proxy_marker, _relay_signature_marker)
+    return await _verify_relay_request(request, db, allow_previous=True)
+
+
+async def _verify_relay_request(
+    request: Request, db: AsyncSession, *, allow_previous: bool
+) -> RelayIdentity:
     try:
         require_trusted_proxy(request, settings.trusted_mtls_proxy)
         headers = parse_relay_auth_headers(request)
@@ -230,10 +303,12 @@ async def get_verified_relay_node(
             raise RelayAuthError(
                 "relay_signature_invalid", 401, "relay request signature invalid"
             )
-        raw_body = await request.body()
+        raw_body = getattr(request.state, "relay_raw_body", None)
+        if raw_body is None:
+            raw_body = await request.body()
         if len(raw_body) > 65_536:
             raise RelayAuthError(
-                "relay_metrics_invalid", 400, "relay metrics invalid"
+                "relay_request_too_large", 413, "relay request too large"
             )
         registry = RelayRegistry(
             db, enrollment_token_pepper=settings.relay_enrollment_token_pepper
@@ -241,6 +316,8 @@ async def get_verified_relay_node(
         identity = await registry.identity(
             node_id=headers.node_id,
             certificate_fingerprint=headers.certificate_fingerprint,
+            allow_previous=allow_previous,
+            now=datetime.now(timezone.utc),
         )
         verify_request_signature(
             request=request,
@@ -286,3 +363,59 @@ def _configured_jwt_secret() -> str | None:
     }:
         return None
     return secret
+
+
+def _configured_jwt() -> tuple[str, str, str, int] | None:
+    secret = _configured_jwt_secret()
+    issuer = settings.jwt_issuer.strip()
+    audience = settings.jwt_audience.strip()
+    maximum_minutes = settings.jwt_max_lifetime_minutes
+    future_skew = settings.jwt_future_iat_skew_seconds
+    if (
+        secret is None
+        or not issuer
+        or len(issuer) > 512
+        or not audience
+        or len(audience) > 256
+        or not isinstance(maximum_minutes, int)
+        or isinstance(maximum_minutes, bool)
+        or not 1 <= maximum_minutes <= 60 * 24
+        or not isinstance(future_skew, int)
+        or isinstance(future_skew, bool)
+        or not 0 <= future_skew <= 300
+    ):
+        return None
+    return secret, issuer, audience, maximum_minutes * 60
+
+
+def _decode_access_token(
+    token: str, configured: tuple[str, str, str, int]
+) -> dict[str, object]:
+    secret, issuer, audience, max_lifetime_seconds = configured
+    payload = jwt.decode(
+        token,
+        secret,
+        algorithms=["HS256"],
+        issuer=issuer,
+        audience=audience,
+    )
+    required = ("sub", "iat", "exp", "iss", "aud")
+    if any(name not in payload for name in required):
+        raise jwt.JWTError("required claim missing")
+    issued_at = payload["iat"]
+    expires_at = payload["exp"]
+    if (
+        not isinstance(payload["sub"], str)
+        or not 1 <= len(payload["sub"]) <= 128
+        or not isinstance(issued_at, int)
+        or isinstance(issued_at, bool)
+        or not isinstance(expires_at, int)
+        or isinstance(expires_at, bool)
+        or expires_at <= issued_at
+        or expires_at - issued_at > max_lifetime_seconds
+        or issued_at
+        > int(datetime.now(timezone.utc).timestamp())
+        + settings.jwt_future_iat_skew_seconds
+    ):
+        raise jwt.JWTError("token time context invalid")
+    return payload

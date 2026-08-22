@@ -100,14 +100,15 @@ async def enroll_postgres_node(
         now=now,
     )
     if ready:
-        await repository.record_heartbeat(
-            node_id=node.node_id,
-            certificate_fingerprint=node.certificate_fingerprint,
-            sequence=1,
-            active_allocations=0,
-            current_egress_bps=0,
-            now=now,
-        )
+        for sequence in (1, 2, 3):
+            await repository.record_heartbeat(
+                node_id=node.node_id,
+                certificate_fingerprint=node.certificate_fingerprint,
+                sequence=sequence,
+                active_allocations=0,
+                current_egress_bps=0,
+                now=now,
+            )
 
 
 @pytest.mark.anyio
@@ -152,14 +153,15 @@ async def test_concurrent_admission_uses_row_locks_and_never_oversubscribes() ->
                 turn_secret="postgres-turn-secret",
                 now=now,
             )
-            await repository.record_heartbeat(
-                node_id=node.node_id,
-                certificate_fingerprint=node.certificate_fingerprint,
-                sequence=1,
-                active_allocations=0,
-                current_egress_bps=0,
-                now=now,
-            )
+            for sequence in (1, 2, 3):
+                await repository.record_heartbeat(
+                    node_id=node.node_id,
+                    certificate_fingerprint=node.certificate_fingerprint,
+                    sequence=sequence,
+                    active_allocations=0,
+                    current_egress_bps=0,
+                    now=now,
+                )
             await setup_session.commit()
 
         started = asyncio.Event()
@@ -804,4 +806,105 @@ async def test_migration_rejects_cross_schema_deferrable_reservation_fk() -> Non
             await connection.execute(
                 text(f'DROP SCHEMA "{other_schema}" CASCADE')
             )
+        await admin_engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_v3_behaviorally_upgrades_v2_schema_and_serializes_concurrent_upgrade() -> None:
+    assert DATABASE_URL is not None
+    schema = "relay_v3_upgrade_" + re.sub(r"[^a-z0-9]", "", uuid4().hex)
+    admin_engine = create_async_engine(asyncpg_url(DATABASE_URL))
+    async with admin_engine.begin() as connection:
+        await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+    first = create_async_engine(asyncpg_url(DATABASE_URL))
+    second = create_async_engine(asyncpg_url(DATABASE_URL))
+    try:
+        await migrate(first, schema=schema)
+        registration_v3_columns = (
+            "receipt_digest",
+            "receipt_expires_at",
+            "ca_certificate_pem",
+            "previous_certificate_fingerprint",
+            "previous_signing_public_key",
+            "previous_auth_expires_at",
+            "renewal_request_id",
+            "renewal_csr_sha256",
+            "renewal_certificate_pem",
+            "renewal_certificate_expires_at",
+        )
+        async with first.begin() as connection:
+            await connection.execute(
+                text(
+                    f'ALTER TABLE "{schema}".relay_nodes '
+                    "DROP CONSTRAINT IF EXISTS "
+                    "ck_relay_nodes_healthy_heartbeat_streak"
+                )
+            )
+            await connection.execute(
+                text(
+                    f'ALTER TABLE "{schema}".relay_nodes '
+                    "DROP COLUMN IF EXISTS healthy_heartbeat_streak"
+                )
+            )
+            for column in registration_v3_columns:
+                await connection.execute(
+                    text(
+                        f'ALTER TABLE "{schema}".relay_node_registrations '
+                        f'DROP COLUMN IF EXISTS {column}'
+                    )
+                )
+            await connection.execute(
+                text(
+                    f'DELETE FROM "{schema}".relay_schema_migrations '
+                    "WHERE version = 3"
+                )
+            )
+
+        await asyncio.gather(
+            migrate(first, schema=schema), migrate(second, schema=schema)
+        )
+        async with first.connect() as connection:
+            node_columns = {
+                row["column_name"]
+                for row in (
+                    await connection.execute(
+                        text(
+                            "SELECT column_name FROM information_schema.columns "
+                            "WHERE table_schema = :schema AND table_name = 'relay_nodes'"
+                        ),
+                        {"schema": schema},
+                    )
+                ).mappings()
+            }
+            registration_columns = {
+                row["column_name"]
+                for row in (
+                    await connection.execute(
+                        text(
+                            "SELECT column_name FROM information_schema.columns "
+                            "WHERE table_schema = :schema AND "
+                            "table_name = 'relay_node_registrations'"
+                        ),
+                        {"schema": schema},
+                    )
+                ).mappings()
+            }
+            versions = list(
+                (
+                    await connection.execute(
+                        text(
+                            f'SELECT version FROM "{schema}".relay_schema_migrations '
+                            "ORDER BY version"
+                        )
+                    )
+                ).scalars()
+            )
+            assert "healthy_heartbeat_streak" in node_columns
+            assert set(registration_v3_columns).issubset(registration_columns)
+            assert versions == [1, 2, 3]
+    finally:
+        await first.dispose()
+        await second.dispose()
+        async with admin_engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
         await admin_engine.dispose()

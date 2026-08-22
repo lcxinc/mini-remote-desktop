@@ -24,6 +24,7 @@ from app.core.config import settings
 from app.core.security import get_current_user_optional
 from app.db.session import Base, get_db
 from app.models.user import User
+from app.middleware.relay_node_boundary import RelayNodeBoundaryMiddleware
 
 
 TLS_HEADERS = {"X-Rdesk-Client-TLS": "verified"}
@@ -234,6 +235,9 @@ def api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, ob
         return admin
 
     app = FastAPI()
+    app.add_middleware(
+        RelayNodeBoundaryMiddleware, trusted_proxy=settings.trusted_mtls_proxy
+    )
     try:
         from app.api.v1 import relays as relay_module
     except ModuleNotFoundError:
@@ -286,7 +290,10 @@ def _enroll(
         },
     )
     assert response.status_code == 202, response.text
-    assert response.json() == {"node_id": node_id, "status": "pending"}
+    assert response.json()["node_id"] == node_id
+    assert response.json()["status"] == "pending"
+    assert len(response.json()["enrollment_id"]) == 36
+    assert len(response.json()["receipt"]) >= 40
     return key, token
 
 
@@ -393,6 +400,9 @@ def test_approval_issues_node_bound_short_lived_client_certificate(
     ]
     eku = certificate.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
     assert ExtendedKeyUsageOID.CLIENT_AUTH in eku
+    key_usage = certificate.extensions.get_extension_for_class(x509.KeyUsage).value
+    assert key_usage.digital_signature is True
+    assert key_usage.key_cert_sign is False
     assert certificate.serial_number > 0
     assert certificate.not_valid_after_utc - certificate.not_valid_before_utc <= timedelta(hours=2)
     assert certificate.not_valid_before_utc >= ca_certificate.not_valid_before_utc
@@ -475,13 +485,82 @@ def test_heartbeat_requires_proxy_certificate_and_ed25519_signature(
     )
     assert accepted.status_code == 200, accepted.text
     assert accepted.json()["sequence"] == 1
-    assert accepted.json()["state"] == "available"
+    assert accepted.json()["state"] == "unavailable"
 
     replay = client.post(
         f"/api/v1/relays/{NODE_ID}/heartbeat", content=body, headers=headers
     )
     assert replay.status_code == 409
     assert _error_code(replay) == "relay_heartbeat_replayed"
+
+
+def test_node_requires_three_consecutive_healthy_heartbeats_to_recover(
+    api: tuple[TestClient, object],
+) -> None:
+    from app.models.relay_node import RelayNode
+
+    client, engine = api
+    key, _ = _enroll(client)
+    _, fingerprint = _approve(client)
+    states: list[str] = []
+    for sequence in (1, 2, 3, 4):
+        body, headers = _heartbeat_request(
+            key, fingerprint, sequence=sequence
+        )
+        response = client.post(
+            f"/api/v1/relays/{NODE_ID}/heartbeat",
+            content=body,
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        states.append(response.json()["state"])
+    assert states == ["unavailable", "unavailable", "available", "available"]
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        assert node.healthy_heartbeat_streak == 3
+
+
+def test_expired_lease_resume_and_drain_have_explicit_recovery_semantics(
+    api: tuple[TestClient, object],
+) -> None:
+    from app.models.relay_node import RelayNode
+
+    client, engine = api
+    key, _ = _enroll(client)
+    _, fingerprint = _approve(client)
+    for sequence in (1, 2, 3):
+        body, headers = _heartbeat_request(key, fingerprint, sequence=sequence)
+        assert client.post(
+            f"/api/v1/relays/{NODE_ID}/heartbeat",
+            content=body,
+            headers=headers,
+        ).status_code == 200
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        node.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        session.commit()
+    body, headers = _heartbeat_request(key, fingerprint, sequence=4)
+    expired = client.post(
+        f"/api/v1/relays/{NODE_ID}/heartbeat", content=body, headers=headers
+    )
+    assert expired.json()["state"] == "unavailable"
+
+    assert client.post(f"/api/v1/relays/{NODE_ID}/resume").status_code == 200
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        assert node.healthy_heartbeat_streak == 0
+    assert client.post(f"/api/v1/relays/{NODE_ID}/drain").status_code == 200
+    for sequence in (5, 6, 7):
+        body, headers = _heartbeat_request(key, fingerprint, sequence=sequence)
+        response = client.post(
+            f"/api/v1/relays/{NODE_ID}/heartbeat",
+            content=body,
+            headers=headers,
+        )
+        assert response.json()["state"] == "draining"
 
 
 
@@ -829,7 +908,7 @@ def test_openapi_documents_relay_authentication_headers_and_stable_errors(
     assert "proxy-only" in enrollment["description"].lower()
     assert "X-Rdesk-Client-TLS" in enrollment["description"]
 
-    stable_responses = {"400", "401", "403", "409", "503"}
+    stable_responses = {"400", "401", "403", "409", "413", "503"}
     for path, operations in schema["paths"].items():
         if not path.startswith("/api/v1/relays"):
             continue

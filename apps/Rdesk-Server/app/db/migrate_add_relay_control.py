@@ -17,7 +17,7 @@ _CHECK_CAST = re.compile(
     flags=re.IGNORECASE,
 )
 _MIGRATION_LOCK_CONTEXT = b"MRD_RELAY_SCHEMA_MIGRATION_V1\x00"
-_RELAY_SCHEMA_VERSIONS = (1, 2)
+_RELAY_SCHEMA_VERSIONS = (1, 2, 3)
 
 
 class RelaySchemaMismatchError(RuntimeError):
@@ -41,7 +41,7 @@ async def migrate(
     *,
     schema: str | None = None,
 ) -> None:
-    """Apply and verify relay schema through v2 in the caller's transaction."""
+    """Apply and verify relay schema through v3 in the caller's transaction."""
     if isinstance(bind, AsyncEngine):
         async with bind.begin() as connection:
             await _migrate_connection(connection, schema=schema)
@@ -103,6 +103,7 @@ async def _migrate_connection(
             max_egress_bps BIGINT NOT NULL,
             current_egress_bps BIGINT NOT NULL DEFAULT 0,
             heartbeat_sequence BIGINT NOT NULL DEFAULT 0,
+            healthy_heartbeat_streak INTEGER NOT NULL DEFAULT 0,
             lease_expires_at TIMESTAMPTZ,
             revoked_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL,
@@ -118,7 +119,10 @@ async def _migrate_connection(
             ),
             CONSTRAINT ck_relay_nodes_max_egress CHECK (max_egress_bps > 0),
             CONSTRAINT ck_relay_nodes_current_egress CHECK (current_egress_bps >= 0),
-            CONSTRAINT ck_relay_nodes_heartbeat_sequence CHECK (heartbeat_sequence >= 0)
+            CONSTRAINT ck_relay_nodes_heartbeat_sequence CHECK (heartbeat_sequence >= 0),
+            CONSTRAINT ck_relay_nodes_healthy_heartbeat_streak CHECK (
+                healthy_heartbeat_streak >= 0 AND healthy_heartbeat_streak <= 3
+            )
         )
         """,
         f"""
@@ -163,6 +167,16 @@ async def _migrate_connection(
             status VARCHAR(16) NOT NULL DEFAULT 'pending',
             certificate_pem BYTEA,
             certificate_expires_at TIMESTAMPTZ,
+            receipt_digest VARCHAR(64),
+            receipt_expires_at TIMESTAMPTZ,
+            ca_certificate_pem BYTEA,
+            previous_certificate_fingerprint VARCHAR(71),
+            previous_signing_public_key BYTEA,
+            previous_auth_expires_at TIMESTAMPTZ,
+            renewal_request_id VARCHAR(128),
+            renewal_csr_sha256 VARCHAR(64),
+            renewal_certificate_pem BYTEA,
+            renewal_certificate_expires_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL,
             approved_at TIMESTAMPTZ,
             CONSTRAINT relay_node_registrations_enrollment_id_key UNIQUE (enrollment_id),
@@ -198,6 +212,38 @@ async def _migrate_connection(
     ]
     for statement in statements:
         await connection.execute(text(statement))
+
+    # v3 is deliberately additive so an already deployed v2 schema upgrades in
+    # place while the advisory transaction lock serializes concurrent starters.
+    for statement in (
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS "
+        "healthy_heartbeat_streak INTEGER NOT NULL DEFAULT 0",
+        f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS receipt_digest VARCHAR(64)",
+        f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS receipt_expires_at TIMESTAMPTZ",
+        f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS ca_certificate_pem BYTEA",
+        f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS "
+        "previous_certificate_fingerprint VARCHAR(71)",
+        f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS previous_signing_public_key BYTEA",
+        f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS "
+        "previous_auth_expires_at TIMESTAMPTZ",
+        f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS renewal_request_id VARCHAR(128)",
+        f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS renewal_csr_sha256 VARCHAR(64)",
+        f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS renewal_certificate_pem BYTEA",
+        f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS "
+        "renewal_certificate_expires_at TIMESTAMPTZ",
+    ):
+        await connection.execute(text(statement))
+    await connection.execute(
+        text(
+            f"""
+            DO $$ BEGIN
+                ALTER TABLE {nodes} ADD CONSTRAINT ck_relay_nodes_healthy_heartbeat_streak
+                CHECK (healthy_heartbeat_streak >= 0 AND healthy_heartbeat_streak <= 3);
+            EXCEPTION WHEN duplicate_object THEN NULL;
+            END $$
+            """
+        )
+    )
 
     await connection.run_sync(
         lambda sync_connection: _assert_schema_conforms(sync_connection, schema)
@@ -246,9 +292,30 @@ def _preflight_existing_schema(sync_connection: object, schema: str | None) -> N
             column["name"]
             for column in inspector.get_columns(table_name, schema=schema)
         }
-        if actual != expected:
+        v3_additions = {
+            "relay_nodes": {"healthy_heartbeat_streak"},
+            "relay_node_registrations": {
+                "receipt_digest", "receipt_expires_at", "ca_certificate_pem",
+                "previous_certificate_fingerprint", "previous_signing_public_key",
+                "previous_auth_expires_at", "renewal_request_id", "renewal_csr_sha256",
+                "renewal_certificate_pem", "renewal_certificate_expires_at",
+            },
+        }.get(table_name, set())
+        if actual not in (expected, expected | v3_additions):
             raise RelaySchemaMismatchError(
                 f"relay schema mismatch for {table_name}: column set differs"
+            )
+        expected_primary_key = {
+            "relay_nodes": ("node_id",),
+            "relay_enrollments": ("id",),
+            "relay_reservations": ("id",),
+            "relay_node_registrations": ("node_id",),
+            "relay_audit_events": ("id",),
+        }[table_name]
+        primary_key = inspector.get_pk_constraint(table_name, schema=schema)
+        if tuple(primary_key.get("constrained_columns") or ()) != expected_primary_key:
+            raise RelaySchemaMismatchError(
+                f"relay schema mismatch for {table_name}: primary key differs"
             )
 
 
@@ -293,6 +360,7 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             "max_egress_bps": (BigInteger, None, False),
             "current_egress_bps": (BigInteger, None, False),
             "heartbeat_sequence": (BigInteger, None, False),
+            "healthy_heartbeat_streak": (Integer, None, False),
             "lease_expires_at": (DateTime, None, True),
             "revoked_at": (DateTime, None, True),
             "created_at": (DateTime, None, False),
@@ -327,6 +395,16 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             "status": (String, 16, False),
             "certificate_pem": (LargeBinary, None, True),
             "certificate_expires_at": (DateTime, None, True),
+            "receipt_digest": (String, 64, True),
+            "receipt_expires_at": (DateTime, None, True),
+            "ca_certificate_pem": (LargeBinary, None, True),
+            "previous_certificate_fingerprint": (String, 71, True),
+            "previous_signing_public_key": (LargeBinary, None, True),
+            "previous_auth_expires_at": (DateTime, None, True),
+            "renewal_request_id": (String, 128, True),
+            "renewal_csr_sha256": (String, 64, True),
+            "renewal_certificate_pem": (LargeBinary, None, True),
+            "renewal_certificate_expires_at": (DateTime, None, True),
             "created_at": (DateTime, None, False),
             "approved_at": (DateTime, None, True),
         },
@@ -382,7 +460,10 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
     }
     if "unavailable" not in str(node_columns["state"]["default"]):
         raise RelaySchemaMismatchError("relay node state default differs")
-    for name in ("active_allocations", "current_egress_bps", "heartbeat_sequence"):
+    for name in (
+        "active_allocations", "current_egress_bps", "heartbeat_sequence",
+        "healthy_heartbeat_streak",
+    ):
         if str(node_columns[name]["default"]).strip("()") != "0":
             raise RelaySchemaMismatchError(f"relay node {name} default differs")
     registration_columns = {
@@ -406,6 +487,9 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
         "ck_relay_nodes_max_egress": "max_egress_bps > 0",
         "ck_relay_nodes_current_egress": "current_egress_bps >= 0",
         "ck_relay_nodes_heartbeat_sequence": "heartbeat_sequence >= 0",
+        "ck_relay_nodes_healthy_heartbeat_streak": (
+            "healthy_heartbeat_streak >= 0 AND healthy_heartbeat_streak <= 3"
+        ),
     }
     checks = {
         constraint["name"]: _normalize_check_expression(constraint["sqltext"])

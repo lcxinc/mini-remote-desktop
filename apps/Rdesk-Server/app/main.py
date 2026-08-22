@@ -10,6 +10,7 @@ from app.core.config import settings
 from app.db.init_db import seed_initial_data
 from app.db.migrate_add_relay_control import migrate as migrate_relay_control
 from app.db.session import AsyncSessionLocal, Base, engine
+from app.middleware.relay_node_boundary import RelayNodeBoundaryMiddleware
 from app.services.realtime_manager import RealtimeSidecarManager
 import app.models  # noqa: F401
 
@@ -42,6 +43,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Keep this as the outermost application middleware.  Uvicorn proxy rewriting is
+# disabled below; the private mTLS proxy must strip forwarding/client auth headers.
+app.add_middleware(
+    RelayNodeBoundaryMiddleware, trusted_proxy=settings.trusted_mtls_proxy
+)
 
 app.include_router(api_router)
 install_relay_openapi(app)
@@ -59,5 +65,6 @@ if __name__ == "__main__":
         port=settings.server_port,
         reload=True,
         workers=1,  # 限制单个 worker 进程，避免 Windows 上多进程导致的热重载问题
+        proxy_headers=False,
         reload_dirs=["app"],  # 明确指定监听的目录
     )

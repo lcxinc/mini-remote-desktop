@@ -8,11 +8,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from cryptography import x509
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from fastapi import Request
+from pydantic import SecretStr
 
 
 _REQUEST_CONTEXT = b"MRD_RELAY_REQUEST_V1\x00"
@@ -48,15 +49,24 @@ class IssuedRelayCertificate:
 def require_trusted_proxy(request: Request, configured_allowlist: str) -> None:
     """Trust proxy metadata only when the direct ASGI peer is explicitly allowed.
 
-    Entries may be exact IPv4/IPv6 addresses or explicit CIDRs.  X-Forwarded-For
-    is deliberately ignored because it is attacker-controlled at this boundary.
+    Entries may be exact IPv4/IPv6 addresses or explicit CIDRs. Forwarding
+    headers are rejected because they are attacker-controlled at this boundary.
     """
 
+    if any(
+        name == b"forwarded"
+        or name.startswith(b"x-forwarded-")
+        or name in {b"x-real-ip", b"x-client-ip"}
+        for name, _ in request.scope.get("headers", ())
+    ):
+        _auth_error("relay_proxy_required", 403, "trusted mTLS proxy required")
     peer = request.client.host if request.client is not None else ""
     try:
         peer_ip = ipaddress.ip_address(peer)
     except ValueError:
         _auth_error("relay_proxy_required", 403, "trusted mTLS proxy required")
+    if isinstance(peer_ip, ipaddress.IPv6Address) and peer_ip.ipv4_mapped is not None:
+        peer_ip = peer_ip.ipv4_mapped
     networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
     for raw_entry in configured_allowlist.split(","):
         entry = raw_entry.strip()
@@ -67,7 +77,10 @@ def require_trusted_proxy(request: Request, configured_allowlist: str) -> None:
         except ValueError:
             # A malformed security setting never broadens the trust boundary.
             continue
-    if not networks or not any(peer_ip in network for network in networks):
+    if not networks or not any(
+        peer_ip.version == network.version and peer_ip in network
+        for network in networks
+    ):
         _auth_error("relay_proxy_required", 403, "trusted mTLS proxy required")
     if request.headers.get("x-rdesk-client-tls", "").lower() != "verified":
         _auth_error("relay_proxy_required", 403, "trusted mTLS proxy required")
@@ -200,18 +213,30 @@ def issue_relay_certificate(
     csr_pem: bytes,
     node_id: str,
     ca_certificate_pem: str,
-    ca_private_key_pem: str,
+    ca_private_key_pem: str | SecretStr,
+    ca_private_key_password: str | SecretStr = "",
     now: datetime,
     validity_seconds: int,
 ) -> IssuedRelayCertificate:
-    if not ca_certificate_pem or not ca_private_key_pem:
+    private_key_pem = (
+        ca_private_key_pem.get_secret_value()
+        if isinstance(ca_private_key_pem, SecretStr)
+        else ca_private_key_pem
+    )
+    private_key_password = (
+        ca_private_key_password.get_secret_value()
+        if isinstance(ca_private_key_password, SecretStr)
+        else ca_private_key_password
+    )
+    if not ca_certificate_pem or not private_key_pem:
         _auth_error("relay_ca_unavailable", 503, "relay certificate authority unavailable")
     if not 300 <= validity_seconds <= 86_400:
         _auth_error("relay_ca_unavailable", 503, "relay certificate authority unavailable")
     try:
         ca_certificate = x509.load_pem_x509_certificate(ca_certificate_pem.encode())
         ca_private_key = serialization.load_pem_private_key(
-            ca_private_key_pem.encode(), password=None
+            private_key_pem.encode(),
+            password=(private_key_password.encode() if private_key_password else None),
         )
         csr = x509.load_pem_x509_csr(csr_pem)
         if not isinstance(
@@ -219,6 +244,12 @@ def issue_relay_certificate(
             (rsa.RSAPrivateKey, ec.EllipticCurvePrivateKey, ed25519.Ed25519PrivateKey),
         ):
             raise ValueError("unsupported CA key")
+        if isinstance(ca_private_key, rsa.RSAPrivateKey) and ca_private_key.key_size < 3072:
+            raise ValueError("RSA CA key is too small")
+        if isinstance(ca_private_key, ec.EllipticCurvePrivateKey) and not isinstance(
+            ca_private_key.curve, (ec.SECP256R1, ec.SECP384R1, ec.SECP521R1)
+        ):
+            raise ValueError("unsupported CA curve")
         if ca_private_key.public_key().public_bytes(
             serialization.Encoding.DER,
             serialization.PublicFormat.SubjectPublicKeyInfo,
@@ -248,7 +279,7 @@ def issue_relay_certificate(
         )
         if not ca_not_before <= now <= ca_not_after:
             raise ValueError("CA certificate is outside its validity window")
-    except (ValueError, TypeError, x509.ExtensionNotFound):
+    except (ValueError, TypeError, UnsupportedAlgorithm, x509.ExtensionNotFound):
         _auth_error("relay_ca_unavailable", 503, "relay certificate authority unavailable")
 
     expires_at = now + timedelta(seconds=validity_seconds)
@@ -278,6 +309,20 @@ def issue_relay_certificate(
         )
         .add_extension(
             x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), critical=True
+        )
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=None,
+                decipher_only=None,
+            ),
+            critical=True,
         )
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
     )
@@ -316,8 +361,15 @@ def _certificate_time(
 
 
 def _bounded_header(request: Request, name: str, maximum: int) -> str:
-    value = request.headers.get(name)
-    if value is None or not value or len(value) > maximum or not value.isascii():
+    values = request.headers.getlist(name)
+    value = values[0] if len(values) == 1 else None
+    if (
+        value is None
+        or not value
+        or "," in value
+        or len(value) > maximum
+        or not value.isascii()
+    ):
         code = (
             "relay_certificate_invalid"
             if name == "x-rdesk-client-cert-sha256"

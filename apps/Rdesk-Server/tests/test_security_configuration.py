@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import logging
+import os
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -29,9 +32,13 @@ from test_relay_node_api import AsyncSessionShim
 class ScalarSession:
     def __init__(self, user: User) -> None:
         self.user = user
+        self.commits = 0
 
     async def scalar(self, _: object) -> User:
         return self.user
+
+    async def commit(self) -> None:
+        self.commits += 1
 
 
 def _user() -> User:
@@ -129,6 +136,8 @@ async def test_strong_explicit_jwt_secret_still_roundtrips(
 ) -> None:
     jwt_secret = "vY7!qP2@kL9#sX4$mR8%tN6&wC3*eH5-zB1+uD0="
     monkeypatch.setitem(settings.__dict__, "jwt_secret", SecretStr(jwt_secret))
+    monkeypatch.setitem(settings.__dict__, "jwt_issuer", "https://auth.rdesk.test")
+    monkeypatch.setitem(settings.__dict__, "jwt_audience", "rdesk-api")
     caplog.set_level(logging.DEBUG)
     user = _user()
     token = create_access_token(user.id, user.username, user.role)
@@ -141,6 +150,158 @@ async def test_strong_explicit_jwt_secret_still_roundtrips(
     assert accepted is user
     assert jwt_secret not in caplog.text
     assert jwt_secret not in repr(settings)
+
+
+def test_sensitive_relay_and_ca_settings_are_secret_types_and_redacted() -> None:
+    configured = Settings(
+        relay_ca_private_key_pem="private-ca-key",
+        relay_ca_private_key_password="private-ca-password",
+        relay_enrollment_token_pepper="11" * 32,
+    )
+    for name, secret in {
+        "relay_ca_private_key_pem": "private-ca-key",
+        "relay_ca_private_key_password": "private-ca-password",
+        "relay_enrollment_token_pepper": "11" * 32,
+    }.items():
+        value = getattr(configured, name)
+        assert isinstance(value, SecretStr)
+        assert secret not in repr(configured)
+
+
+def test_jwt_issuance_requires_explicit_issuer_and_audience(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        settings.__dict__,
+        "jwt_secret",
+        SecretStr("vY7!qP2@kL9#sX4$mR8%tN6&wC3*eH5-zB1+uD0="),
+    )
+    monkeypatch.setitem(settings.__dict__, "jwt_issuer", "")
+    monkeypatch.setitem(settings.__dict__, "jwt_audience", "")
+    with pytest.raises(HTTPException) as unavailable:
+        create_access_token("user-id", "user", "user")
+    assert unavailable.value.status_code == 503
+    assert unavailable.value.detail["code"] == "authentication_unavailable"
+
+
+def test_jwt_contains_pinned_context_and_bounded_lifetime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "vY7!qP2@kL9#sX4$mR8%tN6&wC3*eH5-zB1+uD0="
+    monkeypatch.setitem(settings.__dict__, "jwt_secret", SecretStr(secret))
+    monkeypatch.setitem(settings.__dict__, "jwt_issuer", "https://auth.rdesk.test")
+    monkeypatch.setitem(settings.__dict__, "jwt_audience", "rdesk-api")
+    monkeypatch.setitem(settings.__dict__, "jwt_expire_minutes", 30)
+    monkeypatch.setitem(settings.__dict__, "jwt_max_lifetime_minutes", 60)
+    token = create_access_token("user-id", "user", "user")
+    claims = jwt.get_unverified_claims(token)
+    assert claims["iss"] == "https://auth.rdesk.test"
+    assert claims["aud"] == "rdesk-api"
+    assert set(("sub", "iat", "exp", "iss", "aud")).issubset(claims)
+    assert 0 < claims["exp"] - claims["iat"] <= 3600
+    assert jwt.get_unverified_header(token)["alg"] == "HS256"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing_exp", "wrong_issuer", "wrong_audience", "future_iat", "long_lived"],
+)
+@pytest.mark.anyio
+async def test_jwt_rejects_missing_or_wrong_context_and_unbounded_time(
+    monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    secret = "vY7!qP2@kL9#sX4$mR8%tN6&wC3*eH5-zB1+uD0="
+    issuer = "https://auth.rdesk.test"
+    audience = "rdesk-api"
+    monkeypatch.setitem(settings.__dict__, "jwt_secret", SecretStr(secret))
+    monkeypatch.setitem(settings.__dict__, "jwt_issuer", issuer)
+    monkeypatch.setitem(settings.__dict__, "jwt_audience", audience)
+    monkeypatch.setitem(settings.__dict__, "jwt_max_lifetime_minutes", 60)
+    now = datetime.now(UTC)
+    claims = {
+        "sub": "secure-admin-id",
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=5)).timestamp()),
+        "iss": issuer,
+        "aud": audience,
+    }
+    user = _user()
+    valid = jwt.encode(claims, secret, algorithm="HS256")
+    valid_result = await get_current_user_optional(
+        credentials=HTTPAuthorizationCredentials(
+            scheme="Bearer", credentials=valid
+        ),
+        db=ScalarSession(user),  # type: ignore[arg-type]
+    )
+    assert valid_result is user
+    if mutation == "missing_exp":
+        del claims["exp"]
+    elif mutation == "wrong_issuer":
+        claims["iss"] = "https://other.test"
+    elif mutation == "wrong_audience":
+        claims["aud"] = "other-api"
+    elif mutation == "future_iat":
+        claims["iat"] = int((now + timedelta(minutes=5)).timestamp())
+        claims["exp"] = int((now + timedelta(minutes=10)).timestamp())
+    else:
+        claims["exp"] = int((now + timedelta(hours=2)).timestamp())
+    forged = jwt.encode(claims, secret, algorithm="HS256")
+    accepted = await get_current_user_optional(
+        credentials=HTTPAuthorizationCredentials(
+            scheme="Bearer", credentials=forged
+        ),
+        db=ScalarSession(user),  # type: ignore[arg-type]
+    )
+    assert accepted is None
+
+
+def test_password_hash_is_versioned_and_uses_production_cost() -> None:
+    encoded = hash_password("correct horse battery staple")
+    scheme, version, iterations, salt, digest = encoded.split("$", 4)
+    assert (scheme, version) == ("pbkdf2_sha256", "v2")
+    assert int(iterations) >= 600_000
+    assert base64.b64decode(salt, validate=True)
+    assert base64.b64decode(digest, validate=True)
+    assert verify_password("correct horse battery staple", encoded)
+
+
+def _legacy_password_hash(password: str) -> str:
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode(), salt, 100_000
+    )
+    return "pbkdf2$%s$%s" % (
+        base64.b64encode(salt).decode(),
+        base64.b64encode(digest).decode(),
+    )
+
+
+def test_successful_legacy_password_login_rehashes_before_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    password = "correct horse battery staple"
+    user = _user()
+    user.password_hash = _legacy_password_hash(password)
+    session = ScalarSession(user)
+    secret = "vY7!qP2@kL9#sX4$mR8%tN6&wC3*eH5-zB1+uD0="
+    monkeypatch.setitem(settings.__dict__, "jwt_secret", SecretStr(secret))
+    monkeypatch.setitem(settings.__dict__, "jwt_issuer", "https://auth.rdesk.test")
+    monkeypatch.setitem(settings.__dict__, "jwt_audience", "rdesk-api")
+
+    async def override_db():
+        yield session
+
+    app = FastAPI()
+    app.include_router(auth_router, prefix="/api/v1")
+    app.dependency_overrides[get_db] = override_db
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/auth/login",
+            json={"username": user.username, "password": password},
+        )
+    assert response.status_code == 200, response.text
+    assert user.password_hash.startswith("pbkdf2_sha256$v2$")
+    assert session.commits == 1
 
 
 @pytest.fixture

@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.security import (
     get_verified_relay_node,
+    get_verified_relay_renewal_node,
     require_admin,
     trusted_mtls_proxy_scheme,
 )
@@ -33,10 +34,13 @@ from app.schemas.relay import (
     RelayApprovalResponse,
     RelayEnrollmentRequest,
     RelayEnrollmentResponse,
+    RelayEnrollmentPickupResponse,
     RelayErrorResponse,
     RelayHeartbeatRequest,
     RelayHeartbeatResponse,
     RelayNodeResponse,
+    RelayRenewalRequest,
+    RelayRenewalResponse,
 )
 from app.services.relay_node_auth import RelayAuthError, require_trusted_proxy
 from app.services.relay_registry import (
@@ -74,7 +78,7 @@ _RELAY_ERROR_RESPONSES = {
         "model": RelayErrorResponse,
         "description": "Stable relay-domain error response.",
     }
-    for code in (400, 401, 403, 404, 409, 503)
+    for code in (400, 401, 403, 404, 409, 413, 503)
 }
 
 
@@ -103,6 +107,8 @@ def install_relay_openapi(app: FastAPI) -> None:
         return
 
     def relay_openapi():
+        if app.openapi_schema is not None:
+            return app.openapi_schema
         schema = original_openapi()
         for path, path_item in schema.get("paths", {}).items():
             relay_path = path == "/api/v1/relays" or path.startswith(
@@ -135,10 +141,12 @@ def install_relay_openapi(app: FastAPI) -> None:
                         and parameter.get("name") in _HEARTBEAT_AUTH_HEADERS
                     ):
                         parameter["required"] = True
+        app.openapi_schema = schema
         return schema
 
     relay_openapi.__relay_openapi_installed__ = True  # type: ignore[attr-defined]
     app.openapi = relay_openapi  # type: ignore[method-assign]
+    app.openapi_schema = None
 
 
 def _registry(db: AsyncSession) -> RelayRegistry:
@@ -234,7 +242,7 @@ async def enroll_relay_node(
 ) -> RelayEnrollmentResponse:
     try:
         require_trusted_proxy(request, settings.trusted_mtls_proxy)
-        registration = await _registry(db).request_enrollment(
+        requested = await _registry(db).request_enrollment(
             token=payload.token.get_secret_value(),
             node_id=payload.node_id,
             region=payload.region,
@@ -248,7 +256,53 @@ async def enroll_relay_node(
         await _commit(db)
     except (RelayRegistryError, RelayAuthError) as error:
         _raise_domain(error)
-    return RelayEnrollmentResponse(node_id=registration.node_id, status="pending")
+    return RelayEnrollmentResponse(
+        enrollment_id=requested.registration.enrollment_id,
+        node_id=requested.registration.node_id,
+        status="pending",
+        receipt=requested.receipt,
+    )
+
+
+@router.post(
+    "/enrollments/{enrollment_id}/pickup",
+    response_model=RelayEnrollmentPickupResponse,
+    description=(
+        "Poll an enrollment through the trusted TLS proxy using the one-time "
+        "enrollment receipt. The receipt is never stored or logged in raw form."
+    ),
+    openapi_extra={"security": ({"TrustedMTLSProxy": []},)},
+)
+async def pickup_relay_certificate(
+    enrollment_id: str,
+    request: Request,
+    _proxy_tls_header: Annotated[
+        str | None, Header(alias="X-Rdesk-Client-TLS")
+    ] = None,
+    _receipt_header: Annotated[
+        str | None,
+        Header(alias="X-Relay-Enrollment-Receipt", min_length=20, max_length=512),
+    ] = None,
+    db: AsyncSession = Depends(get_db),
+) -> RelayEnrollmentPickupResponse:
+    try:
+        require_trusted_proxy(request, settings.trusted_mtls_proxy)
+        receipts = request.headers.getlist("x-relay-enrollment-receipt")
+        if (
+            len(receipts) != 1
+            or not receipts[0].isascii()
+            or not 20 <= len(receipts[0]) <= 512
+        ):
+            raise RelayRegistryError(
+                "relay_enrollment_invalid", 401, "relay enrollment invalid"
+            )
+        pickup = await _registry(db).pickup_enrollment(
+            enrollment_id=enrollment_id, receipt=receipts[0], now=_now()
+        )
+        await _commit(db)
+    except (RelayRegistryError, RelayAuthError) as error:
+        _raise_domain(error)
+    return RelayEnrollmentPickupResponse(**pickup.__dict__)
 
 
 @router.post("/{node_id}/approve", response_model=RelayApprovalResponse)
@@ -263,6 +317,7 @@ async def approve_relay_node(
             actor_id=admin.id,
             ca_certificate_pem=settings.relay_ca_certificate_pem,
             ca_private_key_pem=settings.relay_ca_private_key_pem,
+            ca_private_key_password=settings.relay_ca_private_key_password,
             validity_seconds=settings.relay_certificate_validity_seconds,
             now=_now(),
         )
@@ -313,6 +368,60 @@ async def record_relay_heartbeat(
         state=node.state,
         sequence=node.heartbeat_sequence,
         lease_expires_at=node.lease_expires_at,
+    )
+
+
+@router.post(
+    "/{node_id}/renew",
+    response_model=RelayRenewalResponse,
+    description=(
+        "Rotate the node-bound certificate and Ed25519 key using current mTLS "
+        "and request authentication plus a bounded idempotency identifier."
+    ),
+    openapi_extra={"security": ({"TrustedMTLSProxy": [], "RelayEd25519": []},)},
+)
+async def renew_relay_certificate(
+    node_id: str,
+    request: Request,
+    payload: RelayRenewalRequest,
+    identity: RelayIdentity = Depends(get_verified_relay_renewal_node),
+    _renewal_header: Annotated[
+        str | None, Header(alias="X-Relay-Renewal-Id", min_length=1, max_length=128)
+    ] = None,
+    db: AsyncSession = Depends(get_db),
+) -> RelayRenewalResponse:
+    try:
+        renewal_ids = request.headers.getlist("x-relay-renewal-id")
+        if (
+            len(renewal_ids) != 1
+            or renewal_ids[0] != payload.renewal_id
+            or not renewal_ids[0].isascii()
+        ):
+            raise RelayRegistryError(
+                "relay_signature_invalid", 401, "relay request signature invalid"
+            )
+        renewed = await _registry(db).renew(
+            identity=identity,
+            renewal_id=payload.renewal_id,
+            csr_pem=payload.csr_pem,
+            ca_certificate_pem=settings.relay_ca_certificate_pem,
+            ca_private_key_pem=settings.relay_ca_private_key_pem,
+            ca_private_key_password=settings.relay_ca_private_key_password,
+            validity_seconds=settings.relay_certificate_validity_seconds,
+            renew_before_seconds=settings.relay_certificate_renew_before_seconds,
+            previous_auth_grace_seconds=settings.relay_previous_auth_grace_seconds,
+            now=_now(),
+        )
+        await _commit(db)
+    except (RelayRegistryError, RelayAuthError) as error:
+        _raise_domain(error)
+    return RelayRenewalResponse(
+        renewal_id=payload.renewal_id,
+        node_id=node_id,
+        certificate_pem=renewed.certificate.certificate_pem,
+        ca_certificate_pem=renewed.certificate.ca_certificate_pem,
+        fingerprint=renewed.certificate.fingerprint,
+        expires_at=renewed.certificate.expires_at,
     )
 
 

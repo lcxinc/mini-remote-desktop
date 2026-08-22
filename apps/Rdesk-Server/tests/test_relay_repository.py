@@ -153,14 +153,15 @@ async def enroll(
         now=NOW,
     )
     if ready:
-        await repository.record_heartbeat(
-            node_id=node.node_id,
-            certificate_fingerprint=node.certificate_fingerprint,
-            sequence=1,
-            active_allocations=0,
-            current_egress_bps=0,
-            now=NOW,
-        )
+        for sequence in (1, 2, 3):
+            await repository.record_heartbeat(
+                node_id=node.node_id,
+                certificate_fingerprint=node.certificate_fingerprint,
+                sequence=sequence,
+                active_allocations=0,
+                current_egress_bps=0,
+                now=NOW,
+            )
     return node
 
 
@@ -740,14 +741,15 @@ async def test_reservations_preserve_order_are_bounded_idempotent_and_expire(
     assert full == []
 
     for node_id in ("relay-a", "relay-b"):
-        await repository.record_heartbeat(
-            node_id=node_id,
-            certificate_fingerprint=fingerprint(f"certificate:{node_id}"),
-            sequence=2,
-            active_allocations=0,
-            current_egress_bps=0,
-            now=NOW + timedelta(seconds=29),
-        )
+        for sequence in (4, 5, 6):
+            await repository.record_heartbeat(
+                node_id=node_id,
+                certificate_fingerprint=fingerprint(f"certificate:{node_id}"),
+                sequence=sequence,
+                active_allocations=0,
+                current_egress_bps=0,
+                now=NOW + timedelta(seconds=29),
+            )
 
     boundary = await repository.reserve_capacity(
         session_id="session-2",
@@ -885,6 +887,15 @@ async def test_reported_active_allocations_and_pending_reservations_share_capaci
     ) == []
 
     node.active_allocations = 0
+    for sequence in (2, 3):
+        await repository.record_heartbeat(
+            node_id=node.node_id,
+            certificate_fingerprint=node.certificate_fingerprint,
+            sequence=sequence,
+            active_allocations=0,
+            current_egress_bps=0,
+            now=NOW,
+        )
     existing = await repository.reserve_capacity(
         session_id="session-existing",
         user_id="user-existing",

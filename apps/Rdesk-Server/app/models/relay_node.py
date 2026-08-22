@@ -38,6 +38,10 @@ class RelayNode(Base):
         CheckConstraint(
             "heartbeat_sequence >= 0", name="ck_relay_nodes_heartbeat_sequence"
         ),
+        CheckConstraint(
+            "healthy_heartbeat_streak >= 0 AND healthy_heartbeat_streak <= 3",
+            name="ck_relay_nodes_healthy_heartbeat_streak",
+        ),
         Index("ix_relay_nodes_region", "region"),
         Index("ix_relay_nodes_state", "state"),
         Index("ix_relay_nodes_lease", "lease_expires_at"),
@@ -69,6 +73,9 @@ class RelayNode(Base):
     )
     heartbeat_sequence: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    healthy_heartbeat_streak: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
     )
     lease_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
