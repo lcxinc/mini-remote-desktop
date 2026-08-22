@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 from app.api.v1.router import api_router
+from app.api.v1.relays import install_relay_openapi
 from app.core.config import settings
 from app.db.init_db import seed_initial_data
 from app.db.migrate_add_relay_control import migrate as migrate_relay_control
@@ -43,6 +44,7 @@ app.add_middleware(
 )
 
 app.include_router(api_router)
+install_relay_openapi(app)
 
 
 @app.get("/healthz")

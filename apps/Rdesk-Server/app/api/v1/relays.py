@@ -3,7 +3,16 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Annotated, Callable, Coroutine
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Security, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Request,
+    Security,
+    status,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
@@ -65,7 +74,7 @@ _RELAY_ERROR_RESPONSES = {
         "model": RelayErrorResponse,
         "description": "Stable relay-domain error response.",
     }
-    for code in (400, 401, 403, 409, 503)
+    for code in (400, 401, 403, 404, 409, 503)
 }
 
 
@@ -75,6 +84,40 @@ router = APIRouter(
     route_class=RelayAPIRoute,
     responses=_RELAY_ERROR_RESPONSES,
 )
+
+
+def install_relay_openapi(app: FastAPI) -> None:
+    """Remove impossible 422 responses from relay operations only."""
+
+    original_openapi = app.openapi
+    if getattr(original_openapi, "__relay_openapi_installed__", False):
+        return
+
+    def relay_openapi():
+        schema = original_openapi()
+        for path, path_item in schema.get("paths", {}).items():
+            relay_path = path == "/api/v1/relays" or path.startswith(
+                "/api/v1/relays/"
+            )
+            if not relay_path or not isinstance(path_item, dict):
+                continue
+            for method, operation in path_item.items():
+                is_operation = method in {
+                    "get",
+                    "post",
+                    "put",
+                    "patch",
+                    "delete",
+                }
+                if not is_operation or not isinstance(operation, dict):
+                    continue
+                responses = operation.get("responses")
+                if isinstance(responses, dict):
+                    responses.pop("422", None)
+        return schema
+
+    relay_openapi.__relay_openapi_installed__ = True  # type: ignore[attr-defined]
+    app.openapi = relay_openapi  # type: ignore[method-assign]
 
 
 def _registry(db: AsyncSession) -> RelayRegistry:

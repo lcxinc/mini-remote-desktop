@@ -4,6 +4,7 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -89,6 +90,16 @@ def test_admin_approval_list_drain_resume_and_irreversible_revoke(
     resume = client.post(f"/api/v1/relays/{NODE_ID}/resume")
     assert resume.status_code == 409
     assert _error_code(resume) == "relay_node_revoked"
+
+
+@pytest.mark.parametrize("action", ["drain", "resume", "revoke"])
+def test_unknown_relay_admin_transition_returns_stable_not_found(
+    api: tuple[TestClient, object], action: str
+) -> None:
+    client, _ = api
+    response = client.post(f"/api/v1/relays/missing-node/{action}")
+    assert response.status_code == 404
+    assert _error_code(response) == "relay_node_not_found"
 
 
 def test_enrollment_heartbeat_and_admin_transitions_are_durably_audited(

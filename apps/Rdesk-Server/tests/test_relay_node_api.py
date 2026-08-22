@@ -235,11 +235,12 @@ def api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, ob
 
     app = FastAPI()
     try:
-        from app.api.v1.relays import router as relay_router
+        from app.api.v1 import relays as relay_module
     except ModuleNotFoundError:
-        relay_router = None
-    if relay_router is not None:
-        app.include_router(relay_router, prefix="/api/v1")
+        relay_module = None
+    if relay_module is not None:
+        app.include_router(relay_module.router, prefix="/api/v1")
+        relay_module.install_relay_openapi(app)
     app.dependency_overrides[get_db] = override_db
     app.dependency_overrides[get_current_user_optional] = override_user
     client = TestClient(app, client=("127.0.0.1", 41000))
@@ -482,12 +483,51 @@ def test_heartbeat_requires_proxy_certificate_and_ed25519_signature(
     assert replay.status_code == 409
     assert _error_code(replay) == "relay_heartbeat_replayed"
 
-    without_cert = {k: v for k, v in headers.items() if k.lower() != "x-rdesk-client-cert-sha256"}
-    no_cert = client.post(
-        f"/api/v1/relays/{NODE_ID}/heartbeat", content=body, headers=without_cert
+
+
+@pytest.mark.parametrize(
+    "missing_header",
+    [
+        "X-Rdesk-Client-Cert-Sha256",
+        "X-Relay-Node-Id",
+        "X-Relay-Signature",
+        "X-Relay-Timestamp",
+        "X-Relay-Sequence",
+    ],
+)
+def test_missing_required_heartbeat_header_returns_stable_validation_error(
+    api: tuple[TestClient, object], missing_header: str
+) -> None:
+    client, _ = api
+    key, _ = _enroll(client)
+    _, fingerprint = _approve(client)
+    body, headers = _heartbeat_request(key, fingerprint)
+    headers = {
+        name: value
+        for name, value in headers.items()
+        if name.lower() != missing_header.lower()
+    }
+    response = client.post(
+        f"/api/v1/relays/{NODE_ID}/heartbeat", content=body, headers=headers
     )
-    assert no_cert.status_code == 401
-    assert _error_code(no_cert) == "relay_certificate_invalid"
+    assert response.status_code == 400
+    assert _error_code(response) == "relay_metrics_invalid"
+
+
+def test_missing_heartbeat_body_fields_return_stable_validation_error(
+    api: tuple[TestClient, object],
+) -> None:
+    client, _ = api
+    key, _ = _enroll(client)
+    _, fingerprint = _approve(client)
+    body, headers = _heartbeat_request(
+        key, fingerprint, payload={"active_allocations": 0}
+    )
+    response = client.post(
+        f"/api/v1/relays/{NODE_ID}/heartbeat", content=body, headers=headers
+    )
+    assert response.status_code == 400
+    assert _error_code(response) == "relay_metrics_invalid"
 
 
 @pytest.mark.parametrize(
@@ -730,18 +770,27 @@ def test_openapi_documents_relay_authentication_headers_and_stable_errors(
     client, _ = api
     schema = client.get("/openapi.json").json()
     heartbeat = schema["paths"][f"/api/v1/relays/{{node_id}}/heartbeat"]["post"]
-    header_names = {
-        parameter["name"]
-        for parameter in heartbeat.get("parameters", [])
-        if parameter["in"] == "header"
-    }
-    assert {
+    expected_authentication_headers = {
         "X-Rdesk-Client-Cert-Sha256",
         "X-Relay-Node-Id",
         "X-Relay-Signature",
         "X-Relay-Timestamp",
         "X-Relay-Sequence",
-    }.issubset(header_names)
+    }
+    header_names = {
+        parameter["name"]
+        for parameter in heartbeat.get("parameters", [])
+        if parameter["in"] == "header"
+    }
+    assert expected_authentication_headers.issubset(header_names)
+    authentication_headers = {
+        parameter["name"]: parameter
+        for parameter in heartbeat["parameters"]
+        if parameter["in"] == "header"
+        and parameter["name"] in expected_authentication_headers
+    }
+    for name in expected_authentication_headers:
+        assert authentication_headers[name]["required"] is True
     security_schemes = schema["components"]["securitySchemes"]
     assert security_schemes["TrustedMTLSProxy"]["in"] == "header"
     assert security_schemes["RelayEd25519"]["in"] == "header"
@@ -762,8 +811,52 @@ def test_openapi_documents_relay_authentication_headers_and_stable_errors(
             if method not in {"get", "post", "put", "patch", "delete"}:
                 continue
             assert stable_responses.issubset(operation["responses"])
+            assert "422" not in operation["responses"]
             for code in stable_responses:
                 response_schema = operation["responses"][code]["content"][
                     "application/json"
                 ]["schema"]
                 assert response_schema["$ref"].endswith("/RelayErrorResponse")
+
+    for action in ("drain", "resume", "revoke"):
+        operation = schema["paths"][
+            f"/api/v1/relays/{{node_id}}/{action}"
+        ]["post"]
+        error_schema = operation["responses"]["404"]["content"][
+            "application/json"
+        ]["schema"]
+        assert error_schema["$ref"].endswith("/RelayErrorResponse")
+
+
+def test_relay_openapi_filter_is_idempotent_and_scoped() -> None:
+    from app.api.v1 import relays as relay_module
+
+    install_openapi = relay_module.install_relay_openapi
+
+    app = FastAPI()
+    app.include_router(relay_module.router, prefix="/api/v1")
+
+    @app.get("/outside/{count}")
+    async def outside(count: int) -> dict[str, int]:
+        return {"count": count}
+
+    install_openapi(app)
+    installed = app.openapi
+    install_openapi(app)
+    assert app.openapi is installed
+
+    schema = app.openapi()
+    assert "422" in schema["paths"]["/outside/{count}"]["get"]["responses"]
+    for path, operations in schema["paths"].items():
+        if not path.startswith("/api/v1/relays"):
+            continue
+        for method, operation in operations.items():
+            if method in {"get", "post", "put", "patch", "delete"}:
+                assert "422" not in operation["responses"]
+    assert schema["components"]["securitySchemes"]["TrustedMTLSProxy"]
+    heartbeat = schema["paths"][
+        "/api/v1/relays/{node_id}/heartbeat"
+    ]["post"]
+    assert heartbeat["security"] == [
+        {"TrustedMTLSProxy": [], "RelayEd25519": []}
+    ]
