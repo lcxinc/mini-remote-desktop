@@ -6,9 +6,9 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Signer as _, SigningKey};
 use mrd_relay_control::{
-    RelayDirectoryCandidate, RelayDirectoryEndpoint, RelayDirectoryError, RelayDirectoryPayload,
-    RelayDirectoryTransport, RelayReservation, SignedRelayDirectory,
-    MAX_RELAY_DIRECTORY_JSON_BYTES, RELAY_DIRECTORY_MIN_POLICY_REVISION,
+    ContextVerifiedRelayDirectory, RelayDirectoryCandidate, RelayDirectoryEndpoint,
+    RelayDirectoryError, RelayDirectoryPayload, RelayDirectoryTransport, RelayReservation,
+    SignedRelayDirectory, MAX_RELAY_DIRECTORY_JSON_BYTES,
 };
 use serde::Deserialize;
 
@@ -232,26 +232,138 @@ fn malformed_untrusted_and_expired_directories_fail_closed() {
 }
 
 #[test]
-fn correctly_resigned_nonzero_stale_policy_is_rejected() {
-    let mut stale_payload = payload();
-    stale_payload.policy_revision = RELAY_DIRECTORY_MIN_POLICY_REVISION - 1;
-    let stale = signed(stale_payload);
-    let signature_bytes = STANDARD.decode(&stale.signature_b64).unwrap();
+fn context_verification_rejects_a_correctly_resigned_policy_mismatch() {
+    let mut old_policy_payload = payload();
+    old_policy_payload.policy_revision = 1;
+    let old_policy = signed(old_policy_payload);
+    let signature_bytes = STANDARD.decode(&old_policy.signature_b64).unwrap();
     let signature = Signature::from_slice(&signature_bytes).unwrap();
     SigningKey::from_bytes(&TEST_SEED)
         .verifying_key()
         .verify_strict(
-            &stale.payload.canonical_signing_bytes().unwrap(),
+            &old_policy.payload.canonical_signing_bytes().unwrap(),
             &signature,
         )
         .unwrap();
 
+    old_policy
+        .verify(&trusted_keys(), "session-alpha", 1_777_000_010_000)
+        .unwrap();
     assert_eq!(
-        stale.verify(&trusted_keys(), "session-alpha", 1_777_000_010_000),
-        Err(RelayDirectoryError::StalePolicy {
-            minimum: RELAY_DIRECTORY_MIN_POLICY_REVISION,
-            actual: RELAY_DIRECTORY_MIN_POLICY_REVISION - 1,
+        old_policy.verify_for_context(
+            &trusted_keys(),
+            "session-alpha",
+            2,
+            "peer-sha256-0123456789abcdef",
+            1_777_000_010_000,
+        ),
+        Err(RelayDirectoryError::PolicyRevisionMismatch {
+            expected: 2,
+            actual: 1,
         })
+    );
+}
+
+#[test]
+fn context_verification_binds_peer_without_exposing_digest_in_errors() {
+    let valid = signed(payload());
+    let verified: ContextVerifiedRelayDirectory = valid
+        .verify_for_context(
+            &trusted_keys(),
+            "session-alpha",
+            17,
+            "peer-sha256-0123456789abcdef",
+            1_777_000_010_000,
+        )
+        .unwrap();
+    assert_eq!(verified.payload(), &valid.payload);
+
+    assert_eq!(
+        valid.verify_for_context(
+            &trusted_keys(),
+            "session-alpha",
+            17,
+            "other-peer-secret-digest",
+            1_777_000_010_000,
+        ),
+        Err(RelayDirectoryError::PeerBindingMismatch)
+    );
+    assert!(!RelayDirectoryError::PeerBindingMismatch
+        .to_string()
+        .contains("other-peer-secret-digest"));
+}
+
+#[test]
+fn duplicate_reservation_ids_are_rejected_directory_wide() {
+    let mut invalid = payload();
+    invalid.candidates[1].reservation.reservation_id =
+        invalid.candidates[0].reservation.reservation_id.clone();
+    assert_eq!(
+        invalid.canonical_signing_bytes(),
+        Err(RelayDirectoryError::DuplicateReservation)
+    );
+}
+
+#[test]
+fn key_signature_and_time_boundaries_fail_closed() {
+    let valid_payload = payload();
+    let valid = signed(valid_payload.clone());
+
+    let short_key = BTreeMap::from([(TEST_KEY_ID.to_owned(), vec![0_u8; 31])]);
+    assert_eq!(
+        valid.verify(&short_key, "session-alpha", valid_payload.issued_at_ms),
+        Err(RelayDirectoryError::InvalidPublicKey)
+    );
+
+    let mut malformed_base64 = valid.clone();
+    malformed_base64.signature_b64 = "not+base64!".to_owned();
+    assert_eq!(
+        malformed_base64.verify(&trusted_keys(), "session-alpha", valid_payload.issued_at_ms,),
+        Err(RelayDirectoryError::InvalidSignatureEncoding)
+    );
+
+    let mut noncanonical_base64 = valid.clone();
+    let mut encoded = noncanonical_base64.signature_b64.into_bytes();
+    let last_symbol = encoded.len() - 3;
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let symbol_index = alphabet
+        .iter()
+        .position(|symbol| *symbol == encoded[last_symbol])
+        .unwrap();
+    assert_eq!(symbol_index % 16, 0);
+    encoded[last_symbol] = alphabet[symbol_index + 1];
+    noncanonical_base64.signature_b64 = String::from_utf8(encoded).unwrap();
+    assert_eq!(
+        noncanonical_base64.verify(&trusted_keys(), "session-alpha", valid_payload.issued_at_ms,),
+        Err(RelayDirectoryError::InvalidSignatureEncoding)
+    );
+
+    let mut short_signature = valid.clone();
+    short_signature.signature_b64 = STANDARD.encode([0_u8; 63]);
+    assert_eq!(
+        short_signature.verify(&trusted_keys(), "session-alpha", valid_payload.issued_at_ms,),
+        Err(RelayDirectoryError::InvalidSignatureEncoding)
+    );
+
+    assert_eq!(
+        valid.verify(
+            &trusted_keys(),
+            "session-alpha",
+            valid_payload.issued_at_ms - 1,
+        ),
+        Err(RelayDirectoryError::NotYetValid)
+    );
+    valid
+        .verify(&trusted_keys(), "session-alpha", valid_payload.issued_at_ms)
+        .unwrap();
+
+    let reservation_expiry = valid_payload.candidates[0].reservation.expires_at_ms;
+    valid
+        .verify(&trusted_keys(), "session-alpha", reservation_expiry - 1)
+        .unwrap();
+    assert_eq!(
+        valid.verify(&trusted_keys(), "session-alpha", reservation_expiry),
+        Err(RelayDirectoryError::ReservationExpired)
     );
 }
 

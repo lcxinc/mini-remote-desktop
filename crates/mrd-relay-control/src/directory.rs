@@ -18,11 +18,6 @@ use thiserror::Error;
 pub const RELAY_DIRECTORY_CONTEXT: &[u8] = b"MRD_RELAY_DIRECTORY_V1";
 /// Only format version accepted by this implementation.
 pub const RELAY_DIRECTORY_FORMAT_VERSION: u16 = 1;
-/// Oldest signed policy revision accepted by v1 consumers.
-///
-/// Revision 17 is the first deployed selection policy that guarantees the
-/// region, capacity, and failure-domain semantics required by this contract.
-pub const RELAY_DIRECTORY_MIN_POLICY_REVISION: u64 = 17;
 /// Total transport limit, including JSON syntax and escaped string expansion.
 ///
 /// This is eight times the 16 KiB canonical limit, leaving room for the
@@ -102,11 +97,38 @@ pub struct SignedRelayDirectory {
     pub signature_b64: String,
 }
 
-/// A directory whose signature, bindings, time window, and reservations passed validation.
+/// A directory whose signature, structure, session, time window, and reservations are valid.
+///
+/// This type does not establish that the policy revision or intended peer
+/// matches the caller's authorization context. Candidate-consuming code should
+/// require [`ContextVerifiedRelayDirectory`] instead.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedRelayDirectory {
     payload: RelayDirectoryPayload,
     canonical_signing_bytes: Vec<u8>,
+}
+
+/// A directory additionally bound to the caller's exact policy and peer context.
+///
+/// This distinct type is produced only by
+/// [`SignedRelayDirectory::verify_for_context`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextVerifiedRelayDirectory {
+    verified: VerifiedRelayDirectory,
+}
+
+impl ContextVerifiedRelayDirectory {
+    pub fn payload(&self) -> &RelayDirectoryPayload {
+        self.verified.payload()
+    }
+
+    pub fn canonical_signing_bytes(&self) -> &[u8] {
+        self.verified.canonical_signing_bytes()
+    }
+
+    pub fn into_payload(self) -> RelayDirectoryPayload {
+        self.verified.into_payload()
+    }
 }
 
 impl VerifiedRelayDirectory {
@@ -130,8 +152,10 @@ pub enum RelayDirectoryError {
     UnsupportedFormatVersion { version: u16 },
     #[error("relay-directory policy revision is invalid")]
     InvalidPolicyRevision,
-    #[error("relay-directory policy revision {actual} is older than supported minimum {minimum}")]
-    StalePolicy { minimum: u64, actual: u64 },
+    #[error("relay-directory policy revision does not match the expected revision")]
+    PolicyRevisionMismatch { expected: u64, actual: u64 },
+    #[error("relay-directory intended-peer binding does not match")]
+    PeerBindingMismatch,
     #[error("relay-directory JSON exceeds the maximum of {max} bytes")]
     JsonTooLarge { max: usize },
     #[error("relay-directory JSON is invalid")]
@@ -148,6 +172,8 @@ pub enum RelayDirectoryError {
     DuplicateNode,
     #[error("relay candidate contains a duplicate endpoint")]
     DuplicateEndpoint,
+    #[error("relay directory contains a duplicate reservation")]
+    DuplicateReservation,
     #[error("relay candidates are not in canonical order")]
     NonCanonicalCandidateOrder,
     #[error("relay endpoints are not in canonical order")]
@@ -274,12 +300,16 @@ impl RelayDirectoryPayload {
         }
 
         validate_candidate_order(&self.candidates)?;
+        let mut reservation_ids = BTreeSet::new();
         for candidate in &self.candidates {
             validate_string("node_id", &candidate.node_id)?;
             validate_string("region", &candidate.region)?;
             validate_string("failure_domain", &candidate.failure_domain)?;
             validate_string("selection_reason", &candidate.selection_reason)?;
             validate_string("reservation_id", &candidate.reservation.reservation_id)?;
+            if !reservation_ids.insert(candidate.reservation.reservation_id.as_bytes()) {
+                return Err(RelayDirectoryError::DuplicateReservation);
+            }
             if candidate.load_class > 3 {
                 return Err(RelayDirectoryError::InvalidLoadClass);
             }
@@ -331,12 +361,16 @@ impl SignedRelayDirectory {
         let signed = Self::from(raw);
         signed.payload.canonical_signing_bytes()?;
         validate_string("signing_key_id", &signed.signing_key_id)?;
-        if signed.signature_b64.is_empty() || signed.signature_b64.len() > 128 {
-            return Err(RelayDirectoryError::InvalidSignatureEncoding);
-        }
+        decode_signature(&signed.signature_b64)?;
         Ok(signed)
     }
 
+    /// Verify signature, structural invariants, session binding, current time,
+    /// and reservation validity.
+    ///
+    /// This required compatibility entry point deliberately does not compare
+    /// policy revision or intended-peer digest against caller context. Use
+    /// [`Self::verify_for_context`] before consuming relay candidates.
     pub fn verify(
         &self,
         trusted_keys: &BTreeMap<String, Vec<u8>>,
@@ -345,12 +379,6 @@ impl SignedRelayDirectory {
     ) -> Result<VerifiedRelayDirectory, RelayDirectoryError> {
         let canonical_signing_bytes = self.payload.canonical_signing_bytes()?;
         validate_string("signing_key_id", &self.signing_key_id)?;
-        if self.payload.policy_revision < RELAY_DIRECTORY_MIN_POLICY_REVISION {
-            return Err(RelayDirectoryError::StalePolicy {
-                minimum: RELAY_DIRECTORY_MIN_POLICY_REVISION,
-                actual: self.payload.policy_revision,
-            });
-        }
         if self.payload.session_id != expected_session_id {
             return Err(RelayDirectoryError::SessionMismatch);
         }
@@ -379,14 +407,7 @@ impl SignedRelayDirectory {
         let verifying_key = VerifyingKey::from_bytes(&key_bytes)
             .map_err(|_| RelayDirectoryError::InvalidPublicKey)?;
 
-        if self.signature_b64.len() > 128 {
-            return Err(RelayDirectoryError::InvalidSignatureEncoding);
-        }
-        let signature_bytes = STANDARD
-            .decode(self.signature_b64.as_bytes())
-            .map_err(|_| RelayDirectoryError::InvalidSignatureEncoding)?;
-        let signature = Signature::from_slice(&signature_bytes)
-            .map_err(|_| RelayDirectoryError::InvalidSignatureEncoding)?;
+        let signature = decode_signature(&self.signature_b64)?;
         verifying_key
             .verify_strict(&canonical_signing_bytes, &signature)
             .map_err(|_| RelayDirectoryError::InvalidSignature)?;
@@ -395,6 +416,29 @@ impl SignedRelayDirectory {
             payload: self.payload.clone(),
             canonical_signing_bytes,
         })
+    }
+
+    /// Perform basic verification and bind the directory to the caller's exact
+    /// selection-policy revision and intended-peer digest.
+    pub fn verify_for_context(
+        &self,
+        trusted_keys: &BTreeMap<String, Vec<u8>>,
+        expected_session_id: &str,
+        expected_policy_revision: u64,
+        expected_peer_digest: &str,
+        now_ms: u64,
+    ) -> Result<ContextVerifiedRelayDirectory, RelayDirectoryError> {
+        let verified = self.verify(trusted_keys, expected_session_id, now_ms)?;
+        if verified.payload.policy_revision != expected_policy_revision {
+            return Err(RelayDirectoryError::PolicyRevisionMismatch {
+                expected: expected_policy_revision,
+                actual: verified.payload.policy_revision,
+            });
+        }
+        if verified.payload.intended_peer_digest != expected_peer_digest {
+            return Err(RelayDirectoryError::PeerBindingMismatch);
+        }
+        Ok(ContextVerifiedRelayDirectory { verified })
     }
 }
 
@@ -586,6 +630,20 @@ fn validate_string(field: &'static str, value: &str) -> Result<(), RelayDirector
         });
     }
     Ok(())
+}
+
+fn decode_signature(signature_b64: &str) -> Result<Signature, RelayDirectoryError> {
+    if signature_b64.is_empty() || signature_b64.len() > 128 {
+        return Err(RelayDirectoryError::InvalidSignatureEncoding);
+    }
+    let signature_bytes = STANDARD
+        .decode(signature_b64.as_bytes())
+        .map_err(|_| RelayDirectoryError::InvalidSignatureEncoding)?;
+    if STANDARD.encode(&signature_bytes) != signature_b64 {
+        return Err(RelayDirectoryError::InvalidSignatureEncoding);
+    }
+    Signature::from_slice(&signature_bytes)
+        .map_err(|_| RelayDirectoryError::InvalidSignatureEncoding)
 }
 
 fn push_string(
