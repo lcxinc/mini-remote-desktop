@@ -234,7 +234,7 @@ def test_jwt_contains_pinned_context_and_bounded_lifetime(
     claims = jwt.get_unverified_claims(token)
     assert claims["iss"] == "https://auth.rdesk.test"
     assert claims["aud"] == "rdesk-api"
-    assert set(("sub", "iat", "exp", "iss", "aud")).issubset(claims)
+    assert set(("sub", "role", "iat", "exp", "iss", "aud")).issubset(claims)
     assert 0 < claims["exp"] - claims["iat"] <= 3600
     assert jwt.get_unverified_header(token)["alg"] == "HS256"
 
@@ -257,6 +257,7 @@ async def test_jwt_rejects_missing_or_wrong_context_and_unbounded_time(
     now = datetime.now(UTC)
     claims = {
         "sub": "secure-admin-id",
+        "role": "admin",
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=5)).timestamp()),
         "iss": issuer,

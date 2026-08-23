@@ -67,6 +67,11 @@ async def _migrate_connection(
             "version INTEGER PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
         )
     )
+    await connection.run_sync(
+        lambda sync: _verify_migration_ledger(
+            sync, schema, require_exact_versions=False
+        )
+    )
     required_tables = (
         "users", "devices", "session_requests", "relay_nodes",
         "relay_node_registrations",
@@ -104,6 +109,21 @@ async def _migrate_connection(
             f"UPDATE {devices} d SET bound_user_id = NULL, is_bound = FALSE "
             f"WHERE d.bound_user_id IS NOT NULL AND NOT EXISTS ("
             f"SELECT 1 FROM {users} u WHERE u.id = d.bound_user_id)"
+        )
+    )
+    # Historical rows with contradictory binding fields cannot establish a
+    # trustworthy owner. Normalize them to unbound instead of elevating a
+    # stale/caller-controlled owner reference into an active ownership grant.
+    await connection.execute(
+        text(
+            f"UPDATE {devices} SET bound_user_id = NULL, is_bound = FALSE "
+            "WHERE is_bound = FALSE AND bound_user_id IS NOT NULL"
+        )
+    )
+    await connection.execute(
+        text(
+            f"UPDATE {devices} SET is_bound = FALSE "
+            "WHERE is_bound = TRUE AND bound_user_id IS NULL"
         )
     )
     await connection.execute(
@@ -184,6 +204,11 @@ async def _migrate_connection(
             ),
             {"version": version},
         )
+    await connection.run_sync(
+        lambda sync: _verify_migration_ledger(
+            sync, schema, require_exact_versions=True
+        )
+    )
 
 
 def _type_matches(value: object, expected_type: type[object], length: int | None = None) -> bool:
@@ -250,6 +275,98 @@ def _normalize_check_expression(expression: object) -> str:
     return re.sub(r'[\s()"]+', "", without_numeric_quotes)
 
 
+def _normalize_server_default(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    normalized = _CHECK_CAST.sub("", value.strip().lower())
+    while _has_single_outer_parentheses(normalized):
+        normalized = normalized[1:-1].strip()
+    normalized = re.sub(r"\s+", "", normalized)
+    return "now()" if normalized == "current_timestamp" else normalized
+
+
+def _has_single_outer_parentheses(value: str) -> bool:
+    if len(value) < 2 or value[0] != "(" or value[-1] != ")":
+        return False
+    depth = 0
+    for index, character in enumerate(value):
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0 and index != len(value) - 1:
+                return False
+        if depth < 0:
+            return False
+    return depth == 0
+
+
+def _verify_migration_ledger(
+    connection: object,
+    schema: str | None,
+    *,
+    require_exact_versions: bool,
+) -> None:
+    inspector = inspect(connection)
+    table_name = "relay_access_schema_migrations"
+    columns = {
+        column["name"]: column
+        for column in inspector.get_columns(table_name, schema=schema)
+    }
+    if set(columns) != {"version", "applied_at"}:
+        raise RelayAccessMigrationError("relay access migration ledger columns differ")
+    if (
+        columns["version"]["nullable"] is not False
+        or not isinstance(columns["version"]["type"], Integer)
+        or isinstance(columns["version"]["type"], BigInteger)
+        or columns["version"]["default"] is not None
+        or columns["applied_at"]["nullable"] is not False
+        or not _type_matches(columns["applied_at"]["type"], DateTime)
+        or _normalize_server_default(columns["applied_at"]["default"]) != "now()"
+    ):
+        raise RelayAccessMigrationError("relay access migration ledger columns differ")
+    primary_key = inspector.get_pk_constraint(table_name, schema=schema)
+    if (
+        primary_key.get("name") != "relay_access_schema_migrations_pkey"
+        or tuple(primary_key.get("constrained_columns") or ()) != ("version",)
+    ):
+        raise RelayAccessMigrationError(
+            "relay access migration ledger primary key differs"
+        )
+    table = _table(schema, table_name)
+    actual_versions = set(
+        connection.execute(text(f"SELECT version FROM {table}")).scalars()
+    )
+    expected_versions = set(_VERSIONS)
+    if (
+        not actual_versions.issubset(expected_versions)
+        or (require_exact_versions and actual_versions != expected_versions)
+    ):
+        raise RelayAccessMigrationError("relay access migration ledger versions differ")
+
+
+def _index_matches(index: object, columns: tuple[str, ...]) -> bool:
+    if not isinstance(index, dict):
+        return False
+    if tuple(index.get("column_names") or ()) != columns:
+        return False
+    if index.get("unique") is not False:
+        return False
+    sorting = index.get("column_sorting") or {}
+    if any(
+        any(option != "asc" for option in (options or ()))
+        for options in sorting.values()
+    ):
+        return False
+    dialect = index.get("dialect_options") or {}
+    return not (
+        index.get("include_columns")
+        or dialect.get("postgresql_include")
+        or dialect.get("postgresql_where") is not None
+        or dialect.get("postgresql_ops")
+    )
+
+
 def _verify(connection: object, schema: str | None) -> None:
     inspector = inspect(connection)
     for table_name, expected in _auth_specs().items():
@@ -267,15 +384,30 @@ def _verify(connection: object, schema: str | None) -> None:
                 raise RelayAccessMigrationError(
                     f"relay access schema differs for {table_name}.{name}"
                 )
-        if "default" not in str(columns["tenant_id"]["default"]):
+        if _normalize_server_default(columns["tenant_id"]["default"]) != "'default'":
             raise RelayAccessMigrationError(
                 f"relay access tenant default differs for {table_name}"
+            )
+        no_default_columns = {
+            "session_requests": {
+                "grant_expires_at",
+                "policy_revision",
+                "policy_expires_at",
+                "intended_peer_id",
+                "relay_allowed_regions",
+                "relay_preferred_regions",
+                "relay_accepted_transports",
+            }
+        }.get(table_name, set())
+        if any(columns[name]["default"] is not None for name in no_default_columns):
+            raise RelayAccessMigrationError(
+                f"relay access server defaults differ for {table_name}"
             )
     session_columns = {
         column["name"]: column
         for column in inspector.get_columns("session_requests", schema=schema)
     }
-    if "requested" not in str(session_columns["status"]["default"]):
+    if _normalize_server_default(session_columns["status"]["default"]) != "'requested'":
         raise RelayAccessMigrationError("relay session status default differs")
 
     required_checks = {
@@ -311,8 +443,12 @@ def _verify(connection: object, schema: str | None) -> None:
                 f"relay access checks differ for {table_name}"
             )
 
+    effective_schema = schema or connection.scalar(text("SELECT current_schema()"))
+    if not isinstance(effective_schema, str):
+        raise RelayAccessMigrationError("relay access schema is invalid")
     _verify_foreign_key(
-        inspector, schema, table="devices", name="devices_bound_user_id_fkey",
+        inspector, schema, expected_schema=effective_schema,
+        table="devices", name="devices_bound_user_id_fkey",
         constrained=("bound_user_id",), referred_table="users",
         referred=("id",), ondelete="RESTRICT",
     )
@@ -322,7 +458,8 @@ def _verify(connection: object, schema: str | None) -> None:
         ("session_requests_intended_peer_id_fkey", ("intended_peer_id",), "devices", ("id",), "CASCADE"),
     ):
         _verify_foreign_key(
-            inspector, schema, table="session_requests", name=name,
+            inspector, schema, expected_schema=effective_schema,
+            table="session_requests", name=name,
             constrained=constrained, referred_table=referred_table,
             referred=referred, ondelete=ondelete,
         )
@@ -341,10 +478,13 @@ def _verify(connection: object, schema: str | None) -> None:
     }
     for table_name, expected in required_indexes.items():
         actual = {
-            item["name"]: tuple(item["column_names"])
+            item["name"]: item
             for item in inspector.get_indexes(table_name, schema=schema)
         }
-        if any(actual.get(name) != columns for name, columns in expected.items()):
+        if any(
+            not _index_matches(actual.get(name), columns)
+            for name, columns in expected.items()
+        ):
             raise RelayAccessMigrationError(
                 f"relay access indexes differ for {table_name}"
             )
@@ -372,18 +512,86 @@ def _verify(connection: object, schema: str | None) -> None:
                 column["type"], expected_type, length
             ):
                 raise RelayAccessMigrationError("relay topology/metric schema differs")
-    node_columns = {
-        column["name"]: column
-        for column in inspector.get_columns("relay_nodes", schema=schema)
+        expected_defaults = {
+            "relay_nodes": {
+                "measured_rtt_ms": None,
+                "recent_failure_bps": "0",
+                "physical_host_id": None,
+            },
+            "relay_node_registrations": {
+                "physical_host_id": None,
+                "topology_approved_at": None,
+                "encrypted_turn_secret": None,
+            },
+        }[table_name]
+        for name, expected_default in expected_defaults.items():
+            actual_default = columns[name]["default"]
+            if (
+                actual_default is not None
+                if expected_default is None
+                else _normalize_server_default(actual_default) != expected_default
+            ):
+                raise RelayAccessMigrationError(
+                    "relay topology/metric server defaults differ"
+                )
+    relay_checks = {
+        item["name"]: _normalize_check_expression(item["sqltext"])
+        for item in inspector.get_check_constraints("relay_nodes", schema=schema)
     }
-    if str(node_columns["recent_failure_bps"]["default"]).strip("()") != "0":
-        raise RelayAccessMigrationError("relay metric default differs")
+    expected_relay_checks = {
+        "ck_relay_nodes_measured_rtt": (
+            "measured_rtt_ms IS NULL OR "
+            "(measured_rtt_ms >= 0 AND measured_rtt_ms <= 4294967295)"
+        ),
+        "ck_relay_nodes_recent_failure": (
+            "recent_failure_bps >= 0 AND recent_failure_bps <= 10000"
+        ),
+        "ck_relay_nodes_physical_host": (
+            "physical_host_id IS NULL OR "
+            "(length(physical_host_id) >= 1 AND length(physical_host_id) <= 128)"
+        ),
+    }
+    if any(
+        relay_checks.get(name) != _normalize_check_expression(expression)
+        for name, expression in expected_relay_checks.items()
+    ):
+        raise RelayAccessMigrationError("relay topology/metric checks differ")
+    registration_checks = {
+        item["name"]: _normalize_check_expression(item["sqltext"])
+        for item in inspector.get_check_constraints(
+            "relay_node_registrations", schema=schema
+        )
+    }
+    expected_registration_checks = {
+        "ck_relay_node_registrations_topology": (
+            "(topology_approved_at IS NULL AND physical_host_id IS NULL) OR "
+            "(topology_approved_at IS NOT NULL AND physical_host_id IS NOT NULL)"
+        ),
+        "ck_relay_node_registrations_turn_secret": (
+            "encrypted_turn_secret IS NULL OR length(encrypted_turn_secret) >= 30"
+        ),
+    }
+    if any(
+        registration_checks.get(name) != _normalize_check_expression(expression)
+        for name, expression in expected_registration_checks.items()
+    ):
+        raise RelayAccessMigrationError("relay registration checks differ")
+    relay_indexes = {
+        item["name"]: item
+        for item in inspector.get_indexes("relay_nodes", schema=schema)
+    }
+    if not _index_matches(
+        relay_indexes.get("ix_relay_nodes_physical_host"),
+        ("physical_host_id",),
+    ):
+        raise RelayAccessMigrationError("relay topology indexes differ")
 
 
 def _verify_foreign_key(
     inspector: object,
     schema: str | None,
     *,
+    expected_schema: str,
     table: str,
     name: str,
     constrained: tuple[str, ...],
@@ -397,10 +605,12 @@ def _verify_foreign_key(
     }
     key = keys.get(name)
     options = (key or {}).get("options") or {}
+    referred_schema = (key or {}).get("referred_schema") or expected_schema
     if (
         key is None
         or tuple(key.get("constrained_columns") or ()) != constrained
         or key.get("referred_table") != referred_table
+        or referred_schema != expected_schema
         or tuple(key.get("referred_columns") or ()) != referred
         or options.get("ondelete") != ondelete
         or options.get("deferrable") not in {None, False}

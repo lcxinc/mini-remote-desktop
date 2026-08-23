@@ -1036,6 +1036,38 @@ async def test_migration_rejects_cross_schema_deferrable_reservation_fk() -> Non
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "ALTER TABLE relay_nodes ALTER COLUMN state SET DEFAULT 'notunavailable'",
+        "ALTER TABLE relay_node_registrations ALTER COLUMN status SET DEFAULT 'notpending'",
+        "ALTER TABLE relay_nodes ALTER COLUMN measured_rtt_ms SET DEFAULT 7",
+        "DROP INDEX ix_relay_nodes_region; CREATE UNIQUE INDEX "
+        "ix_relay_nodes_region ON relay_nodes (region)",
+        "ALTER TABLE relay_node_registrations DROP CONSTRAINT "
+        "relay_node_registrations_enrollment_id_fkey; ALTER TABLE "
+        "relay_node_registrations ADD CONSTRAINT "
+        "relay_node_registrations_enrollment_id_fkey FOREIGN KEY "
+        "(enrollment_id) REFERENCES relay_enrollments (id) ON DELETE RESTRICT "
+        "DEFERRABLE INITIALLY DEFERRED",
+        "ALTER TABLE relay_schema_migrations ALTER COLUMN version TYPE BIGINT",
+        "ALTER TABLE relay_schema_migrations ALTER COLUMN applied_at DROP DEFAULT",
+        "ALTER TABLE relay_schema_migrations DROP CONSTRAINT relay_schema_migrations_pkey",
+        "INSERT INTO relay_schema_migrations (version) VALUES (999)",
+    ],
+)
+async def test_control_migration_rejects_semantically_malicious_schema(
+    malformation: str,
+) -> None:
+    async with isolated_postgres_engine() as engine:
+        async with engine.begin() as connection:
+            for statement in malformation.split("; "):
+                await connection.execute(text(statement))
+        with pytest.raises(relay_migration.RelaySchemaMismatchError):
+            await migrate(engine)
+
+
+@pytest.mark.anyio
 async def test_v4_behaviorally_upgrades_v2_schema_and_serializes_concurrent_upgrade() -> None:
     assert DATABASE_URL is not None
     schema = "relay_v3_upgrade_" + re.sub(r"[^a-z0-9]", "", uuid4().hex)

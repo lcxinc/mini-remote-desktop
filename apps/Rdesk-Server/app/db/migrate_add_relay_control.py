@@ -239,6 +239,11 @@ async def _migrate_connection(
     ]
     for statement in statements:
         await connection.execute(text(statement))
+    await connection.run_sync(
+        lambda sync_connection: _assert_migration_ledger(
+            sync_connection, schema, require_exact_versions=False
+        )
+    )
     v4_already_applied = bool(
         await connection.scalar(
             text(f"SELECT 1 FROM {versions} WHERE version = 4")
@@ -376,6 +381,11 @@ async def _migrate_connection(
             ),
             {"version": version},
         )
+    await connection.run_sync(
+        lambda sync_connection: _assert_migration_ledger(
+            sync_connection, schema, require_exact_versions=True
+        )
+    )
 
 
 def _preflight_existing_schema(sync_connection: object, schema: str | None) -> None:
@@ -482,6 +492,96 @@ def _normalize_check_expression(expression: object) -> str:
     return re.sub(r'[\s()"]+', "", without_numeric_quotes)
 
 
+def _normalize_server_default(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    normalized = _CHECK_CAST.sub("", value.strip().lower())
+    while _has_single_outer_parentheses(normalized):
+        normalized = normalized[1:-1].strip()
+    normalized = re.sub(r"\s+", "", normalized)
+    return "now()" if normalized == "current_timestamp" else normalized
+
+
+def _has_single_outer_parentheses(value: str) -> bool:
+    if len(value) < 2 or value[0] != "(" or value[-1] != ")":
+        return False
+    depth = 0
+    for index, character in enumerate(value):
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0 and index != len(value) - 1:
+                return False
+        if depth < 0:
+            return False
+    return depth == 0
+
+
+def _assert_migration_ledger(
+    sync_connection: object,
+    schema: str | None,
+    *,
+    require_exact_versions: bool,
+) -> None:
+    inspector = inspect(sync_connection)
+    table_name = "relay_schema_migrations"
+    columns = {
+        column["name"]: column
+        for column in inspector.get_columns(table_name, schema=schema)
+    }
+    if set(columns) != {"version", "applied_at"}:
+        raise RelaySchemaMismatchError("relay migration ledger columns differ")
+    if (
+        columns["version"]["nullable"] is not False
+        or not isinstance(columns["version"]["type"], Integer)
+        or isinstance(columns["version"]["type"], BigInteger)
+        or columns["version"]["default"] is not None
+        or columns["applied_at"]["nullable"] is not False
+        or not _type_matches(columns["applied_at"]["type"], (DateTime, None))
+        or _normalize_server_default(columns["applied_at"]["default"]) != "now()"
+    ):
+        raise RelaySchemaMismatchError("relay migration ledger columns differ")
+    primary_key = inspector.get_pk_constraint(table_name, schema=schema)
+    if (
+        primary_key.get("name") != "relay_schema_migrations_pkey"
+        or tuple(primary_key.get("constrained_columns") or ()) != ("version",)
+    ):
+        raise RelaySchemaMismatchError("relay migration ledger primary key differs")
+    table = _table(schema, table_name)
+    actual_versions = set(
+        sync_connection.execute(text(f"SELECT version FROM {table}")).scalars()
+    )
+    expected_versions = set(_RELAY_SCHEMA_VERSIONS)
+    if (
+        not actual_versions.issubset(expected_versions)
+        or (require_exact_versions and actual_versions != expected_versions)
+    ):
+        raise RelaySchemaMismatchError("relay migration ledger versions differ")
+
+
+def _index_matches(index: object, columns: tuple[str, ...]) -> bool:
+    if not isinstance(index, dict):
+        return False
+    if tuple(index.get("column_names") or ()) != columns:
+        return False
+    if index.get("unique") is not False:
+        return False
+    sorting = index.get("column_sorting") or {}
+    if any(
+        any(option != "asc" for option in (options or ()))
+        for options in sorting.values()
+    ):
+        return False
+    dialect = index.get("dialect_options") or {}
+    return not (
+        index.get("include_columns")
+        or dialect.get("postgresql_include")
+        or dialect.get("postgresql_where") is not None
+        or dialect.get("postgresql_ops")
+    )
+
+
 def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None:
     inspector = inspect(sync_connection)
     specs: dict[str, dict[str, tuple[type[object], int | None, bool]]] = {
@@ -582,6 +682,34 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
                     f"relay schema mismatch for {table_name}.{name}"
                 )
 
+        expected_defaults: dict[str, str | None] = {
+            name: None for name in expected_columns
+        }
+        if table_name == "relay_nodes":
+            expected_defaults.update(
+                {
+                    "state": "'unavailable'",
+                    "active_allocations": "0",
+                    "current_egress_bps": "0",
+                    "heartbeat_sequence": "0",
+                    "healthy_heartbeat_streak": "0",
+                    "recent_failure_bps": "0",
+                }
+            )
+        elif table_name == "relay_node_registrations":
+            expected_defaults["status"] = "'pending'"
+        for name, expected_default in expected_defaults.items():
+            actual_default = columns[name]["default"]
+            if (
+                actual_default is not None
+                if expected_default is None
+                else _normalize_server_default(actual_default) != expected_default
+            ):
+                raise RelaySchemaMismatchError(
+                    f"relay schema mismatch for {table_name}.{name}: "
+                    "server default differs"
+                )
+
     expected_primary_keys = {
         "relay_nodes": ("relay_nodes_pkey", ("node_id",)),
         "relay_enrollments": ("relay_enrollments_pkey", ("id",)),
@@ -600,27 +728,6 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             raise RelaySchemaMismatchError(
                 f"relay schema mismatch for {table_name}: primary key differs"
             )
-
-    node_columns = {
-        column["name"]: column
-        for column in inspector.get_columns("relay_nodes", schema=schema)
-    }
-    if "unavailable" not in str(node_columns["state"]["default"]):
-        raise RelaySchemaMismatchError("relay node state default differs")
-    for name in (
-        "active_allocations", "current_egress_bps", "heartbeat_sequence",
-        "healthy_heartbeat_streak", "recent_failure_bps",
-    ):
-        if str(node_columns[name]["default"]).strip("()") != "0":
-            raise RelaySchemaMismatchError(f"relay node {name} default differs")
-    registration_columns = {
-        column["name"]: column
-        for column in inspector.get_columns(
-            "relay_node_registrations", schema=schema
-        )
-    }
-    if "pending" not in str(registration_columns["status"]["default"]):
-        raise RelaySchemaMismatchError("relay registration status default differs")
 
     required_checks = {
         "ck_relay_nodes_state": (
@@ -743,11 +850,15 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
     registration_options = registration_key.get("options") or {}
     registration_schema = registration_key.get("referred_schema") or expected_referred_schema
     if (
-        tuple(registration_key.get("constrained_columns") or ()) != ("enrollment_id",)
+        registration_key.get("name")
+        != "relay_node_registrations_enrollment_id_fkey"
+        or tuple(registration_key.get("constrained_columns") or ()) != ("enrollment_id",)
         or registration_schema != expected_referred_schema
         or registration_key.get("referred_table") != "relay_enrollments"
         or tuple(registration_key.get("referred_columns") or ()) != ("id",)
         or registration_options.get("ondelete") != "RESTRICT"
+        or registration_options.get("deferrable") not in {None, False}
+        or registration_options.get("initially") is not None
     ):
         raise RelaySchemaMismatchError("relay registration foreign key differs")
 
@@ -777,10 +888,13 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
     }
     for table_name, required in expected_indexes.items():
         actual = {
-            index["name"]: tuple(index["column_names"])
+            index["name"]: index
             for index in inspector.get_indexes(table_name, schema=schema)
         }
-        if any(actual.get(name) != columns for name, columns in required.items()):
+        if any(
+            not _index_matches(actual.get(name), columns)
+            for name, columns in required.items()
+        ):
             raise RelaySchemaMismatchError(
                 f"relay schema mismatch for {table_name}: indexes differ"
             )

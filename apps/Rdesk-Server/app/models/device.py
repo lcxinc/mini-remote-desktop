@@ -25,6 +25,11 @@ class Device(Base):
             "length(tenant_id) BETWEEN 1 AND 64",
             name="ck_devices_tenant_id",
         ),
+        CheckConstraint(
+            "(is_bound = FALSE AND bound_user_id IS NULL) OR "
+            "(is_bound = TRUE AND bound_user_id IS NOT NULL)",
+            name="ck_devices_bound_owner",
+        ),
         Index("ix_devices_tenant_id", "tenant_id"),
         Index("ix_devices_bound_user_id", "bound_user_id"),
     )

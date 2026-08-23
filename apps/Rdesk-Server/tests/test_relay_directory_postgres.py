@@ -84,6 +84,148 @@ async def test_access_migration_rejects_wrong_types_and_weakened_constraints(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "DROP INDEX ix_session_requests_tenant_id; CREATE UNIQUE INDEX "
+        "ix_session_requests_tenant_id ON session_requests (tenant_id)",
+        "ALTER TABLE session_requests ALTER COLUMN intended_peer_id "
+        "SET DEFAULT 'spoof'",
+        "ALTER TABLE relay_node_registrations ALTER COLUMN physical_host_id "
+        "SET DEFAULT 'untrusted-host'",
+        "ALTER TABLE relay_access_schema_migrations ALTER COLUMN version TYPE BIGINT",
+        "ALTER TABLE relay_access_schema_migrations ALTER COLUMN applied_at DROP DEFAULT",
+        "ALTER TABLE relay_access_schema_migrations DROP CONSTRAINT "
+        "relay_access_schema_migrations_pkey",
+        "INSERT INTO relay_access_schema_migrations (version) VALUES (999)",
+    ],
+)
+async def test_access_migration_rejects_malformed_ledger_and_index_semantics(
+    malformation: str,
+) -> None:
+    assert DATABASE_URL is not None
+    schema = "relay_access_exact_" + re.sub(r"[^a-z0-9]", "", uuid4().hex)
+    admin_engine = create_async_engine(asyncpg_url(DATABASE_URL))
+    async with admin_engine.begin() as connection:
+        await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+    engine = create_async_engine(
+        asyncpg_url(DATABASE_URL),
+        connect_args={"server_settings": {"search_path": schema}},
+    )
+    try:
+        async with engine.begin() as connection:
+            await migrate_relay_control(connection)
+            await connection.run_sync(Base.metadata.create_all)
+            await migrate_relay_access(connection)
+            for statement in malformation.split("; "):
+                await connection.execute(text(statement))
+        with pytest.raises(relay_access_migration.RelayAccessMigrationError):
+            await migrate_relay_access(engine)
+    finally:
+        await engine.dispose()
+        async with admin_engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        await admin_engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_access_migration_normalizes_legacy_device_owner_state() -> None:
+    assert DATABASE_URL is not None
+    schema = "relay_access_owner_backfill_" + re.sub(
+        r"[^a-z0-9]", "", uuid4().hex
+    )
+    admin_engine = create_async_engine(asyncpg_url(DATABASE_URL))
+    async with admin_engine.begin() as connection:
+        await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+    engine = create_async_engine(
+        asyncpg_url(DATABASE_URL),
+        connect_args={"server_settings": {"search_path": schema}},
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with engine.begin() as connection:
+            await migrate_relay_control(connection)
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.execute(
+                text("ALTER TABLE devices DROP CONSTRAINT ck_devices_bound_owner")
+            )
+            await connection.execute(
+                text("ALTER TABLE devices ALTER COLUMN tenant_id DROP NOT NULL")
+            )
+        async with sessions.begin() as setup:
+            owner = User(
+                id="legacy-owner",
+                username="legacy-owner",
+                email="legacy-owner@example.test",
+                password_hash="unused",
+                role="user",
+                tenant_id="tenant-a",
+            )
+            setup.add(owner)
+        async with sessions.begin() as setup:
+            setup.add_all(
+                [
+                    Device(
+                        id="legacy-owned-row",
+                        name="legacy-owned",
+                        device_id="legacy-owned-device",
+                        os="Linux",
+                        tenant_id="default",
+                        is_bound=False,
+                        bound_user_id=owner.id,
+                    ),
+                    Device(
+                        id="legacy-ownerless-row",
+                        name="legacy-ownerless",
+                        device_id="legacy-ownerless-device",
+                        os="Linux",
+                        tenant_id="default",
+                        is_bound=True,
+                        bound_user_id=None,
+                    ),
+                    Device(
+                        id="legacy-valid-row",
+                        name="legacy-valid",
+                        device_id="legacy-valid-device",
+                        os="Linux",
+                        tenant_id="default",
+                        is_bound=True,
+                        bound_user_id=owner.id,
+                    ),
+                ]
+            )
+        async with engine.begin() as connection:
+            await connection.execute(text("UPDATE devices SET tenant_id = NULL"))
+
+        await migrate_relay_access(engine)
+
+        async with sessions() as verification:
+            devices = {
+                device.device_id: device
+                for device in (
+                    await verification.scalars(select(Device))
+                ).all()
+            }
+            owned = devices["legacy-owned-device"]
+            assert owned.is_bound is False
+            assert owned.bound_user_id is None
+            assert owned.tenant_id == "default"
+            ownerless = devices["legacy-ownerless-device"]
+            assert ownerless.is_bound is False
+            assert ownerless.bound_user_id is None
+            assert ownerless.tenant_id == "default"
+            valid = devices["legacy-valid-device"]
+            assert valid.is_bound is True
+            assert valid.bound_user_id == "legacy-owner"
+            assert valid.tenant_id == "tenant-a"
+    finally:
+        await engine.dispose()
+        async with admin_engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        await admin_engine.dispose()
+
+
+@pytest.mark.anyio
 async def test_concurrent_directory_issuance_never_oversubscribes_real_postgres():
     assert DATABASE_URL is not None
     schema = "relay_access_test_" + re.sub(r"[^a-z0-9]", "", uuid4().hex)

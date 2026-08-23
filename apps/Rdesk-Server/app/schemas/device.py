@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Optional
 
 
@@ -23,6 +23,8 @@ class DeviceOut(BaseModel):
 
 class DeviceRegisterRequest(BaseModel):
     """设备注册请求"""
+    model_config = ConfigDict(extra="forbid")
+
     motherboard_serial: str = Field(..., min_length=1, max_length=128, description="主板序列号")
     hostname: str = Field(..., min_length=1, max_length=128, description="主机名")
     os_version: str = Field(..., min_length=1, max_length=256, description="操作系统版本")
@@ -36,25 +38,28 @@ class DeviceRegisterResponse(BaseModel):
     """设备注册响应"""
     device_id: str = Field(..., description="分配的设备ID")
     device_name: str = Field(..., description="设备名称")
-    access_token: str = Field(..., description="访问令牌")
+    access_token: str = Field(..., description="访问令牌", repr=False)
 
 
 class DeviceBindRequest(BaseModel):
     """设备绑定请求"""
+    model_config = ConfigDict(extra="forbid")
+
     device_id: str = Field(..., description="设备ID")
-    user_id: str = Field(..., description="用户ID")
 
 
 class DeviceAutoBindRequest(BaseModel):
     """设备自动绑定请求（登录时使用）"""
+    model_config = ConfigDict(extra="forbid")
+
     device_id: str = Field(..., description="设备ID")
-    user_id: str = Field(..., description="用户ID")
 
 
 class DeviceUnbindRequest(BaseModel):
     """设备解绑请求（登出时使用）"""
+    model_config = ConfigDict(extra="forbid")
+
     device_id: str = Field(..., description="设备ID")
-    user_id: str = Field(..., description="用户ID")
 
 
 class DeviceBindingStatus(BaseModel):

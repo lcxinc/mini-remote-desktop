@@ -3,6 +3,7 @@ import base64
 import hashlib
 import hmac
 import os
+import re
 from typing import Annotated, Optional
 
 from fastapi import Depends, Header, HTTPException, Request, Security, status
@@ -14,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.db.session import get_db
+from app.models.device import Device
 from app.models.user import User
 from app.services.relay_node_auth import (
     RelayAuthError,
@@ -32,6 +34,10 @@ _PASSWORD_VERSION = "v2"
 _PASSWORD_MIN_ITERATIONS = 600_000
 _PASSWORD_MAX_VERIFY_ITERATIONS = 2_000_000
 _LEGACY_PASSWORD_ITERATIONS = 100_000
+_DEVICE_AUTHORIZATION = re.compile(
+    r"^Bearer ([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$",
+    flags=re.ASCII,
+)
 
 
 def hash_password(password: str) -> str:
@@ -145,6 +151,15 @@ relay_ed25519_scheme = APIKeyHeader(
     ),
     auto_error=False,
 )
+device_bearer_scheme = APIKeyHeader(
+    name="X-Rdesk-Device-Authorization",
+    scheme_name="DeviceBearer",
+    description=(
+        "A device-role JWT issued when the physical device is first registered. "
+        "Ownership-changing routes require this together with the user's Bearer JWT."
+    ),
+    auto_error=False,
+)
 
 
 async def get_current_user(
@@ -163,13 +178,14 @@ async def get_current_user(
             raise credentials_exception
         payload = _decode_access_token(credentials.credentials, configured)
         user_id: str = payload.get("sub")
-        if user_id is None:
+        token_role = payload.get("role")
+        if user_id is None or token_role not in {"user", "admin"}:
             raise credentials_exception
     except jwt.JWTError:
         raise credentials_exception
 
     user = await db.scalar(select(User).where(User.id == user_id))
-    if user is None:
+    if user is None or user.role != token_role:
         raise credentials_exception
 
     return user
@@ -188,13 +204,70 @@ async def get_current_user_optional(
             return None
         payload = _decode_access_token(credentials.credentials, configured)
         user_id: str = payload.get("sub")
-        if user_id is None:
+        token_role = payload.get("role")
+        if user_id is None or token_role not in {"user", "admin"}:
             return None
     except jwt.JWTError:
         return None
 
     user = await db.scalar(select(User).where(User.id == user_id))
-    return user
+    return user if user is not None and user.role == token_role else None
+
+
+async def get_current_device(
+    request: Request,
+    _device_marker: Annotated[str | None, Security(device_bearer_scheme)] = None,
+    db: AsyncSession = Depends(get_db),
+) -> Device:
+    _ = _device_marker
+    device = await _device_from_request(request, db, required=True)
+    assert device is not None
+    return device
+
+
+async def get_current_device_optional(
+    request: Request,
+    _device_marker: Annotated[str | None, Security(device_bearer_scheme)] = None,
+    db: AsyncSession = Depends(get_db),
+) -> Device | None:
+    _ = _device_marker
+    return await _device_from_request(request, db, required=False)
+
+
+async def _device_from_request(
+    request: Request, db: AsyncSession, *, required: bool
+) -> Device | None:
+    values = request.headers.getlist("x-rdesk-device-authorization")
+    if not values and not required:
+        return None
+    if len(values) != 1 or not 16 <= len(values[0]) <= 4096:
+        raise _device_credentials_exception()
+    matched = _DEVICE_AUTHORIZATION.fullmatch(values[0])
+    if matched is None:
+        raise _device_credentials_exception()
+    try:
+        configured = _configured_jwt()
+        if configured is None:
+            raise _device_credentials_exception()
+        payload = _decode_access_token(matched.group(1), configured)
+        if payload.get("role") != "device":
+            raise _device_credentials_exception()
+        device_id = payload.get("sub")
+        if not isinstance(device_id, str):
+            raise _device_credentials_exception()
+    except jwt.JWTError:
+        raise _device_credentials_exception() from None
+    device = await db.scalar(select(Device).where(Device.device_id == device_id))
+    if device is None:
+        raise _device_credentials_exception()
+    return device
+
+
+def _device_credentials_exception() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid device authentication credentials",
+    )
 
 
 async def require_admin(
