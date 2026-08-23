@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import hmac
 import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -689,9 +690,9 @@ async def test_access_progressively_reencrypts_old_node_secret_envelopes():
     expected: dict[str, bytes] = {}
     try:
         for relay in session.scalars(select(RelayNode)):
-            secret = hashlib.sha256(
-                f"rotating-{relay.node_id}".encode()
-            ).digest()
+            secret = base64.urlsafe_b64encode(
+                hashlib.sha256(f"rotating-{relay.node_id}".encode()).digest()
+            ).rstrip(b"=")
             expected[relay.node_id] = secret
             envelope = old_cipher.encrypt(
                 secret, associated_data=relay.node_id.encode()
@@ -719,6 +720,58 @@ async def test_access_progressively_reencrypts_old_node_secret_envelopes():
                 relay.encrypted_turn_secret,
                 associated_data=relay.node_id.encode(),
             ) == expected[relay.node_id]
+    finally:
+        session.close()
+        engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_access_upgrades_legacy_raw_secret_envelopes_to_wire_strings():
+    engine, session, service = relay_service_fixture()
+    expected: dict[str, bytes] = {}
+    try:
+        for relay in session.scalars(select(RelayNode)):
+            raw_secret = hashlib.sha256(
+                f"legacy-raw-{relay.node_id}".encode()
+            ).digest()
+            expected[relay.node_id] = base64.urlsafe_b64encode(
+                raw_secret
+            ).rstrip(b"=")
+            envelope = service._credential_issuer._cipher.encrypt(
+                raw_secret, associated_data=relay.node_id.encode()
+            )
+            relay.encrypted_turn_secret = envelope
+            registration = session.get(RelayNodeRegistration, relay.node_id)
+            assert registration is not None
+            registration.encrypted_turn_secret = envelope
+        session.commit()
+
+        result = await service.issue_access(
+            current_user_id="user-42",
+            session_id="session-7",
+            policy_revision=17,
+            intended_peer_id="device-7",
+        )
+
+        credentials = {item.node_id: item for item in result.credentials}
+        for relay in session.scalars(select(RelayNode)):
+            registration = session.get(RelayNodeRegistration, relay.node_id)
+            assert registration is not None
+            assert relay.encrypted_turn_secret == registration.encrypted_turn_secret
+            decrypted = service._credential_issuer._cipher.decrypt(
+                relay.encrypted_turn_secret,
+                associated_data=relay.node_id.encode(),
+            )
+            assert decrypted == expected[relay.node_id]
+            issued = credentials[relay.node_id]
+            coturn_credential = base64.b64encode(
+                hmac.new(
+                    expected[relay.node_id],
+                    issued.username.encode("utf-8"),
+                    hashlib.sha1,
+                ).digest()
+            ).decode("ascii")
+            assert hmac.compare_digest(issued.credential, coturn_credential)
     finally:
         session.close()
         engine.dispose()

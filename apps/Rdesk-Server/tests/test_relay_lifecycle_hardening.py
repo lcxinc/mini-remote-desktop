@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import logging
 import threading
@@ -21,9 +22,11 @@ from sqlalchemy.orm import Session
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from app.core.config import settings
+from app.api.v1.relays import _relay_turn_secret_cipher
 from app.models.relay_node import RelayNode
 from app.models.relay_node_registration import RelayNodeRegistration
 from app.middleware.relay_node_boundary import RelayNodeBoundaryMiddleware
+from app.services.turn_credentials import NodeTurnCredentialService
 from test_relay_node_api import (
     NODE_ID,
     TLS_HEADERS,
@@ -95,6 +98,33 @@ def test_node_generated_turn_secret_is_bound_encrypted_and_never_picked_up(
         node = session.get(RelayNode, NODE_ID)
         registration = session.get(RelayNodeRegistration, NODE_ID)
         assert bytes(node.encrypted_turn_secret) == stored_ciphertext
+        cipher = _relay_turn_secret_cipher()
+        assert cipher.decrypt(
+            bytes(node.encrypted_turn_secret),
+            associated_data=NODE_ID.encode("ascii"),
+        ) == NODE_TURN_SECRET.encode("ascii")
+        now_seconds = int(datetime.now(UTC).timestamp())
+        issued = NodeTurnCredentialService(
+            cipher=cipher, now=lambda: now_seconds
+        ).issue(
+            user_id="user-protocol",
+            session_id="session-protocol",
+            node_id=NODE_ID,
+            urls=list(node.endpoints),
+            encrypted_secret=bytes(node.encrypted_turn_secret),
+            grant_deadline_unix_seconds=now_seconds + 300,
+            directory_deadline_unix_seconds=now_seconds + 300,
+            policy_deadline_unix_seconds=now_seconds + 300,
+            node_deadline_unix_seconds=now_seconds + 300,
+        )
+        coturn_credential = base64.b64encode(
+            hmac.new(
+                NODE_TURN_SECRET.encode("ascii"),
+                issued.username.encode("utf-8"),
+                hashlib.sha1,
+            ).digest()
+        ).decode("ascii")
+        assert hmac.compare_digest(issued.credential, coturn_credential)
         assert node.failure_domain == "rack-admin"
         assert node.physical_host_id == "host-admin"
         assert registration.topology_approved_at is not None

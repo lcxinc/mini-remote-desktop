@@ -179,26 +179,30 @@ class NodeTurnCredentialService:
         secret = self._cipher.decrypt_mutable(
             encrypted_secret, associated_data=node_id.encode("utf-8")
         )
+        wire_secret: bytearray | None = None
         try:
             if not isinstance(secret, bytearray):
                 raise TurnCredentialConfigurationError(
                     "relay credential material is unavailable"
                 )
-            if len(secret) != 32 or len(set(secret)) < 8:
-                raise TurnCredentialConfigurationError(
-                    "relay credential material is unavailable"
-                )
+            wire_secret, legacy_raw_envelope = _coturn_wire_secret(secret)
             credential = base64.b64encode(
-                hmac.new(secret, username.encode("utf-8"), hashlib.sha1).digest()
+                hmac.new(
+                    wire_secret, username.encode("utf-8"), hashlib.sha1
+                ).digest()
             ).decode("ascii")
             reencrypted_secret = (
                 self._cipher.encrypt(
-                    bytes(secret), associated_data=node_id.encode("utf-8")
+                    bytes(wire_secret), associated_data=node_id.encode("utf-8")
                 )
-                if self._cipher.needs_reencrypt(encrypted_secret)
+                if legacy_raw_envelope
+                or self._cipher.needs_reencrypt(encrypted_secret)
                 else None
             )
         finally:
+            if wire_secret is not None and wire_secret is not secret:
+                for index in range(len(wire_secret)):
+                    wire_secret[index] = 0
             for index in range(len(secret)):
                 secret[index] = 0
         return NodeTurnCredential(
@@ -224,3 +228,50 @@ class NodeTurnCredentialService:
             hmac.new(secret, username.encode("utf-8"), hashlib.sha1).digest()
         ).decode("ascii")
         return hmac.compare_digest(expected, credential)
+
+
+def _coturn_wire_secret(secret: bytearray) -> tuple[bytearray, bool]:
+    """Return canonical string bytes and whether a legacy raw envelope was read."""
+
+    if len(secret) == 32 and _raw_turn_secret_has_minimum_quality(secret):
+        return bytearray(base64.urlsafe_b64encode(secret).rstrip(b"=")), True
+    if (
+        len(secret) != 43
+        or any(byte > 0x7F for byte in secret)
+        or re.fullmatch(rb"[A-Za-z0-9_-]{43}", bytes(secret)) is None
+    ):
+        raise TurnCredentialConfigurationError(
+            "relay credential material is unavailable"
+        )
+    decoded = bytearray()
+    try:
+        decoded = bytearray(base64.urlsafe_b64decode(bytes(secret) + b"="))
+        canonical = base64.urlsafe_b64encode(decoded).rstrip(b"=")
+        if (
+            len(decoded) != 32
+            or not hmac.compare_digest(canonical, secret)
+            or not _raw_turn_secret_has_minimum_quality(decoded)
+        ):
+            raise TurnCredentialConfigurationError(
+                "relay credential material is unavailable"
+            )
+        return secret, False
+    except (ValueError, TypeError):
+        raise TurnCredentialConfigurationError(
+            "relay credential material is unavailable"
+        ) from None
+    finally:
+        for index in range(len(decoded)):
+            decoded[index] = 0
+
+
+def _raw_turn_secret_has_minimum_quality(secret: bytes | bytearray) -> bool:
+    lowered = bytes(secret).lower()
+    return (
+        len(secret) == 32
+        and len(set(secret)) >= 8
+        and not any(
+            marker in lowered
+            for marker in (b"placeholder", b"changeme", b"change-me")
+        )
+    )

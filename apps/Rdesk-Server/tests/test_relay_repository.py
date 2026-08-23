@@ -286,7 +286,7 @@ async def test_turn_secret_is_encrypted_at_rest_and_not_in_repr_or_errors(
     assert TURN_SECRET.encode() not in ciphertext
     assert TURN_SECRET not in repr(node)
     assert cipher.decrypt(ciphertext, associated_data=node.node_id.encode()) == (
-        base64.urlsafe_b64decode(turn_secret("node:" + node.node_id) + "=")
+        turn_secret("node:" + node.node_id).encode("ascii")
     )
 
     with pytest.raises(RelayRepositoryError) as error:

@@ -967,13 +967,17 @@ class RelayRegistry:
                     "relay_enrollment_invalid", 400, "relay enrollment invalid"
                 )
             digest = hashlib.sha256(decoded).digest()
-            plaintext = bytes(decoded)
+            # Preserve the canonical configured value as coturn's actual HMAC
+            # key. The decoded bytes are used only for quality validation and
+            # the stable enrollment request digest.
+            plaintext = bytearray(encoded.encode("ascii"))
             try:
                 encrypted = cipher.encrypt(
-                    plaintext, associated_data=node_id.encode("utf-8")
+                    bytes(plaintext), associated_data=node_id.encode("utf-8")
                 )
             finally:
-                del plaintext
+                for index in range(len(plaintext)):
+                    plaintext[index] = 0
             return digest, encrypted
         finally:
             for index in range(len(decoded)):

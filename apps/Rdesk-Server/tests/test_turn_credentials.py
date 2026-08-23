@@ -137,6 +137,59 @@ class MutableRecordingCipher:
         return False
 
 
+def test_node_credential_matches_coturn_canonical_secret_string() -> None:
+    canonical_secret = base64.urlsafe_b64encode(
+        hashlib.sha256(b"coturn-wire-secret").digest()
+    ).rstrip(b"=")
+    cipher = RecordingCipher({"relay-a": canonical_secret})
+    issued = NodeTurnCredentialService(
+        cipher=cipher, ttl_seconds=600, now=lambda: NOW
+    ).issue(
+        user_id="user-42",
+        session_id="session-7",
+        node_id="relay-a",
+        urls=["turn:relay-a.example.test:3478?transport=udp"],
+        encrypted_secret=b"active-envelope",
+        grant_deadline_unix_seconds=NOW + 300,
+        directory_deadline_unix_seconds=NOW + 300,
+        policy_deadline_unix_seconds=NOW + 300,
+        node_deadline_unix_seconds=NOW + 300,
+    )
+    expected = base64.b64encode(
+        hmac.new(
+            canonical_secret, issued.username.encode("utf-8"), hashlib.sha1
+        ).digest()
+    ).decode("ascii")
+    assert hmac.compare_digest(issued.credential, expected)
+    assert issued.reencrypted_secret is None
+
+
+def test_node_credential_upgrades_legacy_raw_secret_to_wire_string() -> None:
+    legacy_raw = hashlib.sha256(b"legacy-raw-secret").digest()
+    canonical_secret = base64.urlsafe_b64encode(legacy_raw).rstrip(b"=")
+    cipher = RecordingCipher({"relay-a": legacy_raw})
+    issued = NodeTurnCredentialService(
+        cipher=cipher, ttl_seconds=600, now=lambda: NOW
+    ).issue(
+        user_id="user-42",
+        session_id="session-7",
+        node_id="relay-a",
+        urls=["turn:relay-a.example.test:3478?transport=udp"],
+        encrypted_secret=b"active-but-legacy-envelope",
+        grant_deadline_unix_seconds=NOW + 300,
+        directory_deadline_unix_seconds=NOW + 300,
+        policy_deadline_unix_seconds=NOW + 300,
+        node_deadline_unix_seconds=NOW + 300,
+    )
+    expected = base64.b64encode(
+        hmac.new(
+            canonical_secret, issued.username.encode("utf-8"), hashlib.sha1
+        ).digest()
+    ).decode("ascii")
+    assert hmac.compare_digest(issued.credential, expected)
+    assert issued.reencrypted_secret == b"active:relay-a:" + canonical_secret
+
+
 def test_node_credential_uses_and_clears_the_cipher_mutable_buffer() -> None:
     cipher = MutableRecordingCipher()
     issuer = NodeTurnCredentialService(
@@ -171,7 +224,9 @@ def test_node_credential_uses_and_clears_the_cipher_mutable_buffer() -> None:
 def test_node_credential_ttl_is_exact_minimum_of_all_server_deadlines(
     deadlines: tuple[int, int, int, int], expected: int
 ):
-    relay_a_secret = hashlib.sha256(b"relay-a-unique-secret").digest()
+    relay_a_secret = base64.urlsafe_b64encode(
+        hashlib.sha256(b"relay-a-unique-secret").digest()
+    ).rstrip(b"=")
     cipher = RecordingCipher({"relay-a": relay_a_secret})
     issuer = NodeTurnCredentialService(
         cipher=cipher, ttl_seconds=600, now=lambda: NOW
@@ -200,8 +255,12 @@ def test_node_credential_ttl_is_exact_minimum_of_all_server_deadlines(
 
 
 def test_node_credentials_are_secret_isolated_and_expire_at_exact_now():
-    relay_a_secret = hashlib.sha256(b"relay-a-unique-secret").digest()
-    relay_b_secret = hashlib.sha256(b"relay-b-unique-secret").digest()
+    relay_a_secret = base64.urlsafe_b64encode(
+        hashlib.sha256(b"relay-a-unique-secret").digest()
+    ).rstrip(b"=")
+    relay_b_secret = base64.urlsafe_b64encode(
+        hashlib.sha256(b"relay-b-unique-secret").digest()
+    ).rstrip(b"=")
     cipher = RecordingCipher({
         "relay-a": relay_a_secret,
         "relay-b": relay_b_secret,
@@ -249,7 +308,9 @@ def test_node_credential_returns_active_envelope_for_old_read_key() -> None:
         def needs_reencrypt(self, ciphertext: bytes) -> bool:
             return ciphertext == b"old-envelope"
 
-    secret = hashlib.sha256(b"rotation-secret").digest()
+    secret = base64.urlsafe_b64encode(
+        hashlib.sha256(b"rotation-secret").digest()
+    ).rstrip(b"=")
     cipher = RotatingCipher({"relay-a": secret})
     issued = NodeTurnCredentialService(
         cipher=cipher, ttl_seconds=60, now=lambda: NOW

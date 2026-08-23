@@ -681,6 +681,10 @@ async def test_different_tokens_cannot_concurrently_replace_the_same_registratio
             )
             assert registration is not None
             assert registration.enrollment_id == enrollment_id
+            assert cipher.decrypt(
+                bytes(registration.encrypted_turn_secret),
+                associated_data=node_id.encode("ascii"),
+            ) == TURN_REST_SECRET.get_secret_value().encode("ascii")
 
 
 @pytest.mark.anyio

@@ -913,7 +913,7 @@ def _valid_general_id(value: object) -> bool:
 
 
 def _validated_turn_secret(value: object) -> bytes:
-    """Accept only the node-agent's canonical 32-byte base64url secret."""
+    """Validate 32-byte entropy while preserving the coturn wire string."""
 
     if (
         not isinstance(value, str)
@@ -923,19 +923,26 @@ def _validated_turn_secret(value: object) -> bytes:
     ):
         raise RelayRepositoryError("INVALID_TURN_SECRET", "TURN secret required")
     try:
-        decoded = base64.urlsafe_b64decode(value + "=")
+        decoded = bytearray(base64.urlsafe_b64decode(value + "="))
     except (ValueError, binascii.Error):
         raise RelayRepositoryError(
             "INVALID_TURN_SECRET", "TURN secret required"
         ) from None
-    canonical = base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii")
-    if (
-        len(decoded) != 32
-        or not hmac.compare_digest(canonical, value)
-        or not _turn_secret_has_minimum_quality(decoded)
-    ):
-        raise RelayRepositoryError("INVALID_TURN_SECRET", "TURN secret required")
-    return decoded
+    try:
+        canonical = base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii")
+        if (
+            len(decoded) != 32
+            or not hmac.compare_digest(canonical, value)
+            or not _turn_secret_has_minimum_quality(decoded)
+        ):
+            raise RelayRepositoryError("INVALID_TURN_SECRET", "TURN secret required")
+        # coturn's static-auth-secret is the configured string, not its decoded
+        # entropy bytes. The representation is canonical, so preserving it is
+        # unambiguous and keeps the agent/server/coturn HMAC keys identical.
+        return value.encode("ascii")
+    finally:
+        for index in range(len(decoded)):
+            decoded[index] = 0
 
 
 def _turn_secret_has_minimum_quality(secret: bytes | bytearray) -> bool:
