@@ -5,6 +5,7 @@ members = [
   "apps/realtime-server",
   "apps/mrd-service",
   "apps/mrd-session-agent",
+  "apps/mrd-relay-agent",
   "common-control-proto",
   "crates/mrd-capture-dxgi",
   "crates/mrd-capture-macos",
