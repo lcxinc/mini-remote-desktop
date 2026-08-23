@@ -158,11 +158,13 @@ def test_sensitive_relay_and_ca_settings_are_secret_types_and_redacted() -> None
         relay_ca_private_key_pem="private-ca-key",
         relay_ca_private_key_password="private-ca-password",
         relay_enrollment_token_pepper="11" * 32,
+        device_enrollment_token_pepper="22" * 32,
     )
     for name, secret in {
         "relay_ca_private_key_pem": "private-ca-key",
         "relay_ca_private_key_password": "private-ca-password",
         "relay_enrollment_token_pepper": "11" * 32,
+        "device_enrollment_token_pepper": "22" * 32,
     }.items():
         value = getattr(configured, name)
         assert isinstance(value, SecretStr)
@@ -183,6 +185,7 @@ def test_env_example_documents_security_controls_without_shipping_secrets() -> N
         "RDESK_JWT_SECRET",
         "RDESK_BOOTSTRAP_ADMIN_PASSWORD",
         "RDESK_TURN_AUTH_SECRET",
+        "RDESK_DEVICE_ENROLLMENT_TOKEN_PEPPER",
         "RDESK_RELAY_ENROLLMENT_TOKEN_PEPPER",
         "RDESK_RELAY_CA_PRIVATE_KEY_PEM",
         "RDESK_RELAY_CA_PRIVATE_KEY_PASSWORD",
@@ -193,6 +196,7 @@ def test_env_example_documents_security_controls_without_shipping_secrets() -> N
         "RDESK_JWT_AUDIENCE",
         "RDESK_JWT_FUTURE_IAT_SKEW_SECONDS",
         "RDESK_PASSWORD_PBKDF2_ITERATIONS",
+        "RDESK_DEVICE_ENROLLMENT_TTL_SECONDS",
         "RDESK_TRUSTED_MTLS_PROXY",
         "RDESK_RELAY_MAX_CLOCK_SKEW_SECONDS",
         "RDESK_RELAY_CERTIFICATE_VALIDITY_SECONDS",

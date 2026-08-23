@@ -1044,11 +1044,31 @@ async def test_migration_rejects_cross_schema_deferrable_reservation_fk() -> Non
         "ALTER TABLE relay_nodes ALTER COLUMN measured_rtt_ms SET DEFAULT 7",
         "DROP INDEX ix_relay_nodes_region; CREATE UNIQUE INDEX "
         "ix_relay_nodes_region ON relay_nodes (region)",
+        "DROP INDEX ix_relay_nodes_region; CREATE INDEX "
+        "ix_relay_nodes_region ON relay_nodes USING HASH (region)",
         "ALTER TABLE relay_node_registrations DROP CONSTRAINT "
         "relay_node_registrations_enrollment_id_fkey; ALTER TABLE "
         "relay_node_registrations ADD CONSTRAINT "
         "relay_node_registrations_enrollment_id_fkey FOREIGN KEY "
         "(enrollment_id) REFERENCES relay_enrollments (id) ON DELETE RESTRICT "
+        "DEFERRABLE INITIALLY DEFERRED",
+        "ALTER TABLE relay_node_registrations DROP CONSTRAINT "
+        "ck_relay_node_registrations_topology; ALTER TABLE "
+        "relay_node_registrations ADD CONSTRAINT "
+        "ck_relay_node_registrations_topology CHECK ("
+        "topology_approved_at IS NULL AND (physical_host_id IS NULL OR "
+        "topology_approved_at IS NOT NULL) AND physical_host_id IS NOT NULL)",
+        "ALTER TABLE relay_nodes DROP CONSTRAINT "
+        "ck_relay_nodes_max_allocations; ALTER TABLE relay_nodes ADD "
+        "CONSTRAINT ck_relay_nodes_max_allocations "
+        "CHECK (max_allocations > 0) NOT VALID",
+        "ALTER TABLE relay_enrollments DROP CONSTRAINT "
+        "relay_enrollments_token_digest_key; ALTER TABLE relay_enrollments "
+        "ADD CONSTRAINT relay_enrollments_token_digest_key "
+        "UNIQUE (token_digest) DEFERRABLE INITIALLY DEFERRED",
+        "ALTER TABLE relay_audit_events DROP CONSTRAINT "
+        "relay_audit_events_pkey; ALTER TABLE relay_audit_events ADD "
+        "CONSTRAINT relay_audit_events_pkey PRIMARY KEY (id) "
         "DEFERRABLE INITIALLY DEFERRED",
         "ALTER TABLE relay_schema_migrations ALTER COLUMN version TYPE BIGINT",
         "ALTER TABLE relay_schema_migrations ALTER COLUMN applied_at DROP DEFAULT",
@@ -1063,6 +1083,30 @@ async def test_control_migration_rejects_semantically_malicious_schema(
         async with engine.begin() as connection:
             for statement in malformation.split("; "):
                 await connection.execute(text(statement))
+        with pytest.raises(relay_migration.RelaySchemaMismatchError):
+            await migrate(engine)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "ALTER TABLE relay_nodes ADD CONSTRAINT ck_relay_nodes_extra_deny "
+        "CHECK (FALSE) NOT VALID",
+        "ALTER TABLE relay_nodes ADD CONSTRAINT relay_nodes_extra_unique "
+        "UNIQUE (region, node_id)",
+        "ALTER TABLE relay_nodes ADD CONSTRAINT relay_nodes_extra_fkey "
+        "FOREIGN KEY (node_id) REFERENCES relay_nodes (node_id)",
+        "CREATE INDEX ix_relay_nodes_extra_partial ON relay_nodes (region) "
+        "WHERE state = 'available'",
+    ],
+)
+async def test_control_migration_rejects_extra_semantic_objects(
+    malformation: str,
+) -> None:
+    async with isolated_postgres_engine() as engine:
+        async with engine.begin() as connection:
+            await connection.execute(text(malformation))
         with pytest.raises(relay_migration.RelaySchemaMismatchError):
             await migrate(engine)
 

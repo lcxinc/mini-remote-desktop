@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import func, select, text
+from sqlalchemy import func, inspect, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.db.migrate_add_relay_access as relay_access_migration
@@ -15,6 +15,7 @@ from app.db.migrate_add_relay_access import migrate as migrate_relay_access
 from app.db.migrate_add_relay_control import migrate as migrate_relay_control
 from app.db.session import Base
 from app.models.device import Device
+from app.models.device_enrollment import DeviceEnrollment
 from app.models.relay_enrollment import RelayEnrollment
 from app.models.relay_node import RelayNode
 from app.models.relay_node_registration import RelayNodeRegistration
@@ -24,6 +25,7 @@ from app.models.user import User
 from app.services.relay_directory import RelayAccessError, RelayAccessService
 from app.services.relay_repository import AesGcmRelaySecretCipher, RelayRepository
 from app.services.relay_signing import Ed25519RelayDirectorySigner
+from app.services.session_grants import SessionGrantPolicy
 from app.services.turn_credentials import NodeTurnCredentialService
 
 
@@ -121,6 +123,110 @@ async def test_access_migration_rejects_malformed_ledger_and_index_semantics(
                 await connection.execute(text(statement))
         with pytest.raises(relay_access_migration.RelayAccessMigrationError):
             await migrate_relay_access(engine)
+    finally:
+        await engine.dispose()
+        async with admin_engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        await admin_engine.dispose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "ALTER TABLE relay_access_schema_migrations ADD CONSTRAINT "
+        "ck_relay_access_ledger_extra_deny CHECK (FALSE) NOT VALID",
+        "CREATE INDEX ix_relay_access_ledger_extra ON "
+        "relay_access_schema_migrations (applied_at)",
+        "ALTER TABLE device_enrollments ADD CONSTRAINT "
+        "ck_device_enrollments_extra_deny CHECK (FALSE) NOT VALID",
+        "ALTER TABLE device_enrollments ADD CONSTRAINT "
+        "device_enrollments_extra_unique UNIQUE (expires_at, id)",
+        "ALTER TABLE device_enrollments ADD CONSTRAINT "
+        "device_enrollments_extra_fkey FOREIGN KEY (registered_device_id) "
+        "REFERENCES device_enrollments (id)",
+        "CREATE INDEX ix_device_enrollments_extra_partial ON "
+        "device_enrollments (expires_at) WHERE consumed_at IS NULL",
+        "DROP INDEX ix_device_enrollments_expiry; CREATE INDEX "
+        "ix_device_enrollments_expiry ON device_enrollments USING HASH "
+        "(expires_at)",
+        "ALTER TABLE device_enrollments DROP CONSTRAINT "
+        "ck_device_enrollments_expiry; ALTER TABLE device_enrollments ADD "
+        "CONSTRAINT ck_device_enrollments_expiry "
+        "CHECK (expires_at > issued_at) NOT VALID",
+        "ALTER TABLE device_enrollments DROP CONSTRAINT "
+        "device_enrollments_token_digest_key; ALTER TABLE device_enrollments "
+        "ADD CONSTRAINT device_enrollments_token_digest_key "
+        "UNIQUE (token_digest) DEFERRABLE INITIALLY DEFERRED",
+        "ALTER TABLE device_enrollments DROP CONSTRAINT "
+        "device_enrollments_pkey; ALTER TABLE device_enrollments ADD "
+        "CONSTRAINT device_enrollments_pkey PRIMARY KEY (id) "
+        "DEFERRABLE INITIALLY DEFERRED",
+    ],
+)
+async def test_access_migration_rejects_extra_managed_semantic_objects(
+    malformation: str,
+) -> None:
+    assert DATABASE_URL is not None
+    schema = "relay_access_extra_" + re.sub(r"[^a-z0-9]", "", uuid4().hex)
+    admin_engine = create_async_engine(asyncpg_url(DATABASE_URL))
+    async with admin_engine.begin() as connection:
+        await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+    engine = create_async_engine(
+        asyncpg_url(DATABASE_URL),
+        connect_args={"server_settings": {"search_path": schema}},
+    )
+    try:
+        async with engine.begin() as connection:
+            await migrate_relay_control(connection)
+            await connection.run_sync(Base.metadata.create_all)
+            await migrate_relay_access(connection)
+            for statement in malformation.split("; "):
+                await connection.execute(text(statement))
+        with pytest.raises(relay_access_migration.RelayAccessMigrationError):
+            await migrate_relay_access(engine)
+    finally:
+        await engine.dispose()
+        async with admin_engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        await admin_engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_access_migration_creates_and_strictly_validates_device_enrollments() -> None:
+    assert DATABASE_URL is not None
+    schema = "relay_access_enrollment_" + re.sub(
+        r"[^a-z0-9]", "", uuid4().hex
+    )
+    admin_engine = create_async_engine(asyncpg_url(DATABASE_URL))
+    async with admin_engine.begin() as connection:
+        await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+    engine = create_async_engine(
+        asyncpg_url(DATABASE_URL),
+        connect_args={"server_settings": {"search_path": schema}},
+    )
+    try:
+        async with engine.begin() as connection:
+            await migrate_relay_control(connection)
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.execute(text("DROP TABLE device_enrollments"))
+        await migrate_relay_access(engine)
+        async with engine.connect() as connection:
+            tables = await connection.run_sync(
+                lambda sync: set(inspect(sync).get_table_names())
+            )
+            versions = list(
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT version FROM relay_access_schema_migrations "
+                            "ORDER BY version"
+                        )
+                    )
+                ).scalars()
+            )
+        assert "device_enrollments" in tables
+        assert versions == [1, 2, 3]
     finally:
         await engine.dispose()
         async with admin_engine.begin() as connection:
@@ -288,22 +394,27 @@ async def test_concurrent_directory_issuance_never_oversubscribes_real_postgres(
                 )
                 setup.add_all([enrollment, node, registration])
             for suffix in ("a", "b"):
-                user = User(
+                requester = User(
                     id=f"pg-user-{suffix}", username=f"pg-user-{suffix}",
                     email=f"pg-{suffix}@example.test", password_hash="unused", role="user",
                     tenant_id="tenant-a",
                 )
-                setup.add(user)
+                owner = User(
+                    id=f"pg-owner-{suffix}", username=f"pg-owner-{suffix}",
+                    email=f"pg-owner-{suffix}@example.test", password_hash="unused",
+                    role="user", tenant_id="tenant-a",
+                )
+                setup.add_all([requester, owner])
                 await setup.flush()
                 device = Device(
                     id=f"pg-device-{suffix}", name="target",
                     device_id=f"pg-device-public-{suffix}", os="linux",
-                    is_bound=True, bound_user_id=user.id, tenant_id="tenant-a",
+                    is_bound=True, bound_user_id=owner.id, tenant_id="tenant-a",
                 )
                 setup.add(device)
                 await setup.flush()
                 grant = SessionRequest(
-                    id=f"pg-session-{suffix}", requester_user_id=user.id,
+                    id=f"pg-session-{suffix}", requester_user_id=requester.id,
                     target_device_id=device.id, signaling_room=f"pg-room-{suffix}",
                     tenant_id="tenant-a", status="approved",
                     grant_expires_at=NOW + timedelta(minutes=5),
@@ -329,6 +440,14 @@ async def test_concurrent_directory_issuance_never_oversubscribes_real_postgres(
                     credential_issuer=NodeTurnCredentialService(
                         cipher=cipher, ttl_seconds=600,
                         now=lambda: int(NOW.timestamp()),
+                    ),
+                    current_policy=SessionGrantPolicy(
+                        revision=17,
+                        grant_ttl_seconds=600,
+                        policy_ttl_seconds=600,
+                        allowed_regions=("ap-east",),
+                        preferred_regions=("ap-east",),
+                        accepted_transports=("udp",),
                     ),
                     directory_ttl_seconds=30,
                     now=lambda: NOW,

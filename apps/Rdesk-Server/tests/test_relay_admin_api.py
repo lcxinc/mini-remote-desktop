@@ -197,5 +197,5 @@ def test_relay_registration_and_audit_tables_are_in_explicit_migration() -> None
     assert "CREATE TABLE IF NOT EXISTS {audit_events}" in migration
     assert "relay_node_registrations" in migration
     assert "relay_audit_events" in migration
-    assert '"relay_node_registrations", schema=schema' in migration
-    assert "relay registration check constraints differ" in migration
+    assert '"relay_node_registrations": {' in migration
+    assert "check constraints differ" in migration

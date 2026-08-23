@@ -489,7 +489,7 @@ def _normalize_check_expression(expression: object) -> str:
         return ""
     without_casts = _CHECK_CAST.sub("", expression.lower())
     without_numeric_quotes = re.sub(r"'([0-9]+)'", r"\1", without_casts)
-    return re.sub(r'[\s()"]+', "", without_numeric_quotes)
+    return re.sub(r'[\s"]+', "", without_numeric_quotes)
 
 
 def _normalize_server_default(value: object) -> str:
@@ -548,6 +548,18 @@ def _assert_migration_ledger(
         or tuple(primary_key.get("constrained_columns") or ()) != ("version",)
     ):
         raise RelaySchemaMismatchError("relay migration ledger primary key differs")
+    effective_schema = schema or sync_connection.scalar(
+        text("SELECT current_schema()")
+    )
+    if not isinstance(effective_schema, str):
+        raise RelaySchemaMismatchError("relay migration ledger schema differs")
+    _assert_constraint_states(
+        sync_connection,
+        schema=effective_schema,
+        table_name=table_name,
+        expected_types={"relay_schema_migrations_pkey": "p"},
+    )
+    _assert_empty_semantic_objects(inspector, table_name, schema)
     table = _table(schema, table_name)
     actual_versions = set(
         sync_connection.execute(text(f"SELECT version FROM {table}")).scalars()
@@ -580,6 +592,110 @@ def _index_matches(index: object, columns: tuple[str, ...]) -> bool:
         or dialect.get("postgresql_where") is not None
         or dialect.get("postgresql_ops")
     )
+
+
+def _standalone_indexes(
+    inspector: object, table_name: str, schema: str | None
+) -> dict[str, dict[str, object]]:
+    return {
+        index["name"]: index
+        for index in inspector.get_indexes(table_name, schema=schema)
+        if not index.get("duplicates_constraint")
+    }
+
+
+def _index_access_method(
+    connection: object, *, schema: str, index_name: str
+) -> str | None:
+    return connection.scalar(
+        text(
+            "SELECT am.amname FROM pg_class index_class "
+            "JOIN pg_namespace namespace ON namespace.oid = index_class.relnamespace "
+            "JOIN pg_am am ON am.oid = index_class.relam "
+            "WHERE namespace.nspname = :schema AND index_class.relname = :name "
+            "AND index_class.relkind = 'i'"
+        ),
+        {"schema": schema, "name": index_name},
+    )
+
+
+def _foreign_key_signature(
+    key: dict[str, object], *, current_schema: str
+) -> tuple[object, ...]:
+    options = key.get("options") or {}
+    return (
+        key.get("name"),
+        tuple(key.get("constrained_columns") or ()),
+        key.get("referred_schema") or current_schema,
+        key.get("referred_table"),
+        tuple(key.get("referred_columns") or ()),
+        str(options.get("ondelete") or "NO ACTION").upper(),
+        str(options.get("onupdate") or "NO ACTION").upper(),
+        bool(options.get("deferrable", False)),
+        options.get("initially"),
+        str(options.get("match") or "SIMPLE").upper(),
+    )
+
+
+def _assert_empty_semantic_objects(
+    inspector: object, table_name: str, schema: str | None
+) -> None:
+    if (
+        inspector.get_check_constraints(table_name, schema=schema)
+        or inspector.get_unique_constraints(table_name, schema=schema)
+        or inspector.get_foreign_keys(table_name, schema=schema)
+        or _standalone_indexes(inspector, table_name, schema)
+    ):
+        raise RelaySchemaMismatchError(
+            f"relay schema mismatch for {table_name}: semantic objects differ"
+        )
+
+
+def _constraint_states(
+    connection: object, *, schema: str, table_name: str
+) -> dict[str, tuple[str, bool, bool, bool]]:
+    rows = connection.execute(
+        text(
+            "SELECT constraint_row.conname, constraint_row.contype, "
+            "constraint_row.convalidated, constraint_row.condeferrable, "
+            "constraint_row.condeferred FROM pg_constraint constraint_row "
+            "JOIN pg_class table_row ON table_row.oid = constraint_row.conrelid "
+            "JOIN pg_namespace namespace ON namespace.oid = table_row.relnamespace "
+            "WHERE namespace.nspname = :schema AND table_row.relname = :table_name "
+            "AND constraint_row.contype IN ('p', 'u', 'c', 'f', 'x')"
+        ),
+        {"schema": schema, "table_name": table_name},
+    )
+    return {
+        str(row.conname): (
+            row.contype.decode("ascii")
+            if isinstance(row.contype, bytes)
+            else str(row.contype),
+            bool(row.convalidated),
+            bool(row.condeferrable),
+            bool(row.condeferred),
+        )
+        for row in rows
+    }
+
+
+def _assert_constraint_states(
+    connection: object,
+    *,
+    schema: str,
+    table_name: str,
+    expected_types: dict[str, str],
+) -> None:
+    expected = {
+        name: (constraint_type, True, False, False)
+        for name, constraint_type in expected_types.items()
+    }
+    if _constraint_states(
+        connection, schema=schema, table_name=table_name
+    ) != expected:
+        raise RelaySchemaMismatchError(
+            f"relay schema mismatch for {table_name}: constraint states differ"
+        )
 
 
 def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None:
@@ -729,66 +845,65 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
                 f"relay schema mismatch for {table_name}: primary key differs"
             )
 
-    required_checks = {
-        "ck_relay_nodes_state": (
-            "state = ANY (ARRAY['available', 'degraded', 'draining', "
-            "'unavailable', 'revoked'])"
-        ),
-        "ck_relay_nodes_max_allocations": "max_allocations > 0",
-        "ck_relay_nodes_active_allocations": (
-            "active_allocations >= 0 AND active_allocations <= max_allocations"
-        ),
-        "ck_relay_nodes_max_egress": "max_egress_bps > 0",
-        "ck_relay_nodes_current_egress": "current_egress_bps >= 0",
-        "ck_relay_nodes_heartbeat_sequence": "heartbeat_sequence >= 0",
-        "ck_relay_nodes_healthy_heartbeat_streak": (
-            "healthy_heartbeat_streak >= 0 AND healthy_heartbeat_streak <= 3"
-        ),
-        "ck_relay_nodes_measured_rtt": (
-            "measured_rtt_ms IS NULL OR "
-            "(measured_rtt_ms >= 0 AND measured_rtt_ms <= 4294967295)"
-        ),
-        "ck_relay_nodes_recent_failure": (
-            "recent_failure_bps >= 0 AND recent_failure_bps <= 10000"
-        ),
-        "ck_relay_nodes_physical_host": (
-            "physical_host_id IS NULL OR "
-            "(length(physical_host_id) >= 1 AND length(physical_host_id) <= 128)"
-        ),
+    expected_checks = {
+        "relay_nodes": {
+            "ck_relay_nodes_state": (
+                "state = ANY (ARRAY['available', 'degraded', 'draining', "
+                "'unavailable', 'revoked'])"
+            ),
+            "ck_relay_nodes_max_allocations": "max_allocations > 0",
+            "ck_relay_nodes_active_allocations": (
+                "active_allocations >= 0 AND active_allocations <= max_allocations"
+            ),
+            "ck_relay_nodes_max_egress": "max_egress_bps > 0",
+            "ck_relay_nodes_current_egress": "current_egress_bps >= 0",
+            "ck_relay_nodes_heartbeat_sequence": "heartbeat_sequence >= 0",
+            "ck_relay_nodes_healthy_heartbeat_streak": (
+                "healthy_heartbeat_streak >= 0 AND healthy_heartbeat_streak <= 3"
+            ),
+            "ck_relay_nodes_measured_rtt": (
+                "measured_rtt_ms IS NULL OR "
+                "measured_rtt_ms >= 0 AND measured_rtt_ms <= 4294967295"
+            ),
+            "ck_relay_nodes_recent_failure": (
+                "recent_failure_bps >= 0 AND recent_failure_bps <= 10000"
+            ),
+            "ck_relay_nodes_physical_host": (
+                "physical_host_id IS NULL OR "
+                "length(physical_host_id) >= 1 AND length(physical_host_id) <= 128"
+            ),
+        },
+        "relay_enrollments": {},
+        "relay_reservations": {},
+        "relay_node_registrations": {
+            "ck_relay_node_registrations_status": (
+                "status = ANY (ARRAY['pending', 'approved', 'revoked'])"
+            ),
+            "ck_relay_node_registrations_topology": (
+                "topology_approved_at IS NULL AND physical_host_id IS NULL OR "
+                "topology_approved_at IS NOT NULL AND physical_host_id IS NOT NULL"
+            ),
+            "ck_relay_node_registrations_turn_secret": (
+                "encrypted_turn_secret IS NULL OR length(encrypted_turn_secret) >= 30"
+            ),
+        },
+        "relay_audit_events": {},
     }
-    checks = {
-        constraint["name"]: _normalize_check_expression(constraint["sqltext"])
-        for constraint in inspector.get_check_constraints("relay_nodes", schema=schema)
-    }
-    if any(
-        name not in checks
-        or checks[name] != _normalize_check_expression(expression)
-        for name, expression in required_checks.items()
-    ):
-        raise RelaySchemaMismatchError("relay node check constraints differ")
-    registration_checks = {
-        constraint["name"]: _normalize_check_expression(constraint["sqltext"])
-        for constraint in inspector.get_check_constraints(
-            "relay_node_registrations", schema=schema
-        )
-    }
-    expected_registration_checks = {
-        "ck_relay_node_registrations_status": (
-            "status = ANY (ARRAY['pending', 'approved', 'revoked'])"
-        ),
-        "ck_relay_node_registrations_topology": (
-            "(topology_approved_at IS NULL AND physical_host_id IS NULL) OR "
-            "(topology_approved_at IS NOT NULL AND physical_host_id IS NOT NULL)"
-        ),
-        "ck_relay_node_registrations_turn_secret": (
-            "encrypted_turn_secret IS NULL OR length(encrypted_turn_secret) >= 30"
-        ),
-    }
-    if any(
-        registration_checks.get(name) != _normalize_check_expression(expression)
-        for name, expression in expected_registration_checks.items()
-    ):
-        raise RelaySchemaMismatchError("relay registration check constraints differ")
+    for table_name, expected in expected_checks.items():
+        actual = {
+            constraint["name"]: _normalize_check_expression(constraint["sqltext"])
+            for constraint in inspector.get_check_constraints(
+                table_name, schema=schema
+            )
+        }
+        normalized_expected = {
+            name: _normalize_check_expression(expression)
+            for name, expression in expected.items()
+        }
+        if actual != normalized_expected:
+            raise RelaySchemaMismatchError(
+                f"relay schema mismatch for {table_name}: check constraints differ"
+            )
 
     expected_unique = {
         "relay_nodes": {
@@ -812,55 +927,66 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
                 table_name, schema=schema
             )
         }
-        if any(actual.get(name) != columns for name, columns in required.items()):
+        if actual != required:
             raise RelaySchemaMismatchError(
                 f"relay schema mismatch for {table_name}: unique constraints differ"
             )
 
-    foreign_keys = inspector.get_foreign_keys("relay_reservations", schema=schema)
     expected_referred_schema = schema
     if expected_referred_schema is None:
         expected_referred_schema = sync_connection.scalar(
             text("SELECT current_schema()")
         )
-    matching_foreign_keys = []
-    for key in foreign_keys:
-        options = key.get("options") or {}
-        referred_schema = key.get("referred_schema") or expected_referred_schema
-        if (
-            key.get("name") == "relay_reservations_node_id_fkey"
-            and tuple(key["constrained_columns"]) == ("node_id",)
-            and referred_schema == expected_referred_schema
-            and key["referred_table"] == "relay_nodes"
-            and tuple(key["referred_columns"]) == ("node_id",)
-            and options.get("ondelete") == "CASCADE"
-            and options.get("deferrable") in {None, False}
-            and options.get("initially") is None
-        ):
-            matching_foreign_keys.append(key)
-    if len(foreign_keys) != 1 or len(matching_foreign_keys) != 1:
-        raise RelaySchemaMismatchError("relay reservation foreign key differs")
+    expected_foreign_keys = {
+        "relay_nodes": set(),
+        "relay_enrollments": set(),
+        "relay_reservations": {
+            (
+                "relay_reservations_node_id_fkey", ("node_id",),
+                expected_referred_schema, "relay_nodes", ("node_id",),
+                "CASCADE", "NO ACTION", False, None, "SIMPLE",
+            )
+        },
+        "relay_node_registrations": {
+            (
+                "relay_node_registrations_enrollment_id_fkey", ("enrollment_id",),
+                expected_referred_schema, "relay_enrollments", ("id",),
+                "RESTRICT", "NO ACTION", False, None, "SIMPLE",
+            )
+        },
+        "relay_audit_events": set(),
+    }
+    for table_name, expected in expected_foreign_keys.items():
+        actual = {
+            _foreign_key_signature(key, current_schema=expected_referred_schema)
+            for key in inspector.get_foreign_keys(table_name, schema=schema)
+        }
+        if actual != expected:
+            raise RelaySchemaMismatchError(
+                f"relay schema mismatch for {table_name}: foreign keys differ"
+            )
 
-    registration_foreign_keys = inspector.get_foreign_keys(
-        "relay_node_registrations", schema=schema
-    )
-    if len(registration_foreign_keys) != 1:
-        raise RelaySchemaMismatchError("relay registration foreign key differs")
-    registration_key = registration_foreign_keys[0]
-    registration_options = registration_key.get("options") or {}
-    registration_schema = registration_key.get("referred_schema") or expected_referred_schema
-    if (
-        registration_key.get("name")
-        != "relay_node_registrations_enrollment_id_fkey"
-        or tuple(registration_key.get("constrained_columns") or ()) != ("enrollment_id",)
-        or registration_schema != expected_referred_schema
-        or registration_key.get("referred_table") != "relay_enrollments"
-        or tuple(registration_key.get("referred_columns") or ()) != ("id",)
-        or registration_options.get("ondelete") != "RESTRICT"
-        or registration_options.get("deferrable") not in {None, False}
-        or registration_options.get("initially") is not None
-    ):
-        raise RelaySchemaMismatchError("relay registration foreign key differs")
+    for table_name in specs:
+        primary_key_name = expected_primary_keys[table_name][0]
+        expected_constraint_types = {primary_key_name: "p"}
+        expected_constraint_types.update(
+            {name: "c" for name in expected_checks[table_name]}
+        )
+        expected_constraint_types.update(
+            {name: "u" for name in expected_unique[table_name]}
+        )
+        expected_constraint_types.update(
+            {
+                str(signature[0]): "f"
+                for signature in expected_foreign_keys[table_name]
+            }
+        )
+        _assert_constraint_states(
+            sync_connection,
+            schema=expected_referred_schema,
+            table_name=table_name,
+            expected_types=expected_constraint_types,
+        )
 
     expected_indexes = {
         "relay_nodes": {
@@ -887,17 +1013,27 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
         },
     }
     for table_name, required in expected_indexes.items():
-        actual = {
-            index["name"]: index
-            for index in inspector.get_indexes(table_name, schema=schema)
-        }
-        if any(
-            not _index_matches(actual.get(name), columns)
+        actual = _standalone_indexes(inspector, table_name, schema)
+        if set(actual) != set(required) or any(
+            not _index_matches(actual[name], columns)
+            or _index_access_method(
+                sync_connection,
+                schema=expected_referred_schema,
+                index_name=name,
+            )
+            != "btree"
             for name, columns in required.items()
         ):
             raise RelaySchemaMismatchError(
                 f"relay schema mismatch for {table_name}: indexes differ"
             )
+
+
+def assert_relay_schema_conforms(
+    sync_connection: object, schema: str | None = None
+) -> None:
+    """Validate the complete relay-control schema without mutating it."""
+    _assert_schema_conforms(sync_connection, schema)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,11 @@ from app.services.relay_signing import (
     RelayReservationOut,
     SignedRelayDirectoryOut,
 )
+from app.services.session_grants import (
+    SessionGrantError,
+    SessionGrantPolicy,
+    validate_session_grant_policy,
+)
 from app.services.turn_credentials import NodeTurnCredential, NodeTurnCredentialService
 
 
@@ -132,6 +137,7 @@ class RelayAccessService:
         repository: RelayRepository,
         signer: RelayDirectorySigner,
         credential_issuer: NodeTurnCredentialService,
+        current_policy: SessionGrantPolicy,
         directory_ttl_seconds: int = 30,
         now: Callable[[], datetime] | None = None,
     ) -> None:
@@ -141,6 +147,7 @@ class RelayAccessService:
         self._repository = repository
         self._signer = signer
         self._credential_issuer = credential_issuer
+        self._current_policy = current_policy
         self._directory_ttl_seconds = directory_ttl_seconds
         self._now = now or (lambda: datetime.now(UTC))
 
@@ -199,6 +206,7 @@ class RelayAccessService:
                     requested_policy_revision=policy_revision,
                     requested_peer_id=intended_peer_id,
                     now=now,
+                    current_policy=self._current_policy,
                 )
                 policy = _policy_from_grant(grant)
                 rows = await self._session.execute(
@@ -603,6 +611,7 @@ def authorize_relay_grant(
     requested_policy_revision: int,
     requested_peer_id: str,
     now: datetime,
+    current_policy: SessionGrantPolicy,
 ) -> None:
     """Validate a row-locked grant without revealing which binding failed."""
 
@@ -615,6 +624,7 @@ def authorize_relay_grant(
     participant = current_user_id in {requester_id, owner_id}
     valid = (
         participant
+        and requester_id != owner_id
         and getattr(current_user, "id", None) == current_user_id
         and getattr(requester_user, "id", None) == requester_id
         and getattr(target_owner, "id", None) == owner_id
@@ -637,9 +647,52 @@ def authorize_relay_grant(
         and requested_policy_revision > 0
         and requested_policy_revision == getattr(grant, "policy_revision", None)
         and requested_peer_id == getattr(grant, "intended_peer_id", None)
+        and _grant_conforms_to_current_policy(
+            grant=grant,
+            current_policy=current_policy,
+            requested_policy_revision=requested_policy_revision,
+            now=now,
+        )
     )
     if not valid:
         raise RelayAccessError("relay_access_denied", 403, "relay access denied")
+
+
+def _grant_conforms_to_current_policy(
+    *,
+    grant: object,
+    current_policy: SessionGrantPolicy,
+    requested_policy_revision: int,
+    now: datetime,
+) -> bool:
+    try:
+        validate_session_grant_policy(current_policy)
+    except (SessionGrantError, AttributeError, TypeError):
+        return False
+    grant_expiry = getattr(grant, "grant_expires_at", None)
+    policy_expiry = getattr(grant, "policy_expires_at", None)
+    if not isinstance(grant_expiry, datetime) or not isinstance(
+        policy_expiry, datetime
+    ):
+        return False
+    grant_deadline = _utc(grant_expiry)
+    policy_deadline = _utc(policy_expiry)
+    return (
+        requested_policy_revision
+        == getattr(grant, "policy_revision", None)
+        == current_policy.revision
+        and getattr(grant, "relay_allowed_regions", None)
+        == list(current_policy.allowed_regions)
+        and getattr(grant, "relay_preferred_regions", None)
+        == list(current_policy.preferred_regions)
+        and getattr(grant, "relay_accepted_transports", None)
+        == list(current_policy.accepted_transports)
+        and policy_deadline <= grant_deadline
+        and grant_deadline
+        <= now + timedelta(seconds=current_policy.grant_ttl_seconds)
+        and policy_deadline
+        <= now + timedelta(seconds=current_policy.policy_ttl_seconds)
+    )
 
 
 def intended_peer_digest(peer_id: str) -> str:

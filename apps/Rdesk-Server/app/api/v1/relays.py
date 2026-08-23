@@ -60,6 +60,7 @@ from app.services.relay_signing import (
     Ed25519RelayDirectorySigner,
     SignedRelayDirectoryOut,
 )
+from app.services.session_grants import configured_session_grant_policy
 from app.services.turn_credentials import NodeTurnCredentialService
 
 
@@ -261,6 +262,7 @@ def get_relay_access_service(
             repository=repository,
             signer=signer,
             credential_issuer=issuer,
+            current_policy=configured_session_grant_policy(settings),
             directory_ttl_seconds=settings.relay_directory_ttl_seconds,
         )
     except (ValueError, TypeError, binascii.Error):

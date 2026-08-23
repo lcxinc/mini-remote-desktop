@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     jwt_expire_minutes: int = 60
     jwt_max_lifetime_minutes: int = 60 * 24
     jwt_future_iat_skew_seconds: int = 60
+    device_enrollment_token_pepper: SecretStr = SecretStr("")
+    device_enrollment_ttl_seconds: int = 300
     password_pbkdf2_iterations: int = 600_000
     bootstrap_admin_enabled: bool = False
     bootstrap_admin_username: str = ""

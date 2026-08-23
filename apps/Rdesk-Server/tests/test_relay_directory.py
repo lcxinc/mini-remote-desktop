@@ -38,10 +38,28 @@ from app.models.user import User
 from app.schemas.relay import RelayEnrollmentRequest
 from app.services.relay_repository import AesGcmRelaySecretCipher, RelayRepository
 from app.services.relay_signing import Ed25519RelayDirectorySigner
+from app.services.session_grants import (
+    SessionGrantPolicy,
+    configured_session_grant_policy,
+)
 from app.services.turn_credentials import NodeTurnCredentialService
 
 
 NOW = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
+
+
+def current_grant_policy(
+    *, revision: int = 17,
+    accepted_transports: tuple[str, ...] = ("udp", "tcp", "tls"),
+) -> SessionGrantPolicy:
+    return SessionGrantPolicy(
+        grant_ttl_seconds=600,
+        policy_ttl_seconds=600,
+        revision=revision,
+        allowed_regions=("ap-east", "eu-west"),
+        preferred_regions=("ap-east", "eu-west"),
+        accepted_transports=accepted_transports,
+    )
 
 
 def node(
@@ -254,6 +272,9 @@ def test_grant_authorization_fails_closed_without_enumerating_reason(change):
         "grant_expires_at": NOW + timedelta(minutes=5), "policy_revision": 17,
         "policy_expires_at": NOW + timedelta(minutes=4),
         "intended_peer_id": "device-7",
+        "relay_allowed_regions": ["ap-east", "eu-west"],
+        "relay_preferred_regions": ["ap-east", "eu-west"],
+        "relay_accepted_transports": ["udp", "tcp", "tls"],
     }
     values.update(change)
     grant = SimpleNamespace(**values)
@@ -269,6 +290,7 @@ def test_grant_authorization_fails_closed_without_enumerating_reason(change):
             current_user=SimpleNamespace(id="user-42", tenant_id="tenant-a"),
             current_user_id="user-42",
             requested_policy_revision=17, requested_peer_id="device-7", now=NOW,
+            current_policy=current_grant_policy(),
         )
     assert error.value.code == "relay_access_denied"
     assert "session-7" not in str(error.value)
@@ -282,6 +304,9 @@ def test_only_real_session_participants_are_authorized():
         status="approved", grant_expires_at=NOW + timedelta(minutes=5),
         policy_revision=17, policy_expires_at=NOW + timedelta(minutes=4),
         intended_peer_id="device-7",
+        relay_allowed_regions=["ap-east", "eu-west"],
+        relay_preferred_regions=["ap-east", "eu-west"],
+        relay_accepted_transports=["udp", "tcp", "tls"],
     )
     device = SimpleNamespace(
         id="device-7", bound_user_id="owner-9", is_bound=True,
@@ -294,6 +319,7 @@ def test_only_real_session_participants_are_authorized():
         current_user=SimpleNamespace(id="owner-9", tenant_id="tenant-a"),
         current_user_id="owner-9",
         requested_policy_revision=17, requested_peer_id="device-7", now=NOW,
+        current_policy=current_grant_policy(),
     )
     with pytest.raises(RelayAccessError, match="denied"):
         authorize_relay_grant(
@@ -303,6 +329,7 @@ def test_only_real_session_participants_are_authorized():
             current_user=SimpleNamespace(id="attacker", tenant_id="tenant-a"),
             current_user_id="attacker",
             requested_policy_revision=17, requested_peer_id="device-7", now=NOW,
+            current_policy=current_grant_policy(),
         )
 
 
@@ -313,6 +340,9 @@ def test_stored_intended_peer_must_be_the_bound_target_device():
         status="approved", grant_expires_at=NOW + timedelta(minutes=5),
         policy_revision=17, policy_expires_at=NOW + timedelta(minutes=4),
         intended_peer_id="unrelated-device",
+        relay_allowed_regions=["ap-east", "eu-west"],
+        relay_preferred_regions=["ap-east", "eu-west"],
+        relay_accepted_transports=["udp", "tcp", "tls"],
     )
     device = SimpleNamespace(
         id="device-7", bound_user_id="owner-9", is_bound=True,
@@ -326,6 +356,57 @@ def test_stored_intended_peer_must_be_the_bound_target_device():
             current_user=SimpleNamespace(id="user-42", tenant_id="tenant-a"),
             current_user_id="user-42",
             requested_policy_revision=17, requested_peer_id="unrelated-device", now=NOW,
+            current_policy=current_grant_policy(),
+        )
+    assert error.value.code == "relay_access_denied"
+
+
+@pytest.mark.parametrize(
+    "case", ["revision-bump", "transport-change", "self-grant"]
+)
+def test_current_policy_and_distinct_participants_are_revalidated(case: str) -> None:
+    requester_id = "user-42"
+    owner_id = requester_id if case == "self-grant" else "owner-9"
+    grant = SimpleNamespace(
+        id="session-7",
+        requester_user_id=requester_id,
+        target_device_id="device-7",
+        tenant_id="tenant-a",
+        status="approved",
+        grant_expires_at=NOW + timedelta(minutes=5),
+        policy_revision=17,
+        policy_expires_at=NOW + timedelta(minutes=4),
+        intended_peer_id="device-7",
+        relay_allowed_regions=["ap-east", "eu-west"],
+        relay_preferred_regions=["ap-east", "eu-west"],
+        relay_accepted_transports=["udp", "tcp", "tls"],
+    )
+    device = SimpleNamespace(
+        id="device-7",
+        bound_user_id=owner_id,
+        is_bound=True,
+        tenant_id="tenant-a",
+    )
+    with pytest.raises(RelayAccessError) as error:
+        authorize_relay_grant(
+            grant=grant,
+            target_device=device,
+            requester_user=SimpleNamespace(
+                id=requester_id, tenant_id="tenant-a"
+            ),
+            target_owner=SimpleNamespace(id=owner_id, tenant_id="tenant-a"),
+            current_user=SimpleNamespace(id=requester_id, tenant_id="tenant-a"),
+            current_user_id=requester_id,
+            requested_policy_revision=17,
+            requested_peer_id="device-7",
+            now=NOW,
+            current_policy=current_grant_policy(
+                revision=18 if case == "revision-bump" else 17,
+                accepted_transports=(
+                    ("udp",) if case == "transport-change"
+                    else ("udp", "tcp", "tls")
+                ),
+            ),
         )
     assert error.value.code == "relay_access_denied"
 
@@ -516,6 +597,7 @@ def relay_service_fixture():
         credential_issuer=NodeTurnCredentialService(
             cipher=cipher, ttl_seconds=600, now=lambda: int(NOW.timestamp())
         ),
+        current_policy=current_grant_policy(),
         directory_ttl_seconds=30, now=lambda: NOW,
     )
     return engine, session, service
@@ -540,6 +622,29 @@ async def test_both_bound_participants_reuse_capacity_without_double_reserving()
             item.node_id for item in owner.directory.payload.candidates
         ]
         assert session.scalar(select(func.count()).select_from(RelayReservation)) == 2
+    finally:
+        session.close()
+        engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_historical_self_grant_is_rejected_before_any_reservation():
+    engine, session, service = relay_service_fixture()
+    try:
+        device = session.get(Device, "device-7")
+        device.bound_user_id = "user-42"
+        session.commit()
+        with pytest.raises(RelayAccessError) as error:
+            await service.issue_access(
+                current_user_id="user-42",
+                session_id="session-7",
+                policy_revision=17,
+                intended_peer_id="device-7",
+            )
+        assert error.value.code == "relay_access_denied"
+        assert session.scalar(
+            select(func.count()).select_from(RelayReservation)
+        ) == 0
     finally:
         session.close()
         engine.dispose()
@@ -930,8 +1035,8 @@ def test_production_request_owner_approval_and_both_participant_access_flow(
     engine, session, service = relay_service_fixture()
     try:
         anchor = datetime.now(UTC)
-        service._now = lambda: anchor
-        service._credential_issuer._now = lambda: int(anchor.timestamp())
+        service._now = lambda: datetime.now(UTC)
+        service._credential_issuer._now = lambda: int(datetime.now(UTC).timestamp())
         for relay in session.scalars(select(RelayNode)):
             relay.lease_expires_at = anchor + timedelta(seconds=15)
         for registration in session.scalars(select(RelayNodeRegistration)):
@@ -946,6 +1051,7 @@ def test_production_request_owner_approval_and_both_participant_access_flow(
             "relay_accepted_transports": "udp,tcp,tls",
         }.items():
             monkeypatch.setitem(settings.__dict__, name, value)
+        service._current_policy = configured_session_grant_policy(settings)
         current = SimpleNamespace(user=session.get(User, "user-42"))
         async_session = service._session
 
@@ -983,6 +1089,19 @@ def test_production_request_owner_approval_and_both_participant_access_flow(
             access = client.post("/api/v1/relays/access", json=access_payload)
             assert access.status_code == 200, access.text
             assert access.json()["credentials"]
+
+        reservations_before_bump = session.scalar(
+            select(func.count()).select_from(RelayReservation)
+        )
+        monkeypatch.setitem(settings.__dict__, "relay_policy_revision", 24)
+        service._current_policy = configured_session_grant_policy(settings)
+        current.user = session.get(User, "user-42")
+        revoked = client.post("/api/v1/relays/access", json=access_payload)
+        assert revoked.status_code == 403
+        assert revoked.json()["detail"]["code"] == "relay_access_denied"
+        assert session.scalar(
+            select(func.count()).select_from(RelayReservation)
+        ) == reservations_before_bump
     finally:
         session.close()
         engine.dispose()

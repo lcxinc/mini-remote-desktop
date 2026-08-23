@@ -85,7 +85,7 @@ class SessionGrantService:
     async def approve(
         self, *, session_id: str, current_user_id: str
     ) -> SessionRequest:
-        _validate_policy(self._policy)
+        validate_session_grant_policy(self._policy)
         grant = await self._session.scalar(
             select(SessionRequest)
             .where(SessionRequest.id == session_id)
@@ -186,7 +186,7 @@ def _csv(value: object, *, region: bool) -> tuple[str, ...]:
     return values if all(item in _TRANSPORTS for item in values) else ()
 
 
-def _validate_policy(policy: SessionGrantPolicy) -> None:
+def validate_session_grant_policy(policy: SessionGrantPolicy) -> None:
     valid = (
         isinstance(policy.grant_ttl_seconds, int)
         and not isinstance(policy.grant_ttl_seconds, bool)

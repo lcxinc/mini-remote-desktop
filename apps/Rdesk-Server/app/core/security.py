@@ -38,6 +38,7 @@ _DEVICE_AUTHORIZATION = re.compile(
     r"^Bearer ([A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)$",
     flags=re.ASCII,
 )
+_DEVICE_ENROLLMENT = re.compile(r"^[A-Za-z0-9_-]{43}$", flags=re.ASCII)
 
 
 def hash_password(password: str) -> str:
@@ -160,6 +161,15 @@ device_bearer_scheme = APIKeyHeader(
     ),
     auto_error=False,
 )
+device_enrollment_scheme = APIKeyHeader(
+    name="X-Rdesk-Device-Enrollment",
+    scheme_name="DeviceEnrollment",
+    description=(
+        "Administrator-issued, one-use device enrollment token required for "
+        "the first registration of a physical device."
+    ),
+    auto_error=False,
+)
 
 
 async def get_current_user(
@@ -232,6 +242,27 @@ async def get_current_device_optional(
 ) -> Device | None:
     _ = _device_marker
     return await _device_from_request(request, db, required=False)
+
+
+async def get_device_enrollment_token_optional(
+    request: Request,
+    _enrollment_marker: Annotated[
+        str | None, Security(device_enrollment_scheme)
+    ] = None,
+) -> SecretStr | None:
+    _ = _enrollment_marker
+    values = request.headers.getlist("x-rdesk-device-enrollment")
+    if not values:
+        return None
+    if len(values) != 1 or _DEVICE_ENROLLMENT.fullmatch(values[0]) is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "device_enrollment_invalid",
+                "message": "device enrollment invalid",
+            },
+        )
+    return SecretStr(values[0])
 
 
 async def _device_from_request(

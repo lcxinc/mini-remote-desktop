@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict, Field
 from typing import Optional
 
@@ -39,6 +41,12 @@ class DeviceRegisterResponse(BaseModel):
     device_id: str = Field(..., description="分配的设备ID")
     device_name: str = Field(..., description="设备名称")
     access_token: str = Field(..., description="访问令牌", repr=False)
+
+
+class DeviceEnrollmentTokenOut(BaseModel):
+    enrollment_id: str
+    token: str = Field(repr=False)
+    expires_at: datetime
 
 
 class DeviceBindRequest(BaseModel):

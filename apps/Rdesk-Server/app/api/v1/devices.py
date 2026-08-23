@@ -2,31 +2,40 @@ import re
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import SecretStr
 from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.config import settings
 from app.core.security import (
     create_access_token,
+    get_device_enrollment_token_optional,
     get_current_device,
     get_current_device_optional,
     get_current_user,
     get_current_user_optional,
+    require_admin,
 )
 from app.db.session import get_db
-from app.models.device import Device, generate_device_id_from_serial
+from app.models.device import Device
 from app.models.user import User
 from app.schemas.device import (
     DeviceAutoBindRequest,
     DeviceAutoBindResponse,
     DeviceBindRequest,
     DeviceBindingStatus,
+    DeviceEnrollmentTokenOut,
     DeviceOut,
     DeviceRegisterRequest,
     DeviceRegisterResponse,
     DeviceRenameRequest,
     DeviceRenameResponse,
     DeviceUnbindRequest,
+)
+from app.services.device_enrollment import (
+    DeviceEnrollmentError,
+    DeviceEnrollmentService,
 )
 
 router = APIRouter(prefix="/devices", tags=["devices"])
@@ -56,11 +65,41 @@ def _to_out(device: Device) -> DeviceOut:
     )
 
 
+@router.post(
+    "/enrollment-tokens",
+    response_model=DeviceEnrollmentTokenOut,
+    responses={
+        403: {"description": "Administrator role required."},
+        503: {"description": "Device enrollment is unavailable."},
+    },
+)
+async def issue_device_enrollment_token(
+    current_admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> DeviceEnrollmentTokenOut:
+    try:
+        issued = await _device_enrollment_service(db).issue(
+            admin_user_id=current_admin.id
+        )
+        await _commit(db)
+    except DeviceEnrollmentError as error:
+        await db.rollback()
+        _raise_device_enrollment(error)
+    return DeviceEnrollmentTokenOut(
+        enrollment_id=issued.enrollment_id,
+        token=issued.token.get_secret_value(),
+        expires_at=issued.expires_at,
+    )
+
+
 @router.post("/register", response_model=DeviceRegisterResponse)
 async def register_device(
     payload: DeviceRegisterRequest,
     current_user: User | None = Depends(get_current_user_optional),
     current_device: Device | None = Depends(get_current_device_optional),
+    enrollment_token: SecretStr | None = Depends(
+        get_device_enrollment_token_optional
+    ),
     db: AsyncSession = Depends(get_db),
 ) -> DeviceRegisterResponse:
     """
@@ -69,29 +108,59 @@ async def register_device(
     根据主板序列号生成设备ID。如果设备已存在，返回现有设备信息。
     如果设备不存在，创建新设备。
     """
-    # 检查设备是否已存在
-    existing = await db.scalar(
-        select(Device)
-        .where(Device.motherboard_serial == payload.motherboard_serial)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
+    if enrollment_token is not None:
+        try:
+            registered = await _device_enrollment_service(db).register(
+                token=enrollment_token,
+                registration=payload.model_dump(mode="json"),
+            )
+            await _commit(db)
+            await db.refresh(registered.device)
+        except DeviceEnrollmentError as error:
+            await db.rollback()
+            _raise_device_enrollment(error)
+        access_token = create_access_token(
+            registered.device.device_id,
+            registered.device.name,
+            "device",
+        )
+        return DeviceRegisterResponse(
+            device_id=registered.device.device_id,
+            device_name=registered.device.name,
+            access_token=access_token,
+        )
+
+    # Without a one-time enrollment, this route is refresh-only. Authenticate
+    # before any serial lookup so an anonymous caller (or an unrelated device)
+    # cannot use response differences as a registration oracle.
+    is_admin = current_user is not None and current_user.role == "admin"
+    if not is_admin and current_device is None:
+        _deny_device_registration(401)
+    if is_admin:
+        existing = await db.scalar(
+            select(Device)
+            .where(Device.motherboard_serial == payload.motherboard_serial)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    else:
+        assert current_device is not None
+        existing = await db.scalar(
+            select(Device)
+            .where(Device.id == current_device.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if (
+            existing is None
+            or existing.motherboard_serial != payload.motherboard_serial
+        ):
+            _deny_device_registration(403)
 
     # 根据 OS 版本确定 OS 类型
     os_type = payload.os_version.split()[0] if payload.os_version else "Unknown"
 
     if existing:
-        if current_user is None or current_user.role != "admin":
-            if current_device is None:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Device proof required",
-                )
-            if current_device.id != existing.id:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Device proof does not match",
-                )
         # 设备已存在，更新信息
         if payload.hostname:
             existing.hostname = payload.hostname
@@ -121,45 +190,12 @@ async def register_device(
             access_token=access_token,
         )
     else:
-        # 新设备，生成设备ID
-        device_id = generate_device_id_from_serial(payload.motherboard_serial)
-
-        # 检查 device_id 是否冲突（极小概率）
-        id_conflict = await db.scalar(
-            select(Device).where(Device.device_id == device_id)
-        )
-        if id_conflict:
-            # 如果冲突，添加随机后缀
-            import uuid
-            device_id = f"{device_id}-{uuid.uuid4().hex[:4]}"
-
-        device_name = payload.device_name or payload.hostname
-
-        new_device = Device(
-            name=device_name,
-            device_id=device_id,
-            os=os_type,
-            os_version=payload.os_version,
-            hostname=payload.hostname,
-            motherboard_serial=payload.motherboard_serial,
-            cpu_info=payload.cpu_info,
-            total_memory_mb=payload.total_memory_mb,
-            gpu_info=payload.gpu_info,
-            is_bound=False,
-        )
-        db.add(new_device)
-        await db.commit()
-        await db.refresh(new_device)
-
-        # 生成访问令牌
-        access_token = create_access_token(
-            new_device.device_id, new_device.name, "device"
-        )
-
-        return DeviceRegisterResponse(
-            device_id=new_device.device_id,
-            device_name=new_device.name,
-            access_token=access_token,
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "device_enrollment_required",
+                "message": "device enrollment required",
+            },
         )
 
 
@@ -394,6 +430,47 @@ async def _commit(db: AsyncSession) -> None:
     except Exception:
         await db.rollback()
         raise
+
+
+def _device_enrollment_service(db: AsyncSession) -> DeviceEnrollmentService:
+    configured = settings.device_enrollment_token_pepper
+    raw_pepper = (
+        configured.get_secret_value()
+        if isinstance(configured, SecretStr)
+        else configured
+    )
+    try:
+        pepper = bytes.fromhex(raw_pepper)
+        return DeviceEnrollmentService(
+            db,
+            token_pepper=pepper,
+            ttl_seconds=settings.device_enrollment_ttl_seconds,
+        )
+    except (AttributeError, TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "device_enrollment_unavailable",
+                "message": "device enrollment unavailable",
+            },
+        ) from None
+
+
+def _raise_device_enrollment(error: DeviceEnrollmentError) -> None:
+    raise HTTPException(
+        status_code=error.status_code,
+        detail={"code": error.code, "message": str(error)},
+    ) from None
+
+
+def _deny_device_registration(status_code: int) -> None:
+    raise HTTPException(
+        status_code=status_code,
+        detail={
+            "code": "device_registration_denied",
+            "message": "device registration denied",
+        },
+    )
 
 
 def _naive_utc(value: datetime) -> datetime:
