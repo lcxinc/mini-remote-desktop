@@ -193,6 +193,65 @@ async def test_access_migration_rejects_extra_managed_semantic_objects(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "ALTER TABLE users ADD CONSTRAINT ck_users_extra_deny "
+        "CHECK (FALSE) NOT VALID",
+        "ALTER TABLE devices ADD CONSTRAINT devices_extra_unique "
+        "UNIQUE (name, id)",
+        "ALTER TABLE session_requests ADD CONSTRAINT "
+        "session_requests_extra_self_fkey FOREIGN KEY (id) "
+        "REFERENCES session_requests (id)",
+        "CREATE INDEX ix_users_extra_admin_partial ON users (username) "
+        "WHERE role = 'admin'",
+    ],
+)
+async def test_access_migration_rejects_auth_table_schema_drift_and_rolls_back(
+    malformation: str,
+) -> None:
+    assert DATABASE_URL is not None
+    schema = "relay_access_auth_exact_" + re.sub(
+        r"[^a-z0-9]", "", uuid4().hex
+    )
+    admin_engine = create_async_engine(asyncpg_url(DATABASE_URL))
+    async with admin_engine.begin() as connection:
+        await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+    engine = create_async_engine(
+        asyncpg_url(DATABASE_URL),
+        connect_args={"server_settings": {"search_path": schema}},
+    )
+    try:
+        async with engine.begin() as connection:
+            await migrate_relay_control(connection)
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.execute(text(malformation))
+
+        with pytest.raises(relay_access_migration.RelayAccessMigrationError):
+            await migrate_relay_access(engine)
+
+        async with engine.connect() as connection:
+            ledger_exists = await connection.run_sync(
+                lambda sync: inspect(sync).has_table(
+                    "relay_access_schema_migrations"
+                )
+            )
+            checks = await connection.run_sync(
+                lambda sync: {
+                    item["name"]
+                    for item in inspect(sync).get_check_constraints("users")
+                }
+            )
+        assert ledger_exists is False
+        assert "ck_users_tenant_id_canonical" not in checks
+    finally:
+        await engine.dispose()
+        async with admin_engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        await admin_engine.dispose()
+
+
+@pytest.mark.anyio
 async def test_access_migration_creates_and_strictly_validates_device_enrollments() -> None:
     assert DATABASE_URL is not None
     schema = "relay_access_enrollment_" + re.sub(

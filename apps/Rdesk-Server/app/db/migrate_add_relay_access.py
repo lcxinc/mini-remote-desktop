@@ -406,12 +406,14 @@ def _verify_migration_ledger(
         raise RelayAccessMigrationError("relay access migration ledger versions differ")
 
 
-def _index_matches(index: object, columns: tuple[str, ...]) -> bool:
+def _index_matches(
+    index: object, columns: tuple[str, ...], *, unique: bool = False
+) -> bool:
     if not isinstance(index, dict):
         return False
     if tuple(index.get("column_names") or ()) != columns:
         return False
-    if index.get("unique") is not False:
+    if index.get("unique") is not unique:
         return False
     sorting = index.get("column_sorting") or {}
     if any(
@@ -425,6 +427,7 @@ def _index_matches(index: object, columns: tuple[str, ...]) -> bool:
         or dialect.get("postgresql_include")
         or dialect.get("postgresql_where") is not None
         or dialect.get("postgresql_ops")
+        or dialect.get("postgresql_nulls_not_distinct") is True
     )
 
 
@@ -453,6 +456,33 @@ def _index_access_method(
     )
 
 
+def _verify_exact_indexes(
+    connection: object,
+    inspector: object,
+    *,
+    schema: str | None,
+    current_schema: str,
+    table_name: str,
+    expected: dict[str, tuple[tuple[str, ...], bool]],
+) -> None:
+    actual = _standalone_indexes(inspector, table_name, schema)
+    if set(actual) != set(expected):
+        raise RelayAccessMigrationError(
+            f"relay access indexes differ for {table_name}"
+        )
+    if any(
+        not _index_matches(actual[name], columns, unique=unique)
+        or _index_access_method(
+            connection, schema=current_schema, index_name=name
+        )
+        != "btree"
+        for name, (columns, unique) in expected.items()
+    ):
+        raise RelayAccessMigrationError(
+            f"relay access indexes differ for {table_name}"
+        )
+
+
 def _foreign_key_signature(
     key: dict[str, object], *, current_schema: str
 ) -> tuple[object, ...]:
@@ -468,6 +498,33 @@ def _foreign_key_signature(
         bool(options.get("deferrable", False)),
         options.get("initially"),
         str(options.get("match") or "SIMPLE").upper(),
+    )
+
+
+def _unique_constraint_signature(
+    constraint: dict[str, object],
+) -> tuple[object, ...]:
+    dialect = constraint.get("dialect_options") or {}
+    return (
+        constraint.get("name"),
+        tuple(constraint.get("column_names") or ()),
+        bool(dialect.get("postgresql_nulls_not_distinct", False)),
+        tuple(constraint.get("include_columns") or ()),
+        tuple(dialect.get("postgresql_include") or ()),
+    )
+
+
+def _primary_key_matches(
+    primary_key: dict[str, object],
+    *,
+    name: str,
+    columns: tuple[str, ...],
+) -> bool:
+    dialect = primary_key.get("dialect_options") or {}
+    return (
+        primary_key.get("name") == name
+        and tuple(primary_key.get("constrained_columns") or ()) == columns
+        and not dialect.get("postgresql_include")
     )
 
 
@@ -571,9 +628,10 @@ def _verify_device_enrollment_table(
                 f"relay access device enrollment differs for {name}"
             )
     primary_key = inspector.get_pk_constraint(table_name, schema=schema)
-    if (
-        primary_key.get("name") != "device_enrollments_pkey"
-        or tuple(primary_key.get("constrained_columns") or ()) != ("id",)
+    if not _primary_key_matches(
+        primary_key,
+        name="device_enrollments_pkey",
+        columns=("id",),
     ):
         raise RelayAccessMigrationError(
             "relay access device enrollment primary key differs"
@@ -608,13 +666,19 @@ def _verify_device_enrollment_table(
         )
 
     actual_unique = {
-        constraint["name"]: tuple(constraint["column_names"])
+        _unique_constraint_signature(constraint)
         for constraint in inspector.get_unique_constraints(
             table_name, schema=schema
         )
     }
     if actual_unique != {
-        "device_enrollments_token_digest_key": ("token_digest",)
+        (
+            "device_enrollments_token_digest_key",
+            ("token_digest",),
+            False,
+            (),
+            (),
+        )
     }:
         raise RelayAccessMigrationError(
             "relay access device enrollment unique constraints differ"
@@ -654,17 +718,14 @@ def _verify_device_enrollment_table(
         exact=True,
     )
 
-    indexes = _standalone_indexes(inspector, table_name, schema)
-    if set(indexes) != {"ix_device_enrollments_expiry"} or not _index_matches(
-        indexes["ix_device_enrollments_expiry"], ("expires_at",)
-    ) or _index_access_method(
+    _verify_exact_indexes(
         connection,
-        schema=current_schema,
-        index_name="ix_device_enrollments_expiry",
-    ) != "btree":
-        raise RelayAccessMigrationError(
-            "relay access device enrollment indexes differ"
-        )
+        inspector,
+        schema=schema,
+        current_schema=current_schema,
+        table_name=table_name,
+        expected={"ix_device_enrollments_expiry": (("expires_at",), False)},
+    )
 
 
 def _verify(connection: object, schema: str | None) -> None:
@@ -747,39 +808,119 @@ def _verify(connection: object, schema: str | None) -> None:
             item["name"]: _normalize_check_expression(item["sqltext"])
             for item in inspector.get_check_constraints(table_name, schema=schema)
         }
-        if any(
-            checks.get(name) != _normalize_check_expression(expression)
+        normalized_expected = {
+            name: _normalize_check_expression(expression)
             for name, expression in expected.items()
-        ):
+        }
+        if checks != normalized_expected:
             raise RelayAccessMigrationError(
                 f"relay access checks differ for {table_name}"
             )
 
-    _verify_foreign_key(
-        inspector, schema, expected_schema=effective_schema,
-        table="devices", name="devices_bound_user_id_fkey",
-        constrained=("bound_user_id",), referred_table="users",
-        referred=("id",), ondelete="RESTRICT",
-    )
-    for name, constrained, referred_table, referred, ondelete in (
-        ("session_requests_requester_user_id_fkey", ("requester_user_id",), "users", ("id",), "CASCADE"),
-        ("session_requests_target_device_id_fkey", ("target_device_id",), "devices", ("id",), "CASCADE"),
-        ("session_requests_intended_peer_id_fkey", ("intended_peer_id",), "devices", ("id",), "CASCADE"),
-    ):
-        _verify_foreign_key(
-            inspector, schema, expected_schema=effective_schema,
-            table="session_requests", name=name,
-            constrained=constrained, referred_table=referred_table,
-            referred=referred, ondelete=ondelete,
-        )
+    primary_keys = {
+        "users": ("users_pkey", ("id",)),
+        "devices": ("devices_pkey", ("id",)),
+        "session_requests": ("session_requests_pkey", ("id",)),
+    }
+    for table_name, (name, columns) in primary_keys.items():
+        if not _primary_key_matches(
+            inspector.get_pk_constraint(table_name, schema=schema),
+            name=name,
+            columns=columns,
+        ):
+            raise RelayAccessMigrationError(
+                f"relay access primary key differs for {table_name}"
+            )
+
+    for table_name in primary_keys:
+        actual_unique = {
+            _unique_constraint_signature(constraint)
+            for constraint in inspector.get_unique_constraints(
+                table_name, schema=schema
+            )
+        }
+        if actual_unique:
+            raise RelayAccessMigrationError(
+                f"relay access unique constraints differ for {table_name}"
+            )
+
+    expected_foreign_keys = {
+        "users": set(),
+        "devices": {
+            (
+                "devices_bound_user_id_fkey",
+                ("bound_user_id",),
+                effective_schema,
+                "users",
+                ("id",),
+                "RESTRICT",
+                "NO ACTION",
+                False,
+                None,
+                "SIMPLE",
+            )
+        },
+        "session_requests": {
+            (
+                "session_requests_requester_user_id_fkey",
+                ("requester_user_id",),
+                effective_schema,
+                "users",
+                ("id",),
+                "CASCADE",
+                "NO ACTION",
+                False,
+                None,
+                "SIMPLE",
+            ),
+            (
+                "session_requests_target_device_id_fkey",
+                ("target_device_id",),
+                effective_schema,
+                "devices",
+                ("id",),
+                "CASCADE",
+                "NO ACTION",
+                False,
+                None,
+                "SIMPLE",
+            ),
+            (
+                "session_requests_intended_peer_id_fkey",
+                ("intended_peer_id",),
+                effective_schema,
+                "devices",
+                ("id",),
+                "CASCADE",
+                "NO ACTION",
+                False,
+                None,
+                "SIMPLE",
+            ),
+        },
+    }
+    for table_name, expected in expected_foreign_keys.items():
+        actual = {
+            _foreign_key_signature(key, current_schema=effective_schema)
+            for key in inspector.get_foreign_keys(table_name, schema=schema)
+        }
+        if actual != expected:
+            raise RelayAccessMigrationError(
+                f"relay access foreign keys differ for {table_name}"
+            )
 
     required_constraint_types = {
-        "users": {name: "c" for name in required_checks["users"]},
+        "users": {
+            "users_pkey": "p",
+            **{name: "c" for name in required_checks["users"]},
+        },
         "devices": {
+            "devices_pkey": "p",
             **{name: "c" for name in required_checks["devices"]},
             "devices_bound_user_id_fkey": "f",
         },
         "session_requests": {
+            "session_requests_pkey": "p",
             **{name: "c" for name in required_checks["session_requests"]},
             "session_requests_requester_user_id_fkey": "f",
             "session_requests_target_device_id_fkey": "f",
@@ -792,37 +933,42 @@ def _verify(connection: object, schema: str | None) -> None:
             schema=effective_schema,
             table_name=table_name,
             expected_types=expected_types,
-            exact=False,
+            exact=True,
         )
 
     required_indexes = {
-        "users": {"ix_users_tenant_id": ("tenant_id",)},
+        "users": {
+            "ix_users_email": (("email",), True),
+            "ix_users_tenant_id": (("tenant_id",), False),
+            "ix_users_username": (("username",), True),
+        },
         "devices": {
-            "ix_devices_tenant_id": ("tenant_id",),
-            "ix_devices_bound_user_id": ("bound_user_id",),
+            "ix_devices_bound_user_id": (("bound_user_id",), False),
+            "ix_devices_device_id": (("device_id",), True),
+            "ix_devices_motherboard_serial": (("motherboard_serial",), True),
+            "ix_devices_name": (("name",), False),
+            "ix_devices_tenant_id": (("tenant_id",), False),
         },
         "session_requests": {
-            "ix_session_requests_tenant_id": ("tenant_id",),
-            "ix_session_requests_requester_user_id": ("requester_user_id",),
-            "ix_session_requests_target_device_id": ("target_device_id",),
+            "ix_session_requests_requester_user_id": (
+                ("requester_user_id",), False
+            ),
+            "ix_session_requests_signaling_room": (("signaling_room",), False),
+            "ix_session_requests_target_device_id": (
+                ("target_device_id",), False
+            ),
+            "ix_session_requests_tenant_id": (("tenant_id",), False),
         },
     }
     for table_name, expected in required_indexes.items():
-        actual = {
-            item["name"]: item
-            for item in inspector.get_indexes(table_name, schema=schema)
-        }
-        if any(
-            not _index_matches(actual.get(name), columns)
-            or _index_access_method(
-                connection, schema=effective_schema, index_name=name
-            )
-            != "btree"
-            for name, columns in expected.items()
-        ):
-            raise RelayAccessMigrationError(
-                f"relay access indexes differ for {table_name}"
-            )
+        _verify_exact_indexes(
+            connection,
+            inspector,
+            schema=schema,
+            current_schema=effective_schema,
+            table_name=table_name,
+            expected=expected,
+        )
 
     relay_specs = {
         "relay_nodes": {
@@ -924,42 +1070,6 @@ def _verify(connection: object, schema: str | None) -> None:
         index_name="ix_relay_nodes_physical_host",
     ) != "btree":
         raise RelayAccessMigrationError("relay topology indexes differ")
-
-
-def _verify_foreign_key(
-    inspector: object,
-    schema: str | None,
-    *,
-    expected_schema: str,
-    table: str,
-    name: str,
-    constrained: tuple[str, ...],
-    referred_table: str,
-    referred: tuple[str, ...],
-    ondelete: str,
-) -> None:
-    keys = {
-        key.get("name"): key
-        for key in inspector.get_foreign_keys(table, schema=schema)
-    }
-    key = keys.get(name)
-    options = (key or {}).get("options") or {}
-    referred_schema = (key or {}).get("referred_schema") or expected_schema
-    if (
-        key is None
-        or tuple(key.get("constrained_columns") or ()) != constrained
-        or key.get("referred_table") != referred_table
-        or referred_schema != expected_schema
-        or tuple(key.get("referred_columns") or ()) != referred
-        or options.get("ondelete") != ondelete
-        or str(options.get("onupdate") or "NO ACTION").upper() != "NO ACTION"
-        or options.get("deferrable") not in {None, False}
-        or options.get("initially") is not None
-        or str(options.get("match") or "SIMPLE").upper() != "SIMPLE"
-    ):
-        raise RelayAccessMigrationError(
-            f"relay access foreign key differs for {table}.{name}"
-        )
 
 
 async def _add_constraint(

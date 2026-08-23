@@ -435,6 +435,70 @@ def test_openapi_requires_user_and_device_security_together(
     assert issue["security"] == [{"HTTPBearer": []}]
 
 
+def test_device_registration_check_rejects_non_admin_before_serial_query(
+    device_api: SimpleNamespace,
+) -> None:
+    serial_queries: list[str] = []
+
+    class SerialQuerySpy(AsyncSessionShim):
+        async def scalar(self, *args: object, **kwargs: object) -> object:
+            statement = str(args[0]) if args else ""
+            if "devices.motherboard_serial" in statement:
+                serial_queries.append(statement)
+            return await super().scalar(*args, **kwargs)
+
+    async def override_db():
+        yield SerialQuerySpy(device_api.session)
+
+    device_api.app.dependency_overrides[get_db] = override_db
+    headers_by_caller = (
+        {},
+        {"Authorization": f"Bearer {device_api.user_token}"},
+        {
+            "X-Rdesk-Device-Authorization":
+                f"Bearer {device_api.device_token}"
+        },
+    )
+    for headers in headers_by_caller:
+        known = device_api.client.get(
+            "/api/v1/devices/check/serial-a", headers=headers
+        )
+        unknown = device_api.client.get(
+            "/api/v1/devices/check/serial-unknown", headers=headers
+        )
+        assert known.status_code == unknown.status_code == 403
+        assert known.json() == unknown.json()
+
+    assert serial_queries == []
+
+
+def test_device_registration_check_is_admin_inventory_only(
+    device_api: SimpleNamespace,
+) -> None:
+    headers = {"Authorization": f"Bearer {device_api.admin_token}"}
+
+    known = device_api.client.get(
+        "/api/v1/devices/check/serial-a", headers=headers
+    )
+    unknown = device_api.client.get(
+        "/api/v1/devices/check/serial-unknown", headers=headers
+    )
+
+    assert known.status_code == unknown.status_code == 200
+    assert known.json() == {
+        "registered": True,
+        "device_id": device_api.device.device_id,
+        "device_name": device_api.device.name,
+        "is_bound": False,
+    }
+    assert unknown.json() == {"registered": False}
+    operation = device_api.app.openapi()["paths"][
+        "/api/v1/devices/check/{motherboard_serial}"
+    ]["get"]
+    assert operation["deprecated"] is True
+    assert operation["security"] == [{"HTTPBearer": []}]
+
+
 def _asyncpg_url(url: str) -> str:
     if url.startswith("postgresql://"):
         return "postgresql+asyncpg://" + url.removeprefix("postgresql://")

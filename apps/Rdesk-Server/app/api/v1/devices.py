@@ -199,13 +199,18 @@ async def register_device(
         )
 
 
-@router.get("/check/{motherboard_serial}")
+@router.get(
+    "/check/{motherboard_serial}",
+    deprecated=True,
+    summary="Check device registration (admin inventory only)",
+)
 async def check_device_registration(
     motherboard_serial: str,
+    _admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """
-    检查设备是否已注册
+    检查设备是否已注册。设备接入应直接使用管理员签发的 enrollment token。
     """
     device = await db.scalar(
         select(Device).where(Device.motherboard_serial == motherboard_serial)
