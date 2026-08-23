@@ -1,7 +1,7 @@
 #[cfg(test)]
 use crate::cleanup::{reserve_cleanup_slot_from, CleanupSupervisor};
 #[cfg(test)]
-use std::sync::Weak;
+use std::sync::{Barrier, Weak};
 use std::{
     fmt,
     future::Future,
@@ -58,6 +58,7 @@ const DISCONNECTED_GRACE_PERIOD: Duration = Duration::from_secs(2);
 const BULK_BUFFER_HIGH_WATERMARK: usize = 64 * 1024;
 const BULK_SEND_PACING_INTERVAL: Duration = Duration::from_millis(1);
 const PHYSICAL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+const PHYSICAL_CLEANUP_RETRY: &str = "physical cleanup admission rolled back; retry required";
 const RESTART_VALIDATION_TIMEOUT: Duration = Duration::from_secs(10);
 const RESTART_PROBE_PREFIX: &[u8] = b"mrd-webrtc-restart-probe-v1:";
 static NEXT_RESTART_ROUTE_ID: AtomicU64 = AtomicU64::new(1);
@@ -449,101 +450,203 @@ impl Drop for RestartValidationGuard<'_> {
 #[derive(Debug)]
 enum PhysicalShutdownState {
     Open,
+    Enqueuing { deadline: Instant },
     Closing { deadline: Instant },
     Closed { error: Option<String> },
     Quarantined { error: String },
 }
 
-#[derive(Debug)]
+struct PhysicalLifecycle {
+    state: PhysicalShutdownState,
+    physical: Option<PhysicalPeer>,
+}
+
 struct PhysicalShutdown {
-    state: StdMutex<PhysicalShutdownState>,
+    lifecycle: StdMutex<PhysicalLifecycle>,
     completed: Notify,
+}
+
+impl fmt::Debug for PhysicalShutdown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        f.debug_struct("PhysicalShutdown")
+            .field("state", &lifecycle.state)
+            .field("has_physical", &lifecycle.physical.is_some())
+            .finish()
+    }
 }
 
 impl Default for PhysicalShutdown {
     fn default() -> Self {
         Self {
-            state: StdMutex::new(PhysicalShutdownState::Open),
+            lifecycle: StdMutex::new(PhysicalLifecycle {
+                state: PhysicalShutdownState::Open,
+                physical: None,
+            }),
             completed: Notify::new(),
         }
     }
 }
 
 impl PhysicalShutdown {
-    fn accepted(&self, timeout: Duration) {
-        let mut state = self
-            .state
+    fn install(&self, physical: PhysicalPeer) {
+        let mut lifecycle = self
+            .lifecycle
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        debug_assert!(matches!(*state, PhysicalShutdownState::Open));
-        *state = PhysicalShutdownState::Closing {
-            deadline: Instant::now()
-                .checked_add(timeout)
-                .unwrap_or_else(Instant::now),
+        debug_assert!(matches!(lifecycle.state, PhysicalShutdownState::Open));
+        debug_assert!(lifecycle.physical.is_none());
+        lifecycle.physical = Some(physical);
+    }
+
+    fn begin(&self, timeout: Duration) -> Result<Option<PhysicalPeer>, TransportError> {
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match lifecycle.state {
+            PhysicalShutdownState::Open => {
+                let physical = lifecycle.physical.take().ok_or_else(|| {
+                    TransportError::Message("physical cleanup ownership is unavailable".into())
+                })?;
+                lifecycle.state = PhysicalShutdownState::Enqueuing {
+                    deadline: cleanup_deadline(timeout),
+                };
+                Ok(Some(physical))
+            }
+            PhysicalShutdownState::Enqueuing { .. }
+            | PhysicalShutdownState::Closing { .. }
+            | PhysicalShutdownState::Closed { .. }
+            | PhysicalShutdownState::Quarantined { .. } => Ok(None),
+        }
+    }
+
+    fn accepted(&self, timeout: Duration) {
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        lifecycle.state = match lifecycle.state {
+            PhysicalShutdownState::Enqueuing { deadline } => {
+                PhysicalShutdownState::Closing { deadline }
+            }
+            PhysicalShutdownState::Open if lifecycle.physical.is_none() => {
+                PhysicalShutdownState::Closing {
+                    deadline: cleanup_deadline(timeout),
+                }
+            }
+            _ => return,
         };
+        drop(lifecycle);
+        self.completed.notify_waiters();
+    }
+
+    fn rollback(&self, physical: PhysicalPeer) {
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        debug_assert!(matches!(
+            lifecycle.state,
+            PhysicalShutdownState::Enqueuing { .. }
+        ));
+        debug_assert!(lifecycle.physical.is_none());
+        lifecycle.physical = Some(physical);
+        lifecycle.state = PhysicalShutdownState::Open;
+        drop(lifecycle);
+        self.completed.notify_waiters();
+    }
+
+    fn physical_snapshot(&self) -> Result<PhysicalSnapshot, TransportError> {
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let physical = lifecycle
+            .physical
+            .as_ref()
+            .ok_or_else(|| TransportError::Message("peer connection is closing".into()))?;
+        Ok(PhysicalSnapshot {
+            pc: Arc::clone(&physical.pc),
+            control: Arc::clone(&physical.control),
+            active_tasks: Arc::clone(&physical.active_tasks),
+            h264_sender: Arc::clone(&physical.h264_sender),
+        })
     }
 
     fn is_started(&self) -> bool {
         !matches!(
-            *self
-                .state
+            self.lifecycle
                 .lock()
-                .unwrap_or_else(|poison| poison.into_inner()),
+                .unwrap_or_else(|poison| poison.into_inner())
+                .state,
             PhysicalShutdownState::Open
         )
     }
 
     fn is_finished(&self) -> bool {
         matches!(
-            *self
-                .state
+            self.lifecycle
                 .lock()
-                .unwrap_or_else(|poison| poison.into_inner()),
+                .unwrap_or_else(|poison| poison.into_inner())
+                .state,
             PhysicalShutdownState::Closed { .. }
         )
     }
 
     fn complete(&self, error: Option<String>) {
-        let mut state = self
-            .state
+        let mut lifecycle = self
+            .lifecycle
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        debug_assert!(matches!(*state, PhysicalShutdownState::Closing { .. }));
-        *state = PhysicalShutdownState::Closed { error };
-        drop(state);
+        debug_assert!(matches!(
+            lifecycle.state,
+            PhysicalShutdownState::Closing { .. }
+        ));
+        lifecycle.state = PhysicalShutdownState::Closed { error };
+        drop(lifecycle);
         self.completed.notify_waiters();
     }
 
     fn quarantine(&self, error: String) {
-        let mut state = self
-            .state
+        let mut lifecycle = self
+            .lifecycle
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        debug_assert!(matches!(*state, PhysicalShutdownState::Closing { .. }));
-        *state = PhysicalShutdownState::Quarantined { error };
-        drop(state);
+        debug_assert!(matches!(
+            lifecycle.state,
+            PhysicalShutdownState::Closing { .. }
+        ));
+        lifecycle.state = PhysicalShutdownState::Quarantined { error };
+        drop(lifecycle);
         self.completed.notify_waiters();
     }
 
     async fn wait(&self) -> Result<(), TransportError> {
         loop {
             let notified = self.completed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let outcome = {
-                let state = self
-                    .state
+                let lifecycle = self
+                    .lifecycle
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner());
-                match &*state {
+                match &lifecycle.state {
                     PhysicalShutdownState::Closed { error } => {
                         Some(PhysicalShutdownWait::Closed(error.clone()))
                     }
                     PhysicalShutdownState::Quarantined { error } => {
                         Some(PhysicalShutdownWait::Quarantined(error.clone()))
                     }
-                    PhysicalShutdownState::Closing { deadline } => {
+                    PhysicalShutdownState::Enqueuing { deadline }
+                    | PhysicalShutdownState::Closing { deadline } => {
                         Some(PhysicalShutdownWait::Closing(*deadline))
                     }
-                    PhysicalShutdownState::Open => None,
+                    PhysicalShutdownState::Open => Some(PhysicalShutdownWait::Retry),
                 }
             };
             match outcome {
@@ -561,13 +664,16 @@ impl PhysicalShutdown {
                         ));
                     }
                     tokio::select! {
-                        _ = notified => {}
+                        _ = &mut notified => {}
                         _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
                             return Err(TransportError::Message(
                                 "physical cleanup is still in progress after its deadline".into(),
                             ));
                         }
                     }
+                }
+                Some(PhysicalShutdownWait::Retry) => {
+                    return Err(TransportError::Message(PHYSICAL_CLEANUP_RETRY.into()));
                 }
                 None => notified.await,
             }
@@ -579,6 +685,13 @@ enum PhysicalShutdownWait {
     Closing(Instant),
     Closed(Option<String>),
     Quarantined(String),
+    Retry,
+}
+
+fn cleanup_deadline(timeout: Duration) -> Instant {
+    Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now)
 }
 
 struct PhysicalPeer {
@@ -588,6 +701,34 @@ struct PhysicalPeer {
     active_tasks: Arc<AtomicUsize>,
     h264_sender: Arc<Mutex<H264RtpSender>>,
     cleanup_permit: CleanupPermit,
+}
+
+struct PhysicalAdmissionGuard<'a> {
+    shutdown: &'a PhysicalShutdown,
+    physical: Option<PhysicalPeer>,
+}
+
+impl<'a> PhysicalAdmissionGuard<'a> {
+    fn new(shutdown: &'a PhysicalShutdown, physical: PhysicalPeer) -> Self {
+        Self {
+            shutdown,
+            physical: Some(physical),
+        }
+    }
+
+    fn take(&mut self) -> PhysicalPeer {
+        self.physical
+            .take()
+            .expect("armed shutdown admission owns the physical peer")
+    }
+}
+
+impl Drop for PhysicalAdmissionGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(physical) = self.physical.take() {
+            self.shutdown.rollback(physical);
+        }
+    }
 }
 
 struct PhysicalSnapshot {
@@ -774,7 +915,6 @@ impl From<IceCandidate> for RTCIceCandidateInit {
 }
 
 pub struct WebRtcPeerConnection {
-    physical: StdMutex<Option<PhysicalPeer>>,
     config: PeerConnectionConfig,
     local_candidates: Mutex<mpsc::Receiver<IceCandidate>>,
     h264_rx: Mutex<mpsc::Receiver<QueuedAccessUnit>>,
@@ -798,6 +938,10 @@ pub struct WebRtcPeerConnection {
     last_built_peer_for_test: StdMutex<Option<Weak<WebRtcPeerConnection>>>,
     #[cfg(test)]
     physical_close_gate_for_test: StdMutex<Option<Arc<Semaphore>>>,
+    #[cfg(test)]
+    shutdown_admission_hook_for_test: StdMutex<Option<ShutdownAdmissionHook>>,
+    #[cfg(test)]
+    concurrent_shutdown_observed_for_test: AtomicBool,
     #[cfg(test)]
     restart_validation_gate_for_test: StdMutex<Option<Arc<Semaphore>>>,
     #[cfg(test)]
@@ -826,6 +970,22 @@ struct BlockingCloseInterceptorHook {
     entered: Arc<AtomicBool>,
     gate: Arc<Semaphore>,
     calls: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ShutdownAdmissionHook {
+    entered: Arc<Barrier>,
+    release: Arc<Barrier>,
+    action: ShutdownAdmissionAction,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum ShutdownAdmissionAction {
+    Accept,
+    Reject,
+    Panic,
 }
 
 impl VideoDropCounter {
@@ -1167,9 +1327,9 @@ impl WebRtcPeerConnection {
 
         construction_guard.set_h264_sender(Arc::clone(&h264_sender));
         let physical = construction_guard.finish();
+        shutdown.install(physical);
 
         Ok(Self {
-            physical: StdMutex::new(Some(physical)),
             config,
             local_candidates: Mutex::new(candidate_rx),
             h264_rx: Mutex::new(h264_rx),
@@ -1196,6 +1356,10 @@ impl WebRtcPeerConnection {
             #[cfg(test)]
             physical_close_gate_for_test: StdMutex::new(None),
             #[cfg(test)]
+            shutdown_admission_hook_for_test: StdMutex::new(None),
+            #[cfg(test)]
+            concurrent_shutdown_observed_for_test: AtomicBool::new(false),
+            #[cfg(test)]
             restart_validation_gate_for_test: StdMutex::new(None),
             #[cfg(test)]
             restart_validation_entered_for_test: AtomicBool::new(false),
@@ -1203,19 +1367,7 @@ impl WebRtcPeerConnection {
     }
 
     fn physical_snapshot(&self) -> Result<PhysicalSnapshot, TransportError> {
-        let physical = self
-            .physical
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let physical = physical
-            .as_ref()
-            .ok_or_else(|| TransportError::Message("peer connection is closing".into()))?;
-        Ok(PhysicalSnapshot {
-            pc: Arc::clone(&physical.pc),
-            control: Arc::clone(&physical.control),
-            active_tasks: Arc::clone(&physical.active_tasks),
-            h264_sender: Arc::clone(&physical.h264_sender),
-        })
+        self.shutdown.physical_snapshot()
     }
 
     #[cfg(test)]
@@ -2059,16 +2211,31 @@ impl WebRtcPeerConnection {
         meta: CleanupJobMeta,
         failure_counter: Option<Arc<AtomicU64>>,
     ) -> Result<(), TransportError> {
-        let physical = {
-            let mut physical = self
-                .physical
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            let Some(physical) = physical.take() else {
-                return Ok(());
-            };
-            physical
+        #[cfg(test)]
+        let cleanup_timeout = Duration::from_millis(
+            self.physical_cleanup_timeout_ms_for_test
+                .load(Ordering::Acquire),
+        );
+        #[cfg(not(test))]
+        let cleanup_timeout = PHYSICAL_CLEANUP_TIMEOUT;
+        let Some(physical) = self.shutdown.begin(cleanup_timeout)? else {
+            #[cfg(test)]
+            self.concurrent_shutdown_observed_for_test
+                .store(true, Ordering::Release);
+            return Ok(());
         };
+        let mut admission = PhysicalAdmissionGuard::new(&self.shutdown, physical);
+        #[cfg(test)]
+        let admission_action = self
+            .shutdown_admission_hook_for_test
+            .lock()
+            .expect("shutdown admission hook lock poisoned")
+            .take()
+            .map(|hook| {
+                hook.entered.wait();
+                hook.release.wait();
+                hook.action
+            });
         self.completed_video_drops.seal();
         let shutdown = Arc::clone(&self.shutdown);
         #[cfg(test)]
@@ -2088,12 +2255,18 @@ impl WebRtcPeerConnection {
         #[cfg(not(test))]
         let injected_panic = false;
         #[cfg(test)]
-        let cleanup_timeout = Duration::from_millis(
-            self.physical_cleanup_timeout_ms_for_test
-                .load(Ordering::Acquire),
-        );
-        #[cfg(not(test))]
-        let cleanup_timeout = PHYSICAL_CLEANUP_TIMEOUT;
+        match admission_action {
+            Some(ShutdownAdmissionAction::Reject) => {
+                return Err(TransportError::Message(
+                    "injected cleanup admission rejection".into(),
+                ));
+            }
+            Some(ShutdownAdmissionAction::Panic) => {
+                panic!("injected cleanup admission panic");
+            }
+            Some(ShutdownAdmissionAction::Accept) | None => {}
+        }
+        let physical = admission.take();
         let (permit, payload) = PhysicalCleanupPayload::from_physical(
             physical,
             close_gate,
@@ -2110,12 +2283,22 @@ impl WebRtcPeerConnection {
         ) {
             Ok(()) => Ok(()),
             Err((permit, payload, reason)) => {
-                *self
-                    .physical
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner()) =
-                    Some(payload.into_physical(permit));
+                self.shutdown.rollback(payload.into_physical(permit));
                 Err(TransportError::Message(reason))
+            }
+        }
+    }
+
+    async fn wait_physical_shutdown_with_retry(
+        &self,
+        meta: CleanupJobMeta,
+    ) -> Result<(), TransportError> {
+        loop {
+            match self.shutdown.wait().await {
+                Err(TransportError::Message(message)) if message == PHYSICAL_CLEANUP_RETRY => {
+                    self.start_physical_shutdown_with_meta(meta, None)?;
+                }
+                result => return result,
             }
         }
     }
@@ -2179,14 +2362,12 @@ impl WebRtcPeerConnection {
         } else {
             false
         };
-        let root_started = match self.start_physical_shutdown_with_meta(
-            CleanupJobMeta {
-                kind: "close-root",
-                generation: Some(0),
-                route_id: None,
-            },
-            None,
-        ) {
+        let root_meta = CleanupJobMeta {
+            kind: "close-root",
+            generation: Some(0),
+            route_id: None,
+        };
+        let root_started = match self.start_physical_shutdown_with_meta(root_meta, None) {
             Ok(()) => true,
             Err(error) => {
                 errors.push(error.to_string());
@@ -2195,18 +2376,26 @@ impl WebRtcPeerConnection {
         };
         if pending_started {
             let pending = pending.expect("started pending cleanup has a peer");
-            if let Err(error) = pending.peer.shutdown.wait().await {
+            if let Err(error) = pending
+                .peer
+                .wait_physical_shutdown_with_retry(pending.meta)
+                .await
+            {
                 errors.push(error.to_string());
             }
         }
         if active_started {
             let active = active.expect("started active cleanup has a peer");
-            if let Err(error) = active.peer.shutdown.wait().await {
+            if let Err(error) = active
+                .peer
+                .wait_physical_shutdown_with_retry(active.meta)
+                .await
+            {
                 errors.push(error.to_string());
             }
         }
         if root_started {
-            if let Err(error) = self.shutdown.wait().await {
+            if let Err(error) = self.wait_physical_shutdown_with_retry(root_meta).await {
                 errors.push(error.to_string());
             }
         }
@@ -2506,6 +2695,30 @@ impl WebRtcPeerConnection {
             .physical_close_gate_for_test
             .lock()
             .expect("physical close gate lock poisoned") = Some(gate);
+    }
+
+    #[cfg(test)]
+    fn install_shutdown_admission_hook_for_test(&self, hook: ShutdownAdmissionHook) {
+        *self
+            .shutdown_admission_hook_for_test
+            .lock()
+            .expect("shutdown admission hook lock poisoned") = Some(hook);
+        self.concurrent_shutdown_observed_for_test
+            .store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    async fn wait_for_concurrent_shutdown_observer_for_test(&self) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !self
+                .concurrent_shutdown_observed_for_test
+                .load(Ordering::Acquire)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("concurrent shutdown caller observes admission window");
     }
 
     #[cfg(test)]
@@ -3772,11 +3985,12 @@ mod tests {
         assert!(error.to_string().contains("in progress"));
         assert!(entered.load(Ordering::Acquire));
         assert!(matches!(
-            *peer
+            &peer
                 .shutdown
-                .state
+                .lifecycle
                 .lock()
-                .unwrap_or_else(|poison| poison.into_inner()),
+                .unwrap_or_else(|poison| poison.into_inner())
+                .state,
             PhysicalShutdownState::Closing { .. }
         ));
         assert_eq!(pc.connection_state(), RTCPeerConnectionState::New);
@@ -3811,6 +4025,232 @@ mod tests {
         assert_eq!(close_calls.load(Ordering::Acquire), 1);
         peer.close().await.expect("completed close is idempotent");
         assert_eq!(close_calls.load(Ordering::Acquire), 1);
+        supervisor.shutdown_for_test();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_close_waits_through_the_take_to_acceptance_window() {
+        let supervisor = CleanupSupervisor::start_for_test(1, 1).expect("cleanup supervisor");
+        let close_entered = Arc::new(AtomicBool::new(false));
+        let close_gate = Arc::new(Semaphore::new(0));
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let peer = Arc::new(
+            WebRtcPeerConnection::new_with_blocking_close_interceptor_for_test(
+                PeerConnectionConfig::default(),
+                Arc::clone(&supervisor),
+                BlockingCloseInterceptorHook {
+                    entered: Arc::clone(&close_entered),
+                    gate: Arc::clone(&close_gate),
+                    calls: Arc::clone(&close_calls),
+                },
+            )
+            .await
+            .expect("peer"),
+        );
+        let physical = peer.physical_snapshot().expect("physical owners");
+        let pc = physical.pc;
+        let active_tasks = physical.active_tasks;
+        peer.set_physical_cleanup_timeout_for_test(Duration::from_millis(30));
+        let admission_entered = Arc::new(Barrier::new(2));
+        let admission_release = Arc::new(Barrier::new(2));
+        peer.install_shutdown_admission_hook_for_test(ShutdownAdmissionHook {
+            entered: Arc::clone(&admission_entered),
+            release: Arc::clone(&admission_release),
+            action: ShutdownAdmissionAction::Accept,
+        });
+
+        let first_peer = Arc::clone(&peer);
+        let first = tokio::spawn(async move { first_peer.close().await });
+        tokio::task::spawn_blocking(move || admission_entered.wait())
+            .await
+            .expect("first caller reaches the admission window");
+        let second_peer = Arc::clone(&peer);
+        let mut second = tokio::spawn(async move { second_peer.close().await });
+        peer.wait_for_concurrent_shutdown_observer_for_test().await;
+        tokio::task::spawn_blocking(move || admission_release.wait())
+            .await
+            .expect("release cleanup admission");
+
+        let first_error = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .expect("first close is bounded")
+            .expect("first close task")
+            .expect_err("blocked physical cleanup remains in progress");
+        assert!(first_error.to_string().contains("in progress"));
+        let second_before_physical_release =
+            tokio::time::timeout(Duration::from_millis(150), &mut second).await;
+
+        close_gate.add_permits(1);
+        if second_before_physical_release.is_err() {
+            second
+                .await
+                .expect("second close task after physical release")
+                .expect("physical release completes the old waiting caller");
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !peer.physical_shutdown_finished_for_test() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same physical close eventually completes");
+        assert!(close_entered.load(Ordering::Acquire));
+        assert_eq!(pc.connection_state(), RTCPeerConnectionState::Closed);
+        assert_eq!(active_tasks.load(Ordering::Acquire), 0);
+        assert_eq!(close_calls.load(Ordering::Acquire), 1);
+        assert_eq!(supervisor.snapshot().available_admission_slots, 1);
+        supervisor.shutdown_for_test();
+
+        let second_result = second_before_physical_release
+            .expect("concurrent close must not wait for physical completion")
+            .expect("second close task");
+        let second_error = second_result.expect_err("concurrent close reports in progress");
+        assert!(second_error.to_string().contains("in progress"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rejected_shutdown_admission_restores_ownership_and_wakes_a_retrying_caller() {
+        let supervisor = CleanupSupervisor::start_for_test(1, 1).expect("cleanup supervisor");
+        let close_entered = Arc::new(AtomicBool::new(false));
+        let close_gate = Arc::new(Semaphore::new(0));
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let peer = Arc::new(
+            WebRtcPeerConnection::new_with_blocking_close_interceptor_for_test(
+                PeerConnectionConfig::default(),
+                Arc::clone(&supervisor),
+                BlockingCloseInterceptorHook {
+                    entered: Arc::clone(&close_entered),
+                    gate: Arc::clone(&close_gate),
+                    calls: Arc::clone(&close_calls),
+                },
+            )
+            .await
+            .expect("peer"),
+        );
+        let physical = peer.physical_snapshot().expect("physical owners");
+        let pc = physical.pc;
+        let active_tasks = physical.active_tasks;
+        peer.set_physical_cleanup_timeout_for_test(Duration::from_millis(30));
+        let admission_entered = Arc::new(Barrier::new(2));
+        let admission_release = Arc::new(Barrier::new(2));
+        peer.install_shutdown_admission_hook_for_test(ShutdownAdmissionHook {
+            entered: Arc::clone(&admission_entered),
+            release: Arc::clone(&admission_release),
+            action: ShutdownAdmissionAction::Reject,
+        });
+
+        let first_peer = Arc::clone(&peer);
+        let first = tokio::spawn(async move { first_peer.close().await });
+        tokio::task::spawn_blocking(move || admission_entered.wait())
+            .await
+            .expect("first caller reaches the admission window");
+        let second_peer = Arc::clone(&peer);
+        let mut second = tokio::spawn(async move { second_peer.close().await });
+        peer.wait_for_concurrent_shutdown_observer_for_test().await;
+        tokio::task::spawn_blocking(move || admission_release.wait())
+            .await
+            .expect("reject first cleanup admission");
+
+        let first_error = first
+            .await
+            .expect("first close task")
+            .expect_err("injected admission is rejected");
+        assert!(first_error.to_string().contains("admission rejection"));
+        let second_before_physical_release =
+            tokio::time::timeout(Duration::from_millis(150), &mut second).await;
+
+        close_gate.add_permits(1);
+        if second_before_physical_release.is_err() {
+            second.abort();
+            let _ = second.await;
+            peer.close()
+                .await
+                .expect("fallback cleanup after RED timeout");
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !peer.physical_shutdown_finished_for_test() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retried physical cleanup completes");
+        assert_eq!(pc.connection_state(), RTCPeerConnectionState::Closed);
+        assert_eq!(active_tasks.load(Ordering::Acquire), 0);
+        assert_eq!(close_calls.load(Ordering::Acquire), 1);
+        assert_eq!(supervisor.snapshot().available_admission_slots, 1);
+        supervisor.shutdown_for_test();
+
+        let second_result = second_before_physical_release
+            .expect("waiting caller is notified and retries admission")
+            .expect("second close task");
+        let second_error = second_result.expect_err("retried cleanup remains in progress");
+        assert!(second_error.to_string().contains("in progress"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn panicked_shutdown_admission_rolls_back_and_wakes_a_retrying_caller() {
+        let supervisor = CleanupSupervisor::start_for_test(1, 1).expect("cleanup supervisor");
+        let close_entered = Arc::new(AtomicBool::new(false));
+        let close_gate = Arc::new(Semaphore::new(0));
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let peer = Arc::new(
+            WebRtcPeerConnection::new_with_blocking_close_interceptor_for_test(
+                PeerConnectionConfig::default(),
+                Arc::clone(&supervisor),
+                BlockingCloseInterceptorHook {
+                    entered: Arc::clone(&close_entered),
+                    gate: Arc::clone(&close_gate),
+                    calls: Arc::clone(&close_calls),
+                },
+            )
+            .await
+            .expect("peer"),
+        );
+        let physical = peer.physical_snapshot().expect("physical owners");
+        let pc = physical.pc;
+        let active_tasks = physical.active_tasks;
+        peer.set_physical_cleanup_timeout_for_test(Duration::from_millis(30));
+        let admission_entered = Arc::new(Barrier::new(2));
+        let admission_release = Arc::new(Barrier::new(2));
+        peer.install_shutdown_admission_hook_for_test(ShutdownAdmissionHook {
+            entered: Arc::clone(&admission_entered),
+            release: Arc::clone(&admission_release),
+            action: ShutdownAdmissionAction::Panic,
+        });
+
+        let first_peer = Arc::clone(&peer);
+        let first = tokio::spawn(async move { first_peer.close().await });
+        tokio::task::spawn_blocking(move || admission_entered.wait())
+            .await
+            .expect("first caller reaches the admission window");
+        let second_peer = Arc::clone(&peer);
+        let second = tokio::spawn(async move { second_peer.close().await });
+        peer.wait_for_concurrent_shutdown_observer_for_test().await;
+        tokio::task::spawn_blocking(move || admission_release.wait())
+            .await
+            .expect("panic first cleanup admission");
+
+        assert!(first.await.expect_err("first close panics").is_panic());
+        let second_error = tokio::time::timeout(Duration::from_millis(150), second)
+            .await
+            .expect("waiting caller is notified and retries after unwind")
+            .expect("second close task")
+            .expect_err("retried cleanup remains in progress");
+        assert!(second_error.to_string().contains("in progress"));
+
+        close_gate.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !peer.physical_shutdown_finished_for_test() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("physical cleanup completes after admission panic rollback");
+        assert!(close_entered.load(Ordering::Acquire));
+        assert_eq!(pc.connection_state(), RTCPeerConnectionState::Closed);
+        assert_eq!(active_tasks.load(Ordering::Acquire), 0);
+        assert_eq!(close_calls.load(Ordering::Acquire), 1);
+        assert_eq!(supervisor.snapshot().available_admission_slots, 1);
         supervisor.shutdown_for_test();
     }
 
@@ -3876,11 +4316,12 @@ mod tests {
         assert!(error.to_string().contains("quarantined"));
         assert!(!panicked.physical_shutdown_finished_for_test());
         assert!(matches!(
-            *panicked
+            &panicked
                 .shutdown
-                .state
+                .lifecycle
                 .lock()
-                .unwrap_or_else(|poison| poison.into_inner()),
+                .unwrap_or_else(|poison| poison.into_inner())
+                .state,
             PhysicalShutdownState::Quarantined { .. }
         ));
         assert_eq!(panicked_pc.connection_state(), RTCPeerConnectionState::New);
