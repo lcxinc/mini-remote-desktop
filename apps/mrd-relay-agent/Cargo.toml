@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 async-trait = "0.1"
 base64 = "0.22"
+mrd-transport-webrtc = { path = "../../crates/mrd-transport-webrtc" }
 rand = "0.8"
 rcgen = { version = "0.13.2", features = ["zeroize", "x509-parser"] }
 reqwest.workspace = true

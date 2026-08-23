@@ -1,20 +1,429 @@
 use std::{
+    fs::{self, OpenOptions},
+    future::Future,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU8, Ordering},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use ring::rand::{SecureRandom as _, SystemRandom};
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
-    backend::{BackendError, NodeDirective, RelayBackendPort, SignedHeartbeat},
-    process::{AllocationProbeEvidence, CoturnRuntimePort, ProcessError, ProcessHealth},
+    backend::{
+        BackendError, EnrollmentRequest, HeartbeatPayload, NodeDirective,
+        RelayBackendClientFactoryPort, RelayBackendPort, RelayHealth, SignedHeartbeat,
+        SwappableRelayBackend,
+    },
+    identity::{CertificateState, IdentityFsPort},
+    metrics::MetricsPort,
+    process::{
+        AllocationProbeEvidence, CoturnRuntimePort, LocalAllocationProbePort, ProcessError,
+        ProcessHealth, SecretBytes,
+    },
 };
 
 const HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 const MAX_RESTART_ATTEMPTS: u8 = 3;
 const MAX_BACKEND_BACKOFF_MS: u64 = 30_000;
+
+/// Run the backend/identity heartbeat worker and the local coturn supervisor as
+/// independent portable tasks. Neither worker's await points hold the other's
+/// state or prevent it from being polled.
+pub async fn run_agent<H, S>(heartbeat_worker: H, supervisor_worker: S) -> Result<(), RuntimeError>
+where
+    H: Future<Output = Result<(), RuntimeError>>,
+    S: Future<Output = Result<(), RuntimeError>>,
+{
+    tokio::try_join!(heartbeat_worker, supervisor_worker)?;
+    Ok(())
+}
+
+fn generate_pending_rotation(
+    identity_epoch: u64,
+    directive_sequence: u64,
+    secret_version: u64,
+    not_before_unix_seconds: i64,
+    old_credential_deadline_unix_seconds: i64,
+    observed_wall_unix_seconds: i64,
+    observed_monotonic_ms: u64,
+) -> Result<PendingSecretRotation, RuntimeError> {
+    let random = SystemRandom::new();
+    let mut rotation_id = [0u8; 24];
+    let mut secret = Zeroizing::new([0u8; 32]);
+    random
+        .fill(&mut rotation_id)
+        .map_err(|_| RuntimeError::StateInvalid)?;
+    random
+        .fill(secret.as_mut())
+        .map_err(|_| RuntimeError::StateInvalid)?;
+    Ok(PendingSecretRotation {
+        identity_epoch,
+        directive_sequence,
+        rotation_id: URL_SAFE_NO_PAD.encode(rotation_id),
+        secret_version,
+        turn_rest_secret: PersistentSecret::new(URL_SAFE_NO_PAD.encode(secret.as_ref())),
+        not_before_unix_seconds,
+        old_credential_deadline_unix_seconds,
+        observed_wall_unix_seconds,
+        observed_monotonic_ms,
+        phase: SecretRotationPhase::Intent,
+        probe_evidence_sha256: None,
+    })
+}
+
+fn safe_window_elapsed(pending: &PendingSecretRotation, clock: &dyn ClockPort) -> bool {
+    let remaining_seconds = pending
+        .old_credential_deadline_unix_seconds
+        .saturating_sub(pending.observed_wall_unix_seconds)
+        .max(0) as u64;
+    let deadline_monotonic_ms = pending
+        .observed_monotonic_ms
+        .saturating_add(remaining_seconds.saturating_mul(1_000));
+    clock.monotonic_ms() >= deadline_monotonic_ms
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostPressureSnapshot {
+    pub packet_loss_bps: u16,
+    pub cpu_usage_bps: u16,
+    pub memory_usage_bps: u16,
+    pub measured_rtt_ms: Option<u32>,
+    pub recent_failure_bps: u16,
+}
+
+pub struct HeartbeatSampler<M: MetricsPort, P: LocalAllocationProbePort> {
+    metrics: Arc<M>,
+    probe: Arc<P>,
+    boot_id: String,
+    endpoints: Vec<String>,
+    max_allocations: u32,
+    max_egress_bps: u64,
+}
+
+impl<M: MetricsPort, P: LocalAllocationProbePort> HeartbeatSampler<M, P> {
+    pub fn new(
+        metrics: Arc<M>,
+        probe: Arc<P>,
+        endpoints: Vec<String>,
+        max_allocations: u32,
+        max_egress_bps: u64,
+    ) -> Result<Self, RuntimeError> {
+        let mut boot_id = [0u8; 16];
+        SystemRandom::new()
+            .fill(&mut boot_id)
+            .map_err(|_| RuntimeError::StateInvalid)?;
+        let sampler = Self {
+            metrics,
+            probe,
+            boot_id: URL_SAFE_NO_PAD.encode(boot_id),
+            endpoints,
+            max_allocations,
+            max_egress_bps,
+        };
+        if sampler.endpoints.is_empty()
+            || sampler.endpoints.len() > 4
+            || sampler.max_allocations == 0
+            || sampler.max_egress_bps == 0
+        {
+            return Err(RuntimeError::StateInvalid);
+        }
+        Ok(sampler)
+    }
+
+    pub async fn sample(
+        &self,
+        identity_epoch: u64,
+        process_health: ProcessHealth,
+        listener_health: ProcessHealth,
+        pressure: HostPressureSnapshot,
+        applied_secret_version: u64,
+    ) -> Result<HeartbeatPayload, RuntimeError> {
+        let metrics = self
+            .metrics
+            .collect()
+            .await
+            .map_err(|_| RuntimeError::StateInvalid)?;
+        let probe_health = match self.probe.probe().await {
+            Ok(AllocationProbeEvidence::Live(_)) => RelayHealth::Healthy,
+            Ok(AllocationProbeEvidence::NonEvidence) => RelayHealth::NonEvidence,
+            Err(_) => RelayHealth::Failed,
+        };
+        let mut nonce = [0u8; 32];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| RuntimeError::StateInvalid)?;
+        let payload = HeartbeatPayload {
+            identity_epoch,
+            boot_id: self.boot_id.clone(),
+            nonce: URL_SAFE_NO_PAD.encode(nonce),
+            process_health: process_health.into(),
+            listener_health: listener_health.into(),
+            probe_health,
+            active_allocations: metrics.active_allocations,
+            current_ingress_bps: metrics.current_ingress_bps,
+            current_egress_bps: metrics.current_egress_bps,
+            max_allocations: self.max_allocations,
+            max_egress_bps: self.max_egress_bps,
+            packet_loss_bps: pressure.packet_loss_bps,
+            cpu_usage_bps: pressure.cpu_usage_bps,
+            memory_usage_bps: pressure.memory_usage_bps,
+            measured_rtt_ms: pressure.measured_rtt_ms,
+            recent_failure_bps: pressure.recent_failure_bps,
+            endpoints: self.endpoints.clone(),
+            applied_secret_version,
+        };
+        payload.validate().map_err(RuntimeError::Backend)?;
+        Ok(payload)
+    }
+}
+
+impl From<ProcessHealth> for RelayHealth {
+    fn from(value: ProcessHealth) -> Self {
+        match value {
+            ProcessHealth::Healthy => Self::Healthy,
+            ProcessHealth::Degraded => Self::Degraded,
+            ProcessHealth::Failed => Self::Failed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityMaintenance {
+    PendingApproval,
+    Activated { identity_epoch: u64 },
+    Ready { identity_epoch: u64 },
+    Renewed { identity_epoch: u64 },
+}
+
+pub struct IdentityLifecycle {
+    mtls_installed: bool,
+    renewal_window: Duration,
+}
+
+#[derive(Clone, Default)]
+pub struct SharedProcessHealth(Arc<AtomicU8>);
+
+impl SharedProcessHealth {
+    pub fn get(&self) -> ProcessHealth {
+        match self.0.load(Ordering::Acquire) {
+            2 => ProcessHealth::Healthy,
+            1 => ProcessHealth::Degraded,
+            _ => ProcessHealth::Failed,
+        }
+    }
+
+    pub fn set(&self, health: ProcessHealth) {
+        let encoded = match health {
+            ProcessHealth::Healthy => 2,
+            ProcessHealth::Degraded => 1,
+            ProcessHealth::Failed => 0,
+        };
+        self.0.store(encoded, Ordering::Release);
+    }
+}
+
+impl IdentityLifecycle {
+    pub fn new(renewal_window: Duration) -> Result<Self, RuntimeError> {
+        if renewal_window.is_zero() || renewal_window > Duration::from_secs(7 * 24 * 60 * 60) {
+            return Err(RuntimeError::StateInvalid);
+        }
+        Ok(Self {
+            mtls_installed: false,
+            renewal_window,
+        })
+    }
+
+    pub async fn maintain_once<F: IdentityFsPort>(
+        &mut self,
+        identity: &mut CertificateState<F>,
+        enrollment_backend: &dyn RelayBackendPort,
+        slot: &SwappableRelayBackend,
+        factory: &dyn RelayBackendClientFactoryPort,
+        enrollment: Option<EnrollmentRequest>,
+        now_unix_seconds: i64,
+    ) -> Result<IdentityMaintenance, RuntimeError> {
+        if identity.active_certificate().is_none() {
+            if !identity.has_pending_enrollment() {
+                identity
+                    .enroll(
+                        enrollment_backend,
+                        enrollment.ok_or(RuntimeError::EnrollmentMissing)?,
+                    )
+                    .await?;
+            }
+            if !identity.pickup(enrollment_backend).await? {
+                return Ok(IdentityMaintenance::PendingApproval);
+            }
+            identity.install_active_backend(factory, slot)?;
+            self.mtls_installed = true;
+            return Ok(IdentityMaintenance::Activated {
+                identity_epoch: identity.identity_epoch(),
+            });
+        }
+        if !self.mtls_installed {
+            identity.install_active_backend(factory, slot)?;
+            self.mtls_installed = true;
+        }
+        let certificate = identity
+            .active_certificate()
+            .ok_or(RuntimeError::EnrollmentMissing)?;
+        let renewal_due_at = certificate
+            .expires_at_unix_seconds
+            .saturating_sub(i64::try_from(self.renewal_window.as_secs()).unwrap_or(i64::MAX));
+        if now_unix_seconds >= renewal_due_at {
+            let renewal_id = identity
+                .pending_renewal_id()
+                .map(str::to_owned)
+                .unwrap_or(generate_rotation_identifier()?);
+            identity
+                .renew_and_swap(slot, &renewal_id, now_unix_seconds, factory, slot)
+                .await?;
+            return Ok(IdentityMaintenance::Renewed {
+                identity_epoch: identity.identity_epoch(),
+            });
+        }
+        Ok(IdentityMaintenance::Ready {
+            identity_epoch: identity.identity_epoch(),
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn backend_worker_once<F, C, K, S, J, M, P>(
+    lifecycle: &mut IdentityLifecycle,
+    identity: &mut CertificateState<F>,
+    enrollment_backend: &dyn RelayBackendPort,
+    slot: &SwappableRelayBackend,
+    factory: &dyn RelayBackendClientFactoryPort,
+    enrollment: Option<EnrollmentRequest>,
+    runtime: &mut AgentRuntime<SwappableRelayBackend, C, K, S, J>,
+    sampler: &HeartbeatSampler<M, P>,
+    process_health: ProcessHealth,
+    listener_health: ProcessHealth,
+    pressure: HostPressureSnapshot,
+) -> Result<IdentityMaintenance, RuntimeError>
+where
+    F: IdentityFsPort,
+    C: CoturnRuntimePort,
+    K: ClockPort,
+    S: SleeperPort,
+    J: JitterPort,
+    M: MetricsPort,
+    P: LocalAllocationProbePort,
+{
+    let maintenance = lifecycle
+        .maintain_once(
+            identity,
+            enrollment_backend,
+            slot,
+            factory,
+            enrollment,
+            runtime.clock.unix_seconds(),
+        )
+        .await?;
+    if maintenance == IdentityMaintenance::PendingApproval {
+        return Ok(maintenance);
+    }
+    if let IdentityMaintenance::Renewed { identity_epoch } = maintenance {
+        runtime.activate_identity_epoch(identity_epoch)?;
+    }
+    runtime
+        .heartbeat_cycle(identity, sampler, process_health, listener_health, pressure)
+        .await?;
+    // Directives are not merely reported to a caller: the production worker
+    // drives the crash-recoverable secret transaction on every heartbeat.
+    // A future safety deadline returns `false` and is revisited next cycle.
+    let _ = runtime.advance_secret_rotation(identity).await?;
+    Ok(maintenance)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_backend_worker<F, C, K, S, J, M, P>(
+    lifecycle: &mut IdentityLifecycle,
+    identity: &mut CertificateState<F>,
+    enrollment_backend: &dyn RelayBackendPort,
+    slot: &SwappableRelayBackend,
+    factory: &dyn RelayBackendClientFactoryPort,
+    enrollment: Option<EnrollmentRequest>,
+    runtime: &mut AgentRuntime<SwappableRelayBackend, C, K, S, J>,
+    sampler: &HeartbeatSampler<M, P>,
+    supervisor_health: &SharedProcessHealth,
+    pressure: HostPressureSnapshot,
+) -> Result<(), RuntimeError>
+where
+    F: IdentityFsPort,
+    C: CoturnRuntimePort,
+    K: ClockPort,
+    S: SleeperPort,
+    J: JitterPort,
+    M: MetricsPort,
+    P: LocalAllocationProbePort,
+{
+    let mut backend_attempt = 0u32;
+    loop {
+        match backend_worker_once(
+            lifecycle,
+            identity,
+            enrollment_backend,
+            slot,
+            factory,
+            enrollment.clone(),
+            runtime,
+            sampler,
+            supervisor_health.get(),
+            supervisor_health.get(),
+            pressure,
+        )
+        .await
+        {
+            Ok(IdentityMaintenance::PendingApproval) => {
+                backend_attempt = 0;
+                runtime.sleeper.sleep(Duration::from_secs(5)).await;
+            }
+            Ok(_) => backend_attempt = 0,
+            Err(RuntimeError::Backend(BackendError::Unavailable)) => {
+                let delay = runtime.backend_retry_delay(backend_attempt);
+                backend_attempt = backend_attempt.saturating_add(1);
+                runtime.sleeper.sleep(delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+pub async fn run_coturn_supervisor<B, C, K, S, J>(
+    runtime: &mut AgentRuntime<B, C, K, S, J>,
+    shared_health: &SharedProcessHealth,
+) -> Result<(), RuntimeError>
+where
+    B: RelayBackendPort,
+    C: CoturnRuntimePort,
+    K: ClockPort,
+    S: SleeperPort,
+    J: JitterPort,
+{
+    loop {
+        runtime.supervise_coturn_once().await?;
+        shared_health.set(runtime.process_health());
+        runtime.sleeper.sleep(Duration::from_secs(1)).await;
+    }
+}
+
+fn generate_rotation_identifier() -> Result<String, RuntimeError> {
+    let mut identifier = [0u8; 24];
+    SystemRandom::new()
+        .fill(&mut identifier)
+        .map_err(|_| RuntimeError::StateInvalid)?;
+    Ok(URL_SAFE_NO_PAD.encode(identifier))
+}
 
 pub trait ClockPort: Send + Sync {
     fn monotonic_ms(&self) -> u64;
@@ -30,17 +439,244 @@ pub trait JitterPort: Send + Sync {
     fn jitter_ms(&self, upper_exclusive: u64) -> u64;
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+const MAX_RUNTIME_STATE_BYTES: u64 = 64 * 1024;
+
+const fn initial_identity_epoch() -> u64 {
+    1
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretRotationPhase {
+    Intent,
+    Uploaded,
+    Applied,
+    Probed,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PersistentSecret(String);
+
+impl PersistentSecret {
+    fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Clone for PersistentSecret {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl PartialEq for PersistentSecret {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for PersistentSecret {}
+
+impl std::fmt::Debug for PersistentSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PersistentSecret(REDACTED)")
+    }
+}
+
+impl Drop for PersistentSecret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingSecretRotation {
+    pub identity_epoch: u64,
+    pub directive_sequence: u64,
+    pub rotation_id: String,
+    pub secret_version: u64,
+    pub turn_rest_secret: PersistentSecret,
+    pub not_before_unix_seconds: i64,
+    pub old_credential_deadline_unix_seconds: i64,
+    pub observed_wall_unix_seconds: i64,
+    pub observed_monotonic_ms: u64,
+    pub phase: SecretRotationPhase,
+    pub probe_evidence_sha256: Option<[u8; 32]>,
+}
+
+impl std::fmt::Debug for PendingSecretRotation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingSecretRotation")
+            .field("identity_epoch", &self.identity_epoch)
+            .field("directive_sequence", &self.directive_sequence)
+            .field("rotation_id", &self.rotation_id)
+            .field("secret_version", &self.secret_version)
+            .field("turn_rest_secret", &"REDACTED")
+            .field("not_before_unix_seconds", &self.not_before_unix_seconds)
+            .field(
+                "old_credential_deadline_unix_seconds",
+                &self.old_credential_deadline_unix_seconds,
+            )
+            .field("phase", &self.phase)
+            .field("probe_evidence_sha256", &self.probe_evidence_sha256)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeStateSnapshot {
+    #[serde(default = "initial_identity_epoch")]
+    pub identity_epoch: u64,
     pub last_directive_sequence: u64,
     pub secret_version: u64,
     pub secret_digest: Option<[u8; 32]>,
     pub draining: bool,
+    #[serde(default)]
+    pub pending_rotation: Option<PendingSecretRotation>,
+}
+
+impl Default for RuntimeStateSnapshot {
+    fn default() -> Self {
+        Self {
+            identity_epoch: initial_identity_epoch(),
+            last_directive_sequence: 0,
+            secret_version: 0,
+            secret_digest: None,
+            draining: false,
+            pending_rotation: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for RuntimeStateSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeStateSnapshot")
+            .field("identity_epoch", &self.identity_epoch)
+            .field("last_directive_sequence", &self.last_directive_sequence)
+            .field("secret_version", &self.secret_version)
+            .field("secret_digest", &self.secret_digest.map(|_| "REDACTED"))
+            .field("draining", &self.draining)
+            .field("pending_rotation", &self.pending_rotation)
+            .finish()
+    }
 }
 
 pub trait RuntimeStateStorePort: Send + Sync {
     fn load(&self) -> Result<RuntimeStateSnapshot, RuntimeError>;
     fn atomic_store(&self, state: &RuntimeStateSnapshot) -> Result<(), RuntimeError>;
+}
+
+pub struct StdRuntimeStateStore {
+    path: PathBuf,
+}
+
+impl StdRuntimeStateStore {
+    pub fn new(path: PathBuf) -> Result<Self, RuntimeError> {
+        if !path.is_absolute() || path.file_name().is_none() {
+            return Err(RuntimeError::StateInvalid);
+        }
+        Ok(Self { path })
+    }
+
+    fn temporary_path(&self) -> PathBuf {
+        self.path.with_extension(format!(
+            "tmp-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ))
+    }
+}
+
+impl RuntimeStateStorePort for StdRuntimeStateStore {
+    fn load(&self) -> Result<RuntimeStateSnapshot, RuntimeError> {
+        let metadata = match fs::metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RuntimeStateSnapshot::default())
+            }
+            Err(_) => return Err(RuntimeError::StateIo),
+        };
+        if !metadata.is_file() || metadata.len() > MAX_RUNTIME_STATE_BYTES {
+            return Err(RuntimeError::StateInvalid);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(RuntimeError::StateInvalid);
+            }
+        }
+        let body = Zeroizing::new(fs::read(&self.path).map_err(|_| RuntimeError::StateIo)?);
+        serde_json::from_slice(&body).map_err(|_| RuntimeError::StateInvalid)
+    }
+
+    fn atomic_store(&self, state: &RuntimeStateSnapshot) -> Result<(), RuntimeError> {
+        let parent = self.path.parent().ok_or(RuntimeError::StateInvalid)?;
+        fs::create_dir_all(parent).map_err(|_| RuntimeError::StateIo)?;
+        let temporary = self.temporary_path();
+        let body =
+            Zeroizing::new(serde_json::to_vec(state).map_err(|_| RuntimeError::StateInvalid)?);
+        if body.len() > MAX_RUNTIME_STATE_BYTES as usize {
+            return Err(RuntimeError::StateInvalid);
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|_| RuntimeError::StateIo)?;
+        let result = (|| {
+            file.write_all(&body).map_err(|_| RuntimeError::StateIo)?;
+            file.sync_all().map_err(|_| RuntimeError::StateIo)?;
+            atomic_replace_runtime_path(&temporary, &self.path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_runtime_path(from: &Path, to: &Path) -> Result<(), RuntimeError> {
+    fs::rename(from, to).map_err(|_| RuntimeError::StateIo)?;
+    fs::File::open(to.parent().ok_or(RuntimeError::StateInvalid)?)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| RuntimeError::StateIo)
+}
+
+#[cfg(windows)]
+fn atomic_replace_runtime_path(from: &Path, to: &Path) -> Result<(), RuntimeError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: both buffers are NUL-terminated and live through the call.
+    let result = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(RuntimeError::StateIo)
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -167,10 +803,12 @@ where
     next_heartbeat_at_ms: u64,
     restart_attempts: u8,
     process_health: ProcessHealth,
+    identity_epoch: u64,
     last_directive_sequence: u64,
     secret_version: u64,
     secret_digest: Option<[u8; 32]>,
     draining: bool,
+    pending_rotation: Option<PendingSecretRotation>,
     state_store: Arc<dyn RuntimeStateStorePort>,
 }
 
@@ -209,9 +847,22 @@ where
         state_store: Arc<dyn RuntimeStateStorePort>,
     ) -> Result<Self, RuntimeError> {
         let now = clock.monotonic_ms();
-        let state = state_store.load()?;
+        let mut state = state_store.load()?;
         if (state.secret_version == 0) != state.secret_digest.is_none() {
             return Err(RuntimeError::StateInvalid);
+        }
+        if let Some(pending) = state.pending_rotation.as_mut() {
+            if pending.identity_epoch != state.identity_epoch
+                || pending.secret_version <= state.secret_version
+                || pending.old_credential_deadline_unix_seconds < pending.not_before_unix_seconds
+            {
+                return Err(RuntimeError::StateInvalid);
+            }
+            // A monotonic origin is process-local. Rebase the persisted absolute
+            // deadline at each restart using the injected wall clock.
+            pending.observed_wall_unix_seconds = clock.unix_seconds();
+            pending.observed_monotonic_ms = now;
+            state_store.atomic_store(&state)?;
         }
         Ok(Self {
             backend,
@@ -222,10 +873,12 @@ where
             next_heartbeat_at_ms: now,
             restart_attempts: 0,
             process_health: ProcessHealth::Failed,
+            identity_epoch: state.identity_epoch,
             last_directive_sequence: state.last_directive_sequence,
             secret_version: state.secret_version,
             secret_digest: state.secret_digest,
             draining: state.draining,
+            pending_rotation: state.pending_rotation,
             state_store,
         })
     }
@@ -275,6 +928,10 @@ where
                 self.restart_attempts = 0;
             }
             ProcessHealth::Failed if self.restart_attempts < MAX_RESTART_ATTEMPTS => {
+                let delay_seconds = 1u64 << self.restart_attempts;
+                self.sleeper
+                    .sleep(Duration::from_secs(delay_seconds.min(4)))
+                    .await;
                 self.restart_attempts += 1;
                 let _ = self.coturn.restart().await;
             }
@@ -293,6 +950,33 @@ where
         self.apply_directive(directive).await
     }
 
+    pub async fn heartbeat_cycle<F, M, P>(
+        &mut self,
+        identity: &mut CertificateState<F>,
+        sampler: &HeartbeatSampler<M, P>,
+        process_health: ProcessHealth,
+        listener_health: ProcessHealth,
+        pressure: HostPressureSnapshot,
+    ) -> Result<(), RuntimeError>
+    where
+        F: IdentityFsPort,
+        M: MetricsPort,
+        P: LocalAllocationProbePort,
+    {
+        self.wait_until_next_heartbeat().await;
+        let payload = sampler
+            .sample(
+                identity.identity_epoch(),
+                process_health,
+                listener_health,
+                pressure,
+                self.secret_version,
+            )
+            .await?;
+        let heartbeat = identity.sign_heartbeat(self.clock.unix_seconds(), payload)?;
+        self.heartbeat_once(heartbeat).await
+    }
+
     pub async fn probe_coturn_once(&mut self) -> Result<AllocationProbeEvidence, RuntimeError> {
         let evidence = self
             .coturn
@@ -306,14 +990,72 @@ where
     }
 
     pub async fn apply_directive(&mut self, directive: NodeDirective) -> Result<(), RuntimeError> {
+        if directive.identity_epoch != self.identity_epoch {
+            return Err(RuntimeError::DirectiveReplay);
+        }
         if directive.sequence <= self.last_directive_sequence {
             return Err(RuntimeError::DirectiveReplay);
         }
-        if directive.secret_update.is_some() && !directive.draining {
+        if directive.secret_update.is_some() && !directive.desired.draining {
             return Err(RuntimeError::SecretUpdateUnsafe);
+        }
+        if directive.desired.secret_version < self.secret_version {
+            return Err(RuntimeError::SecretVersionReplay);
         }
         let mut next_secret_version = self.secret_version;
         let mut next_secret_digest = self.secret_digest;
+        let mut next_pending_rotation = self.pending_rotation.clone();
+        if directive.desired.secret_version > self.secret_version && self.secret_version > 0 {
+            if !directive.desired.draining {
+                return Err(RuntimeError::SecretUpdateUnsafe);
+            }
+            let (Some(not_before), Some(deadline)) = (
+                directive.desired.not_before_unix_seconds,
+                directive.desired.old_credential_deadline_unix_seconds,
+            ) else {
+                return Err(RuntimeError::SecretUpdateUnsafe);
+            };
+            if deadline < not_before {
+                return Err(RuntimeError::SecretUpdateUnsafe);
+            }
+            match &next_pending_rotation {
+                Some(pending)
+                    if pending.identity_epoch != directive.identity_epoch
+                        || pending.secret_version != directive.desired.secret_version =>
+                {
+                    return Err(RuntimeError::SecretVersionReplay)
+                }
+                Some(_) => {}
+                None => {
+                    next_pending_rotation = Some(generate_pending_rotation(
+                        directive.identity_epoch,
+                        directive.sequence,
+                        directive.desired.secret_version,
+                        not_before,
+                        deadline,
+                        self.clock.unix_seconds(),
+                        self.clock.monotonic_ms(),
+                    )?);
+                    // Persist secret intent before any drain or process side effect.
+                    let intent = RuntimeStateSnapshot {
+                        identity_epoch: self.identity_epoch,
+                        last_directive_sequence: self.last_directive_sequence,
+                        secret_version: self.secret_version,
+                        secret_digest: self.secret_digest,
+                        draining: self.draining,
+                        pending_rotation: next_pending_rotation.clone(),
+                    };
+                    self.state_store.atomic_store(&intent)?;
+                    self.pending_rotation = intent.pending_rotation;
+                }
+            }
+        }
+        if directive.desired.draining != self.draining {
+            self.coturn
+                .set_draining(directive.desired.draining)
+                .await
+                .map_err(RuntimeError::Process)?;
+        }
         if let Some(update) = directive.secret_update {
             let update_digest = update.secret.digest();
             if update.version < self.secret_version
@@ -332,23 +1074,142 @@ where
                 next_secret_digest = Some(update_digest);
             }
         }
-        if directive.draining != self.draining {
-            self.coturn
-                .set_draining(directive.draining)
-                .await
-                .map_err(RuntimeError::Process)?;
-        }
         let next = RuntimeStateSnapshot {
+            identity_epoch: self.identity_epoch,
             last_directive_sequence: directive.sequence,
             secret_version: next_secret_version,
             secret_digest: next_secret_digest,
-            draining: directive.draining,
+            draining: directive.desired.draining,
+            pending_rotation: next_pending_rotation,
         };
         self.state_store.atomic_store(&next)?;
         self.last_directive_sequence = next.last_directive_sequence;
         self.secret_version = next.secret_version;
         self.secret_digest = next.secret_digest;
         self.draining = next.draining;
+        self.pending_rotation = next.pending_rotation;
+        Ok(())
+    }
+
+    pub async fn advance_secret_rotation<F: IdentityFsPort>(
+        &mut self,
+        identity: &mut CertificateState<F>,
+    ) -> Result<bool, RuntimeError> {
+        let Some(mut pending) = self.pending_rotation.clone() else {
+            return Ok(false);
+        };
+        if pending.identity_epoch != self.identity_epoch
+            || identity.identity_epoch() != self.identity_epoch
+        {
+            return Err(RuntimeError::DirectiveReplay);
+        }
+        if !self.draining {
+            return Err(RuntimeError::SecretUpdateUnsafe);
+        }
+        if pending.phase == SecretRotationPhase::Intent {
+            let request = identity.prepare_secret_upload(
+                self.clock.unix_seconds(),
+                pending.rotation_id.clone(),
+                pending.secret_version,
+                SecretString::from(pending.turn_rest_secret.expose().to_owned()),
+            )?;
+            self.backend
+                .upload_secret(request)
+                .await
+                .map_err(RuntimeError::Backend)?;
+            pending.phase = SecretRotationPhase::Uploaded;
+            self.persist_pending_rotation(pending.clone())?;
+        }
+        if !safe_window_elapsed(&pending, self.clock.as_ref()) {
+            return Ok(false);
+        }
+        let snapshot = self
+            .coturn
+            .snapshot()
+            .await
+            .map_err(RuntimeError::Process)?;
+        if snapshot.active_allocations != 0 {
+            return Ok(false);
+        }
+        if pending.phase == SecretRotationPhase::Uploaded {
+            let secret = URL_SAFE_NO_PAD
+                .decode(pending.turn_rest_secret.expose())
+                .map(SecretBytes::new)
+                .map_err(|_| RuntimeError::StateInvalid)?;
+            self.coturn
+                .apply_secret(pending.secret_version, secret)
+                .await
+                .map_err(RuntimeError::Process)?;
+            pending.phase = SecretRotationPhase::Applied;
+            self.persist_pending_rotation(pending.clone())?;
+        }
+        if pending.phase == SecretRotationPhase::Applied {
+            let evidence = self
+                .coturn
+                .probe_local_allocation()
+                .await
+                .map_err(RuntimeError::Process)?;
+            let proof = evidence
+                .proof_sha256()
+                .ok_or(RuntimeError::Process(ProcessError::ProbeInvalid))?;
+            pending.probe_evidence_sha256 = Some(proof);
+            pending.phase = SecretRotationPhase::Probed;
+            self.persist_pending_rotation(pending.clone())?;
+        }
+        let proof = pending
+            .probe_evidence_sha256
+            .ok_or(RuntimeError::StateInvalid)?;
+        let request = identity.prepare_secret_commit(
+            self.clock.unix_seconds(),
+            pending.rotation_id.clone(),
+            pending.secret_version,
+            proof,
+        )?;
+        self.backend
+            .commit_secret(request)
+            .await
+            .map_err(RuntimeError::Backend)?;
+        let digest = {
+            use ring::digest::{digest, SHA256};
+            let decoded = Zeroizing::new(
+                URL_SAFE_NO_PAD
+                    .decode(pending.turn_rest_secret.expose())
+                    .map_err(|_| RuntimeError::StateInvalid)?,
+            );
+            let value = digest(&SHA256, &decoded);
+            let mut digest = [0u8; 32];
+            digest.copy_from_slice(value.as_ref());
+            digest
+        };
+        let committed = RuntimeStateSnapshot {
+            identity_epoch: self.identity_epoch,
+            last_directive_sequence: self.last_directive_sequence,
+            secret_version: pending.secret_version,
+            secret_digest: Some(digest),
+            draining: self.draining,
+            pending_rotation: None,
+        };
+        self.state_store.atomic_store(&committed)?;
+        self.secret_version = committed.secret_version;
+        self.secret_digest = committed.secret_digest;
+        self.pending_rotation = None;
+        Ok(true)
+    }
+
+    fn persist_pending_rotation(
+        &mut self,
+        pending: PendingSecretRotation,
+    ) -> Result<(), RuntimeError> {
+        let state = RuntimeStateSnapshot {
+            identity_epoch: self.identity_epoch,
+            last_directive_sequence: self.last_directive_sequence,
+            secret_version: self.secret_version,
+            secret_digest: self.secret_digest,
+            draining: self.draining,
+            pending_rotation: Some(pending.clone()),
+        };
+        self.state_store.atomic_store(&state)?;
+        self.pending_rotation = Some(pending);
         Ok(())
     }
 
@@ -362,6 +1223,26 @@ where
 
     pub fn is_draining(&self) -> bool {
         self.draining
+    }
+
+    pub fn activate_identity_epoch(&mut self, identity_epoch: u64) -> Result<(), RuntimeError> {
+        if identity_epoch != self.identity_epoch.saturating_add(1) {
+            return Err(RuntimeError::DirectiveReplay);
+        }
+        let state = RuntimeStateSnapshot {
+            identity_epoch,
+            last_directive_sequence: 0,
+            secret_version: self.secret_version,
+            secret_digest: self.secret_digest,
+            // Fail safe: renewal never silently resumes a draining node.
+            draining: self.draining,
+            pending_rotation: None,
+        };
+        self.state_store.atomic_store(&state)?;
+        self.identity_epoch = identity_epoch;
+        self.last_directive_sequence = 0;
+        self.pending_rotation = None;
+        Ok(())
     }
 }
 

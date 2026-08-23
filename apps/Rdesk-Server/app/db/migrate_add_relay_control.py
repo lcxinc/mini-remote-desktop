@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import re
 
-from sqlalchemy import BigInteger, DateTime, Integer, LargeBinary, String, inspect, text
+from sqlalchemy import Boolean, BigInteger, DateTime, Integer, LargeBinary, String, inspect, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -17,7 +17,7 @@ _CHECK_CAST = re.compile(
     flags=re.IGNORECASE,
 )
 _MIGRATION_LOCK_CONTEXT = b"MRD_RELAY_SCHEMA_MIGRATION_V1\x00"
-_RELAY_SCHEMA_VERSIONS = (1, 2, 3, 4, 5, 6, 7)
+_RELAY_SCHEMA_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8)
 
 
 class RelaySchemaMismatchError(RuntimeError):
@@ -36,12 +36,57 @@ def _table(schema: str | None, name: str) -> str:
     return f'"{schema}".{name}'
 
 
+def _v8_constraints_sql(nodes: str) -> str:
+    constraints = (
+        ("ck_relay_nodes_current_ingress", "current_ingress_bps >= 0"),
+        ("ck_relay_nodes_identity_epoch", "identity_epoch >= 1"),
+        (
+            "ck_relay_nodes_health",
+            "process_health IN ('healthy', 'degraded', 'failed') AND "
+            "listener_health IN ('healthy', 'degraded', 'failed') AND "
+            "probe_health IN ('healthy', 'failed', 'non_evidence')",
+        ),
+        (
+            "ck_relay_nodes_pressure",
+            "packet_loss_bps >= 0 AND packet_loss_bps <= 10000 AND "
+            "cpu_usage_bps >= 0 AND cpu_usage_bps <= 10000 AND "
+            "memory_usage_bps >= 0 AND memory_usage_bps <= 10000",
+        ),
+        (
+            "ck_relay_nodes_secret_versions",
+            "active_secret_version >= 1 AND applied_secret_version >= 1 AND "
+            "desired_secret_version >= active_secret_version",
+        ),
+        (
+            "ck_relay_nodes_rotation_pending",
+            "(pending_secret_version IS NULL AND "
+            "pending_encrypted_turn_secret IS NULL AND "
+            "pending_secret_digest IS NULL AND pending_rotation_id IS NULL AND "
+            "pending_secret_uploaded_at IS NULL) OR "
+            "(pending_secret_version = desired_secret_version AND "
+            "pending_encrypted_turn_secret IS NOT NULL AND "
+            "length(pending_encrypted_turn_secret) >= 30 AND "
+            "pending_secret_digest IS NOT NULL AND "
+            "length(pending_secret_digest) = 32 AND "
+            "pending_rotation_id IS NOT NULL AND "
+            "pending_secret_uploaded_at IS NOT NULL)",
+        ),
+    )
+    statements = "\n".join(
+        "BEGIN "
+        f"ALTER TABLE {nodes} ADD CONSTRAINT {name} CHECK ({expression}); "
+        "EXCEPTION WHEN duplicate_object THEN NULL; END;"
+        for name, expression in constraints
+    )
+    return f"DO $$ BEGIN {statements} END $$"
+
+
 async def migrate(
     bind: AsyncEngine | AsyncConnection = default_engine,
     *,
     schema: str | None = None,
 ) -> None:
-    """Apply and verify relay schema through v7 in the caller's transaction."""
+    """Apply and verify relay schema through v8 in the caller's transaction."""
     if isinstance(bind, AsyncEngine):
         async with bind.begin() as connection:
             await _migrate_connection(connection, schema=schema)
@@ -108,8 +153,8 @@ async def _migrate_connection(
             )
             return
         if existing_versions == _RELAY_SCHEMA_VERSIONS[:-1]:
-            # v7 is the directory-generation reservation lifecycle. Do not
-            # replay any earlier table creation, backfill, or constraint DDL.
+            # v8 is one additive relay-node transaction. Keep the normal
+            # deployed v7 -> v8 path narrow and once-only.
             await connection.run_sync(
                 lambda sync_connection: _preflight_existing_schema(
                     sync_connection, schema
@@ -117,23 +162,41 @@ async def _migrate_connection(
             )
             await connection.execute(
                 text(
-                    f"ALTER TABLE {reservations} ADD COLUMN superseded_at "
-                    "TIMESTAMPTZ"
+                    f"""
+                    ALTER TABLE {nodes}
+                        ADD COLUMN current_ingress_bps BIGINT NOT NULL DEFAULT 0,
+                        ADD COLUMN identity_epoch BIGINT NOT NULL DEFAULT 1,
+                        ADD COLUMN last_boot_id VARCHAR(22),
+                        ADD COLUMN last_heartbeat_nonce VARCHAR(43),
+                        ADD COLUMN process_health VARCHAR(16) NOT NULL DEFAULT 'failed',
+                        ADD COLUMN listener_health VARCHAR(16) NOT NULL DEFAULT 'failed',
+                        ADD COLUMN probe_health VARCHAR(16) NOT NULL DEFAULT 'non_evidence',
+                        ADD COLUMN packet_loss_bps INTEGER NOT NULL DEFAULT 0,
+                        ADD COLUMN cpu_usage_bps INTEGER NOT NULL DEFAULT 0,
+                        ADD COLUMN memory_usage_bps INTEGER NOT NULL DEFAULT 0,
+                        ADD COLUMN active_secret_version BIGINT NOT NULL DEFAULT 1,
+                        ADD COLUMN applied_secret_version BIGINT NOT NULL DEFAULT 1,
+                        ADD COLUMN desired_secret_version BIGINT NOT NULL DEFAULT 1,
+                        ADD COLUMN desired_draining BOOLEAN NOT NULL DEFAULT false,
+                        ADD COLUMN secret_not_before TIMESTAMPTZ,
+                        ADD COLUMN old_credential_deadline TIMESTAMPTZ,
+                        ADD COLUMN pending_secret_version BIGINT,
+                        ADD COLUMN pending_encrypted_turn_secret BYTEA,
+                        ADD COLUMN pending_secret_digest BYTEA,
+                        ADD COLUMN pending_rotation_id VARCHAR(128),
+                        ADD COLUMN pending_secret_uploaded_at TIMESTAMPTZ,
+                        ADD COLUMN committed_rotation_id VARCHAR(128)
+                    """
                 )
             )
-            await connection.execute(
-                text(
-                    f"ALTER TABLE {reservations} ADD COLUMN "
-                    "directory_generation VARCHAR(64) NOT NULL DEFAULT 'legacy'"
-                )
-            )
+            await connection.execute(text(_v8_constraints_sql(nodes)))
             await connection.run_sync(
                 lambda sync_connection: _assert_schema_conforms(
                     sync_connection, schema
                 )
             )
             await connection.execute(
-                text(f"INSERT INTO {versions} (version) VALUES (7)")
+                text(f"INSERT INTO {versions} (version) VALUES (8)")
             )
             await connection.run_sync(
                 lambda sync_connection: _assert_migration_ledger(
@@ -162,7 +225,29 @@ async def _migrate_connection(
             max_allocations INTEGER NOT NULL,
             active_allocations INTEGER NOT NULL DEFAULT 0,
             max_egress_bps BIGINT NOT NULL,
+            current_ingress_bps BIGINT NOT NULL DEFAULT 0,
             current_egress_bps BIGINT NOT NULL DEFAULT 0,
+            identity_epoch BIGINT NOT NULL DEFAULT 1,
+            last_boot_id VARCHAR(22),
+            last_heartbeat_nonce VARCHAR(43),
+            process_health VARCHAR(16) NOT NULL DEFAULT 'failed',
+            listener_health VARCHAR(16) NOT NULL DEFAULT 'failed',
+            probe_health VARCHAR(16) NOT NULL DEFAULT 'non_evidence',
+            packet_loss_bps INTEGER NOT NULL DEFAULT 0,
+            cpu_usage_bps INTEGER NOT NULL DEFAULT 0,
+            memory_usage_bps INTEGER NOT NULL DEFAULT 0,
+            active_secret_version BIGINT NOT NULL DEFAULT 1,
+            applied_secret_version BIGINT NOT NULL DEFAULT 1,
+            desired_secret_version BIGINT NOT NULL DEFAULT 1,
+            desired_draining BOOLEAN NOT NULL DEFAULT false,
+            secret_not_before TIMESTAMPTZ,
+            old_credential_deadline TIMESTAMPTZ,
+            pending_secret_version BIGINT,
+            pending_encrypted_turn_secret BYTEA,
+            pending_secret_digest BYTEA,
+            pending_rotation_id VARCHAR(128),
+            pending_secret_uploaded_at TIMESTAMPTZ,
+            committed_rotation_id VARCHAR(128),
             heartbeat_sequence BIGINT NOT NULL DEFAULT 0,
             healthy_heartbeat_streak INTEGER NOT NULL DEFAULT 0,
             measured_rtt_ms BIGINT,
@@ -181,7 +266,38 @@ async def _migrate_connection(
                 active_allocations >= 0 AND active_allocations <= max_allocations
             ),
             CONSTRAINT ck_relay_nodes_max_egress CHECK (max_egress_bps > 0),
+            CONSTRAINT ck_relay_nodes_current_ingress CHECK (current_ingress_bps >= 0),
             CONSTRAINT ck_relay_nodes_current_egress CHECK (current_egress_bps >= 0),
+            CONSTRAINT ck_relay_nodes_identity_epoch CHECK (identity_epoch >= 1),
+            CONSTRAINT ck_relay_nodes_health CHECK (
+                process_health IN ('healthy', 'degraded', 'failed') AND
+                listener_health IN ('healthy', 'degraded', 'failed') AND
+                probe_health IN ('healthy', 'failed', 'non_evidence')
+            ),
+            CONSTRAINT ck_relay_nodes_pressure CHECK (
+                packet_loss_bps BETWEEN 0 AND 10000 AND
+                cpu_usage_bps BETWEEN 0 AND 10000 AND
+                memory_usage_bps BETWEEN 0 AND 10000
+            ),
+            CONSTRAINT ck_relay_nodes_secret_versions CHECK (
+                active_secret_version >= 1 AND
+                applied_secret_version >= 1 AND
+                desired_secret_version >= active_secret_version
+            ),
+            CONSTRAINT ck_relay_nodes_rotation_pending CHECK (
+                (pending_secret_version IS NULL AND
+                 pending_encrypted_turn_secret IS NULL AND
+                 pending_secret_digest IS NULL AND
+                 pending_rotation_id IS NULL AND
+                 pending_secret_uploaded_at IS NULL) OR
+                (pending_secret_version = desired_secret_version AND
+                 pending_encrypted_turn_secret IS NOT NULL AND
+                 length(pending_encrypted_turn_secret) >= 30 AND
+                 pending_secret_digest IS NOT NULL AND
+                 length(pending_secret_digest) = 32 AND
+                 pending_rotation_id IS NOT NULL AND
+                 pending_secret_uploaded_at IS NOT NULL)
+            ),
             CONSTRAINT ck_relay_nodes_heartbeat_sequence CHECK (heartbeat_sequence >= 0),
             CONSTRAINT ck_relay_nodes_healthy_heartbeat_streak CHECK (
                 healthy_heartbeat_streak >= 0 AND healthy_heartbeat_streak <= 3
@@ -321,6 +437,40 @@ async def _migrate_connection(
         f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS "
         "recent_failure_bps INTEGER NOT NULL DEFAULT 0",
         f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS physical_host_id VARCHAR(128)",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS "
+        "current_ingress_bps BIGINT NOT NULL DEFAULT 0",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS "
+        "identity_epoch BIGINT NOT NULL DEFAULT 1",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS last_boot_id VARCHAR(22)",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS last_heartbeat_nonce VARCHAR(43)",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS "
+        "process_health VARCHAR(16) NOT NULL DEFAULT 'failed'",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS "
+        "listener_health VARCHAR(16) NOT NULL DEFAULT 'failed'",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS "
+        "probe_health VARCHAR(16) NOT NULL DEFAULT 'non_evidence'",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS "
+        "packet_loss_bps INTEGER NOT NULL DEFAULT 0",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS "
+        "cpu_usage_bps INTEGER NOT NULL DEFAULT 0",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS "
+        "memory_usage_bps INTEGER NOT NULL DEFAULT 0",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS "
+        "active_secret_version BIGINT NOT NULL DEFAULT 1",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS "
+        "applied_secret_version BIGINT NOT NULL DEFAULT 1",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS "
+        "desired_secret_version BIGINT NOT NULL DEFAULT 1",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS "
+        "desired_draining BOOLEAN NOT NULL DEFAULT false",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS secret_not_before TIMESTAMPTZ",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS old_credential_deadline TIMESTAMPTZ",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS pending_secret_version BIGINT",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS pending_encrypted_turn_secret BYTEA",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS pending_secret_digest BYTEA",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS pending_rotation_id VARCHAR(128)",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS pending_secret_uploaded_at TIMESTAMPTZ",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS committed_rotation_id VARCHAR(128)",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS receipt_digest VARCHAR(64)",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS request_digest VARCHAR(64)",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS receipt_expires_at TIMESTAMPTZ",
@@ -395,6 +545,39 @@ async def _migrate_connection(
         (
             "ck_relay_nodes_physical_host",
             "physical_host_id IS NULL OR length(physical_host_id) BETWEEN 1 AND 128",
+        ),
+        ("ck_relay_nodes_current_ingress", "current_ingress_bps >= 0"),
+        ("ck_relay_nodes_identity_epoch", "identity_epoch >= 1"),
+        (
+            "ck_relay_nodes_health",
+            "process_health IN ('healthy', 'degraded', 'failed') AND "
+            "listener_health IN ('healthy', 'degraded', 'failed') AND "
+            "probe_health IN ('healthy', 'failed', 'non_evidence')",
+        ),
+        (
+            "ck_relay_nodes_pressure",
+            "packet_loss_bps >= 0 AND packet_loss_bps <= 10000 AND "
+            "cpu_usage_bps >= 0 AND cpu_usage_bps <= 10000 AND "
+            "memory_usage_bps >= 0 AND memory_usage_bps <= 10000",
+        ),
+        (
+            "ck_relay_nodes_secret_versions",
+            "active_secret_version >= 1 AND applied_secret_version >= 1 AND "
+            "desired_secret_version >= active_secret_version",
+        ),
+        (
+            "ck_relay_nodes_rotation_pending",
+            "(pending_secret_version IS NULL AND "
+            "pending_encrypted_turn_secret IS NULL AND "
+            "pending_secret_digest IS NULL AND pending_rotation_id IS NULL AND "
+            "pending_secret_uploaded_at IS NULL) OR "
+            "(pending_secret_version = desired_secret_version AND "
+            "pending_encrypted_turn_secret IS NOT NULL AND "
+            "length(pending_encrypted_turn_secret) >= 30 AND "
+            "pending_secret_digest IS NOT NULL AND "
+            "length(pending_secret_digest) = 32 AND "
+            "pending_rotation_id IS NOT NULL AND "
+            "pending_secret_uploaded_at IS NOT NULL)",
         ),
     ):
         await connection.execute(
@@ -535,6 +718,32 @@ def _preflight_existing_schema(sync_connection: object, schema: str | None) -> N
                 "directory_generation",
             },
         }.get(table_name, set())
+        v8_additions = {
+            "relay_nodes": {
+                "current_ingress_bps",
+                "identity_epoch",
+                "last_boot_id",
+                "last_heartbeat_nonce",
+                "process_health",
+                "listener_health",
+                "probe_health",
+                "packet_loss_bps",
+                "cpu_usage_bps",
+                "memory_usage_bps",
+                "active_secret_version",
+                "applied_secret_version",
+                "desired_secret_version",
+                "desired_draining",
+                "secret_not_before",
+                "old_credential_deadline",
+                "pending_secret_version",
+                "pending_encrypted_turn_secret",
+                "pending_secret_digest",
+                "pending_rotation_id",
+                "pending_secret_uploaded_at",
+                "committed_rotation_id",
+            },
+        }.get(table_name, set())
         allowed = (
             expected
             | v3_additions
@@ -542,6 +751,7 @@ def _preflight_existing_schema(sync_connection: object, schema: str | None) -> N
             | v5_additions
             | v6_additions
             | v7_additions
+            | v8_additions
         )
         if not expected.issubset(actual) or not actual.issubset(allowed):
             raise RelaySchemaMismatchError(
@@ -833,7 +1043,29 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             "max_allocations": (Integer, None, False),
             "active_allocations": (Integer, None, False),
             "max_egress_bps": (BigInteger, None, False),
+            "current_ingress_bps": (BigInteger, None, False),
             "current_egress_bps": (BigInteger, None, False),
+            "identity_epoch": (BigInteger, None, False),
+            "last_boot_id": (String, 22, True),
+            "last_heartbeat_nonce": (String, 43, True),
+            "process_health": (String, 16, False),
+            "listener_health": (String, 16, False),
+            "probe_health": (String, 16, False),
+            "packet_loss_bps": (Integer, None, False),
+            "cpu_usage_bps": (Integer, None, False),
+            "memory_usage_bps": (Integer, None, False),
+            "active_secret_version": (BigInteger, None, False),
+            "applied_secret_version": (BigInteger, None, False),
+            "desired_secret_version": (BigInteger, None, False),
+            "desired_draining": (Boolean, None, False),
+            "secret_not_before": (DateTime, None, True),
+            "old_credential_deadline": (DateTime, None, True),
+            "pending_secret_version": (BigInteger, None, True),
+            "pending_encrypted_turn_secret": (LargeBinary, None, True),
+            "pending_secret_digest": (LargeBinary, None, True),
+            "pending_rotation_id": (String, 128, True),
+            "pending_secret_uploaded_at": (DateTime, None, True),
+            "committed_rotation_id": (String, 128, True),
             "heartbeat_sequence": (BigInteger, None, False),
             "healthy_heartbeat_streak": (Integer, None, False),
             "measured_rtt_ms": (BigInteger, None, True),
@@ -928,7 +1160,19 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
                 {
                     "state": "'unavailable'",
                     "active_allocations": "0",
+                    "current_ingress_bps": "0",
                     "current_egress_bps": "0",
+                    "identity_epoch": "1",
+                    "process_health": "'failed'",
+                    "listener_health": "'failed'",
+                    "probe_health": "'non_evidence'",
+                    "packet_loss_bps": "0",
+                    "cpu_usage_bps": "0",
+                    "memory_usage_bps": "0",
+                    "active_secret_version": "1",
+                    "applied_secret_version": "1",
+                    "desired_secret_version": "1",
+                    "desired_draining": "false",
                     "heartbeat_sequence": "0",
                     "healthy_heartbeat_streak": "0",
                     "recent_failure_bps": "0",
@@ -980,7 +1224,36 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
                 "active_allocations >= 0 AND active_allocations <= max_allocations"
             ),
             "ck_relay_nodes_max_egress": "max_egress_bps > 0",
+            "ck_relay_nodes_current_ingress": "current_ingress_bps >= 0",
             "ck_relay_nodes_current_egress": "current_egress_bps >= 0",
+            "ck_relay_nodes_identity_epoch": "identity_epoch >= 1",
+            "ck_relay_nodes_health": (
+                "process_health = ANY (ARRAY['healthy', 'degraded', 'failed'])) AND ("
+                "listener_health = ANY (ARRAY['healthy', 'degraded', 'failed'])) AND ("
+                "probe_health = ANY (ARRAY['healthy', 'failed', 'non_evidence'])"
+            ),
+            "ck_relay_nodes_pressure": (
+                "packet_loss_bps >= 0 AND packet_loss_bps <= 10000 AND "
+                "cpu_usage_bps >= 0 AND cpu_usage_bps <= 10000 AND "
+                "memory_usage_bps >= 0 AND memory_usage_bps <= 10000"
+            ),
+            "ck_relay_nodes_secret_versions": (
+                "active_secret_version >= 1 AND applied_secret_version >= 1 AND "
+                "desired_secret_version >= active_secret_version"
+            ),
+            "ck_relay_nodes_rotation_pending": (
+                "pending_secret_version IS NULL AND "
+                "pending_encrypted_turn_secret IS NULL AND "
+                "pending_secret_digest IS NULL AND pending_rotation_id IS NULL AND "
+                "pending_secret_uploaded_at IS NULL OR "
+                "pending_secret_version = desired_secret_version AND "
+                "pending_encrypted_turn_secret IS NOT NULL AND "
+                "length(pending_encrypted_turn_secret) >= 30 AND "
+                "pending_secret_digest IS NOT NULL AND "
+                "length(pending_secret_digest) = 32 AND "
+                "pending_rotation_id IS NOT NULL AND "
+                "pending_secret_uploaded_at IS NOT NULL"
+            ),
             "ck_relay_nodes_heartbeat_sequence": "heartbeat_sequence >= 0",
             "ck_relay_nodes_healthy_heartbeat_streak": (
                 "healthy_heartbeat_streak >= 0 AND healthy_heartbeat_streak <= 3"

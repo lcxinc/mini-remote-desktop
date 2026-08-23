@@ -1,0 +1,10 @@
+{
+  "method": "POST",
+  "path": "/api/v1/relays/relay-hkg-1/heartbeat",
+  "node_id": "relay-hkg-1",
+  "timestamp": 1760000000,
+  "sequence": 42,
+  "request_body_json": "{\"identity_epoch\":7,\"boot_id\":\"AgICAgICAgICAgICAgICAg\",\"nonce\":\"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE\",\"process_health\":\"healthy\",\"listener_health\":\"healthy\",\"probe_health\":\"healthy\",\"active_allocations\":3,\"current_ingress_bps\":400000,\"current_egress_bps\":800000,\"max_allocations\":1000,\"max_egress_bps\":1000000000,\"packet_loss_bps\":25,\"cpu_usage_bps\":1200,\"memory_usage_bps\":3400,\"measured_rtt_ms\":18,\"recent_failure_bps\":50,\"endpoints\":[\"turn:relay-hkg-1.example.test:3478?transport=udp\"],\"applied_secret_version\":4}",
+  "canonical_hex": "4d52445f52454c41595f524551554553545f56310000000004504f5354000000242f6170692f76312f72656c6179732f72656c61792d686b672d312f6865617274626561740000000b72656c61792d686b672d310000000a31373630303030303030000000023432000000201127551b77aacc0d13cf4b33ac394d979e695dcf5af64bcddf98896979a8cc1e",
+  "response_body_json": "{\"node_id\":\"relay-hkg-1\",\"identity_epoch\":7,\"sequence\":42,\"state\":\"available\",\"desired\":{\"draining\":false,\"secret_version\":4,\"not_before\":null,\"old_credential_deadline\":null},\"lease_expires_at\":\"2025-10-09T08:53:35Z\"}"
+}

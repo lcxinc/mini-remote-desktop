@@ -9,7 +9,7 @@ from typing import Any
 
 _MAX_BODY_BYTES = 65_536
 _NODE_PATH = re.compile(
-    r"^/api/v1/relays/(?:enroll|enrollments/[^/]+/pickup|[^/]+/(?:heartbeat|renew))$"
+    r"^/api/v1/relays/(?:enroll|enrollments/[^/]+/pickup|[^/]+/(?:heartbeat|renew|secret-rotation/(?:upload|commit)))$"
 )
 _CONTENT_LENGTH = re.compile(rb"^(0|[1-9][0-9]{0,19})$")
 _FORWARDED_HEADERS = {

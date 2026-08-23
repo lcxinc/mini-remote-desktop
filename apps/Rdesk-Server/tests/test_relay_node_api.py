@@ -29,8 +29,11 @@ from app.models.user import User
 from app.middleware.relay_node_boundary import RelayNodeBoundaryMiddleware
 from app.schemas.relay import (
     RelayEnrollmentRequest,
+    RelayHeartbeatRequest,
     RelayHeartbeatResponse,
     RelayNodeResponse,
+    RelaySecretCommitRequest,
+    RelaySecretUploadRequest,
 )
 
 
@@ -39,6 +42,73 @@ NODE_ID = "relay-ap-east-1"
 NODE_TURN_SECRET = base64.urlsafe_b64encode(b"node-held-turn-secret-material!!").rstrip(
     b"="
 ).decode("ascii")
+
+
+def test_shared_heartbeat_fixture_is_exact_and_accepts_available_state() -> None:
+    fixture_path = (
+        Path(__file__).parents[3] / "tests" / "fixtures" / "relay_heartbeat_wire_v1.json"
+    )
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    body = fixture["request_body_json"].encode("utf-8")
+    payload = RelayHeartbeatRequest.model_validate_json(body)
+    assert payload.identity_epoch == 7
+    assert payload.boot_id == "AgICAgICAgICAgICAgICAg"
+    assert payload.nonce == "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
+    assert payload.current_ingress_bps == 400_000
+    assert payload.applied_secret_version == 4
+    assert _canonical_request(
+        fixture["method"],
+        fixture["path"],
+        fixture["node_id"],
+        fixture["timestamp"],
+        fixture["sequence"],
+        body,
+    ).hex() == fixture["canonical_hex"]
+    response = RelayHeartbeatResponse.model_validate_json(fixture["response_body_json"])
+    assert response.state == "available"
+    assert response.identity_epoch == 7
+    assert response.desired.secret_version == 4
+
+
+def test_shared_secret_rotation_fixture_is_exact_for_upload_and_commit() -> None:
+    fixture_path = (
+        Path(__file__).parents[3]
+        / "tests"
+        / "fixtures"
+        / "relay_secret_rotation_wire_v1.json"
+    )
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    upload = fixture["upload"]
+    upload_payload = RelaySecretUploadRequest.model_validate_json(upload["body_json"])
+    assert upload_payload.identity_epoch == 1
+    assert upload_payload.rotation_id == "rotation-0001"
+    assert upload_payload.secret_version == 2
+    assert upload_payload.turn_rest_secret.get_secret_value() == (
+        "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"
+    )
+    assert _canonical_request(
+        upload["method"],
+        upload["path"],
+        fixture["node_id"],
+        upload["timestamp"],
+        upload["sequence"],
+        upload["body_json"].encode("utf-8"),
+    ).startswith(b"MRD_RELAY_REQUEST_V1\x00")
+
+    commit = fixture["commit"]
+    commit_payload = RelaySecretCommitRequest.model_validate_json(commit["body_json"])
+    assert commit_payload.identity_epoch == 1
+    assert commit_payload.rotation_id == "rotation-0001"
+    assert commit_payload.secret_version == 2
+    assert commit_payload.probe_evidence_sha256 == "ab" * 32
+    assert _canonical_request(
+        commit["method"],
+        commit["path"],
+        fixture["node_id"],
+        commit["timestamp"],
+        commit["sequence"],
+        commit["body_json"].encode("utf-8"),
+    ).startswith(b"MRD_RELAY_REQUEST_V1\x00")
 
 
 def _approval_body(node_id: str = NODE_ID) -> dict[str, str]:
@@ -63,8 +133,15 @@ def test_new_enrollment_rejects_colon_node_id_but_legacy_outputs_remain_valid() 
 
     heartbeat = RelayHeartbeatResponse(
         node_id="relay:legacy",
+        identity_epoch=1,
         state="available",
         sequence=1,
+        desired={
+            "draining": False,
+            "secret_version": 1,
+            "not_before": None,
+            "old_credential_deadline": None,
+        },
         lease_expires_at=datetime.now(UTC),
     )
     node = RelayNodeResponse(
@@ -222,18 +299,19 @@ def _heartbeat_request(
     payload: dict[str, object] | None = None,
     path: str | None = None,
     method: str = "POST",
+    replace_payload: bool = False,
 ) -> tuple[bytes, dict[str, str]]:
     timestamp = timestamp or int(time.time())
     route_path = path or f"/api/v1/relays/{node_id}/heartbeat"
-    body = json.dumps(
-        payload
-        or {
-            "active_allocations": 1,
-            "current_egress_bps": 1024,
-            "endpoints": ["turn:relay.example.test:3478?transport=udp"],
-        },
-        separators=(",", ":"),
-    ).encode()
+    complete_payload = _extended_heartbeat_payload()
+    complete_payload["nonce"] = base64.urlsafe_b64encode(
+        hashlib.sha256(f"test-nonce:{sequence}".encode()).digest()
+    ).rstrip(b"=").decode()
+    if replace_payload and payload is not None:
+        complete_payload = payload
+    elif payload is not None:
+        complete_payload.update(payload)
+    body = json.dumps(complete_payload, separators=(",", ":")).encode()
     signature = key.sign(
         _canonical_request(method, route_path, node_id, timestamp, sequence, body)
     )
@@ -247,6 +325,29 @@ def _heartbeat_request(
         "Content-Type": "application/json",
     }
     return body, headers
+
+
+def _extended_heartbeat_payload(*, identity_epoch: int = 1) -> dict[str, object]:
+    return {
+        "identity_epoch": identity_epoch,
+        "boot_id": base64.urlsafe_b64encode(bytes([2]) * 16).rstrip(b"=").decode(),
+        "nonce": base64.urlsafe_b64encode(bytes([1]) * 32).rstrip(b"=").decode(),
+        "process_health": "healthy",
+        "listener_health": "healthy",
+        "probe_health": "healthy",
+        "active_allocations": 1,
+        "current_ingress_bps": 512,
+        "current_egress_bps": 1024,
+        "max_allocations": 100,
+        "max_egress_bps": 1_000_000,
+        "packet_loss_bps": 0,
+        "cpu_usage_bps": 100,
+        "memory_usage_bps": 200,
+        "measured_rtt_ms": 10,
+        "recent_failure_bps": 0,
+        "endpoints": ["turn:relay.example.test:3478?transport=udp"],
+        "applied_secret_version": 1,
+    }
 
 
 def _error_code(response: object) -> str:
@@ -607,6 +708,190 @@ def test_heartbeat_requires_proxy_certificate_and_ed25519_signature(
     assert _error_code(replay) == "relay_heartbeat_replayed"
 
 
+def test_extended_heartbeat_is_epoch_bound_and_returns_strict_desired_state(
+    api: tuple[TestClient, object],
+) -> None:
+    client, _ = api
+    key, _ = _enroll(client)
+    _, fingerprint = _approve(client)
+    body, headers = _heartbeat_request(
+        key, fingerprint, payload=_extended_heartbeat_payload()
+    )
+    response = client.post(
+        f"/api/v1/relays/{NODE_ID}/heartbeat", content=body, headers=headers
+    )
+    assert response.status_code == 200, response.text
+    assert response.headers["cache-control"] == "no-store, private"
+    assert response.json() == {
+        "node_id": NODE_ID,
+        "identity_epoch": 1,
+        "sequence": 1,
+        "state": "unavailable",
+        "desired": {
+            "draining": False,
+            "secret_version": 1,
+            "not_before": None,
+            "old_credential_deadline": None,
+        },
+        "lease_expires_at": response.json()["lease_expires_at"],
+    }
+
+
+def test_node_generated_secret_rotation_is_authenticated_encrypted_and_atomic(
+    api: tuple[TestClient, object],
+) -> None:
+    from app.models.relay_audit_event import RelayAuditEvent
+    from app.models.relay_node import RelayNode
+
+    client, engine = api
+    key, _ = _enroll(client)
+    _, fingerprint = _approve(client)
+    with Session(engine) as session:
+        before_rotation = session.get(RelayNode, NODE_ID)
+        assert before_rotation is not None
+        active_ciphertext = bytes(before_rotation.encrypted_turn_secret)
+    requested = client.post(
+        f"/api/v1/relays/{NODE_ID}/rotate-secret",
+        json={"credential_ttl_seconds": 60},
+    )
+    assert requested.status_code == 202, requested.text
+    directive = requested.json()
+    assert directive["identity_epoch"] == 1
+    assert directive["secret_version"] == 2
+    assert directive["draining"] is True
+    assert "turn_rest_secret" not in requested.text
+
+    heartbeat_body, heartbeat_headers = _heartbeat_request(
+        key, fingerprint, sequence=1
+    )
+    heartbeat = client.post(
+        f"/api/v1/relays/{NODE_ID}/heartbeat",
+        content=heartbeat_body,
+        headers=heartbeat_headers,
+    )
+    assert heartbeat.status_code == 200, heartbeat.text
+    assert heartbeat.json()["desired"]["secret_version"] == 2
+    assert heartbeat.json()["desired"]["draining"] is True
+
+    rotation_id = "rotation-0001"
+    new_secret = base64.urlsafe_b64encode(
+        hashlib.sha256(b"task7-node-generated-rotation").digest()
+    ).rstrip(b"=").decode()
+    upload_path = f"/api/v1/relays/{NODE_ID}/secret-rotation/upload"
+    upload_payload = {
+        "identity_epoch": 1,
+        "rotation_id": rotation_id,
+        "secret_version": 2,
+        "turn_rest_secret": new_secret,
+    }
+    upload_body, upload_headers = _heartbeat_request(
+        key,
+        fingerprint,
+        sequence=2,
+        path=upload_path,
+        payload=upload_payload,
+        replace_payload=True,
+    )
+    uploaded = client.post(upload_path, content=upload_body, headers=upload_headers)
+    assert uploaded.status_code == 202, uploaded.text
+    assert new_secret not in uploaded.text
+
+    # A transport retry uses a new request sequence but the same idempotency ID.
+    retry_body, retry_headers = _heartbeat_request(
+        key,
+        fingerprint,
+        sequence=3,
+        path=upload_path,
+        payload=upload_payload,
+        replace_payload=True,
+    )
+    retried = client.post(upload_path, content=retry_body, headers=retry_headers)
+    assert retried.status_code == 202, retried.text
+    assert retried.json() == uploaded.json()
+
+    conflicting_payload = dict(upload_payload)
+    conflicting_payload["turn_rest_secret"] = base64.urlsafe_b64encode(
+        hashlib.sha256(b"different-secret-same-version").digest()
+    ).rstrip(b"=").decode()
+    conflict_body, conflict_headers = _heartbeat_request(
+        key,
+        fingerprint,
+        sequence=4,
+        path=upload_path,
+        payload=conflicting_payload,
+        replace_payload=True,
+    )
+    conflict = client.post(upload_path, content=conflict_body, headers=conflict_headers)
+    assert conflict.status_code == 409, conflict.text
+    assert _error_code(conflict) == "relay_secret_rotation_conflict"
+
+    empty_body, empty_headers = _heartbeat_request(
+        key,
+        fingerprint,
+        sequence=5,
+        payload={"active_allocations": 0},
+    )
+    empty = client.post(
+        f"/api/v1/relays/{NODE_ID}/heartbeat",
+        content=empty_body,
+        headers=empty_headers,
+    )
+    assert empty.status_code == 200, empty.text
+
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        assert node.pending_encrypted_turn_secret is not None
+        assert new_secret.encode() not in node.pending_encrypted_turn_secret
+        assert bytes(node.encrypted_turn_secret) == active_ciphertext
+        node.old_credential_deadline = datetime.now(UTC) - timedelta(seconds=1)
+        session.commit()
+
+    commit_path = f"/api/v1/relays/{NODE_ID}/secret-rotation/commit"
+    commit_payload = {
+        "identity_epoch": 1,
+        "rotation_id": rotation_id,
+        "secret_version": 2,
+        "probe_evidence_sha256": "ab" * 32,
+    }
+    commit_body, commit_headers = _heartbeat_request(
+        key,
+        fingerprint,
+        sequence=6,
+        path=commit_path,
+        payload=commit_payload,
+        replace_payload=True,
+    )
+    committed = client.post(commit_path, content=commit_body, headers=commit_headers)
+    assert committed.status_code == 200, committed.text
+    assert committed.json()["active_secret_version"] == 2
+    retry_commit_body, retry_commit_headers = _heartbeat_request(
+        key,
+        fingerprint,
+        sequence=7,
+        path=commit_path,
+        payload=commit_payload,
+        replace_payload=True,
+    )
+    retried_commit = client.post(
+        commit_path, content=retry_commit_body, headers=retry_commit_headers
+    )
+    assert retried_commit.status_code == 200, retried_commit.text
+    assert retried_commit.json() == committed.json()
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        assert node.active_secret_version == 2
+        assert node.applied_secret_version == 2
+        assert node.pending_encrypted_turn_secret is None
+        events = session.scalars(
+            select(RelayAuditEvent).where(
+                RelayAuditEvent.action == "relay_secret_rotation_committed"
+            )
+        ).all()
+        assert len(events) == 1
+
+
 def test_node_requires_three_consecutive_healthy_heartbeats_to_recover(
     api: tuple[TestClient, object],
 ) -> None:
@@ -632,6 +917,40 @@ def test_node_requires_three_consecutive_healthy_heartbeats_to_recover(
         node = session.get(RelayNode, NODE_ID)
         assert node is not None
         assert node.healthy_heartbeat_streak == 3
+
+
+def test_failed_local_supervisor_heartbeats_never_restore_available(
+    api: tuple[TestClient, object],
+) -> None:
+    from app.models.relay_node import RelayNode
+
+    client, engine = api
+    key, _ = _enroll(client)
+    _, fingerprint = _approve(client)
+    states: list[str] = []
+    for sequence in (1, 2, 3, 4, 5):
+        body, headers = _heartbeat_request(
+            key,
+            fingerprint,
+            sequence=sequence,
+            payload={
+                "process_health": "failed",
+                "listener_health": "failed",
+                "probe_health": "failed",
+            },
+        )
+        response = client.post(
+            f"/api/v1/relays/{NODE_ID}/heartbeat",
+            content=body,
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        states.append(response.json()["state"])
+    assert states == ["unavailable"] * 5
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        assert node.healthy_heartbeat_streak == 0
 
 
 def test_authenticated_heartbeat_persists_selection_metrics(
@@ -750,7 +1069,10 @@ def test_missing_heartbeat_body_fields_return_stable_validation_error(
     key, _ = _enroll(client)
     _, fingerprint = _approve(client)
     body, headers = _heartbeat_request(
-        key, fingerprint, payload={"active_allocations": 0}
+        key,
+        fingerprint,
+        payload={"active_allocations": 0},
+        replace_payload=True,
     )
     response = client.post(
         f"/api/v1/relays/{NODE_ID}/heartbeat", content=body, headers=headers

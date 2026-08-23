@@ -50,6 +50,12 @@ from app.schemas.relay import (
     RelayRevocationResponse,
     RelayRenewalRequest,
     RelayRenewalResponse,
+    RelaySecretCommitRequest,
+    RelaySecretCommitResponse,
+    RelaySecretRotationDirective,
+    RelaySecretRotationRequest,
+    RelaySecretUploadRequest,
+    RelaySecretUploadResponse,
 )
 from app.services.relay_node_auth import RelayAuthError, require_trusted_proxy
 from app.services.relay_registry import (
@@ -526,8 +532,21 @@ async def record_relay_heartbeat(
         node = await _registry(db).record_heartbeat(
             identity=identity,
             sequence=request.state.relay_sequence,
+            identity_epoch=payload.identity_epoch,
+            boot_id=payload.boot_id,
+            nonce=payload.nonce,
+            process_health=payload.process_health,
+            listener_health=payload.listener_health,
+            probe_health=payload.probe_health,
             active_allocations=payload.active_allocations,
+            current_ingress_bps=payload.current_ingress_bps,
             current_egress_bps=payload.current_egress_bps,
+            max_allocations=payload.max_allocations,
+            max_egress_bps=payload.max_egress_bps,
+            packet_loss_bps=payload.packet_loss_bps,
+            cpu_usage_bps=payload.cpu_usage_bps,
+            memory_usage_bps=payload.memory_usage_bps,
+            applied_secret_version=payload.applied_secret_version,
             measured_rtt_ms=payload.measured_rtt_ms,
             recent_failure_bps=payload.recent_failure_bps,
             endpoints=payload.endpoints,
@@ -538,8 +557,15 @@ async def record_relay_heartbeat(
         _raise_domain(error)
     return RelayHeartbeatResponse(
         node_id=node_id,
+        identity_epoch=node.identity_epoch,
         state=node.state,
         sequence=node.heartbeat_sequence,
+        desired={
+            "draining": node.desired_draining,
+            "secret_version": node.desired_secret_version,
+            "not_before": node.secret_not_before,
+            "old_credential_deadline": node.old_credential_deadline,
+        },
         lease_expires_at=node.lease_expires_at,
     )
 
@@ -598,6 +624,106 @@ async def renew_relay_certificate(
         ca_certificate_pem=renewed.certificate.ca_certificate_pem,
         fingerprint=renewed.certificate.fingerprint,
         expires_at=renewed.certificate.expires_at,
+    )
+
+
+@router.post(
+    "/{node_id}/rotate-secret",
+    response_model=RelaySecretRotationDirective,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def rotate_relay_secret(
+    node_id: str,
+    payload: RelaySecretRotationRequest,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> RelaySecretRotationDirective:
+    try:
+        node = await _registry(db).request_secret_rotation(
+            node_id=node_id,
+            actor_id=admin.id,
+            credential_ttl_seconds=payload.credential_ttl_seconds,
+            now=_now(),
+        )
+        await _commit(db)
+    except RelayRegistryError as error:
+        _raise_domain(error)
+    return RelaySecretRotationDirective(
+        node_id=node.node_id,
+        identity_epoch=node.identity_epoch,
+        secret_version=node.desired_secret_version,
+        draining=True,
+        not_before=node.secret_not_before,
+        old_credential_deadline=node.old_credential_deadline,
+    )
+
+
+@router.post(
+    "/{node_id}/secret-rotation/upload",
+    response_model=RelaySecretUploadResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    openapi_extra={"security": ({"TrustedMTLSProxy": [], "RelayEd25519": []},)},
+)
+async def upload_relay_secret(
+    node_id: str,
+    request: Request,
+    payload: RelaySecretUploadRequest,
+    identity: RelayIdentity = Depends(get_verified_relay_node),
+    db: AsyncSession = Depends(get_db),
+) -> RelaySecretUploadResponse:
+    try:
+        node = await _registry(db).upload_secret_rotation(
+            identity=identity,
+            sequence=request.state.relay_sequence,
+            identity_epoch=payload.identity_epoch,
+            rotation_id=payload.rotation_id,
+            secret_version=payload.secret_version,
+            turn_rest_secret=payload.turn_rest_secret,
+            now=_now(),
+        )
+        await _commit(db)
+    except RelayRegistryError as error:
+        _raise_domain(error)
+    return RelaySecretUploadResponse(
+        node_id=node_id,
+        identity_epoch=node.identity_epoch,
+        rotation_id=payload.rotation_id,
+        secret_version=payload.secret_version,
+        status="uploaded",
+    )
+
+
+@router.post(
+    "/{node_id}/secret-rotation/commit",
+    response_model=RelaySecretCommitResponse,
+    openapi_extra={"security": ({"TrustedMTLSProxy": [], "RelayEd25519": []},)},
+)
+async def commit_relay_secret(
+    node_id: str,
+    request: Request,
+    payload: RelaySecretCommitRequest,
+    identity: RelayIdentity = Depends(get_verified_relay_node),
+    db: AsyncSession = Depends(get_db),
+) -> RelaySecretCommitResponse:
+    try:
+        node = await _registry(db).commit_secret_rotation(
+            identity=identity,
+            sequence=request.state.relay_sequence,
+            identity_epoch=payload.identity_epoch,
+            rotation_id=payload.rotation_id,
+            secret_version=payload.secret_version,
+            probe_evidence_sha256=payload.probe_evidence_sha256,
+            now=_now(),
+        )
+        await _commit(db)
+    except RelayRegistryError as error:
+        _raise_domain(error)
+    return RelaySecretCommitResponse(
+        node_id=node_id,
+        identity_epoch=node.identity_epoch,
+        rotation_id=payload.rotation_id,
+        active_secret_version=node.active_secret_version,
+        status="committed",
     )
 
 

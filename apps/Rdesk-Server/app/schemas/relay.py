@@ -36,6 +36,20 @@ Region = Annotated[
     ),
 ]
 Endpoint = Annotated[str, StringConstraints(min_length=1, max_length=512)]
+RotationId = Annotated[
+    str,
+    StringConstraints(
+        min_length=8,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$",
+    ),
+]
+BootId = Annotated[
+    str, StringConstraints(min_length=22, max_length=22, pattern=r"^[A-Za-z0-9_-]{22}$")
+]
+RequestNonce = Annotated[
+    str, StringConstraints(min_length=43, max_length=43, pattern=r"^[A-Za-z0-9_-]{43}$")
+]
 
 
 class EnrollmentTokenRequest(BaseModel):
@@ -87,8 +101,8 @@ class RelayEnrollmentPickupResponse(BaseModel):
     enrollment_id: str
     node_id: RelayId
     status: str
-    certificate_pem: str | None = None
-    ca_certificate_pem: str | None = None
+    certificate_pem: str | None = Field(default=None, repr=False)
+    ca_certificate_pem: str | None = Field(default=None, repr=False)
     expires_at: datetime | None = None
 
 
@@ -109,8 +123,8 @@ class RelayRenewalRequest(BaseModel):
 class RelayRenewalResponse(BaseModel):
     renewal_id: RelayId
     node_id: RelayId
-    certificate_pem: str
-    ca_certificate_pem: str
+    certificate_pem: str = Field(repr=False)
+    ca_certificate_pem: str = Field(repr=False)
     fingerprint: str
     expires_at: datetime
 
@@ -123,20 +137,107 @@ class RelayApprovalResponse(BaseModel):
 class RelayHeartbeatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    identity_epoch: int = Field(strict=True, ge=1, le=2**63 - 1)
+    boot_id: BootId
+    nonce: RequestNonce
+    process_health: Literal["healthy", "degraded", "failed"]
+    listener_health: Literal["healthy", "degraded", "failed"]
+    probe_health: Literal["healthy", "failed", "non_evidence"]
     active_allocations: int = Field(strict=True, ge=0, le=2**31 - 1)
+    current_ingress_bps: int = Field(strict=True, ge=0, le=2**63 - 1)
     current_egress_bps: int = Field(strict=True, ge=0, le=2**63 - 1)
+    max_allocations: int = Field(strict=True, ge=1, le=2**31 - 1)
+    max_egress_bps: int = Field(strict=True, ge=1, le=2**63 - 1)
+    packet_loss_bps: int = Field(strict=True, ge=0, le=10_000)
+    cpu_usage_bps: int = Field(strict=True, ge=0, le=10_000)
+    memory_usage_bps: int = Field(strict=True, ge=0, le=10_000)
     measured_rtt_ms: int | None = Field(
         default=None, strict=True, ge=0, le=2**32 - 1
     )
     recent_failure_bps: int = Field(default=0, strict=True, ge=0, le=10_000)
     endpoints: list[Endpoint] = Field(min_length=1, max_length=4)
+    applied_secret_version: int = Field(strict=True, ge=1, le=2**63 - 1)
+
+
+class RelayDesiredState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    draining: bool
+    secret_version: int = Field(strict=True, ge=1, le=2**63 - 1)
+    not_before: datetime | None
+    old_credential_deadline: datetime | None
 
 
 class RelayHeartbeatResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     node_id: RelayId
-    state: str
-    sequence: int
+    identity_epoch: int = Field(strict=True, ge=1, le=2**63 - 1)
+    state: Literal["available", "degraded", "draining", "unavailable", "revoked"]
+    sequence: int = Field(strict=True, ge=1, le=2**63 - 1)
+    desired: RelayDesiredState
     lease_expires_at: datetime
+
+
+class RelaySecretRotationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    credential_ttl_seconds: int = Field(strict=True, ge=60, le=3600)
+
+
+class RelaySecretRotationDirective(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: RelayId
+    identity_epoch: int = Field(strict=True, ge=1, le=2**63 - 1)
+    secret_version: int = Field(strict=True, ge=2, le=2**63 - 1)
+    draining: Literal[True]
+    not_before: datetime
+    old_credential_deadline: datetime
+
+
+class RelaySecretUploadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    identity_epoch: int = Field(strict=True, ge=1, le=2**63 - 1)
+    rotation_id: RotationId
+    secret_version: int = Field(strict=True, ge=2, le=2**63 - 1)
+    turn_rest_secret: SecretStr = Field(repr=False)
+
+    _validate_secret = field_validator("turn_rest_secret")(
+        RelayEnrollmentRequest.validate_turn_rest_secret.__func__
+    )
+
+
+class RelaySecretUploadResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: RelayId
+    identity_epoch: int
+    rotation_id: RotationId
+    secret_version: int
+    status: Literal["uploaded"]
+
+
+class RelaySecretCommitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    identity_epoch: int = Field(strict=True, ge=1, le=2**63 - 1)
+    rotation_id: RotationId
+    secret_version: int = Field(strict=True, ge=2, le=2**63 - 1)
+    probe_evidence_sha256: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+
+
+class RelaySecretCommitResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: RelayId
+    identity_epoch: int
+    rotation_id: RotationId
+    active_secret_version: int
+    status: Literal["committed"]
 
 
 class RelayNodeResponse(BaseModel):

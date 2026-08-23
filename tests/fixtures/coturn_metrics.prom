@@ -1,0 +1,5 @@
+# coturn exporter snapshot used by the relay-agent contract
+turn_active_allocations 12
+turn_current_ingress_bps 1048576
+turn_current_egress_bps 2097152
+turn_errors_total 3

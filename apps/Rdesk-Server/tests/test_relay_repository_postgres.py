@@ -827,7 +827,11 @@ async def test_migration_schema_matches_orm_and_required_indexes() -> None:
             versions = await connection.scalar(
                 text("SELECT COUNT(*) FROM relay_schema_migrations WHERE version = 1")
             )
+            current_version = await connection.scalar(
+                text("SELECT MAX(version) FROM relay_schema_migrations")
+            )
         assert versions == 1
+        assert current_version == 8
         columns = snapshot["nodes_columns"]
         assert str(columns["endpoints"]["type"]).upper() == "JSONB"
         assert columns["state"]["nullable"] is False
@@ -837,8 +841,17 @@ async def test_migration_schema_matches_orm_and_required_indexes() -> None:
             "current_egress_bps",
             "heartbeat_sequence",
             "recent_failure_bps",
+            "current_ingress_bps",
         ):
             assert str(columns[name]["default"]).strip("()") == "0"
+        for name in (
+            "identity_epoch",
+            "active_secret_version",
+            "applied_secret_version",
+            "desired_secret_version",
+        ):
+            assert str(columns[name]["default"]).strip("()") == "1"
+        assert str(columns["desired_draining"]["default"]).strip("()") == "false"
         assert {
             "ck_relay_nodes_state",
             "ck_relay_nodes_max_allocations",
@@ -897,16 +910,28 @@ async def test_current_migration_ledger_runs_read_only_schema_verification() -> 
 
 
 @pytest.mark.anyio
-async def test_migration_with_only_v7_missing_executes_only_v7_step() -> None:
+async def test_migration_with_only_v8_missing_executes_only_v8_step() -> None:
     async with isolated_postgres_engine() as engine:
         async with engine.begin() as connection:
             await connection.execute(
-                text("DELETE FROM relay_schema_migrations WHERE version = 7")
+                text("DELETE FROM relay_schema_migrations WHERE version = 8")
             )
             await connection.execute(
                 text(
-                    "ALTER TABLE relay_reservations "
-                    "DROP COLUMN superseded_at, DROP COLUMN directory_generation"
+                    "ALTER TABLE relay_nodes "
+                    "DROP COLUMN current_ingress_bps, "
+                    "DROP COLUMN identity_epoch, DROP COLUMN last_boot_id, "
+                    "DROP COLUMN last_heartbeat_nonce, DROP COLUMN process_health, "
+                    "DROP COLUMN listener_health, DROP COLUMN probe_health, "
+                    "DROP COLUMN packet_loss_bps, DROP COLUMN cpu_usage_bps, "
+                    "DROP COLUMN memory_usage_bps, DROP COLUMN active_secret_version, "
+                    "DROP COLUMN applied_secret_version, DROP COLUMN desired_secret_version, "
+                    "DROP COLUMN desired_draining, DROP COLUMN secret_not_before, "
+                    "DROP COLUMN old_credential_deadline, DROP COLUMN pending_secret_version, "
+                    "DROP COLUMN pending_encrypted_turn_secret, "
+                    "DROP COLUMN pending_secret_digest, DROP COLUMN pending_rotation_id, "
+                    "DROP COLUMN pending_secret_uploaded_at, "
+                    "DROP COLUMN committed_rotation_id"
                 )
             )
 
@@ -937,11 +962,15 @@ async def test_migration_with_only_v7_missing_executes_only_v7_step() -> None:
         ]
         assert len(mutating) == 3, mutating
         assert all(
-            "RELAY_RESERVATIONS" in statement
+            "RELAY_NODES" in statement
             or "INSERT INTO RELAY_SCHEMA_MIGRATIONS" in statement
             for statement in mutating
         )
-        assert not any(statement.startswith(("CREATE ", "DO ", "UPDATE ")) for statement in mutating)
+        assert [statement.split(maxsplit=1)[0] for statement in mutating] == [
+            "ALTER",
+            "DO",
+            "INSERT",
+        ]
         async with engine.connect() as connection:
             versions = list(
                 (
@@ -953,7 +982,64 @@ async def test_migration_with_only_v7_missing_executes_only_v7_step() -> None:
                     )
                 ).scalars()
             )
-        assert versions == list(range(1, 8))
+        assert versions == list(range(1, 9))
+
+
+@pytest.mark.anyio
+async def test_v7_to_v8_failure_rolls_back_columns_constraints_and_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with isolated_postgres_engine() as engine:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("DELETE FROM relay_schema_migrations WHERE version = 8")
+            )
+            await connection.execute(
+                text(
+                    "ALTER TABLE relay_nodes "
+                    "DROP COLUMN current_ingress_bps, "
+                    "DROP COLUMN identity_epoch, DROP COLUMN last_boot_id, "
+                    "DROP COLUMN last_heartbeat_nonce, DROP COLUMN process_health, "
+                    "DROP COLUMN listener_health, DROP COLUMN probe_health, "
+                    "DROP COLUMN packet_loss_bps, DROP COLUMN cpu_usage_bps, "
+                    "DROP COLUMN memory_usage_bps, DROP COLUMN active_secret_version, "
+                    "DROP COLUMN applied_secret_version, DROP COLUMN desired_secret_version, "
+                    "DROP COLUMN desired_draining, DROP COLUMN secret_not_before, "
+                    "DROP COLUMN old_credential_deadline, DROP COLUMN pending_secret_version, "
+                    "DROP COLUMN pending_encrypted_turn_secret, "
+                    "DROP COLUMN pending_secret_digest, DROP COLUMN pending_rotation_id, "
+                    "DROP COLUMN pending_secret_uploaded_at, "
+                    "DROP COLUMN committed_rotation_id"
+                )
+            )
+
+        def fail_exact_verifier(*_args: object) -> None:
+            raise relay_migration.RelaySchemaMismatchError("injected v8 verifier failure")
+
+        monkeypatch.setattr(
+            relay_migration, "_assert_schema_conforms", fail_exact_verifier
+        )
+        with pytest.raises(
+            relay_migration.RelaySchemaMismatchError,
+            match="injected v8 verifier failure",
+        ):
+            await migrate(engine)
+
+        async with engine.connect() as connection:
+            version = await connection.scalar(
+                text("SELECT MAX(version) FROM relay_schema_migrations")
+            )
+
+            def has_v8_column(sync_connection: object) -> bool:
+                columns = {
+                    column["name"]
+                    for column in inspect(sync_connection).get_columns("relay_nodes")
+                }
+                return "identity_epoch" in columns
+
+            column_exists = await connection.run_sync(has_v8_column)
+        assert version == 7
+        assert column_exists is False
 
 
 @pytest.mark.anyio
@@ -1313,7 +1399,7 @@ async def test_v4_behaviorally_upgrades_v2_schema_and_serializes_concurrent_upgr
             assert "healthy_heartbeat_streak" in node_columns
             assert set(registration_v3_columns).issubset(registration_columns)
             assert set(registration_v4_columns).issubset(registration_columns)
-            assert versions == [1, 2, 3, 4, 5, 6, 7]
+            assert versions == [1, 2, 3, 4, 5, 6, 7, 8]
     finally:
         await first.dispose()
         await second.dispose()

@@ -650,7 +650,20 @@ class RelayRegistry:
             previous_certificate_expires_at,
         )
         node.certificate_fingerprint = certificate.fingerprint
+        node.identity_epoch += 1
         node.heartbeat_sequence = 0
+        # Desired-state messages are scoped to the certificate identity epoch.
+        # A grace-period identity may retry renewal, but it cannot carry a
+        # rotation intent into the new epoch.
+        node.desired_draining = False
+        node.desired_secret_version = node.active_secret_version
+        node.secret_not_before = None
+        node.old_credential_deadline = None
+        node.pending_secret_version = None
+        node.pending_encrypted_turn_secret = None
+        node.pending_secret_digest = None
+        node.pending_rotation_id = None
+        node.pending_secret_uploaded_at = None
         node.healthy_heartbeat_streak = 0
         node.state = "unavailable"
         node.lease_expires_at = None
@@ -670,8 +683,21 @@ class RelayRegistry:
         *,
         identity: RelayIdentity,
         sequence: int,
+        identity_epoch: int,
+        boot_id: str,
+        nonce: str,
+        process_health: str,
+        listener_health: str,
+        probe_health: str,
         active_allocations: int,
+        current_ingress_bps: int,
         current_egress_bps: int,
+        max_allocations: int,
+        max_egress_bps: int,
+        packet_loss_bps: int,
+        cpu_usage_bps: int,
+        memory_usage_bps: int,
+        applied_secret_version: int,
         measured_rtt_ms: int | None = None,
         recent_failure_bps: int = 0,
         endpoints: list[str],
@@ -693,57 +719,94 @@ class RelayRegistry:
             type(recent_failure_bps) is not int
             or not 0 <= recent_failure_bps <= 10_000
         )
-        if active_allocations > node.max_allocations or invalid_selection_metrics:
+        health_values_valid = (
+            process_health in {"healthy", "degraded", "failed"}
+            and listener_health in {"healthy", "degraded", "failed"}
+            and probe_health in {"healthy", "failed", "non_evidence"}
+        )
+        if (
+            identity_epoch != node.identity_epoch
+            or active_allocations > node.max_allocations
+            or max_allocations != node.max_allocations
+            or max_egress_bps != node.max_egress_bps
+            or applied_secret_version != node.applied_secret_version
+            or not health_values_valid
+            or invalid_selection_metrics
+        ):
             self._error("relay_metrics_invalid", 400, "relay metrics invalid")
-        lease_expires_at = now + timedelta(seconds=15)
+        heartbeat_healthy = (
+            process_health == "healthy"
+            and listener_health == "healthy"
+            and probe_health == "healthy"
+        )
+        lease_expires_at = (
+            now + timedelta(seconds=15) if heartbeat_healthy else now
+        )
         fresh_ready = and_(
             RelayNode.state.in_(("available", "degraded")),
             RelayNode.lease_expires_at.is_not(None),
             RelayNode.lease_expires_at > now,
         )
-        next_streak = case(
-            (RelayNode.state == "draining", RelayNode.healthy_heartbeat_streak),
-            (fresh_ready, 3),
-            (
-                RelayNode.state == "unavailable",
-                case(
-                    (RelayNode.healthy_heartbeat_streak < 3,
-                     RelayNode.healthy_heartbeat_streak + 1),
-                    else_=3,
+        if heartbeat_healthy:
+            next_streak = case(
+                (RelayNode.state == "draining", RelayNode.healthy_heartbeat_streak),
+                (fresh_ready, 3),
+                (
+                    RelayNode.state == "unavailable",
+                    case(
+                        (
+                            RelayNode.healthy_heartbeat_streak < 3,
+                            RelayNode.healthy_heartbeat_streak + 1,
+                        ),
+                        else_=3,
+                    ),
                 ),
-            ),
-            else_=1,
-        )
+                else_=1,
+            )
+            next_state = case(
+                (RelayNode.state == "draining", "draining"),
+                (fresh_ready, RelayNode.state),
+                (
+                    and_(
+                        RelayNode.state == "unavailable",
+                        RelayNode.healthy_heartbeat_streak >= 2,
+                    ),
+                    "available",
+                ),
+                else_="unavailable",
+            )
+        else:
+            next_streak = 0
+            next_state = "unavailable"
         result = await self._session.execute(
             update(RelayNode)
             .where(
                 RelayNode.node_id == identity.node_id,
                 RelayNode.certificate_fingerprint == identity.certificate_fingerprint,
+                RelayNode.identity_epoch == identity_epoch,
                 RelayNode.state != "revoked",
                 RelayNode.heartbeat_sequence < sequence,
             )
             .values(
                 heartbeat_sequence=sequence,
                 active_allocations=active_allocations,
+                current_ingress_bps=current_ingress_bps,
                 current_egress_bps=current_egress_bps,
+                last_boot_id=boot_id,
+                last_heartbeat_nonce=nonce,
+                process_health=process_health,
+                listener_health=listener_health,
+                probe_health=probe_health,
+                packet_loss_bps=packet_loss_bps,
+                cpu_usage_bps=cpu_usage_bps,
+                memory_usage_bps=memory_usage_bps,
                 measured_rtt_ms=measured_rtt_ms,
                 recent_failure_bps=recent_failure_bps,
                 endpoints=canonical_endpoints,
                 lease_expires_at=lease_expires_at,
                 updated_at=now,
                 healthy_heartbeat_streak=next_streak,
-                state=case(
-                    (RelayNode.state == "draining", "draining"),
-                    (fresh_ready, RelayNode.state),
-                    (
-                        and_(
-                            RelayNode.state == "unavailable",
-                            RelayNode.healthy_heartbeat_streak >= 2,
-                        ),
-                        "available",
-                    ),
-                    else_="unavailable",
-                ),
+                state=next_state,
             )
             .returning(RelayNode.node_id)
         )
@@ -775,6 +838,195 @@ class RelayRegistry:
             select(RelayNode).order_by(RelayNode.node_id)
         )
         return list(nodes)
+
+    async def request_secret_rotation(
+        self,
+        *,
+        node_id: str,
+        actor_id: str,
+        credential_ttl_seconds: int,
+        now: datetime,
+    ) -> RelayNode:
+        if not 60 <= credential_ttl_seconds <= 3600:
+            self._error("relay_secret_rotation_invalid", 400, "relay secret rotation invalid")
+        async with self._node_identity_lock(node_id):
+            node = await self._session.get(RelayNode, node_id)
+            if node is None:
+                self._error("relay_node_not_found", 404, "relay node not found")
+            if node.state == "revoked":
+                self._error("relay_node_revoked", 409, "relay node revoked")
+            if node.desired_secret_version > node.active_secret_version:
+                return node
+            node.desired_secret_version = node.active_secret_version + 1
+            node.desired_draining = True
+            node.secret_not_before = now
+            node.old_credential_deadline = now + timedelta(
+                seconds=credential_ttl_seconds
+            )
+            node.pending_secret_version = None
+            node.pending_encrypted_turn_secret = None
+            node.pending_secret_digest = None
+            node.pending_rotation_id = None
+            node.pending_secret_uploaded_at = None
+            node.state = "draining"
+            node.lease_expires_at = now
+            node.healthy_heartbeat_streak = 0
+            node.updated_at = now
+            self._audit(
+                action="relay_secret_rotation_requested",
+                node_id=node_id,
+                actor_id=actor_id,
+                details={"secret_version": node.desired_secret_version},
+                now=now,
+            )
+            await self._session.flush()
+            return node
+
+    async def upload_secret_rotation(
+        self,
+        *,
+        identity: RelayIdentity,
+        sequence: int,
+        identity_epoch: int,
+        rotation_id: str,
+        secret_version: int,
+        turn_rest_secret: SecretStr,
+        now: datetime,
+    ) -> RelayNode:
+        if identity.is_previous:
+            self._error("relay_identity_epoch_invalid", 409, "relay identity epoch invalid")
+        secret_digest, encrypted_secret = self._protect_turn_secret(
+            turn_rest_secret, node_id=identity.node_id
+        )
+        async with self._node_identity_lock(identity.node_id):
+            node = await self._session.get(RelayNode, identity.node_id)
+            if node is None or node.certificate_fingerprint != identity.certificate_fingerprint:
+                self._error("relay_certificate_invalid", 401, "relay certificate invalid")
+            if node.state == "revoked":
+                self._error("relay_node_revoked", 403, "relay node revoked")
+            if identity_epoch != node.identity_epoch:
+                self._error("relay_identity_epoch_invalid", 409, "relay identity epoch invalid")
+            if sequence <= node.heartbeat_sequence:
+                self._error("relay_heartbeat_replayed", 409, "relay heartbeat replayed")
+            if (
+                not node.desired_draining
+                or node.state != "draining"
+                or secret_version != node.desired_secret_version
+                or secret_version <= node.active_secret_version
+            ):
+                self._error("relay_secret_rotation_invalid", 409, "relay secret rotation invalid")
+            if node.pending_secret_version is not None:
+                if (
+                    node.pending_secret_version != secret_version
+                    or node.pending_rotation_id != rotation_id
+                    or node.pending_secret_digest is None
+                    or not hmac.compare_digest(node.pending_secret_digest, secret_digest)
+                ):
+                    self._error(
+                        "relay_secret_rotation_conflict",
+                        409,
+                        "relay secret rotation conflict",
+                    )
+            else:
+                node.pending_secret_version = secret_version
+                node.pending_encrypted_turn_secret = encrypted_secret
+                node.pending_secret_digest = secret_digest
+                node.pending_rotation_id = rotation_id
+                node.pending_secret_uploaded_at = now
+                self._audit(
+                    action="relay_secret_rotation_uploaded",
+                    node_id=identity.node_id,
+                    actor_id=None,
+                    details={"secret_version": secret_version},
+                    now=now,
+                )
+            node.heartbeat_sequence = sequence
+            node.updated_at = now
+            await self._session.flush()
+            return node
+
+    async def commit_secret_rotation(
+        self,
+        *,
+        identity: RelayIdentity,
+        sequence: int,
+        identity_epoch: int,
+        rotation_id: str,
+        secret_version: int,
+        probe_evidence_sha256: str,
+        now: datetime,
+    ) -> RelayNode:
+        if identity.is_previous:
+            self._error("relay_identity_epoch_invalid", 409, "relay identity epoch invalid")
+        if re.fullmatch(r"[0-9a-f]{64}", probe_evidence_sha256) is None:
+            self._error("relay_probe_invalid", 400, "relay allocation probe invalid")
+        async with self._node_identity_lock(identity.node_id):
+            node = await self._session.get(RelayNode, identity.node_id)
+            if node is None or node.certificate_fingerprint != identity.certificate_fingerprint:
+                self._error("relay_certificate_invalid", 401, "relay certificate invalid")
+            if node.state == "revoked":
+                self._error("relay_node_revoked", 403, "relay node revoked")
+            if identity_epoch != node.identity_epoch:
+                self._error("relay_identity_epoch_invalid", 409, "relay identity epoch invalid")
+            if sequence <= node.heartbeat_sequence:
+                self._error("relay_heartbeat_replayed", 409, "relay heartbeat replayed")
+            # A lost commit response is retried with a fresh signed request
+            # sequence but the same persisted rotation id. Acknowledge only
+            # the exact already-active transaction and never audit twice.
+            if (
+                node.active_secret_version == secret_version
+                and node.applied_secret_version == secret_version
+                and node.committed_rotation_id == rotation_id
+                and node.pending_secret_version is None
+                and node.pending_encrypted_turn_secret is None
+            ):
+                node.heartbeat_sequence = sequence
+                node.updated_at = now
+                await self._session.flush()
+                return node
+            deadline = (
+                self._as_utc(node.old_credential_deadline)
+                if node.old_credential_deadline is not None
+                else None
+            )
+            if (
+                node.state != "draining"
+                or not node.desired_draining
+                or node.active_allocations != 0
+                or deadline is None
+                or now < deadline
+                or node.pending_secret_version != secret_version
+                or node.pending_rotation_id != rotation_id
+                or node.pending_encrypted_turn_secret is None
+                or secret_version != node.desired_secret_version
+            ):
+                self._error("relay_secret_rotation_unsafe", 409, "relay secret rotation unsafe")
+            node.encrypted_turn_secret = bytes(node.pending_encrypted_turn_secret)
+            node.active_secret_version = secret_version
+            node.applied_secret_version = secret_version
+            node.pending_secret_version = None
+            node.pending_encrypted_turn_secret = None
+            node.pending_secret_digest = None
+            node.pending_rotation_id = None
+            node.pending_secret_uploaded_at = None
+            node.committed_rotation_id = rotation_id
+            node.desired_draining = False
+            node.secret_not_before = None
+            node.old_credential_deadline = None
+            node.state = "unavailable"
+            node.lease_expires_at = None
+            node.healthy_heartbeat_streak = 0
+            node.heartbeat_sequence = sequence
+            node.updated_at = now
+            self._audit(
+                action="relay_secret_rotation_committed",
+                node_id=identity.node_id,
+                actor_id=None,
+                details={"secret_version": secret_version},
+                now=now,
+            )
+            await self._session.flush()
+            return node
 
     async def transition(
         self, *, node_id: str, action: str, actor_id: str, now: datetime

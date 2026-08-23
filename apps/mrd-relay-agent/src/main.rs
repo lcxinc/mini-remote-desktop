@@ -1,3 +1,4 @@
-fn main() {
-    eprintln!("mrd-relay-agent requires an installed platform adapter (see deploy/turn)");
+fn main() -> std::process::ExitCode {
+    eprintln!("relay_native_adapter_unavailable");
+    std::process::ExitCode::from(78)
 }

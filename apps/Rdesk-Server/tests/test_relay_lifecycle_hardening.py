@@ -241,6 +241,7 @@ def _renewal_request(
         path=path,
         sequence=sequence,
         payload={"renewal_id": renewal_id, "csr_pem": csr_pem},
+        replace_payload=True,
     )
     headers["X-Relay-Renewal-Id"] = renewal_id
     return body, headers
@@ -655,7 +656,11 @@ def test_renewal_lost_response_retry_rotates_once_and_old_cert_is_renew_only(
     ).not_valid_after_utc
     with Session(engine) as session:
         registration = session.get(RelayNodeRegistration, NODE_ID)
+        node = session.get(RelayNode, NODE_ID)
         assert registration is not None
+        assert node is not None
+        assert node.identity_epoch == 2
+        assert node.heartbeat_sequence == 0
         assert registration.previous_certificate_expires_at is not None
         assert registration.renewal_record_expires_at is not None
         assert (
@@ -725,7 +730,10 @@ def test_renewal_lost_response_retry_rotates_once_and_old_cert_is_renew_only(
     assert _error_code(old_heartbeat) == "relay_certificate_invalid"
 
     new_body, new_headers = _heartbeat_request(
-        new_key, new_fingerprint, sequence=1
+        new_key,
+        new_fingerprint,
+        sequence=1,
+        payload={"identity_epoch": 2},
     )
     new_heartbeat = client.post(
         f"/api/v1/relays/{NODE_ID}/heartbeat",

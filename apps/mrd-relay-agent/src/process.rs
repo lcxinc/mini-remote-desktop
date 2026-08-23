@@ -1,6 +1,9 @@
-use std::{fmt, net::SocketAddr};
+use std::{fmt, net::IpAddr, time::Duration};
 
 use async_trait::async_trait;
+use mrd_transport_webrtc::{probe_turn_relay, IceServerConfig, TurnRelayProbeConfig};
+use secrecy::{ExposeSecret, SecretString};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -29,22 +32,145 @@ impl CoturnSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AllocationProbeEvidence {
-    pub allocated_relay_address: Option<SocketAddr>,
-    pub permission_installed: bool,
-    pub sent_nonce: [u8; 16],
-    pub received_nonce: Option<[u8; 16]>,
-    pub bytes_sent: u64,
-    pub bytes_received: u64,
+pub enum AllocationProbeEvidence {
+    /// A fake, port-open check, unavailable live environment, or any other
+    /// observation which cannot prove a TURN allocation and relayed traffic.
+    NonEvidence,
+    Live(LiveAllocationEvidence),
 }
 
 impl AllocationProbeEvidence {
     pub fn is_real_roundtrip(&self) -> bool {
-        self.allocated_relay_address.is_some()
-            && self.permission_installed
-            && self.received_nonce == Some(self.sent_nonce)
-            && self.bytes_sent >= self.sent_nonce.len() as u64
-            && self.bytes_received >= self.sent_nonce.len() as u64
+        matches!(self, Self::Live(_))
+    }
+
+    pub fn proof_sha256(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::NonEvidence => None,
+            Self::Live(evidence) => Some(evidence.proof_sha256),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveAllocationEvidence {
+    proof_sha256: [u8; 32],
+}
+
+#[async_trait]
+pub trait LocalAllocationProbePort: Send + Sync {
+    async fn probe(&self) -> Result<AllocationProbeEvidence, ProcessError>;
+}
+
+pub struct WebRtcLocalAllocationProbe {
+    urls: Vec<String>,
+    username: SecretString,
+    credential: SecretString,
+    timeout: Duration,
+}
+
+impl WebRtcLocalAllocationProbe {
+    pub fn new(
+        urls: Vec<String>,
+        username: SecretString,
+        credential: SecretString,
+        timeout: Duration,
+    ) -> Result<Self, ProcessError> {
+        if urls.is_empty()
+            || urls.len() > 4
+            || urls.iter().any(|url| {
+                url.is_empty() || url.len() > 512 || url.contains('@') || !is_local_turn_url(url)
+            })
+            || username.expose_secret().is_empty()
+            || username.expose_secret().len() > 512
+            || credential.expose_secret().is_empty()
+            || credential.expose_secret().len() > 512
+            || timeout.is_zero()
+            || timeout > Duration::from_secs(60)
+        {
+            return Err(ProcessError::ProbeUnavailable);
+        }
+        Ok(Self {
+            urls,
+            username,
+            credential,
+            timeout,
+        })
+    }
+}
+
+fn is_local_turn_url(value: &str) -> bool {
+    let Some(authority_and_query) = value
+        .strip_prefix("turn:")
+        .or_else(|| value.strip_prefix("turns:"))
+    else {
+        return false;
+    };
+    let mut parts = authority_and_query.split('?');
+    let authority = parts.next().unwrap_or_default();
+    let query = parts.next();
+    if parts.next().is_some()
+        || query.is_some_and(|query| !matches!(query, "transport=udp" | "transport=tcp"))
+    {
+        return false;
+    }
+    let (host, port) = if let Some(ipv6) = authority.strip_prefix('[') {
+        let Some((host, port)) = ipv6.split_once("]:") else {
+            return false;
+        };
+        (host, port)
+    } else {
+        let Some((host, port)) = authority.rsplit_once(':') else {
+            return false;
+        };
+        (host, port)
+    };
+    let local_host = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    local_host && port.parse::<u16>().is_ok_and(|port| port != 0)
+}
+
+impl fmt::Debug for WebRtcLocalAllocationProbe {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WebRtcLocalAllocationProbe")
+            .field("url_count", &self.urls.len())
+            .field("username", &"REDACTED")
+            .field("credential", &"REDACTED")
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl LocalAllocationProbePort for WebRtcLocalAllocationProbe {
+    async fn probe(&self) -> Result<AllocationProbeEvidence, ProcessError> {
+        let evidence = probe_turn_relay(TurnRelayProbeConfig {
+            ice_servers: vec![IceServerConfig::new(
+                self.urls.clone(),
+                self.username.expose_secret().to_owned(),
+                self.credential.expose_secret().to_owned(),
+            )],
+            timeout: self.timeout,
+        })
+        .await
+        .map_err(|_| ProcessError::ProbeUnavailable)?;
+        let pair = evidence.selected_pair();
+        let mut hasher = Sha256::new();
+        hasher.update(b"MRD_TURN_LIVE_PROBE_V1\0");
+        hasher.update(pair.local_candidate_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(pair.remote_candidate_id.as_bytes());
+        hasher.update(pair.packets_sent.to_be_bytes());
+        hasher.update(pair.packets_received.to_be_bytes());
+        hasher.update(pair.bytes_sent.to_be_bytes());
+        hasher.update(pair.bytes_received.to_be_bytes());
+        let proof_sha256: [u8; 32] = hasher.finalize().into();
+        Ok(AllocationProbeEvidence::Live(LiveAllocationEvidence {
+            proof_sha256,
+        }))
     }
 }
 
