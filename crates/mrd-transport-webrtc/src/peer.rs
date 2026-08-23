@@ -1,4 +1,6 @@
 #[cfg(test)]
+use crate::cleanup::{reserve_cleanup_slot_from, CleanupSupervisor};
+#[cfg(test)]
 use std::sync::Weak;
 use std::{
     fmt,
@@ -34,7 +36,10 @@ use webrtc::{
 };
 
 use crate::{
-    cleanup::{submit_cleanup, CleanupJobMeta},
+    cleanup::{
+        reserve_cleanup_slot, submit_cleanup, CleanupJobMeta, CleanupPayload, CleanupPermit,
+        CleanupPhase,
+    },
     config::{
         ice_server_secret_values, normalize_secret_values, IceServerConfig, IceTransportPolicy,
         PeerConnectionConfig, PeerConnectionRole,
@@ -464,17 +469,13 @@ impl Default for PhysicalShutdown {
 }
 
 impl PhysicalShutdown {
-    fn begin(&self) -> bool {
+    fn accepted(&self) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if matches!(*state, PhysicalShutdownState::Open) {
-            *state = PhysicalShutdownState::Closing;
-            true
-        } else {
-            false
-        }
+        debug_assert!(matches!(*state, PhysicalShutdownState::Open));
+        *state = PhysicalShutdownState::Closing;
     }
 
     fn is_started(&self) -> bool {
@@ -529,33 +530,169 @@ impl PhysicalShutdown {
     }
 }
 
-struct PeerConstructionGuard {
+struct PhysicalPeer {
     pc: Arc<RTCPeerConnection>,
     control: Arc<ControlState>,
-    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    tasks: Arc<StdMutex<Vec<JoinHandle<()>>>>,
+    active_tasks: Arc<AtomicUsize>,
+    h264_sender: Arc<Mutex<H264RtpSender>>,
+    cleanup_permit: CleanupPermit,
+}
+
+struct PhysicalSnapshot {
+    pc: Arc<RTCPeerConnection>,
+    control: Arc<ControlState>,
+    active_tasks: Arc<AtomicUsize>,
+    h264_sender: Arc<Mutex<H264RtpSender>>,
+}
+
+struct PartialPhysicalPeer {
+    pc: Arc<RTCPeerConnection>,
+    control: Arc<ControlState>,
+    tasks: Arc<StdMutex<Vec<JoinHandle<()>>>>,
+    active_tasks: Arc<AtomicUsize>,
+    h264_sender: Option<Arc<Mutex<H264RtpSender>>>,
+    cleanup_permit: CleanupPermit,
+}
+
+impl PartialPhysicalPeer {
+    fn finish(mut self) -> PhysicalPeer {
+        PhysicalPeer {
+            pc: self.pc,
+            control: self.control,
+            tasks: self.tasks,
+            active_tasks: self.active_tasks,
+            h264_sender: self
+                .h264_sender
+                .take()
+                .expect("completed peer has an H.264 sender"),
+            cleanup_permit: self.cleanup_permit,
+        }
+    }
+}
+
+struct PhysicalCleanupPayload {
+    owners: Option<PhysicalCleanupOwners>,
+    close_gate: Option<Arc<Semaphore>>,
+    injected_failure: bool,
+    injected_panic: bool,
+}
+
+struct PhysicalCleanupOwners {
+    pc: Arc<RTCPeerConnection>,
+    control: Arc<ControlState>,
+    tasks: Arc<StdMutex<Vec<JoinHandle<()>>>>,
+    active_tasks: Arc<AtomicUsize>,
+    h264_sender: Option<Arc<Mutex<H264RtpSender>>>,
+}
+
+impl PhysicalCleanupPayload {
+    fn from_partial(physical: PartialPhysicalPeer) -> (CleanupPermit, Self) {
+        (
+            physical.cleanup_permit,
+            Self {
+                owners: Some(PhysicalCleanupOwners {
+                    pc: physical.pc,
+                    control: physical.control,
+                    tasks: physical.tasks,
+                    active_tasks: physical.active_tasks,
+                    h264_sender: physical.h264_sender,
+                }),
+                close_gate: None,
+                injected_failure: false,
+                injected_panic: false,
+            },
+        )
+    }
+
+    fn from_physical(
+        physical: PhysicalPeer,
+        close_gate: Option<Arc<Semaphore>>,
+        injected_failure: bool,
+        injected_panic: bool,
+    ) -> (CleanupPermit, Self) {
+        (
+            physical.cleanup_permit,
+            Self {
+                owners: Some(PhysicalCleanupOwners {
+                    pc: physical.pc,
+                    control: physical.control,
+                    tasks: physical.tasks,
+                    active_tasks: physical.active_tasks,
+                    h264_sender: Some(physical.h264_sender),
+                }),
+                close_gate,
+                injected_failure,
+                injected_panic,
+            },
+        )
+    }
+
+    fn into_physical(mut self, cleanup_permit: CleanupPermit) -> PhysicalPeer {
+        let mut owners = self
+            .owners
+            .take()
+            .expect("rejected cleanup retains physical owners");
+        PhysicalPeer {
+            pc: owners.pc,
+            control: owners.control,
+            tasks: owners.tasks,
+            active_tasks: owners.active_tasks,
+            h264_sender: owners
+                .h264_sender
+                .take()
+                .expect("completed peer cleanup payload retains its sender"),
+            cleanup_permit,
+        }
+    }
+}
+
+impl Drop for PhysicalCleanupPayload {
+    fn drop(&mut self) {
+        let Some(owners) = &self.owners else {
+            return;
+        };
+        let tasks = owners
+            .tasks
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        for task in tasks.iter() {
+            task.abort();
+        }
+    }
+}
+
+struct PeerConstructionGuard {
+    physical: Option<PartialPhysicalPeer>,
     completed_video_drops: Arc<VideoDropCounter>,
     shutdown: Arc<PhysicalShutdown>,
-    armed: bool,
 }
 
 impl PeerConstructionGuard {
-    fn disarm(&mut self) {
-        self.armed = false;
+    fn set_h264_sender(&mut self, sender: Arc<Mutex<H264RtpSender>>) {
+        self.physical
+            .as_mut()
+            .expect("armed construction guard")
+            .h264_sender = Some(sender);
+    }
+
+    fn finish(mut self) -> PhysicalPeer {
+        self.physical
+            .take()
+            .expect("armed construction guard")
+            .finish()
     }
 }
 
 impl Drop for PeerConstructionGuard {
     fn drop(&mut self) {
-        if self.armed && self.shutdown.begin() {
+        if let Some(physical) = self.physical.take() {
             self.completed_video_drops.seal();
-            enqueue_physical_cleanup(
+            let (permit, payload) = PhysicalCleanupPayload::from_partial(physical);
+            let _ = enqueue_physical_cleanup(
                 Arc::clone(&self.shutdown),
-                Arc::clone(&self.tasks),
-                Arc::clone(&self.control),
-                Arc::clone(&self.pc),
-                None,
-                false,
-                false,
+                permit,
+                payload,
                 CleanupJobMeta {
                     kind: "partial-construction",
                     generation: None,
@@ -580,18 +717,14 @@ impl From<IceCandidate> for RTCIceCandidateInit {
 }
 
 pub struct WebRtcPeerConnection {
-    pc: Arc<RTCPeerConnection>,
+    physical: StdMutex<Option<PhysicalPeer>>,
     config: PeerConnectionConfig,
-    h264_sender: Mutex<H264RtpSender>,
     local_candidates: Mutex<mpsc::Receiver<IceCandidate>>,
     h264_rx: Mutex<mpsc::Receiver<QueuedAccessUnit>>,
     reliable_rx: Mutex<mpsc::Receiver<QueuedBytes>>,
     realtime_rx: Mutex<mpsc::Receiver<QueuedBytes>>,
     bulk_rx: Mutex<mpsc::Receiver<QueuedBytes>>,
-    control: Arc<ControlState>,
     connection_state_rx: watch::Receiver<RTCPeerConnectionState>,
-    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
-    active_tasks: Arc<AtomicUsize>,
     completed_video_drops: Arc<VideoDropCounter>,
     shutdown: Arc<PhysicalShutdown>,
     restart: StdMutex<RestartState>,
@@ -677,7 +810,13 @@ impl Drop for WebRtcPeerConnection {
 
 impl WebRtcPeerConnection {
     pub async fn new(config: PeerConnectionConfig) -> Result<Self, TransportError> {
-        Self::new_inner(config, None).await
+        Self::new_inner(
+            config,
+            None,
+            #[cfg(test)]
+            None,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -686,14 +825,34 @@ impl WebRtcPeerConnection {
         entered: Arc<AtomicBool>,
         gate: Arc<Semaphore>,
     ) -> Result<Self, TransportError> {
-        Self::new_inner(config, Some((entered, gate))).await
+        Self::new_inner(config, Some((entered, gate)), None).await
+    }
+
+    #[cfg(test)]
+    async fn new_with_cleanup_supervisor_for_test(
+        config: PeerConnectionConfig,
+        supervisor: Arc<CleanupSupervisor>,
+    ) -> Result<Self, TransportError> {
+        Self::new_inner(config, None, Some(supervisor)).await
     }
 
     async fn new_inner(
         config: PeerConnectionConfig,
         construction_hook: Option<(Arc<AtomicBool>, Arc<Semaphore>)>,
+        #[cfg(test)] cleanup_supervisor: Option<Arc<CleanupSupervisor>>,
     ) -> Result<Self, TransportError> {
         let codec = config.preflight()?.clone();
+        #[cfg(test)]
+        let cleanup_permit = if let Some(supervisor) = cleanup_supervisor {
+            reserve_cleanup_slot_from(&supervisor).await
+        } else {
+            reserve_cleanup_slot().await
+        };
+        #[cfg(not(test))]
+        let cleanup_permit = reserve_cleanup_slot().await;
+        let cleanup_permit = cleanup_permit.map_err(|error| {
+            TransportError::Message(format!("WebRTC cleanup capacity unavailable: {error}"))
+        })?;
         let config_secrets = secret_values(&config.ice_servers);
         let mut media_engine = MediaEngine::default();
         media_engine
@@ -743,19 +902,23 @@ impl WebRtcPeerConnection {
             config.realtime_queue_bytes,
             config.bulk_queue_bytes,
         );
-        let tasks = Arc::new(Mutex::new(Vec::new()));
+        let tasks = Arc::new(StdMutex::new(Vec::new()));
         let active_tasks = Arc::new(AtomicUsize::new(0));
         let completed_video_drops = Arc::new(VideoDropCounter::default());
         let shutdown = Arc::new(PhysicalShutdown::default());
         let (h264_tx, h264_rx) = mpsc::channel(capacity);
         let h264_queue_budget = Arc::new(Semaphore::new(config.video_queue_bytes));
         let mut construction_guard = PeerConstructionGuard {
-            pc: Arc::clone(&pc),
-            control: Arc::clone(&control),
-            tasks: Arc::clone(&tasks),
+            physical: Some(PartialPhysicalPeer {
+                pc: Arc::clone(&pc),
+                control: Arc::clone(&control),
+                tasks: Arc::clone(&tasks),
+                active_tasks: Arc::clone(&active_tasks),
+                h264_sender: None,
+                cleanup_permit,
+            }),
             completed_video_drops: Arc::clone(&completed_video_drops),
             shutdown: Arc::clone(&shutdown),
-            armed: true,
         };
         if let Some((entered, gate)) = construction_hook {
             entered.store(true, Ordering::Release);
@@ -814,7 +977,7 @@ impl WebRtcPeerConnection {
             let completed_video_drops = Arc::clone(&remote_completed_video_drops);
             let shutdown = Arc::clone(&remote_shutdown);
             Box::pin(async move {
-                let mut tasks = tasks.lock().await;
+                let mut tasks = tasks.lock().unwrap_or_else(|poison| poison.into_inner());
                 if shutdown.is_started() {
                     return;
                 }
@@ -877,38 +1040,38 @@ impl WebRtcPeerConnection {
             control.install(bulk, weak_callback_owner(&pc)).await?;
         }
 
-        let h264_sender = H264RtpSender::new_with_profile_level_id(
+        let h264_sender = Arc::new(Mutex::new(H264RtpSender::new_with_profile_level_id(
             "screen",
             "desktop",
             config.fps,
             config.mtu,
             codec.profile.into(),
             codec.profile_level_id,
-        );
+        )));
         let rtp_sender = pc
-            .add_track(h264_sender.track() as Arc<dyn TrackLocal + Send + Sync>)
+            .add_track(h264_sender.lock().await.track() as Arc<dyn TrackLocal + Send + Sync>)
             .await
             .map_err(|error| TransportError::Message(format!("add H.264 track failed: {error}")))?;
         let rtcp_task = spawn_tracked(&active_tasks, async move {
             while rtp_sender.read_rtcp().await.is_ok() {}
         });
-        tasks.lock().await.push(rtcp_task);
+        tasks
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(rtcp_task);
 
-        construction_guard.disarm();
+        construction_guard.set_h264_sender(Arc::clone(&h264_sender));
+        let physical = construction_guard.finish();
 
         Ok(Self {
-            pc,
+            physical: StdMutex::new(Some(physical)),
             config,
-            h264_sender: Mutex::new(h264_sender),
             local_candidates: Mutex::new(candidate_rx),
             h264_rx: Mutex::new(h264_rx),
             reliable_rx: Mutex::new(reliable_rx),
             realtime_rx: Mutex::new(realtime_rx),
             bulk_rx: Mutex::new(bulk_rx),
-            control,
             connection_state_rx,
-            tasks,
-            active_tasks,
             completed_video_drops,
             shutdown,
             restart: StdMutex::new(RestartState::default()),
@@ -934,6 +1097,27 @@ impl WebRtcPeerConnection {
         })
     }
 
+    fn physical_snapshot(&self) -> Result<PhysicalSnapshot, TransportError> {
+        let physical = self
+            .physical
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let physical = physical
+            .as_ref()
+            .ok_or_else(|| TransportError::Message("peer connection is closing".into()))?;
+        Ok(PhysicalSnapshot {
+            pc: Arc::clone(&physical.pc),
+            control: Arc::clone(&physical.control),
+            active_tasks: Arc::clone(&physical.active_tasks),
+            h264_sender: Arc::clone(&physical.h264_sender),
+        })
+    }
+
+    #[cfg(test)]
+    fn physical_pc_for_test(&self) -> Option<Arc<RTCPeerConnection>> {
+        self.physical_snapshot().ok().map(|physical| physical.pc)
+    }
+
     pub async fn create_offer(&self) -> Result<SessionDescription, TransportError> {
         let (generation, route_token, route) = self.active_snapshot();
         if let Some(route) = route {
@@ -949,16 +1133,15 @@ impl WebRtcPeerConnection {
 
     async fn create_offer_physical(&self) -> Result<SessionDescription, TransportError> {
         self.require_role(PeerConnectionRole::Offerer)?;
-        let offer = self
-            .pc
+        let pc = self.physical_snapshot()?.pc;
+        let offer = pc
             .create_offer(None)
             .await
             .map_err(peer_error("create offer"))?;
         let description =
             SessionDescription::initial(SessionDescriptionType::Offer, offer.sdp.clone());
         let sdp = offer.sdp.clone();
-        self.pc
-            .set_local_description(offer)
+        pc.set_local_description(offer)
             .await
             .map_err(|error| redact_sdp_error(peer_error("set local offer")(error), &sdp))?;
         Ok(description)
@@ -992,22 +1175,18 @@ impl WebRtcPeerConnection {
         let remote_sdp = offer.sdp;
         let offer = RTCSessionDescription::offer(remote_sdp.clone())
             .map_err(|error| redact_sdp_error(peer_error("parse offer")(error), &remote_sdp))?;
-        self.pc
-            .set_remote_description(offer)
-            .await
-            .map_err(|error| {
-                redact_sdp_error(peer_error("set remote offer")(error), &remote_sdp)
-            })?;
-        let answer = self
-            .pc
+        let pc = self.physical_snapshot()?.pc;
+        pc.set_remote_description(offer).await.map_err(|error| {
+            redact_sdp_error(peer_error("set remote offer")(error), &remote_sdp)
+        })?;
+        let answer = pc
             .create_answer(None)
             .await
             .map_err(peer_error("create answer"))?;
         let description =
             SessionDescription::initial(SessionDescriptionType::Answer, answer.sdp.clone());
         let local_sdp = answer.sdp.clone();
-        self.pc
-            .set_local_description(answer)
+        pc.set_local_description(answer)
             .await
             .map_err(|error| redact_sdp_error(peer_error("set local answer")(error), &local_sdp))?;
         Ok(description)
@@ -1042,7 +1221,8 @@ impl WebRtcPeerConnection {
         let remote_sdp = answer.sdp;
         let answer = RTCSessionDescription::answer(remote_sdp.clone())
             .map_err(|error| redact_sdp_error(peer_error("parse answer")(error), &remote_sdp))?;
-        self.pc
+        self.physical_snapshot()?
+            .pc
             .set_remote_description(answer)
             .await
             .map_err(|error| redact_sdp_error(peer_error("set remote answer")(error), &remote_sdp))
@@ -1088,7 +1268,8 @@ impl WebRtcPeerConnection {
         candidate: IceCandidate,
     ) -> Result<(), TransportError> {
         let secrets = candidate_secret_values(&candidate);
-        self.pc
+        self.physical_snapshot()?
+            .pc
             .add_ice_candidate(candidate.into())
             .await
             .map_err(peer_error_redacted("add ICE candidate", &secrets))
@@ -1165,7 +1346,8 @@ impl WebRtcPeerConnection {
         &self,
         access_unit: &EncodedAccessUnit,
     ) -> Result<usize, TransportError> {
-        self.h264_sender
+        self.physical_snapshot()?
+            .h264_sender
             .lock()
             .await
             .send_access_unit(access_unit)
@@ -1256,9 +1438,25 @@ impl WebRtcPeerConnection {
     }
 
     async fn control_channels_physical(&self) -> ControlChannels {
-        let reliable = self.control.channel(ControlLane::Reliable).await;
-        let realtime = self.control.channel(ControlLane::Realtime).await;
-        let bulk = self.control.channel(ControlLane::Bulk).await;
+        let control = self
+            .physical_snapshot()
+            .ok()
+            .map(|physical| physical.control);
+        let reliable = if let Some(control) = &control {
+            control.channel(ControlLane::Reliable).await
+        } else {
+            None
+        };
+        let realtime = if let Some(control) = &control {
+            control.channel(ControlLane::Realtime).await
+        } else {
+            None
+        };
+        let bulk = if let Some(control) = &control {
+            control.channel(ControlLane::Bulk).await
+        } else {
+            None
+        };
         ControlChannels {
             reliable: reliable.as_deref().map(channel_info).unwrap_or_else(|| {
                 crate::ControlChannelInfo {
@@ -1293,14 +1491,17 @@ impl WebRtcPeerConnection {
     }
 
     async fn selected_candidate_pair_stats_physical(&self) -> Option<SelectedCandidatePairStats> {
-        selected_candidate_pair(self.pc.get_stats().await)
+        let pc = self.physical_snapshot().ok()?.pc;
+        selected_candidate_pair(pc.get_stats().await)
     }
 
     pub fn active_task_count(&self) -> usize {
         if let Some(route) = self.active_route() {
-            return route.active_tasks.load(Ordering::Acquire);
+            return route.active_task_count();
         }
-        self.active_tasks.load(Ordering::Acquire)
+        self.physical_snapshot()
+            .map(|physical| physical.active_tasks.load(Ordering::Acquire))
+            .unwrap_or(0)
     }
 
     /// Create a replacement offer with a strictly newer authenticated generation.
@@ -1620,14 +1821,14 @@ impl WebRtcPeerConnection {
             (peer, previous)
         };
 
-        let cleanup = if let Some(previous) = previous {
-            previous.peer.start_physical_shutdown_with_meta(
+        let (cleanup, cleanup_started) = if let Some(previous) = previous {
+            let cleanup_started = previous.peer.start_physical_shutdown_with_meta(
                 previous.meta,
                 Some(Arc::clone(&self.restart_cleanup_failures)),
             );
-            Arc::clone(&previous.peer.shutdown)
+            (Arc::clone(&previous.peer.shutdown), cleanup_started)
         } else {
-            self.start_physical_shutdown_with_meta(
+            let cleanup_started = self.start_physical_shutdown_with_meta(
                 CleanupJobMeta {
                     kind: "commit-old-route",
                     generation: Some(0),
@@ -1635,9 +1836,16 @@ impl WebRtcPeerConnection {
                 },
                 Some(Arc::clone(&self.restart_cleanup_failures)),
             );
-            Arc::clone(&self.shutdown)
+            (Arc::clone(&self.shutdown), cleanup_started)
         };
-        let _ = cleanup.wait().await;
+        if cleanup_started.is_ok() {
+            let _ = cleanup.wait().await;
+        } else {
+            // Publication above is the commit point. A cleanup admission invariant failure must
+            // remain observable, but cannot turn a committed replacement into a caller-visible
+            // failure.
+            self.restart_cleanup_failures.fetch_add(1, Ordering::AcqRel);
+        }
         debug_assert_eq!(replacement.config.role, self.config.role);
         Ok(())
     }
@@ -1709,38 +1917,55 @@ impl WebRtcPeerConnection {
             (None, None)
         };
         if let Some(active) = active {
-            active
+            if active
                 .peer
-                .start_physical_shutdown_with_meta(active.meta, None);
+                .start_physical_shutdown_with_meta(active.meta, None)
+                .is_err()
+            {
+                self.restart_cleanup_failures.fetch_add(1, Ordering::AcqRel);
+            }
         }
         if let Some(pending) = pending {
-            pending
+            if pending
                 .peer
-                .start_physical_shutdown_with_meta(pending.meta, None);
+                .start_physical_shutdown_with_meta(pending.meta, None)
+                .is_err()
+            {
+                self.restart_cleanup_failures.fetch_add(1, Ordering::AcqRel);
+            }
         }
-        self.start_physical_shutdown_with_meta(
-            CleanupJobMeta {
-                kind: root_kind,
-                generation: Some(0),
-                route_id: None,
-            },
-            None,
-        );
+        if self
+            .start_physical_shutdown_with_meta(
+                CleanupJobMeta {
+                    kind: root_kind,
+                    generation: Some(0),
+                    route_id: None,
+                },
+                None,
+            )
+            .is_err()
+        {
+            self.restart_cleanup_failures.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     fn start_physical_shutdown_with_meta(
         &self,
         meta: CleanupJobMeta,
         failure_counter: Option<Arc<AtomicU64>>,
-    ) {
-        if !self.shutdown.begin() {
-            return;
-        }
+    ) -> Result<(), TransportError> {
+        let physical = {
+            let mut physical = self
+                .physical
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let Some(physical) = physical.take() else {
+                return Ok(());
+            };
+            physical
+        };
         self.completed_video_drops.seal();
         let shutdown = Arc::clone(&self.shutdown);
-        let tasks = Arc::clone(&self.tasks);
-        let control = Arc::clone(&self.control);
-        let pc = Arc::clone(&self.pc);
         #[cfg(test)]
         let close_gate = self
             .physical_close_gate_for_test
@@ -1764,18 +1989,30 @@ impl WebRtcPeerConnection {
         );
         #[cfg(not(test))]
         let cleanup_timeout = PHYSICAL_CLEANUP_TIMEOUT;
-        enqueue_physical_cleanup(
-            shutdown,
-            tasks,
-            control,
-            pc,
+        let (permit, payload) = PhysicalCleanupPayload::from_physical(
+            physical,
             close_gate,
             injected_failure,
             injected_panic,
+        );
+        match enqueue_physical_cleanup(
+            shutdown,
+            permit,
+            payload,
             meta,
             cleanup_timeout,
             failure_counter,
-        );
+        ) {
+            Ok(()) => Ok(()),
+            Err((permit, payload, reason)) => {
+                *self
+                    .physical
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) =
+                    Some(payload.into_physical(permit));
+                Err(TransportError::Message(reason))
+            }
+        }
     }
 
     pub async fn close(&self) -> Result<(), TransportError> {
@@ -1808,37 +2045,65 @@ impl WebRtcPeerConnection {
             };
             (active, pending)
         };
-        if let Some(pending) = &pending {
-            pending
+        let mut errors = Vec::new();
+        let pending_started = if let Some(pending) = &pending {
+            match pending
                 .peer
-                .start_physical_shutdown_with_meta(pending.meta, None);
-        }
-        if let Some(active) = &active {
-            active
+                .start_physical_shutdown_with_meta(pending.meta, None)
+            {
+                Ok(()) => true,
+                Err(error) => {
+                    errors.push(error.to_string());
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        let active_started = if let Some(active) = &active {
+            match active
                 .peer
-                .start_physical_shutdown_with_meta(active.meta, None);
-        }
-        self.start_physical_shutdown_with_meta(
+                .start_physical_shutdown_with_meta(active.meta, None)
+            {
+                Ok(()) => true,
+                Err(error) => {
+                    errors.push(error.to_string());
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        let root_started = match self.start_physical_shutdown_with_meta(
             CleanupJobMeta {
                 kind: "close-root",
                 generation: Some(0),
                 route_id: None,
             },
             None,
-        );
-        let mut errors = Vec::new();
-        if let Some(pending) = pending {
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                errors.push(error.to_string());
+                false
+            }
+        };
+        if pending_started {
+            let pending = pending.expect("started pending cleanup has a peer");
             if let Err(error) = pending.peer.shutdown.wait().await {
                 errors.push(error.to_string());
             }
         }
-        if let Some(active) = active {
+        if active_started {
+            let active = active.expect("started active cleanup has a peer");
             if let Err(error) = active.peer.shutdown.wait().await {
                 errors.push(error.to_string());
             }
         }
-        if let Err(error) = self.shutdown.wait().await {
-            errors.push(error.to_string());
+        if root_started {
+            if let Err(error) = self.shutdown.wait().await {
+                errors.push(error.to_string());
+            }
         }
         if errors.is_empty() {
             Ok(())
@@ -2069,7 +2334,8 @@ impl WebRtcPeerConnection {
             }
         };
         if let Some(peer) = peer {
-            peer.peer.start_physical_shutdown_with_meta(peer.meta, None);
+            peer.peer
+                .start_physical_shutdown_with_meta(peer.meta, None)?;
         }
         Ok(true)
     }
@@ -2335,7 +2601,8 @@ impl WebRtcPeerConnection {
     ) -> Result<Arc<RTCDataChannel>, TransportError> {
         let deadline = tokio::time::Instant::now() + CHANNEL_OPEN_TIMEOUT;
         loop {
-            if let Some(channel) = self.control.channel(lane).await {
+            let control = self.physical_snapshot()?.control;
+            if let Some(channel) = control.channel(lane).await {
                 if channel.ready_state() == RTCDataChannelState::Open {
                     return Ok(channel);
                 }
@@ -2356,37 +2623,21 @@ fn close_loser(loser: Option<CleanupTarget>) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn enqueue_physical_cleanup(
     shutdown: Arc<PhysicalShutdown>,
-    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
-    control: Arc<ControlState>,
-    pc: Arc<RTCPeerConnection>,
-    close_gate: Option<Arc<Semaphore>>,
-    injected_failure: bool,
-    injected_panic: bool,
+    permit: CleanupPermit,
+    payload: PhysicalCleanupPayload,
     meta: CleanupJobMeta,
     timeout: Duration,
     failure_counter: Option<Arc<AtomicU64>>,
-) {
+) -> Result<(), (CleanupPermit, PhysicalCleanupPayload, String)> {
+    let accepted_shutdown = Arc::clone(&shutdown);
     submit_cleanup(
+        permit,
         meta,
         timeout,
-        async move {
-            match run_physical_shutdown(
-                tasks,
-                control,
-                pc,
-                close_gate,
-                injected_failure,
-                injected_panic,
-            )
-            .await
-            {
-                Some(error) => Err(error),
-                None => Ok(()),
-            }
-        },
+        payload,
+        move || accepted_shutdown.accepted(),
         move |outcome| {
             let error = outcome.error_message();
             if error.is_some() {
@@ -2396,52 +2647,74 @@ fn enqueue_physical_cleanup(
             }
             shutdown.complete(error);
         },
-    );
+    )
+    .map_err(|rejected| (rejected.permit, rejected.payload, rejected.reason))
 }
 
-async fn run_physical_shutdown(
-    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
-    control: Arc<ControlState>,
-    pc: Arc<RTCPeerConnection>,
-    close_gate: Option<Arc<Semaphore>>,
-    injected_failure: bool,
-    injected_panic: bool,
-) -> Option<String> {
-    assert!(!injected_panic, "injected physical cleanup panic");
-    if let Some(close_gate) = close_gate {
-        let _ = close_gate.acquire().await;
+impl CleanupPayload for PhysicalCleanupPayload {
+    fn normal_cleanup(&mut self) -> CleanupPhase<'_> {
+        Box::pin(async move {
+            assert!(!self.injected_panic, "injected physical cleanup panic");
+            if let Some(close_gate) = &self.close_gate {
+                let _ = close_gate.acquire().await;
+            }
+            close_physical_payload(self).await?;
+            if self.injected_failure {
+                Err("physical cleanup reported a failure".into())
+            } else {
+                Ok(())
+            }
+        })
     }
-    let mut tasks = tasks.lock().await;
-    for task in tasks.iter() {
-        task.abort();
+
+    fn force_cleanup(&mut self) -> CleanupPhase<'_> {
+        Box::pin(async move { close_physical_payload(self).await })
     }
-    for task in tasks.drain(..) {
+}
+
+async fn close_physical_payload(payload: &mut PhysicalCleanupPayload) -> Result<(), String> {
+    let owners = payload
+        .owners
+        .as_mut()
+        .ok_or_else(|| "physical cleanup owners missing".to_string())?;
+    let tasks = {
+        let mut tasks = owners
+            .tasks
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        for task in tasks.iter() {
+            task.abort();
+        }
+        std::mem::take(&mut *tasks)
+    };
+    for task in tasks {
         let _ = task.await;
     }
-    drop(tasks);
-    if let Some(channel) = control.channel(ControlLane::Reliable).await {
-        let _ = channel.close().await;
+    let close_channels = async {
+        if let Some(channel) = owners.control.channel(ControlLane::Reliable).await {
+            let _ = channel.close().await;
+        }
+        if let Some(channel) = owners.control.channel(ControlLane::Realtime).await {
+            let _ = channel.close().await;
+        }
+        if let Some(channel) = owners.control.channel(ControlLane::Bulk).await {
+            let _ = channel.close().await;
+        }
+    };
+    let ((), close_result) = tokio::join!(close_channels, owners.pc.close());
+    if owners.active_tasks.load(Ordering::Acquire) != 0 {
+        return Err("tracked WebRTC tasks did not drain".into());
     }
-    if let Some(channel) = control.channel(ControlLane::Realtime).await {
-        let _ = channel.close().await;
-    }
-    if let Some(channel) = control.channel(ControlLane::Bulk).await {
-        let _ = channel.close().await;
-    }
-    let close_error = pc
-        .close()
-        .await
-        .err()
-        .map(|error| format!("close peer connection failed: {error}"));
-    if injected_failure {
-        Some("injected old-route close failure".into())
-    } else {
-        close_error
+    let _ = &owners.h264_sender;
+    match close_result {
+        Ok(()) => Ok(()),
+        Err(_) if owners.pc.connection_state() == RTCPeerConnectionState::Closed => Ok(()),
+        Err(_) => Err("close peer connection failed".to_string()),
     }
 }
 
 fn close_route_best_effort(peer: &WebRtcPeerConnection, meta: CleanupJobMeta) {
-    peer.start_physical_shutdown_with_meta(meta, None);
+    let _ = peer.start_physical_shutdown_with_meta(meta, None);
 }
 
 fn decode_hex(byte: u8) -> Option<u8> {
@@ -2681,16 +2954,19 @@ fn spawn_tracked<F>(counter: &Arc<AtomicUsize>, future: F) -> JoinHandle<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    counter.fetch_add(1, Ordering::AcqRel);
-    let counter = Arc::clone(counter);
-    tokio::spawn(async move {
-        struct TaskGuard(Arc<AtomicUsize>);
-        impl Drop for TaskGuard {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::AcqRel);
-            }
+    struct TaskGuard(Arc<AtomicUsize>);
+    impl Drop for TaskGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
         }
-        let _guard = TaskGuard(counter);
+    }
+
+    counter.fetch_add(1, Ordering::AcqRel);
+    let guard = TaskGuard(Arc::clone(counter));
+    tokio::spawn(async move {
+        // Construct the guard before spawning so aborting a never-polled task still decrements the
+        // physical task count when Tokio drops its captured future.
+        let _guard = guard;
         future.await;
     })
 }
@@ -3090,7 +3366,7 @@ mod tests {
             .close()
             .await
             .expect_err("later close still reports the recorded physical cleanup failure");
-        assert!(cleanup.to_string().contains("injected"));
+        assert!(cleanup.to_string().contains("cleanup job failed"));
     }
 
     #[tokio::test]
@@ -3175,7 +3451,7 @@ mod tests {
             .close()
             .await
             .expect_err("recorded root cleanup failure remains observable");
-        assert!(cleanup.to_string().contains("injected"));
+        assert!(cleanup.to_string().contains("cleanup job failed"));
     }
 
     #[tokio::test]
@@ -3314,6 +3590,7 @@ mod tests {
                 .await
                 .expect("peer"),
         );
+        let pc = peer.physical_pc_for_test().expect("physical PC");
         let gate = Arc::new(Semaphore::new(0));
         peer.install_physical_close_gate_for_test(Arc::clone(&gate));
         let closing_peer = Arc::clone(&peer);
@@ -3337,7 +3614,7 @@ mod tests {
         })
         .await
         .expect("detached shutdown finishes after caller cancellation");
-        assert_eq!(peer.pc.connection_state(), RTCPeerConnectionState::Closed);
+        assert_eq!(pc.connection_state(), RTCPeerConnectionState::Closed);
     }
 
     #[tokio::test]
@@ -3345,6 +3622,11 @@ mod tests {
         let timed_out = WebRtcPeerConnection::new(PeerConnectionConfig::default())
             .await
             .expect("timeout peer");
+        let timed_out_physical = timed_out
+            .physical_snapshot()
+            .expect("timeout physical owners");
+        let timed_out_pc = timed_out_physical.pc;
+        let timed_out_active_tasks = timed_out_physical.active_tasks;
         timed_out.install_physical_close_gate_for_test(Arc::new(Semaphore::new(0)));
         timed_out.set_physical_cleanup_timeout_for_test(Duration::from_millis(20));
         let error = tokio::time::timeout(Duration::from_secs(2), timed_out.close())
@@ -3353,10 +3635,27 @@ mod tests {
             .expect_err("timed out cleanup is aggregated");
         assert!(error.to_string().contains("timed out"));
         assert!(timed_out.physical_shutdown_finished_for_test());
+        assert_eq!(
+            timed_out_pc.connection_state(),
+            RTCPeerConnectionState::Closed,
+            "timeout completion must follow a force phase that physically closes the PC"
+        );
+        assert_eq!(
+            timed_out_active_tasks.load(Ordering::Acquire),
+            0,
+            "timeout force phase must abort and drain every tracked task"
+        );
+        let second = tokio::time::timeout(Duration::from_secs(1), timed_out.close())
+            .await
+            .expect("second close is bounded and idempotent");
+        assert!(second.is_err(), "the original timeout remains observable");
 
         let panicked = WebRtcPeerConnection::new(PeerConnectionConfig::default())
             .await
             .expect("panic peer");
+        let panicked_physical = panicked.physical_snapshot().expect("panic physical owners");
+        let panicked_pc = panicked_physical.pc;
+        let panicked_active_tasks = panicked_physical.active_tasks;
         panicked.inject_physical_cleanup_panic_for_test();
         let error = tokio::time::timeout(Duration::from_secs(2), panicked.close())
             .await
@@ -3364,6 +3663,11 @@ mod tests {
             .expect_err("panicked cleanup is aggregated");
         assert!(error.to_string().contains("panicked"));
         assert!(panicked.physical_shutdown_finished_for_test());
+        assert_eq!(
+            panicked_pc.connection_state(),
+            RTCPeerConnectionState::Closed
+        );
+        assert_eq!(panicked_active_tasks.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -3375,6 +3679,9 @@ mod tests {
         let peer = runtime
             .block_on(WebRtcPeerConnection::new(PeerConnectionConfig::default()))
             .expect("peer");
+        let physical = peer.physical_snapshot().expect("physical owners");
+        let pc = physical.pc;
+        let active_tasks = physical.active_tasks;
         drop(runtime);
 
         peer.terminate_now();
@@ -3384,7 +3691,8 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(peer.physical_shutdown_finished_for_test());
-        assert_eq!(peer.pc.connection_state(), RTCPeerConnectionState::Closed);
+        assert_eq!(pc.connection_state(), RTCPeerConnectionState::Closed);
+        assert_eq!(active_tasks.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -3398,6 +3706,9 @@ mod tests {
                 .block_on(WebRtcPeerConnection::new(PeerConnectionConfig::default()))
                 .expect("peer"),
         );
+        let physical = peer.physical_snapshot().expect("physical owners");
+        let pc = physical.pc;
+        let active_tasks = physical.active_tasks;
         let gate = Arc::new(Semaphore::new(0));
         peer.install_physical_close_gate_for_test(Arc::clone(&gate));
         let closing_peer = Arc::clone(&peer);
@@ -3417,7 +3728,8 @@ mod tests {
         }
 
         assert!(peer.physical_shutdown_finished_for_test());
-        assert_eq!(peer.pc.connection_state(), RTCPeerConnectionState::Closed);
+        assert_eq!(pc.connection_state(), RTCPeerConnectionState::Closed);
+        assert_eq!(active_tasks.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
@@ -3465,38 +3777,66 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_pressure_uses_fixed_workers_and_eventually_converges() {
-        let before = crate::cleanup_supervisor_snapshot();
-        let count = before.queue_capacity + 4;
-        let mut peers = Vec::with_capacity(count);
-        for _ in 0..count {
-            peers.push(
-                WebRtcPeerConnection::new(PeerConnectionConfig::default())
-                    .await
-                    .expect("pressure peer"),
-            );
-        }
-        for peer in peers {
-            peer.terminate_now();
-        }
+        let supervisor = CleanupSupervisor::start_for_test(1, 2).expect("cleanup supervisor");
+        let first = WebRtcPeerConnection::new_with_cleanup_supervisor_for_test(
+            PeerConnectionConfig::default(),
+            Arc::clone(&supervisor),
+        )
+        .await
+        .expect("first admitted peer");
+        let second = WebRtcPeerConnection::new_with_cleanup_supervisor_for_test(
+            PeerConnectionConfig::default(),
+            Arc::clone(&supervisor),
+        )
+        .await
+        .expect("second admitted peer");
+        let first_snapshot = first.physical_snapshot().expect("first physical owners");
+        let second_snapshot = second.physical_snapshot().expect("second physical owners");
 
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                let snapshot = crate::cleanup_supervisor_snapshot();
-                if snapshot.completed_jobs >= before.completed_jobs + count as u64
-                    && snapshot.queue_depth == 0
-                    && snapshot.active_jobs == 0
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
+        let third = tokio::time::timeout(
+            Duration::from_secs(3),
+            WebRtcPeerConnection::new_with_cleanup_supervisor_for_test(
+                PeerConnectionConfig::default(),
+                Arc::clone(&supervisor),
+            ),
+        )
+        .await
+        .expect("capacity refusal is bounded")
+        .expect_err("the third peer must be rejected before constructing a physical PC");
+        assert!(third.to_string().contains("capacity admission timed out"));
+        assert_eq!(supervisor.snapshot().available_admission_slots, 0);
+
+        first.terminate_now();
+        second.terminate_now();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (first_result, second_result) =
+                tokio::join!(first.shutdown.wait(), second.shutdown.wait());
+            first_result.expect("first physical cleanup");
+            second_result.expect("second physical cleanup");
         })
         .await
-        .expect("bounded cleanup queue drains");
+        .expect("reserved cleanup jobs converge");
 
-        let after = crate::cleanup_supervisor_snapshot();
-        assert_eq!(after.worker_count, 2);
-        assert_eq!(after.queue_capacity, before.queue_capacity);
+        assert_eq!(
+            first_snapshot.pc.connection_state(),
+            RTCPeerConnectionState::Closed
+        );
+        assert_eq!(
+            second_snapshot.pc.connection_state(),
+            RTCPeerConnectionState::Closed
+        );
+        assert_eq!(first_snapshot.active_tasks.load(Ordering::Acquire), 0);
+        assert_eq!(second_snapshot.active_tasks.load(Ordering::Acquire), 0);
+        let after = supervisor.snapshot();
+        assert_eq!(after.available_admission_slots, 2);
+        assert_eq!(after.worker_count, 1);
+        assert_eq!(after.queue_capacity, 2);
+        assert_eq!(after.admission_capacity, 2);
+        assert_eq!(after.queue_depth, 0);
+        assert_eq!(after.active_jobs, 0);
+        assert_eq!(after.saturated_jobs, 0);
+        assert_eq!(after.completed_jobs, 2);
+        supervisor.shutdown_for_test();
     }
 
     #[tokio::test]
@@ -3600,6 +3940,8 @@ mod tests {
                 .await
                 .expect("pending"),
         );
+        let root_pc = root.physical_pc_for_test().expect("root PC");
+        let pending_pc = pending.physical_pc_for_test().expect("pending PC");
         active.fail_close_for_test.store(true, Ordering::Release);
         let route_token = RestartRouteToken::generate().expect("route token");
         let mut description =
@@ -3625,13 +3967,13 @@ mod tests {
 
         let error = root.close().await.expect_err("one cleanup reports failure");
 
-        assert!(error.to_string().contains("injected"));
+        assert!(error.to_string().contains("cleanup job failed"));
         assert!(root.physical_shutdown_finished_for_test());
         assert!(active.physical_shutdown_finished_for_test());
         assert!(pending.physical_shutdown_finished_for_test());
-        assert_eq!(root.pc.connection_state(), RTCPeerConnectionState::Closed);
+        assert_eq!(root_pc.connection_state(), RTCPeerConnectionState::Closed);
         assert_eq!(
-            pending.pc.connection_state(),
+            pending_pc.connection_state(),
             RTCPeerConnectionState::Closed
         );
     }
