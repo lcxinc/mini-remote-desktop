@@ -34,6 +34,7 @@ use webrtc::{
 };
 
 use crate::{
+    cleanup::{submit_cleanup, CleanupJobMeta},
     config::{
         ice_server_secret_values, normalize_secret_values, IceServerConfig, IceTransportPolicy,
         PeerConnectionConfig, PeerConnectionRole,
@@ -51,6 +52,7 @@ const CHANNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const DISCONNECTED_GRACE_PERIOD: Duration = Duration::from_secs(2);
 const BULK_BUFFER_HIGH_WATERMARK: usize = 64 * 1024;
 const BULK_SEND_PACING_INTERVAL: Duration = Duration::from_millis(1);
+const PHYSICAL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 const RESTART_VALIDATION_TIMEOUT: Duration = Duration::from_secs(10);
 const RESTART_PROBE_PREFIX: &[u8] = b"mrd-webrtc-restart-probe-v1:";
 static NEXT_RESTART_ROUTE_ID: AtomicU64 = AtomicU64::new(1);
@@ -337,9 +339,15 @@ struct RestartState {
     active_generation: u64,
     highest_seen_generation: u64,
     active_route_token: Option<RestartRouteToken>,
+    active_route_id: Option<u64>,
     active_replacement: Option<Arc<WebRtcPeerConnection>>,
     pending: Option<PendingRestart>,
     last_aborted_route: Option<(u64, RestartRouteToken)>,
+}
+
+struct CleanupTarget {
+    peer: Arc<WebRtcPeerConnection>,
+    meta: CleanupJobMeta,
 }
 
 impl RestartState {
@@ -457,7 +465,10 @@ impl Default for PhysicalShutdown {
 
 impl PhysicalShutdown {
     fn begin(&self) -> bool {
-        let mut state = self.state.lock().expect("shutdown state lock poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if matches!(*state, PhysicalShutdownState::Open) {
             *state = PhysicalShutdownState::Closing;
             true
@@ -468,21 +479,29 @@ impl PhysicalShutdown {
 
     fn is_started(&self) -> bool {
         !matches!(
-            *self.state.lock().expect("shutdown state lock poisoned"),
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
             PhysicalShutdownState::Open
         )
     }
 
     fn is_finished(&self) -> bool {
         matches!(
-            *self.state.lock().expect("shutdown state lock poisoned"),
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
             PhysicalShutdownState::Closed { .. }
         )
     }
 
     fn complete(&self, error: Option<String>) {
-        *self.state.lock().expect("shutdown state lock poisoned") =
-            PhysicalShutdownState::Closed { error };
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = PhysicalShutdownState::Closed { error };
         self.completed.notify_waiters();
     }
 
@@ -490,7 +509,10 @@ impl PhysicalShutdown {
         loop {
             let notified = self.completed.notified();
             let outcome = {
-                let state = self.state.lock().expect("shutdown state lock poisoned");
+                let state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
                 match &*state {
                     PhysicalShutdownState::Closed { error } => Some(error.clone()),
                     PhysicalShutdownState::Open | PhysicalShutdownState::Closing => None,
@@ -503,6 +525,45 @@ impl PhysicalShutdown {
                 };
             }
             notified.await;
+        }
+    }
+}
+
+struct PeerConstructionGuard {
+    pc: Arc<RTCPeerConnection>,
+    control: Arc<ControlState>,
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    completed_video_drops: Arc<VideoDropCounter>,
+    shutdown: Arc<PhysicalShutdown>,
+    armed: bool,
+}
+
+impl PeerConstructionGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PeerConstructionGuard {
+    fn drop(&mut self) {
+        if self.armed && self.shutdown.begin() {
+            self.completed_video_drops.seal();
+            enqueue_physical_cleanup(
+                Arc::clone(&self.shutdown),
+                Arc::clone(&self.tasks),
+                Arc::clone(&self.control),
+                Arc::clone(&self.pc),
+                None,
+                false,
+                false,
+                CleanupJobMeta {
+                    kind: "partial-construction",
+                    generation: None,
+                    route_id: None,
+                },
+                PHYSICAL_CLEANUP_TIMEOUT,
+                None,
+            );
         }
     }
 }
@@ -537,6 +598,10 @@ pub struct WebRtcPeerConnection {
     restart_cleanup_failures: Arc<AtomicU64>,
     #[cfg(test)]
     fail_close_for_test: AtomicBool,
+    #[cfg(test)]
+    panic_cleanup_for_test: AtomicBool,
+    #[cfg(test)]
+    physical_cleanup_timeout_ms_for_test: AtomicU64,
     #[cfg(test)]
     restart_build_gate_for_test: StdMutex<Option<Arc<Semaphore>>>,
     #[cfg(test)]
@@ -606,12 +671,28 @@ impl fmt::Debug for WebRtcPeerConnection {
 
 impl Drop for WebRtcPeerConnection {
     fn drop(&mut self) {
-        self.terminate_now();
+        self.terminate_with_kind("peer-drop");
     }
 }
 
 impl WebRtcPeerConnection {
     pub async fn new(config: PeerConnectionConfig) -> Result<Self, TransportError> {
+        Self::new_inner(config, None).await
+    }
+
+    #[cfg(test)]
+    async fn new_blocked_after_pc_for_test(
+        config: PeerConnectionConfig,
+        entered: Arc<AtomicBool>,
+        gate: Arc<Semaphore>,
+    ) -> Result<Self, TransportError> {
+        Self::new_inner(config, Some((entered, gate))).await
+    }
+
+    async fn new_inner(
+        config: PeerConnectionConfig,
+        construction_hook: Option<(Arc<AtomicBool>, Arc<Semaphore>)>,
+    ) -> Result<Self, TransportError> {
         let codec = config.preflight()?.clone();
         let config_secrets = secret_values(&config.ice_servers);
         let mut media_engine = MediaEngine::default();
@@ -656,6 +737,31 @@ impl WebRtcPeerConnection {
         );
 
         let capacity = config.event_queue_capacity;
+        let (control, reliable_rx, realtime_rx, bulk_rx) = ControlState::new(
+            capacity,
+            config.reliable_queue_bytes,
+            config.realtime_queue_bytes,
+            config.bulk_queue_bytes,
+        );
+        let tasks = Arc::new(Mutex::new(Vec::new()));
+        let active_tasks = Arc::new(AtomicUsize::new(0));
+        let completed_video_drops = Arc::new(VideoDropCounter::default());
+        let shutdown = Arc::new(PhysicalShutdown::default());
+        let (h264_tx, h264_rx) = mpsc::channel(capacity);
+        let h264_queue_budget = Arc::new(Semaphore::new(config.video_queue_bytes));
+        let mut construction_guard = PeerConstructionGuard {
+            pc: Arc::clone(&pc),
+            control: Arc::clone(&control),
+            tasks: Arc::clone(&tasks),
+            completed_video_drops: Arc::clone(&completed_video_drops),
+            shutdown: Arc::clone(&shutdown),
+            armed: true,
+        };
+        if let Some((entered, gate)) = construction_hook {
+            entered.store(true, Ordering::Release);
+            let _ = gate.acquire().await;
+        }
+
         let (candidate_tx, candidate_rx) = mpsc::channel(capacity);
         pc.on_ice_candidate(Box::new(move |candidate| {
             let candidate_tx = candidate_tx.clone();
@@ -677,12 +783,6 @@ impl WebRtcPeerConnection {
             })
         }));
 
-        let (control, reliable_rx, realtime_rx, bulk_rx) = ControlState::new(
-            capacity,
-            config.reliable_queue_bytes,
-            config.realtime_queue_bytes,
-            config.bulk_queue_bytes,
-        );
         let remote_control = Arc::clone(&control);
         let remote_pc = weak_callback_owner(&pc);
         pc.on_data_channel(Box::new(move |channel: Arc<RTCDataChannel>| {
@@ -701,12 +801,6 @@ impl WebRtcPeerConnection {
             })
         }));
 
-        let tasks = Arc::new(Mutex::new(Vec::new()));
-        let active_tasks = Arc::new(AtomicUsize::new(0));
-        let completed_video_drops = Arc::new(VideoDropCounter::default());
-        let shutdown = Arc::new(PhysicalShutdown::default());
-        let (h264_tx, h264_rx) = mpsc::channel(capacity);
-        let h264_queue_budget = Arc::new(Semaphore::new(config.video_queue_bytes));
         let remote_tasks = Arc::clone(&tasks);
         let remote_active_tasks = Arc::clone(&active_tasks);
         let remote_completed_video_drops = Arc::clone(&completed_video_drops);
@@ -800,6 +894,8 @@ impl WebRtcPeerConnection {
         });
         tasks.lock().await.push(rtcp_task);
 
+        construction_guard.disarm();
+
         Ok(Self {
             pc,
             config,
@@ -819,6 +915,12 @@ impl WebRtcPeerConnection {
             restart_cleanup_failures: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             fail_close_for_test: AtomicBool::new(false),
+            #[cfg(test)]
+            panic_cleanup_for_test: AtomicBool::new(false),
+            #[cfg(test)]
+            physical_cleanup_timeout_ms_for_test: AtomicU64::new(
+                PHYSICAL_CLEANUP_TIMEOUT.as_millis() as u64,
+            ),
             #[cfg(test)]
             restart_build_gate_for_test: StdMutex::new(None),
             #[cfg(test)]
@@ -1217,7 +1319,7 @@ impl WebRtcPeerConnection {
         let (config, loser) = self.begin_restart(generation, route_token.clone(), None)?;
         let mut build_guard = RestartBuildGuard::new(self, generation, route_token.clone());
         let config = restart_peer_config(config, ice_servers);
-        close_loser(loser).await;
+        close_loser(loser);
 
         let pending = match Self::new(config).await {
             Ok(peer) => Arc::new(peer),
@@ -1227,7 +1329,14 @@ impl WebRtcPeerConnection {
         let mut offer = match pending.create_offer_physical().await {
             Ok(offer) => offer,
             Err(error) => {
-                close_route_best_effort(&pending).await;
+                close_route_best_effort(
+                    &pending,
+                    CleanupJobMeta {
+                        kind: "restart-build-failed",
+                        generation: Some(generation),
+                        route_id: None,
+                    },
+                );
                 return Err(redact_transport_error(error, &secrets));
             }
         };
@@ -1239,7 +1348,14 @@ impl WebRtcPeerConnection {
             offer.clone(),
             None,
         ) {
-            close_route_best_effort(&pending).await;
+            close_route_best_effort(
+                &pending,
+                CleanupJobMeta {
+                    kind: "restart-build-lost",
+                    generation: Some(generation),
+                    route_id: None,
+                },
+            );
             return Err(self.restart_build_rejection(generation, "restart offer"));
         }
         build_guard.disarm();
@@ -1269,7 +1385,7 @@ impl WebRtcPeerConnection {
             self.begin_restart(generation, route_token.clone(), Some(request_fingerprint))?;
         let mut build_guard = RestartBuildGuard::new(self, generation, route_token.clone());
         let config = restart_peer_config(config, ice_servers);
-        close_loser(loser).await;
+        close_loser(loser);
 
         let pending = match Self::new(config).await {
             Ok(peer) => Arc::new(peer),
@@ -1280,7 +1396,14 @@ impl WebRtcPeerConnection {
         let mut answer = match pending.accept_offer_physical(offer).await {
             Ok(answer) => answer,
             Err(error) => {
-                close_route_best_effort(&pending).await;
+                close_route_best_effort(
+                    &pending,
+                    CleanupJobMeta {
+                        kind: "restart-build-failed",
+                        generation: Some(generation),
+                        route_id: None,
+                    },
+                );
                 return Err(redact_transport_error(error, &secrets));
             }
         };
@@ -1292,7 +1415,14 @@ impl WebRtcPeerConnection {
             answer.clone(),
             Some(request_fingerprint),
         ) {
-            close_route_best_effort(&pending).await;
+            close_route_best_effort(
+                &pending,
+                CleanupJobMeta {
+                    kind: "restart-build-lost",
+                    generation: Some(generation),
+                    route_id: None,
+                },
+            );
             return Err(self.restart_build_rejection(generation, "restart offer"));
         }
         build_guard.disarm();
@@ -1471,33 +1601,43 @@ impl WebRtcPeerConnection {
                 });
                 return Err(stale_generation_error(generation, "restart evidence"));
             }
-            let previous = state.active_replacement.replace(Arc::clone(&peer));
+            let previous_generation = state.active_generation;
+            let previous_route_id = state.active_route_id;
+            let previous = state
+                .active_replacement
+                .replace(Arc::clone(&peer))
+                .map(|peer| CleanupTarget {
+                    peer,
+                    meta: CleanupJobMeta {
+                        kind: "commit-old-route",
+                        generation: Some(previous_generation),
+                        route_id: previous_route_id,
+                    },
+                });
             state.active_generation = generation;
             state.active_route_token = Some(route_token);
+            state.active_route_id = Some(route_id);
             (peer, previous)
         };
 
         let cleanup = if let Some(previous) = previous {
-            previous.start_physical_shutdown();
-            Arc::clone(&previous.shutdown)
+            previous.peer.start_physical_shutdown_with_meta(
+                previous.meta,
+                Some(Arc::clone(&self.restart_cleanup_failures)),
+            );
+            Arc::clone(&previous.peer.shutdown)
         } else {
-            self.start_physical_shutdown();
+            self.start_physical_shutdown_with_meta(
+                CleanupJobMeta {
+                    kind: "commit-old-route",
+                    generation: Some(0),
+                    route_id: None,
+                },
+                Some(Arc::clone(&self.restart_cleanup_failures)),
+            );
             Arc::clone(&self.shutdown)
         };
-        let failure_recorded = Arc::new(AtomicBool::new(false));
-        let background_recorded = Arc::clone(&failure_recorded);
-        let background_failures = Arc::clone(&self.restart_cleanup_failures);
-        let background_cleanup = Arc::clone(&cleanup);
-        tokio::spawn(async move {
-            if background_cleanup.wait().await.is_err()
-                && !background_recorded.swap(true, Ordering::AcqRel)
-            {
-                background_failures.fetch_add(1, Ordering::AcqRel);
-            }
-        });
-        if cleanup.wait().await.is_err() && !failure_recorded.swap(true, Ordering::AcqRel) {
-            self.restart_cleanup_failures.fetch_add(1, Ordering::AcqRel);
-        }
+        let _ = cleanup.wait().await;
         debug_assert_eq!(replacement.config.role, self.config.role);
         Ok(())
     }
@@ -1520,7 +1660,7 @@ impl WebRtcPeerConnection {
         generation: u64,
         route_token: &RestartRouteToken,
     ) -> Result<bool, TransportError> {
-        self.abort_restart_bound(generation, route_token, None)
+        self.abort_restart_bound(generation, route_token, None, "restart-abort")
     }
 
     /// Number of old-route close failures recovered after a replacement was published.
@@ -1530,11 +1670,38 @@ impl WebRtcPeerConnection {
 
     /// Begin idempotent transport termination without requiring an async caller.
     pub fn terminate_now(&self) {
+        self.terminate_with_kind("terminate");
+    }
+
+    pub(crate) fn terminate_probe_now(&self) {
+        self.terminate_with_kind("probe");
+    }
+
+    fn terminate_with_kind(&self, root_kind: &'static str) {
         let (active, pending) = if let Ok(mut state) = self.restart.lock() {
             state.terminated = true;
-            let active = state.active_replacement.take();
+            let active = state.active_replacement.take().map(|peer| CleanupTarget {
+                peer,
+                meta: CleanupJobMeta {
+                    kind: "terminate-active-restart",
+                    generation: Some(state.active_generation),
+                    route_id: state.active_route_id,
+                },
+            });
             let pending = match state.pending.take() {
-                Some(PendingRestart::Ready { peer, .. }) => Some(peer),
+                Some(PendingRestart::Ready {
+                    generation,
+                    route_id,
+                    peer,
+                    ..
+                }) => Some(CleanupTarget {
+                    peer,
+                    meta: CleanupJobMeta {
+                        kind: "terminate-pending-restart",
+                        generation: Some(generation),
+                        route_id: Some(route_id),
+                    },
+                }),
                 _ => None,
             };
             (active, pending)
@@ -1542,23 +1709,30 @@ impl WebRtcPeerConnection {
             (None, None)
         };
         if let Some(active) = active {
-            active.terminate_physical_now();
+            active
+                .peer
+                .start_physical_shutdown_with_meta(active.meta, None);
         }
         if let Some(pending) = pending {
-            pending.terminate_physical_now();
+            pending
+                .peer
+                .start_physical_shutdown_with_meta(pending.meta, None);
         }
-        self.terminate_physical_now();
+        self.start_physical_shutdown_with_meta(
+            CleanupJobMeta {
+                kind: root_kind,
+                generation: Some(0),
+                route_id: None,
+            },
+            None,
+        );
     }
 
-    fn terminate_physical_now(&self) {
-        self.start_physical_shutdown();
-    }
-
-    fn force_terminate_physical_now(&self) {
-        self.start_physical_shutdown();
-    }
-
-    fn start_physical_shutdown(&self) {
+    fn start_physical_shutdown_with_meta(
+        &self,
+        meta: CleanupJobMeta,
+        failure_counter: Option<Arc<AtomicU64>>,
+    ) {
         if !self.shutdown.begin() {
             return;
         }
@@ -1579,61 +1753,87 @@ impl WebRtcPeerConnection {
         let injected_failure = self.fail_close_for_test.load(Ordering::Acquire);
         #[cfg(not(test))]
         let injected_failure = false;
-        let cleanup = async move {
-            let error =
-                run_physical_shutdown(tasks, control, pc, close_gate, injected_failure).await;
-            shutdown.complete(error);
-        };
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(cleanup);
-        } else {
-            let shutdown_on_spawn_failure = Arc::clone(&self.shutdown);
-            if std::thread::Builder::new()
-                .name("mrd-webrtc-shutdown".into())
-                .spawn(move || {
-                    match tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        Ok(runtime) => runtime.block_on(cleanup),
-                        Err(error) => shutdown_on_spawn_failure
-                            .complete(Some(format!("create shutdown runtime failed: {error}"))),
-                    }
-                })
-                .is_err()
-            {
-                self.shutdown
-                    .complete(Some("spawn shutdown fallback thread failed".into()));
-            }
-        }
+        #[cfg(test)]
+        let injected_panic = self.panic_cleanup_for_test.load(Ordering::Acquire);
+        #[cfg(not(test))]
+        let injected_panic = false;
+        #[cfg(test)]
+        let cleanup_timeout = Duration::from_millis(
+            self.physical_cleanup_timeout_ms_for_test
+                .load(Ordering::Acquire),
+        );
+        #[cfg(not(test))]
+        let cleanup_timeout = PHYSICAL_CLEANUP_TIMEOUT;
+        enqueue_physical_cleanup(
+            shutdown,
+            tasks,
+            control,
+            pc,
+            close_gate,
+            injected_failure,
+            injected_panic,
+            meta,
+            cleanup_timeout,
+            failure_counter,
+        );
     }
 
     pub async fn close(&self) -> Result<(), TransportError> {
         let (active, pending) = {
             let mut state = self.restart_state();
             state.terminated = true;
-            let active = state.active_replacement.take();
+            let active = state.active_replacement.take().map(|peer| CleanupTarget {
+                peer,
+                meta: CleanupJobMeta {
+                    kind: "close-active-restart",
+                    generation: Some(state.active_generation),
+                    route_id: state.active_route_id,
+                },
+            });
             let pending = match state.pending.take() {
-                Some(PendingRestart::Ready { peer, .. }) => Some(peer),
+                Some(PendingRestart::Ready {
+                    generation,
+                    route_id,
+                    peer,
+                    ..
+                }) => Some(CleanupTarget {
+                    peer,
+                    meta: CleanupJobMeta {
+                        kind: "close-pending-restart",
+                        generation: Some(generation),
+                        route_id: Some(route_id),
+                    },
+                }),
                 _ => None,
             };
             (active, pending)
         };
         if let Some(pending) = &pending {
-            pending.start_physical_shutdown();
+            pending
+                .peer
+                .start_physical_shutdown_with_meta(pending.meta, None);
         }
         if let Some(active) = &active {
-            active.start_physical_shutdown();
+            active
+                .peer
+                .start_physical_shutdown_with_meta(active.meta, None);
         }
-        self.start_physical_shutdown();
+        self.start_physical_shutdown_with_meta(
+            CleanupJobMeta {
+                kind: "close-root",
+                generation: Some(0),
+                route_id: None,
+            },
+            None,
+        );
         let mut errors = Vec::new();
         if let Some(pending) = pending {
-            if let Err(error) = pending.shutdown.wait().await {
+            if let Err(error) = pending.peer.shutdown.wait().await {
                 errors.push(error.to_string());
             }
         }
         if let Some(active) = active {
-            if let Err(error) = active.shutdown.wait().await {
+            if let Err(error) = active.peer.shutdown.wait().await {
                 errors.push(error.to_string());
             }
         }
@@ -1648,11 +1848,6 @@ impl WebRtcPeerConnection {
                 errors.join("; ")
             )))
         }
-    }
-
-    async fn close_physical(&self) -> Result<(), TransportError> {
-        self.start_physical_shutdown();
-        self.shutdown.wait().await
     }
 
     fn require_role(&self, expected: PeerConnectionRole) -> Result<(), TransportError> {
@@ -1700,7 +1895,7 @@ impl WebRtcPeerConnection {
         generation: u64,
         route_token: RestartRouteToken,
         request_fingerprint: Option<[u8; 32]>,
-    ) -> Result<(PeerConnectionConfig, Option<Arc<WebRtcPeerConnection>>), TransportError> {
+    ) -> Result<(PeerConnectionConfig, Option<CleanupTarget>), TransportError> {
         let mut state = self.restart_state();
         if state.terminated {
             return Err(terminated_error());
@@ -1728,7 +1923,19 @@ impl WebRtcPeerConnection {
             .map(|peer| peer.config.clone())
             .unwrap_or_else(|| self.config.clone());
         let loser = match state.pending.take() {
-            Some(PendingRestart::Ready { peer, .. }) => Some(peer),
+            Some(PendingRestart::Ready {
+                generation,
+                route_id,
+                peer,
+                ..
+            }) => Some(CleanupTarget {
+                peer,
+                meta: CleanupJobMeta {
+                    kind: "losing-restart",
+                    generation: Some(generation),
+                    route_id: Some(route_id),
+                },
+            }),
             _ => None,
         };
         state.pending = Some(PendingRestart::Building {
@@ -1792,7 +1999,12 @@ impl WebRtcPeerConnection {
         route_token: &RestartRouteToken,
         route_id: Option<u64>,
     ) {
-        let _ = self.abort_restart_bound(generation, route_token, route_id);
+        let _ = self.abort_restart_bound(
+            generation,
+            route_token,
+            route_id,
+            "restart-validation-failed",
+        );
     }
 
     fn abort_restart_bound(
@@ -1800,6 +2012,7 @@ impl WebRtcPeerConnection {
         generation: u64,
         route_token: &RestartRouteToken,
         route_id: Option<u64>,
+        cleanup_kind: &'static str,
     ) -> Result<bool, TransportError> {
         let peer = {
             let mut state = self.restart_state();
@@ -1832,7 +2045,14 @@ impl WebRtcPeerConnection {
                 let pending = state.pending.take().expect("matching pending route");
                 state.last_aborted_route = Some((generation, route_token.clone()));
                 match pending {
-                    PendingRestart::Ready { peer, .. } => Some(peer),
+                    PendingRestart::Ready { route_id, peer, .. } => Some(CleanupTarget {
+                        peer,
+                        meta: CleanupJobMeta {
+                            kind: cleanup_kind,
+                            generation: Some(generation),
+                            route_id: Some(route_id),
+                        },
+                    }),
                     PendingRestart::Building { .. } => None,
                 }
             } else if state.last_aborted_route.as_ref().is_some_and(
@@ -1849,7 +2069,7 @@ impl WebRtcPeerConnection {
             }
         };
         if let Some(peer) = peer {
-            peer.terminate_physical_now();
+            peer.peer.start_physical_shutdown_with_meta(peer.meta, None);
         }
         Ok(true)
     }
@@ -1915,6 +2135,19 @@ impl WebRtcPeerConnection {
             .physical_close_gate_for_test
             .lock()
             .expect("physical close gate lock poisoned") = Some(gate);
+    }
+
+    #[cfg(test)]
+    fn set_physical_cleanup_timeout_for_test(&self, timeout: Duration) {
+        self.physical_cleanup_timeout_ms_for_test.store(
+            u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
+    }
+
+    #[cfg(test)]
+    fn inject_physical_cleanup_panic_for_test(&self) {
+        self.panic_cleanup_for_test.store(true, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -2117,10 +2350,53 @@ impl WebRtcPeerConnection {
     }
 }
 
-async fn close_loser(loser: Option<Arc<WebRtcPeerConnection>>) {
+fn close_loser(loser: Option<CleanupTarget>) {
     if let Some(loser) = loser {
-        close_route_best_effort(&loser).await;
+        close_route_best_effort(&loser.peer, loser.meta);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enqueue_physical_cleanup(
+    shutdown: Arc<PhysicalShutdown>,
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    control: Arc<ControlState>,
+    pc: Arc<RTCPeerConnection>,
+    close_gate: Option<Arc<Semaphore>>,
+    injected_failure: bool,
+    injected_panic: bool,
+    meta: CleanupJobMeta,
+    timeout: Duration,
+    failure_counter: Option<Arc<AtomicU64>>,
+) {
+    submit_cleanup(
+        meta,
+        timeout,
+        async move {
+            match run_physical_shutdown(
+                tasks,
+                control,
+                pc,
+                close_gate,
+                injected_failure,
+                injected_panic,
+            )
+            .await
+            {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        },
+        move |outcome| {
+            let error = outcome.error_message();
+            if error.is_some() {
+                if let Some(counter) = failure_counter {
+                    counter.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+            shutdown.complete(error);
+        },
+    );
 }
 
 async fn run_physical_shutdown(
@@ -2129,7 +2405,9 @@ async fn run_physical_shutdown(
     pc: Arc<RTCPeerConnection>,
     close_gate: Option<Arc<Semaphore>>,
     injected_failure: bool,
+    injected_panic: bool,
 ) -> Option<String> {
+    assert!(!injected_panic, "injected physical cleanup panic");
     if let Some(close_gate) = close_gate {
         let _ = close_gate.acquire().await;
     }
@@ -2162,10 +2440,8 @@ async fn run_physical_shutdown(
     }
 }
 
-async fn close_route_best_effort(peer: &WebRtcPeerConnection) {
-    if peer.close_physical().await.is_err() {
-        peer.force_terminate_physical_now();
-    }
+fn close_route_best_effort(peer: &WebRtcPeerConnection, meta: CleanupJobMeta) {
+    peer.start_physical_shutdown_with_meta(meta, None);
 }
 
 fn decode_hex(byte: u8) -> Option<u8> {
@@ -2729,6 +3005,7 @@ mod tests {
             active_generation: 9,
             highest_seen_generation: 9,
             active_route_token: Some(RestartRouteToken::generate().expect("route token")),
+            active_route_id: Some(99),
             active_replacement: Some(Arc::clone(&peer)),
             pending: None,
             last_aborted_route: None,
@@ -2753,6 +3030,7 @@ mod tests {
                 .expect("replacement peer"),
         );
         let route_token = RestartRouteToken::generate().expect("route token");
+        let route_secret = route_token.to_wire();
         let route_id = NEXT_RESTART_ROUTE_ID.fetch_add(1, Ordering::Relaxed);
         let mut description =
             SessionDescription::initial(SessionDescriptionType::Offer, "state-harness-only".into());
@@ -2793,6 +3071,17 @@ mod tests {
 
         assert_eq!(active.current_generation().await, 1);
         assert_eq!(active.restart_cleanup_failure_count(), 1);
+        let cleanup_snapshot = crate::cleanup_supervisor_snapshot();
+        let cleanup_failure = cleanup_snapshot
+            .recent_failures
+            .iter()
+            .rev()
+            .find(|failure| failure.job_kind == "commit-old-route")
+            .expect("global cleanup failure is observable");
+        assert_eq!(cleanup_failure.job_kind, "commit-old-route");
+        assert_eq!(cleanup_failure.generation, Some(0));
+        assert_eq!(cleanup_failure.route_id_summary, None);
+        assert!(!cleanup_failure.reason.contains(&route_secret));
         assert!(Arc::ptr_eq(
             &active.active_route().expect("published replacement"),
             &replacement
@@ -3051,6 +3340,32 @@ mod tests {
         assert_eq!(peer.pc.connection_state(), RTCPeerConnectionState::Closed);
     }
 
+    #[tokio::test]
+    async fn physical_cleanup_timeout_and_panic_finish_wait_with_errors() {
+        let timed_out = WebRtcPeerConnection::new(PeerConnectionConfig::default())
+            .await
+            .expect("timeout peer");
+        timed_out.install_physical_close_gate_for_test(Arc::new(Semaphore::new(0)));
+        timed_out.set_physical_cleanup_timeout_for_test(Duration::from_millis(20));
+        let error = tokio::time::timeout(Duration::from_secs(2), timed_out.close())
+            .await
+            .expect("supervisor timeout completes wait")
+            .expect_err("timed out cleanup is aggregated");
+        assert!(error.to_string().contains("timed out"));
+        assert!(timed_out.physical_shutdown_finished_for_test());
+
+        let panicked = WebRtcPeerConnection::new(PeerConnectionConfig::default())
+            .await
+            .expect("panic peer");
+        panicked.inject_physical_cleanup_panic_for_test();
+        let error = tokio::time::timeout(Duration::from_secs(2), panicked.close())
+            .await
+            .expect("supervisor panic completes wait")
+            .expect_err("panicked cleanup is aggregated");
+        assert!(error.to_string().contains("panicked"));
+        assert!(panicked.physical_shutdown_finished_for_test());
+    }
+
     #[test]
     fn terminate_without_an_ambient_runtime_uses_owned_fallback_cleanup() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3070,6 +3385,151 @@ mod tests {
         }
         assert!(peer.physical_shutdown_finished_for_test());
         assert_eq!(peer.pc.connection_state(), RTCPeerConnectionState::Closed);
+    }
+
+    #[test]
+    fn shutdown_started_inside_a_dropped_runtime_still_reaches_closed() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("setup runtime");
+        let peer = Arc::new(
+            runtime
+                .block_on(WebRtcPeerConnection::new(PeerConnectionConfig::default()))
+                .expect("peer"),
+        );
+        let gate = Arc::new(Semaphore::new(0));
+        peer.install_physical_close_gate_for_test(Arc::clone(&gate));
+        let closing_peer = Arc::clone(&peer);
+        runtime.block_on(async move {
+            tokio::spawn(async move {
+                let _ = closing_peer.close().await;
+            });
+            tokio::task::yield_now().await;
+        });
+        assert!(peer.physical_shutdown_started_for_test());
+
+        drop(runtime);
+        gate.add_permits(1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !peer.physical_shutdown_finished_for_test() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+
+        assert!(peer.physical_shutdown_finished_for_test());
+        assert_eq!(peer.pc.connection_state(), RTCPeerConnectionState::Closed);
+    }
+
+    #[tokio::test]
+    async fn blocked_losing_route_cleanup_does_not_block_the_next_build() {
+        let peer = WebRtcPeerConnection::new(PeerConnectionConfig::default())
+            .await
+            .expect("peer");
+        peer.create_restart_offer(
+            1,
+            vec![IceServerConfig::new(
+                vec!["turn:relay.example.test:3478".into()],
+                "user".into(),
+                "credential".into(),
+            )],
+        )
+        .await
+        .expect("first pending route");
+        let loser = peer
+            .last_built_peer_for_test()
+            .and_then(|peer| peer.upgrade())
+            .expect("losing peer");
+        let gate = Arc::new(Semaphore::new(0));
+        loser.install_physical_close_gate_for_test(Arc::clone(&gate));
+
+        let second = tokio::time::timeout(
+            Duration::from_millis(250),
+            peer.create_restart_offer(
+                2,
+                vec![IceServerConfig::new(
+                    vec!["turn:relay.example.test:3478".into()],
+                    "user".into(),
+                    "credential".into(),
+                )],
+            ),
+        )
+        .await
+        .expect("loser cleanup must be handed off before building generation two")
+        .expect("generation two offer");
+
+        assert_eq!(second.generation(), 2);
+        assert!(loser.physical_shutdown_started_for_test());
+        gate.add_permits(1);
+        peer.close().await.expect("close peer");
+    }
+
+    #[tokio::test]
+    async fn cleanup_pressure_uses_fixed_workers_and_eventually_converges() {
+        let before = crate::cleanup_supervisor_snapshot();
+        let count = before.queue_capacity + 4;
+        let mut peers = Vec::with_capacity(count);
+        for _ in 0..count {
+            peers.push(
+                WebRtcPeerConnection::new(PeerConnectionConfig::default())
+                    .await
+                    .expect("pressure peer"),
+            );
+        }
+        for peer in peers {
+            peer.terminate_now();
+        }
+
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let snapshot = crate::cleanup_supervisor_snapshot();
+                if snapshot.completed_jobs >= before.completed_jobs + count as u64
+                    && snapshot.queue_depth == 0
+                    && snapshot.active_jobs == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bounded cleanup queue drains");
+
+        let after = crate::cleanup_supervisor_snapshot();
+        assert_eq!(after.worker_count, 2);
+        assert_eq!(after.queue_capacity, before.queue_capacity);
+    }
+
+    #[tokio::test]
+    async fn cancelled_partial_construction_is_handed_to_the_supervisor() {
+        let before = crate::cleanup_supervisor_snapshot();
+        let entered = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(Semaphore::new(0));
+        let build = tokio::spawn(WebRtcPeerConnection::new_blocked_after_pc_for_test(
+            PeerConnectionConfig::default(),
+            Arc::clone(&entered),
+            Arc::clone(&gate),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("constructor reached the guarded partial peer");
+
+        build.abort();
+        assert!(build.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while crate::cleanup_supervisor_snapshot().completed_jobs <= before.completed_jobs {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("partial peer cleanup completes independently");
+
+        let after = crate::cleanup_supervisor_snapshot();
+        assert!(after.submitted_jobs > before.submitted_jobs);
+        assert_eq!(after.worker_count, 2);
     }
 
     #[tokio::test]
@@ -3150,6 +3610,7 @@ mod tests {
             state.active_generation = 1;
             state.highest_seen_generation = 2;
             state.active_route_token = Some(RestartRouteToken::generate().expect("active token"));
+            state.active_route_id = Some(1);
             state.active_replacement = Some(Arc::clone(&active));
             state.pending = Some(PendingRestart::Ready {
                 generation: 2,

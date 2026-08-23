@@ -1,4 +1,4 @@
-use std::{future::Future, time::Duration};
+use std::{future::Future, sync::OnceLock, time::Duration};
 
 use mrd_pipeline_core::{EncodedAccessUnit, VideoCodec};
 
@@ -9,6 +9,8 @@ use crate::{
 };
 
 const PROBE_PAYLOAD: &[u8] = b"mrd-turn-relay-probe-v1";
+const MAX_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_CONCURRENT_PROBES: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct TurnRelayProbeConfig {
@@ -91,24 +93,26 @@ pub async fn probe_turn_relay(
             "TURN probe timeout must be non-zero".into(),
         ));
     }
+    if config.timeout > MAX_PROBE_TIMEOUT {
+        return Err(TransportError::Message(format!(
+            "TURN probe timeout exceeds the maximum of {} seconds",
+            MAX_PROBE_TIMEOUT.as_secs()
+        )));
+    }
     let secrets = secret_values(&config.ice_servers);
-    let deadline = tokio::time::Instant::now() + config.timeout;
-    run_before_probe_deadline(deadline, async move {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(config.timeout)
+        .ok_or_else(|| TransportError::Message("TURN probe deadline is out of range".into()))?;
+    run_in_probe_slot(deadline, async move {
         let offerer_config =
             probe_peer_config(PeerConnectionRole::Offerer, config.ice_servers.clone());
         let answerer_config = probe_peer_config(PeerConnectionRole::Answerer, config.ice_servers);
-        // Separate tasks prevent either peer's CPU-heavy synchronous setup from serializing the
-        // pair or starving the deadline driver. Detached task outputs are dropped on completion,
-        // which invokes the peer's cancellation-safe shutdown when a deadline wins.
-        let offerer_task =
-            tokio::spawn(async move { WebRtcPeerConnection::new(offerer_config).await });
-        let answerer_task =
-            tokio::spawn(async move { WebRtcPeerConnection::new(answerer_config).await });
-        let (offerer, answerer) = tokio::join!(offerer_task, answerer_task);
-        let offerer = offerer
-            .map_err(|_| TransportError::Message("TURN offerer creation task failed".into()))?;
-        let answerer = answerer
-            .map_err(|_| TransportError::Message("TURN answerer creation task failed".into()))?;
+        // The constructors are owned directly by this deadline-scoped future. A deadline drops
+        // both futures and their construction guards; no detached JoinHandle can accumulate.
+        let (offerer, answerer) = tokio::join!(
+            WebRtcPeerConnection::new(offerer_config),
+            WebRtcPeerConnection::new(answerer_config)
+        );
         let offerer = offerer.map_err(|error| redact(error, &secrets))?;
         let answerer = answerer.map_err(|error| redact(error, &secrets))?;
         let result = run_live_probe(&offerer, &answerer)
@@ -117,11 +121,33 @@ pub async fn probe_turn_relay(
 
         // Shutdown is deliberately started, not awaited. Each peer's physical shutdown owns its
         // resources and keeps running if this deadline or its caller cancels this future.
-        offerer.terminate_now();
-        answerer.terminate_now();
+        offerer.terminate_probe_now();
+        answerer.terminate_probe_now();
         result
     })
     .await
+}
+
+fn probe_slots() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static PROBE_SLOTS: OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    PROBE_SLOTS
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PROBES)))
+}
+
+async fn run_in_probe_slot<T, F>(
+    deadline: tokio::time::Instant,
+    operation: F,
+) -> Result<T, TransportError>
+where
+    F: Future<Output = Result<T, TransportError>>,
+{
+    let permit = tokio::time::timeout_at(deadline, probe_slots().clone().acquire_owned())
+        .await
+        .map_err(|_| TransportError::Message("TURN probe timed out".into()))?
+        .map_err(|_| TransportError::Message("TURN probe limiter is closed".into()))?;
+    let result = run_before_probe_deadline(deadline, operation).await;
+    drop(permit);
+    result
 }
 
 async fn run_before_probe_deadline<T, F>(
@@ -231,7 +257,7 @@ fn redact(error: TransportError, secrets: &[String]) -> TransportError {
 mod tests {
     use super::*;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     };
 
@@ -305,5 +331,51 @@ mod tests {
             started.elapsed() <= timeout + Duration::from_millis(100),
             "probe exceeded the single deadline by more than scheduling tolerance"
         );
+    }
+
+    #[tokio::test]
+    async fn excessive_probe_timeout_is_rejected_without_instant_overflow() {
+        let error = probe_turn_relay(TurnRelayProbeConfig {
+            ice_servers: vec![IceServerConfig::new(
+                vec!["turn:relay.example.test:3478".into()],
+                "user".into(),
+                "credential".into(),
+            )],
+            timeout: Duration::MAX,
+        })
+        .await
+        .expect_err("unbounded timeout must fail before deadline arithmetic");
+
+        assert!(error.to_string().contains("maximum"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn process_probe_limit_bounds_repeated_timed_operations() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let mut probes = Vec::new();
+        for _ in 0..(MAX_CONCURRENT_PROBES * 3) {
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            probes.push(tokio::spawn(async move {
+                run_in_probe_slot(
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                    async move {
+                        let current = active.fetch_add(1, Ordering::AcqRel) + 1;
+                        maximum.fetch_max(current, Ordering::AcqRel);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        active.fetch_sub(1, Ordering::AcqRel);
+                        Ok(())
+                    },
+                )
+                .await
+            }));
+        }
+        for probe in probes {
+            probe.await.unwrap().unwrap();
+        }
+
+        assert!(maximum.load(Ordering::Acquire) <= MAX_CONCURRENT_PROBES);
+        assert_eq!(active.load(Ordering::Acquire), 0);
     }
 }

@@ -16,12 +16,14 @@ use webrtc::{
     },
 };
 
+mod cleanup;
 mod config;
 mod control;
 mod peer;
 mod probe;
 mod stats;
 
+pub use cleanup::{cleanup_supervisor_snapshot, CleanupFailureSummary, CleanupSupervisorSnapshot};
 pub use config::{
     H264CodecConfig, H264CodecProfile, IceServerConfig, IceTransportPolicy, PeerConnectionConfig,
     PeerConnectionRole, VideoCodecConfig,
