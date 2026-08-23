@@ -2,7 +2,17 @@ from datetime import datetime
 from uuid import uuid4
 import hashlib
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
@@ -10,6 +20,14 @@ from app.db.session import Base
 
 class Device(Base):
     __tablename__ = "devices"
+    __table_args__ = (
+        CheckConstraint(
+            "length(tenant_id) BETWEEN 1 AND 64",
+            name="ck_devices_tenant_id",
+        ),
+        Index("ix_devices_tenant_id", "tenant_id"),
+        Index("ix_devices_bound_user_id", "bound_user_id"),
+    )
 
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid4())
@@ -22,6 +40,9 @@ class Device(Base):
     ip: Mapped[str] = mapped_column(String(64), default="")
     group: Mapped[str] = mapped_column(String(64), default="默认")
     favorite: Mapped[bool] = mapped_column(Boolean, default=False)
+    tenant_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="default", server_default=text("'default'")
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     # 设备绑定相关字段
@@ -33,7 +54,11 @@ class Device(Base):
     gpu_info: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_bound: Mapped[bool] = mapped_column(Boolean, default=False)
     bound_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    bound_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    bound_user_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
 
     status: Mapped["DeviceStatus"] = relationship(
         "DeviceStatus",

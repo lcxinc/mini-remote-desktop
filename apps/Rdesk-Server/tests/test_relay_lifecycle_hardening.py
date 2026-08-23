@@ -26,6 +26,7 @@ from app.middleware.relay_node_boundary import RelayNodeBoundaryMiddleware
 from test_relay_node_api import (
     NODE_ID,
     TLS_HEADERS,
+    _approval_body,
     _approve,
     _canonical_request,
     _csr,
@@ -35,6 +36,11 @@ from test_relay_node_api import (
     _issue_token,
     api,
 )
+
+
+NODE_TURN_SECRET = base64.urlsafe_b64encode(b"node-held-turn-secret-material!!").rstrip(
+    b"="
+).decode("ascii")
 
 
 def _enrollment_payload(token: str, csr_pem: str) -> dict[str, object]:
@@ -47,7 +53,97 @@ def _enrollment_payload(token: str, csr_pem: str) -> dict[str, object]:
         "max_allocations": 100,
         "max_egress_bps": 1_000_000,
         "csr_pem": csr_pem,
+        "turn_rest_secret": NODE_TURN_SECRET,
     }
+
+
+def test_node_generated_turn_secret_is_bound_encrypted_and_never_picked_up(
+    api: tuple[TestClient, object], caplog: pytest.LogCaptureFixture
+) -> None:
+    client, engine = api
+    caplog.set_level(logging.DEBUG)
+    token = _issue_token(client)
+    csr_pem, _ = _csr(NODE_ID)
+    payload = {
+        **_enrollment_payload(token, csr_pem),
+        "turn_rest_secret": NODE_TURN_SECRET,
+    }
+    enrolled = client.post(
+        "/api/v1/relays/enroll", headers=TLS_HEADERS, json=payload
+    )
+    assert enrolled.status_code == 202, enrolled.text
+    enrollment_id = enrolled.json()["enrollment_id"]
+    receipt = enrolled.json()["receipt"]
+    with Session(engine) as session:
+        registration = session.get(RelayNodeRegistration, NODE_ID)
+        assert registration.encrypted_turn_secret is not None
+        assert NODE_TURN_SECRET.encode() not in registration.encrypted_turn_secret
+        stored_ciphertext = bytes(registration.encrypted_turn_secret)
+
+    approved = client.post(
+        f"/api/v1/relays/{NODE_ID}/approve",
+        json={"failure_domain": "rack-admin", "physical_host_id": "host-admin"},
+    )
+    assert approved.status_code == 200, approved.text
+    pickup = _pickup(client, enrollment_id, receipt)
+    assert pickup.status_code == 200, pickup.text
+    assert "turn_rest_secret" not in pickup.json()
+    assert NODE_TURN_SECRET not in pickup.text
+    assert NODE_TURN_SECRET not in caplog.text
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        registration = session.get(RelayNodeRegistration, NODE_ID)
+        assert bytes(node.encrypted_turn_secret) == stored_ciphertext
+        assert node.failure_domain == "rack-admin"
+        assert node.physical_host_id == "host-admin"
+        assert registration.topology_approved_at is not None
+
+
+def test_same_enrollment_token_with_different_turn_secret_conflicts(
+    api: tuple[TestClient, object],
+) -> None:
+    client, _ = api
+    token = _issue_token(client)
+    csr_pem, _ = _csr(NODE_ID)
+    payload = {
+        **_enrollment_payload(token, csr_pem),
+        "turn_rest_secret": NODE_TURN_SECRET,
+    }
+    first = client.post("/api/v1/relays/enroll", headers=TLS_HEADERS, json=payload)
+    assert first.status_code == 202, first.text
+    changed = dict(payload)
+    changed["turn_rest_secret"] = base64.urlsafe_b64encode(b"x" * 32).rstrip(
+        b"="
+    ).decode("ascii")
+    conflict = client.post(
+        "/api/v1/relays/enroll", headers=TLS_HEADERS, json=changed
+    )
+    assert conflict.status_code == 409
+    assert _error_code(conflict) == "relay_enrollment_already_used"
+
+
+def test_admin_approval_requires_explicit_trusted_topology(
+    api: tuple[TestClient, object],
+) -> None:
+    client, _ = api
+    token = _issue_token(client)
+    csr_pem, _ = _csr(NODE_ID)
+    enrolled = client.post(
+        "/api/v1/relays/enroll",
+        headers=TLS_HEADERS,
+        json={
+            **_enrollment_payload(token, csr_pem),
+            "turn_rest_secret": NODE_TURN_SECRET,
+        },
+    )
+    assert enrolled.status_code == 202, enrolled.text
+    missing = client.post(f"/api/v1/relays/{NODE_ID}/approve", json={})
+    assert missing.status_code == 400
+    assigned = client.post(
+        f"/api/v1/relays/{NODE_ID}/approve",
+        json={"failure_domain": "rack-admin", "physical_host_id": "host-admin"},
+    )
+    assert assigned.status_code == 200, assigned.text
 
 
 def _enroll_with_receipt(
@@ -217,10 +313,11 @@ def test_pickup_is_pending_then_idempotently_delivers_approved_certificate(
         "certificate_pem": None,
         "ca_certificate_pem": None,
         "expires_at": None,
-        "turn_rest_secret": None,
     }
 
-    approved = client.post(f"/api/v1/relays/{NODE_ID}/approve")
+    approved = client.post(
+        f"/api/v1/relays/{NODE_ID}/approve", json=_approval_body()
+    )
     assert approved.status_code == 200
     assert approved.json() == {"node_id": NODE_ID, "status": "approved"}
     delivered = _pickup(client, enrollment_id, receipt)
@@ -230,12 +327,16 @@ def test_pickup_is_pending_then_idempotently_delivers_approved_certificate(
     assert delivered.json()["status"] == "approved"
     assert "BEGIN CERTIFICATE" in delivered.json()["certificate_pem"]
     assert "BEGIN CERTIFICATE" in delivered.json()["ca_certificate_pem"]
-    turn_rest_secret = delivered.json()["turn_rest_secret"]
-    assert isinstance(turn_rest_secret, str) and len(turn_rest_secret) >= 40
+    assert "turn_rest_secret" not in delivered.json()
+    assert NODE_TURN_SECRET not in delivered.text
     with Session(engine) as session:
         node = session.get(RelayNode, NODE_ID)
+        registration = session.get(RelayNodeRegistration, NODE_ID)
         assert node is not None
-        assert turn_rest_secret.encode() not in bytes(node.encrypted_turn_secret)
+        assert registration is not None
+        assert bytes(node.encrypted_turn_secret) == bytes(
+            registration.encrypted_turn_secret
+        )
 
 
 def test_approval_does_not_issue_until_first_pickup_and_concurrent_pickup_signs_once(
@@ -247,7 +348,9 @@ def test_approval_does_not_issue_until_first_pickup_and_concurrent_pickup_signs_
         before_approval = session.get(RelayNodeRegistration, NODE_ID)
         assert before_approval is not None
         immutable_receipt_expiry = before_approval.receipt_expires_at
-    approved = client.post(f"/api/v1/relays/{NODE_ID}/approve")
+    approved = client.post(
+        f"/api/v1/relays/{NODE_ID}/approve", json=_approval_body()
+    )
     assert approved.status_code == 200
     with Session(engine) as session:
         registration = session.get(RelayNodeRegistration, NODE_ID)
@@ -285,7 +388,9 @@ def test_approved_registration_can_be_irreversibly_revoked_before_pickup(
     assert enrolled.status_code == 202
     enrollment_id = enrolled.json()["enrollment_id"]
     receipt = enrolled.json()["receipt"]
-    assert client.post(f"/api/v1/relays/{NODE_ID}/approve").status_code == 200
+    assert client.post(
+        f"/api/v1/relays/{NODE_ID}/approve", json=_approval_body()
+    ).status_code == 200
 
     revoked = client.post(f"/api/v1/relays/{NODE_ID}/revoke")
     assert revoked.status_code == 200, revoked.text
@@ -312,7 +417,9 @@ def test_approved_registration_can_be_irreversibly_revoked_before_pickup(
         assert registration.certificate_pem is None
         assert session.get(RelayNode, NODE_ID) is None
 
-    approve_again = client.post(f"/api/v1/relays/{NODE_ID}/approve")
+    approve_again = client.post(
+        f"/api/v1/relays/{NODE_ID}/approve", json=_approval_body()
+    )
     assert (approve_again.status_code, _error_code(approve_again)) == (
         403,
         "relay_node_revoked",
@@ -345,7 +452,9 @@ def test_expired_receipt_cannot_be_revived_by_approval_and_new_token_recovers(
         401,
         "relay_enrollment_invalid",
     )
-    approval = client.post(f"/api/v1/relays/{NODE_ID}/approve")
+    approval = client.post(
+        f"/api/v1/relays/{NODE_ID}/approve", json=_approval_body()
+    )
     assert approval.status_code == 409
     assert _error_code(approval) == "relay_enrollment_invalid"
     after = _pickup(client, enrollment_id, receipt)
@@ -363,7 +472,9 @@ def test_expired_receipt_cannot_be_revived_by_approval_and_new_token_recovers(
     )
     assert replacement.status_code == 202, replacement.text
     assert replacement.json()["enrollment_id"] != enrollment_id
-    assert client.post(f"/api/v1/relays/{NODE_ID}/approve").status_code == 200
+    assert client.post(
+        f"/api/v1/relays/{NODE_ID}/approve", json=_approval_body()
+    ).status_code == 200
     delivered = _pickup(
         client,
         replacement.json()["enrollment_id"],
@@ -1075,7 +1186,9 @@ def test_ca_policy_rejects_rsa_below_3072_bits(
         settings.__dict__, "relay_ca_private_key_pem", SecretStr(private_key)
     )
     _enroll(client)
-    assert client.post(f"/api/v1/relays/{NODE_ID}/approve").status_code == 200
+    assert client.post(
+        f"/api/v1/relays/{NODE_ID}/approve", json=_approval_body()
+    ).status_code == 200
     enrollment_id, receipt = getattr(client, "_relay_enrollment_delivery")
     response = _pickup(client, enrollment_id, receipt)
     assert response.status_code == 503
@@ -1115,7 +1228,9 @@ def test_encrypted_ca_private_key_password_is_supported_and_fail_closed(
         SecretStr(configured_password),
     )
     _enroll(client)
-    assert client.post(f"/api/v1/relays/{NODE_ID}/approve").status_code == 200
+    assert client.post(
+        f"/api/v1/relays/{NODE_ID}/approve", json=_approval_body()
+    ).status_code == 200
     enrollment_id, receipt = getattr(client, "_relay_enrollment_delivery")
     response = _pickup(client, enrollment_id, receipt)
     if password_kind == "correct":

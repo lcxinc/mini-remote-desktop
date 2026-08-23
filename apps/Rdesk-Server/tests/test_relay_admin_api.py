@@ -15,7 +15,9 @@ from app.core.security import get_current_user_optional
 from app.models.user import User
 from test_relay_node_api import (
     NODE_ID,
+    NODE_TURN_SECRET,
     TLS_HEADERS,
+    _approval_body,
     _approve,
     _csr,
     _enroll,
@@ -48,7 +50,7 @@ def test_admin_role_is_required_for_all_management_routes(api: tuple[TestClient,
     routes = [
         ("POST", "/api/v1/relays/enrollment-tokens", {"ttl_seconds": 300}),
         ("GET", "/api/v1/relays", None),
-        ("POST", f"/api/v1/relays/{NODE_ID}/approve", None),
+        ("POST", f"/api/v1/relays/{NODE_ID}/approve", _approval_body()),
         ("POST", f"/api/v1/relays/{NODE_ID}/drain", None),
         ("POST", f"/api/v1/relays/{NODE_ID}/resume", None),
         ("POST", f"/api/v1/relays/{NODE_ID}/revoke", None),
@@ -157,8 +159,9 @@ def test_secrets_and_raw_auth_material_are_not_logged(
             "failure_domain": "rack-a",
             "endpoints": ["turn:relay.example.test:3478"],
             "max_allocations": 100,
-            "max_egress_bps": 1_000_000,
-            "csr_pem": csr_pem,
+                "max_egress_bps": 1_000_000,
+                "csr_pem": csr_pem,
+                "turn_rest_secret": NODE_TURN_SECRET,
         },
     )
     assert response.status_code == 202
@@ -181,6 +184,7 @@ def test_secrets_and_raw_auth_material_are_not_logged(
         raw_signature,
         "raw-auth-secret",
         settings.relay_ca_private_key_pem,
+        NODE_TURN_SECRET,
     ):
         assert secret not in output
 

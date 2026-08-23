@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     relay_directory_signing_private_key: SecretStr = SecretStr("")
     relay_turn_secret_encryption_key: SecretStr = SecretStr("")
     relay_turn_secret_encryption_key_id: str = "active"
+    session_grant_ttl_seconds: int = 600
+    relay_policy_ttl_seconds: int = 600
+    relay_policy_revision: int = 1
+    relay_allowed_regions: str = ""
+    relay_preferred_regions: str = ""
+    relay_accepted_transports: str = "udp,tcp,tls"
     # Empty means fail closed: relay management traffic is accepted only from
     # explicit IP addresses/networks of the terminating mTLS proxy.
     trusted_mtls_proxy: str = ""

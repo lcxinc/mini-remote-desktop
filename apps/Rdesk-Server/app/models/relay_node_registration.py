@@ -27,6 +27,15 @@ class RelayNodeRegistration(Base):
             "status IN ('pending', 'approved', 'revoked')",
             name="ck_relay_node_registrations_status",
         ),
+        CheckConstraint(
+            "(topology_approved_at IS NULL AND physical_host_id IS NULL) OR "
+            "(topology_approved_at IS NOT NULL AND physical_host_id IS NOT NULL)",
+            name="ck_relay_node_registrations_topology",
+        ),
+        CheckConstraint(
+            "encrypted_turn_secret IS NULL OR length(encrypted_turn_secret) >= 30",
+            name="ck_relay_node_registrations_turn_secret",
+        ),
     )
 
     node_id: Mapped[str] = mapped_column(String(128), primary_key=True)
@@ -38,6 +47,10 @@ class RelayNodeRegistration(Base):
     )
     region: Mapped[str] = mapped_column(String(64), nullable=False)
     failure_domain: Mapped[str] = mapped_column(String(128), nullable=False)
+    physical_host_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    topology_approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     endpoints: Mapped[list[str]] = mapped_column(
         JSON().with_variant(JSONB(), "postgresql"), nullable=False
     )
@@ -45,6 +58,9 @@ class RelayNodeRegistration(Base):
     max_egress_bps: Mapped[int] = mapped_column(BigInteger, nullable=False)
     csr_pem: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     signing_public_key: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    encrypted_turn_secret: Mapped[bytes | None] = mapped_column(
+        LargeBinary, nullable=True
+    )
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
     certificate_pem: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     certificate_expires_at: Mapped[datetime | None] = mapped_column(

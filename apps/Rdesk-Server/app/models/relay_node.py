@@ -51,14 +51,20 @@ class RelayNode(Base):
             "recent_failure_bps >= 0 AND recent_failure_bps <= 10000",
             name="ck_relay_nodes_recent_failure",
         ),
+        CheckConstraint(
+            "physical_host_id IS NULL OR length(physical_host_id) BETWEEN 1 AND 128",
+            name="ck_relay_nodes_physical_host",
+        ),
         Index("ix_relay_nodes_region", "region"),
         Index("ix_relay_nodes_state", "state"),
         Index("ix_relay_nodes_lease", "lease_expires_at"),
+        Index("ix_relay_nodes_physical_host", "physical_host_id"),
     )
 
     node_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     region: Mapped[str] = mapped_column(String(64), nullable=False)
     failure_domain: Mapped[str] = mapped_column(String(128), nullable=False)
+    physical_host_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     state: Mapped[str] = mapped_column(
         String(16),
         nullable=False,

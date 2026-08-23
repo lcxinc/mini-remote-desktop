@@ -36,6 +36,7 @@ from app.schemas.relay import (
     EnrollmentTokenRequest,
     EnrollmentTokenResponse,
     RelayApprovalResponse,
+    RelayApprovalRequest,
     RelayEnrollmentRequest,
     RelayEnrollmentResponse,
     RelayEnrollmentPickupResponse,
@@ -305,6 +306,7 @@ def _node_response(node: RelayNode) -> RelayNodeResponse:
         node_id=node.node_id,
         region=node.region,
         failure_domain=node.failure_domain,
+        physical_host_id=node.physical_host_id,
         state=node.state,
         endpoints=list(node.endpoints),
         max_allocations=node.max_allocations,
@@ -377,6 +379,7 @@ async def enroll_relay_node(
             max_allocations=payload.max_allocations,
             max_egress_bps=payload.max_egress_bps,
             csr_pem=payload.csr_pem,
+            turn_rest_secret=payload.turn_rest_secret,
             receipt_ttl_seconds=settings.relay_enrollment_receipt_ttl_seconds,
             now=_now(),
         )
@@ -441,6 +444,7 @@ async def pickup_relay_certificate(
 @router.post("/{node_id}/approve", response_model=RelayApprovalResponse)
 async def approve_relay_node(
     node_id: str,
+    payload: RelayApprovalRequest,
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> RelayApprovalResponse:
@@ -448,6 +452,8 @@ async def approve_relay_node(
         approved = await _registry(db).approve(
             node_id=node_id,
             actor_id=admin.id,
+            failure_domain=payload.failure_domain,
+            physical_host_id=payload.physical_host_id,
             now=_now(),
         )
         await _commit(db)

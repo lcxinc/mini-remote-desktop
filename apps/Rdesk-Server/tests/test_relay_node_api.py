@@ -35,6 +35,16 @@ from app.schemas.relay import (
 
 TLS_HEADERS = {"X-Rdesk-Client-TLS": "verified"}
 NODE_ID = "relay-ap-east-1"
+NODE_TURN_SECRET = base64.urlsafe_b64encode(b"node-held-turn-secret-material!!").rstrip(
+    b"="
+).decode("ascii")
+
+
+def _approval_body(node_id: str = NODE_ID) -> dict[str, str]:
+    return {
+        "failure_domain": "rack-a",
+        "physical_host_id": f"host-{node_id}",
+    }
 
 
 def test_new_enrollment_rejects_colon_node_id_but_legacy_outputs_remain_valid() -> None:
@@ -336,6 +346,7 @@ def _enroll(
             "max_allocations": 100,
             "max_egress_bps": 1_000_000,
             "csr_pem": csr_pem,
+            "turn_rest_secret": NODE_TURN_SECRET,
         },
     )
     assert response.status_code == 202, response.text
@@ -352,7 +363,9 @@ def _enroll(
 
 
 def _approve(client: TestClient, node_id: str = NODE_ID) -> tuple[str, str]:
-    response = client.post(f"/api/v1/relays/{node_id}/approve")
+    response = client.post(
+        f"/api/v1/relays/{node_id}/approve", json=_approval_body(node_id)
+    )
     assert response.status_code == 200, response.text
     assert response.json() == {"node_id": node_id, "status": "approved"}
     enrollment_id, receipt = getattr(client, "_relay_enrollment_delivery")
@@ -392,6 +405,7 @@ def test_enrollment_is_tls_proxy_bound_one_use_pending_and_csr_bound(
         "max_allocations": 100,
         "max_egress_bps": 1_000_000,
         "csr_pem": csr_pem,
+        "turn_rest_secret": NODE_TURN_SECRET,
     }
 
     missing_tls = client.post("/api/v1/relays/enroll", json=payload)
@@ -447,6 +461,7 @@ def test_enrollment_rejects_invalid_csr_pop_identity_and_key(
             "max_allocations": 100,
             "max_egress_bps": 1_000_000,
             "csr_pem": csr_pem,
+            "turn_rest_secret": NODE_TURN_SECRET,
         },
     )
     assert response.status_code == 400
@@ -493,7 +508,9 @@ def test_approval_fails_closed_without_or_with_mismatched_ca(
 ) -> None:
     client, _ = api
     _enroll(client)
-    approval = client.post(f"/api/v1/relays/{NODE_ID}/approve")
+    approval = client.post(
+        f"/api/v1/relays/{NODE_ID}/approve", json=_approval_body()
+    )
     assert approval.status_code == 200
     enrollment_id, receipt = getattr(client, "_relay_enrollment_delivery")
     monkeypatch.setattr(settings, "relay_ca_private_key_pem", "")
@@ -524,7 +541,9 @@ def test_approval_rejects_invalid_ca_time_usage_and_remaining_lifetime(
 ) -> None:
     client, _ = api
     _enroll(client)
-    approval = client.post(f"/api/v1/relays/{NODE_ID}/approve")
+    approval = client.post(
+        f"/api/v1/relays/{NODE_ID}/approve", json=_approval_body()
+    )
     assert approval.status_code == 200
     enrollment_id, receipt = getattr(client, "_relay_enrollment_delivery")
     now = datetime.now(UTC)

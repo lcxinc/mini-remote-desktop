@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import hashlib
 import hmac
+import re
 import secrets
 import threading
 from collections.abc import Iterable
@@ -37,6 +39,7 @@ _ENROLLMENT_CONTEXT = b"MRD_RELAY_ENROLLMENT_V1\x00"
 _RECEIPT_CONTEXT = b"MRD_RELAY_RECEIPT_V1\x00"
 _RECEIPT_DERIVE_CONTEXT = b"MRD_RELAY_RECEIPT_DERIVE_V1\x00"
 _ENROLLMENT_REQUEST_CONTEXT = b"MRD_RELAY_ENROLLMENT_REQUEST_V1\x00"
+_TOPOLOGY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _NODE_IDENTITY_LOCK_CONTEXT = b"MRD_RELAY_NODE_IDENTITY_LOCK_V1\x00"
 _LOCAL_NODE_LOCKS = tuple(threading.Lock() for _ in range(256))
 _LOCAL_NODE_LOCKS_INFO = "relay_registry_local_node_locks"
@@ -79,7 +82,6 @@ class RelayEnrollmentPickup:
     certificate_pem: str | None
     ca_certificate_pem: str | None
     expires_at: datetime | None
-    turn_rest_secret: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -141,12 +143,16 @@ class RelayRegistry:
         max_allocations: int,
         max_egress_bps: int,
         csr_pem: str,
+        turn_rest_secret: SecretStr,
         receipt_ttl_seconds: int,
         now: datetime,
     ) -> RequestedRelayEnrollment:
         self._require_pepper()
         canonical_csr, signing_public_key = validate_relay_csr(csr_pem, node_id)
         canonical_endpoints = self._endpoints(endpoints, "relay_enrollment_invalid")
+        secret_digest, encrypted_turn_secret = self._protect_turn_secret(
+            turn_rest_secret, node_id=node_id
+        )
         if not 60 <= receipt_ttl_seconds <= 7 * 86_400:
             self._error(
                 "relay_enrollment_invalid", 503, "relay enrollment is not configured"
@@ -159,6 +165,7 @@ class RelayRegistry:
             max_allocations=max_allocations,
             max_egress_bps=max_egress_bps,
             canonical_csr=canonical_csr,
+            turn_secret_digest=secret_digest,
         )
         digest = self._token_digest(token)
         enrollment = await self._session.scalar(
@@ -224,6 +231,7 @@ class RelayRegistry:
             registration.max_egress_bps = max_egress_bps
             registration.csr_pem = canonical_csr
             registration.signing_public_key = signing_public_key
+            registration.encrypted_turn_secret = encrypted_turn_secret
             registration.status = "pending"
             registration.request_digest = request_digest
             registration.receipt_digest = self._receipt_digest(receipt)
@@ -232,6 +240,8 @@ class RelayRegistry:
             registration.ca_certificate_pem = None
             registration.certificate_expires_at = None
             registration.approved_at = None
+            registration.physical_host_id = None
+            registration.topology_approved_at = None
             registration.previous_certificate_fingerprint = None
             registration.previous_signing_public_key = None
             registration.previous_auth_expires_at = None
@@ -261,8 +271,15 @@ class RelayRegistry:
         *,
         node_id: str,
         actor_id: str,
+        failure_domain: str,
+        physical_host_id: str,
         now: datetime,
     ) -> RelayNodeRegistration:
+        if (
+            _TOPOLOGY_ID.fullmatch(failure_domain) is None
+            or _TOPOLOGY_ID.fullmatch(physical_host_id) is None
+        ):
+            self._error("relay_topology_invalid", 400, "relay topology invalid")
         async with self._node_identity_lock(node_id):
             existing, registration = await self._locked_node_and_registration(node_id)
             if registration is not None and registration.status == "revoked":
@@ -279,12 +296,18 @@ class RelayRegistry:
             ):
                 self._error("relay_enrollment_invalid", 409, "relay enrollment invalid")
             registration.status = "approved"
+            registration.failure_domain = failure_domain
+            registration.physical_host_id = physical_host_id
+            registration.topology_approved_at = now
             registration.approved_at = now
             self._audit(
                 action="relay_node_approved",
                 node_id=node_id,
                 actor_id=actor_id,
-                details={},
+                details={
+                    "failure_domain": failure_domain,
+                    "physical_host_id": physical_host_id,
+                },
                 now=now,
             )
             await self._session.flush()
@@ -386,7 +409,12 @@ class RelayRegistry:
                 )
             if registration.status != "approved":
                 self._error("relay_enrollment_invalid", 401, "relay enrollment invalid")
-            turn_rest_secret: str | None = None
+            if (
+                registration.topology_approved_at is None
+                or registration.physical_host_id is None
+                or registration.encrypted_turn_secret is None
+            ):
+                self._error("relay_enrollment_invalid", 409, "relay enrollment invalid")
             if registration.certificate_pem is None:
                 certificate = issue_relay_certificate(
                     csr_pem=registration.csr_pem,
@@ -398,24 +426,18 @@ class RelayRegistry:
                     validity_seconds=validity_seconds,
                 )
                 if node is None:
-                    turn_secret_cipher = self._turn_secret_cipher
-                    if turn_secret_cipher is None:
-                        self._error(
-                            "relay_access_unavailable", 503, "relay access unavailable"
-                        )
-                    turn_rest_secret = secrets.token_urlsafe(32)
-                    encrypted_turn_secret = turn_secret_cipher.encrypt(
-                        turn_rest_secret.encode("utf-8"),
-                        associated_data=registration.node_id.encode("utf-8"),
-                    )
                     node = RelayNode(
                         node_id=registration.node_id,
-                        encrypted_turn_secret=encrypted_turn_secret,
+                        encrypted_turn_secret=bytes(
+                            registration.encrypted_turn_secret
+                        ),
                         created_at=now,
                     )
                     self._session.add(node)
                 node.region = registration.region
                 node.failure_domain = registration.failure_domain
+                node.physical_host_id = registration.physical_host_id
+                node.encrypted_turn_secret = bytes(registration.encrypted_turn_secret)
                 node.state = "unavailable"
                 node.endpoints = registration.endpoints
                 node.certificate_fingerprint = certificate.fingerprint
@@ -443,8 +465,6 @@ class RelayRegistry:
                     now=now,
                 )
                 await self._session.flush()
-            if turn_rest_secret is None:
-                turn_rest_secret = self._decrypt_turn_secret(node)
             if (
                 registration.certificate_pem is None
                 or registration.ca_certificate_pem is None
@@ -467,23 +487,7 @@ class RelayRegistry:
                 certificate_pem=registration.certificate_pem.decode(),
                 ca_certificate_pem=registration.ca_certificate_pem.decode(),
                 expires_at=self._as_utc(registration.certificate_expires_at),
-                turn_rest_secret=turn_rest_secret,
             )
-
-    def _decrypt_turn_secret(self, node: RelayNode | None) -> str | None:
-        if node is None:
-            return None
-        turn_secret_cipher = self._turn_secret_cipher
-        if turn_secret_cipher is None:
-            self._error("relay_access_unavailable", 503, "relay access unavailable")
-        try:
-            plaintext = turn_secret_cipher.decrypt(
-                bytes(node.encrypted_turn_secret),
-                associated_data=node.node_id.encode("utf-8"),
-            )
-            return plaintext.decode("utf-8")
-        except Exception:
-            self._error("relay_access_unavailable", 503, "relay access unavailable")
 
     async def renew(
         self,
@@ -932,6 +936,44 @@ class RelayRegistry:
             self._pepper, _RECEIPT_CONTEXT + receipt.encode("ascii"), hashlib.sha256
         ).hexdigest()
 
+    def _protect_turn_secret(
+        self, value: SecretStr, *, node_id: str
+    ) -> tuple[bytes, bytes]:
+        cipher = self._turn_secret_cipher
+        if cipher is None or not isinstance(value, SecretStr):
+            self._error(
+                "relay_access_unavailable", 503, "relay access unavailable"
+            )
+        encoded = value.get_secret_value()
+        if (
+            len(encoded) != 43
+            or not encoded.isascii()
+            or re.fullmatch(r"[A-Za-z0-9_-]{43}", encoded) is None
+        ):
+            self._error("relay_enrollment_invalid", 400, "relay enrollment invalid")
+        try:
+            decoded = bytearray(base64.urlsafe_b64decode(encoded + "="))
+        except (ValueError, binascii.Error):
+            self._error("relay_enrollment_invalid", 400, "relay enrollment invalid")
+        try:
+            canonical = base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii")
+            if len(decoded) != 32 or not hmac.compare_digest(canonical, encoded):
+                self._error(
+                    "relay_enrollment_invalid", 400, "relay enrollment invalid"
+                )
+            digest = hashlib.sha256(decoded).digest()
+            plaintext = bytes(decoded)
+            try:
+                encrypted = cipher.encrypt(
+                    plaintext, associated_data=node_id.encode("utf-8")
+                )
+            finally:
+                del plaintext
+            return digest, encrypted
+        finally:
+            for index in range(len(decoded)):
+                decoded[index] = 0
+
     def _derive_receipt(
         self, token: str, enrollment_id: str, request_digest: str
     ) -> str:
@@ -956,6 +998,7 @@ class RelayRegistry:
         max_allocations: int,
         max_egress_bps: int,
         canonical_csr: bytes,
+        turn_secret_digest: bytes,
     ) -> str:
         fields = (
             node_id.encode("utf-8"),
@@ -966,6 +1009,7 @@ class RelayRegistry:
             max_allocations.to_bytes(8, "big"),
             max_egress_bps.to_bytes(8, "big"),
             canonical_csr,
+            turn_secret_digest,
         )
         return hashlib.sha256(
             _ENROLLMENT_REQUEST_CONTEXT + cls._length_prefixed(fields)

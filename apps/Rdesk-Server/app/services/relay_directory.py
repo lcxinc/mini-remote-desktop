@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Callable, Iterable, NoReturn, Protocol
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.models.device import Device
 from app.models.relay_audit_event import RelayAuditEvent
@@ -16,6 +16,7 @@ from app.models.relay_node import RelayNode
 from app.models.relay_node_registration import RelayNodeRegistration
 from app.models.relay_reservation import RelayReservation
 from app.models.session_request import SessionRequest
+from app.models.user import User
 from app.services.relay_repository import RelayRepository, RelayRepositoryError
 from app.services.relay_signing import (
     RelayDirectoryCandidateOut,
@@ -50,6 +51,8 @@ class RelayNodeView:
     node_id: str
     region: str
     failure_domain: str
+    physical_host_id: str | None
+    topology_approved: bool
     state: str
     lease_expires_at: datetime | None
     revoked_at: datetime | None
@@ -98,6 +101,7 @@ class RelaySelectedNode:
     node_id: str
     region: str
     failure_domain: str
+    physical_host_id: str
     endpoints: tuple[str, ...]
     score: int
     selection_reason: str = "eligible"
@@ -167,9 +171,30 @@ class RelayAccessService:
                 )
                 if target_device is None:
                     _deny_access()
+                if not target_device.is_bound or target_device.bound_user_id is None:
+                    _deny_access()
+                participant_rows = await self._session.scalars(
+                    select(User)
+                    .where(
+                        User.id.in_(
+                            {
+                                grant.requester_user_id,
+                                target_device.bound_user_id,
+                                current_user_id,
+                            }
+                        )
+                    )
+                    .order_by(User.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+                participants = {user.id: user for user in participant_rows}
                 authorize_relay_grant(
                     grant=grant,
                     target_device=target_device,
+                    requester_user=participants.get(grant.requester_user_id),
+                    target_owner=participants.get(target_device.bound_user_id),
+                    current_user=participants.get(current_user_id),
                     current_user_id=current_user_id,
                     requested_policy_revision=policy_revision,
                     requested_peer_id=intended_peer_id,
@@ -188,12 +213,39 @@ class RelayAccessService:
                 )
                 records = list(rows.all())
                 views = [_view(node, registration) for node, registration in records]
+                pending_rows = await self._session.execute(
+                    select(
+                        RelayReservation.node_id,
+                        func.count(RelayReservation.id),
+                    )
+                    .where(
+                        RelayReservation.node_id.in_(
+                            [node.node_id for node, _ in records]
+                        ),
+                        RelayReservation.session_id != session_id,
+                        RelayReservation.expires_at > now,
+                    )
+                    .group_by(RelayReservation.node_id)
+                )
+                pending_by_node = {
+                    node_id: int(count) for node_id, count in pending_rows.all()
+                }
+                views = [
+                    replace(
+                        view,
+                        active_allocations=(
+                            view.active_allocations
+                            + pending_by_node.get(view.node_id, 0)
+                        ),
+                    )
+                    for view in views
+                ]
                 decision = select_relay_nodes(policy, views, now=now)
                 by_id = {
                     node.node_id: (node, registration, view)
                     for (node, registration), view in zip(records, views, strict=True)
                 }
-                ordered_candidates = _distinct_domain_candidates(decision.eligible)
+                ordered_candidates = decision.eligible[:8]
                 if not ordered_candidates:
                     raise RelayAccessError(
                         "relay_capacity_unavailable", 503, "relay capacity unavailable"
@@ -218,7 +270,7 @@ class RelayAccessService:
                         )
                     ).all()
                 )
-                reservations = await self._repository.reserve_capacity(
+                primary_reservations = await self._repository.reserve_capacity(
                     session_id=session_id,
                     # Capacity belongs to the server-verified grant, not whichever
                     # of its two participants happens to request credentials first.
@@ -226,11 +278,34 @@ class RelayAccessService:
                     ordered_node_ids=[item.node_id for item in ordered_candidates],
                     now=now,
                     ttl_seconds=reservation_ttl,
+                    result_limit=1,
                 )
-                if not reservations:
+                if not primary_reservations:
                     raise RelayAccessError(
                         "relay_capacity_unavailable", 503, "relay capacity unavailable"
                     )
+                primary = primary_reservations[0]
+                selected_primary = next(
+                    item for item in ordered_candidates if item.node_id == primary.node_id
+                )
+                backup_candidates = [
+                    item
+                    for item in ordered_candidates
+                    if item.node_id != primary.node_id
+                    and item.failure_domain != selected_primary.failure_domain
+                    and item.physical_host_id != selected_primary.physical_host_id
+                ]
+                backup_reservations: list[RelayReservation] = []
+                if policy.max_backups > 0 and backup_candidates:
+                    backup_reservations = await self._repository.reserve_capacity(
+                        session_id=session_id,
+                        user_id=grant.requester_user_id,
+                        ordered_node_ids=[item.node_id for item in backup_candidates],
+                        now=now,
+                        ttl_seconds=reservation_ttl,
+                        result_limit=1,
+                    )
+                reservations = primary_reservations + backup_reservations
                 existing_reservations = [
                     item
                     for item in reservations
@@ -487,6 +562,7 @@ def select_relay_nodes(
                 node_id=node.node_id,
                 region=node.region,
                 failure_domain=node.failure_domain,
+                physical_host_id=node.physical_host_id,
                 endpoints=compatible,
                 score=_score(policy, node),
             )
@@ -496,18 +572,17 @@ def select_relay_nodes(
 
     selected: list[RelaySelectedNode] = []
     used_domains: set[str] = set()
-    used_hosts: set[str] = set()
+    used_physical_hosts: set[str] = set()
     for candidate in candidates:
-        candidate_hosts = _endpoint_hosts(candidate.endpoints)
         if (
             candidate.failure_domain in used_domains
-            or not candidate_hosts.isdisjoint(used_hosts)
+            or candidate.physical_host_id in used_physical_hosts
         ):
             continue
         reason = "preferred-region" if not selected else "failure-domain-backup"
         selected.append(replace(candidate, selection_reason=reason))
         used_domains.add(candidate.failure_domain)
-        used_hosts.update(candidate_hosts)
+        used_physical_hosts.add(candidate.physical_host_id)
         if len(selected) >= 1 + max(0, min(policy.max_backups, 7)):
             break
     return RelaySelectionDecision(
@@ -521,6 +596,9 @@ def authorize_relay_grant(
     *,
     grant: object,
     target_device: object,
+    requester_user: object,
+    target_owner: object,
+    current_user: object,
     current_user_id: str,
     requested_policy_revision: int,
     requested_peer_id: str,
@@ -531,12 +609,21 @@ def authorize_relay_grant(
     now = _utc(now)
     grant_expiry = getattr(grant, "grant_expires_at", None)
     policy_expiry = getattr(grant, "policy_expires_at", None)
-    participant = current_user_id == getattr(grant, "requester_user_id", None) or (
-        bool(getattr(target_device, "is_bound", False))
-        and current_user_id == getattr(target_device, "bound_user_id", None)
-    )
+    tenant_id = getattr(grant, "tenant_id", None)
+    requester_id = getattr(grant, "requester_user_id", None)
+    owner_id = getattr(target_device, "bound_user_id", None)
+    participant = current_user_id in {requester_id, owner_id}
     valid = (
         participant
+        and getattr(current_user, "id", None) == current_user_id
+        and getattr(requester_user, "id", None) == requester_id
+        and getattr(target_owner, "id", None) == owner_id
+        and isinstance(tenant_id, str)
+        and _CREDENTIAL_SCOPE.fullmatch(tenant_id) is not None
+        and getattr(current_user, "tenant_id", None) == tenant_id
+        and getattr(requester_user, "tenant_id", None) == tenant_id
+        and getattr(target_owner, "tenant_id", None) == tenant_id
+        and getattr(target_device, "tenant_id", None) == tenant_id
         and getattr(target_device, "id", None) == getattr(grant, "target_device_id", None)
         and getattr(grant, "intended_peer_id", None)
         == getattr(target_device, "id", None)
@@ -627,6 +714,13 @@ def _view(node: RelayNode, registration: RelayNodeRegistration) -> RelayNodeView
         node_id=node.node_id,
         region=node.region,
         failure_domain=node.failure_domain,
+        physical_host_id=node.physical_host_id,
+        topology_approved=(
+            registration.topology_approved_at is not None
+            and registration.physical_host_id is not None
+            and registration.physical_host_id == node.physical_host_id
+            and registration.failure_domain == node.failure_domain
+        ),
         state=node.state,
         lease_expires_at=node.lease_expires_at,
         revoked_at=node.revoked_at,
@@ -647,16 +741,15 @@ def _distinct_domain_candidates(
 ) -> tuple[RelaySelectedNode, ...]:
     selected: list[RelaySelectedNode] = []
     domains: set[str] = set()
-    hosts: set[str] = set()
+    physical_hosts: set[str] = set()
     for candidate in candidates:
-        candidate_hosts = _endpoint_hosts(candidate.endpoints)
         if (
             candidate.failure_domain in domains
-            or not candidate_hosts.isdisjoint(hosts)
+            or candidate.physical_host_id in physical_hosts
         ):
             continue
         domains.add(candidate.failure_domain)
-        hosts.update(candidate_hosts)
+        physical_hosts.add(candidate.physical_host_id)
         selected.append(candidate)
         if len(selected) >= 8:
             break
@@ -731,6 +824,8 @@ def _rejection_reason(
         return "revoked"
     if node.registration_status != "approved":
         return "certificate_unapproved"
+    if not node.topology_approved or node.physical_host_id is None:
+        return "topology_unapproved"
     if node.certificate_expires_at is None or _utc(node.certificate_expires_at) <= now:
         return "certificate_expired"
     if node.lease_expires_at is None or _utc(node.lease_expires_at) <= now:

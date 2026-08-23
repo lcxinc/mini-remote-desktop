@@ -3,7 +3,14 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, StringConstraints
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    StringConstraints,
+    field_validator,
+)
 
 
 RelayId = Annotated[
@@ -51,6 +58,22 @@ class RelayEnrollmentRequest(BaseModel):
     max_allocations: int = Field(ge=1, le=2**31 - 1)
     max_egress_bps: int = Field(ge=1, le=2**63 - 1)
     csr_pem: str = Field(min_length=100, max_length=16_384, repr=False)
+    turn_rest_secret: SecretStr = Field(repr=False)
+
+    @field_validator("turn_rest_secret")
+    @classmethod
+    def validate_turn_rest_secret(cls, value: SecretStr) -> SecretStr:
+        encoded = value.get_secret_value()
+        if (
+            len(encoded) != 43
+            or not encoded.isascii()
+            or any(
+                character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+                for character in encoded
+            )
+        ):
+            raise ValueError("TURN REST secret must be canonical base64url")
+        return value
 
 
 class RelayEnrollmentResponse(BaseModel):
@@ -67,7 +90,13 @@ class RelayEnrollmentPickupResponse(BaseModel):
     certificate_pem: str | None = None
     ca_certificate_pem: str | None = None
     expires_at: datetime | None = None
-    turn_rest_secret: str | None = Field(default=None, repr=False)
+
+
+class RelayApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    failure_domain: CredentialSafeRelayId
+    physical_host_id: CredentialSafeRelayId
 
 
 class RelayRenewalRequest(BaseModel):
@@ -114,6 +143,7 @@ class RelayNodeResponse(BaseModel):
     node_id: RelayId
     region: Region
     failure_domain: RelayId
+    physical_host_id: RelayId | None = None
     state: str
     endpoints: list[str]
     max_allocations: int

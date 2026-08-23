@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import os
 import re
@@ -10,6 +11,7 @@ from typing import AsyncIterator
 from uuid import uuid4
 
 import pytest
+from pydantic import SecretStr
 from sqlalchemy import func, inspect, select, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
@@ -36,6 +38,11 @@ from test_relay_node_api import _ca_material, _csr
 
 
 DATABASE_URL = os.getenv("MRD_TEST_DATABASE_URL")
+TURN_REST_SECRET = SecretStr(
+    base64.urlsafe_b64encode(b"postgres-relay-turn-secret-32b!!")
+    .rstrip(b"=")
+    .decode("ascii")
+)
 pytestmark = pytest.mark.skipif(
     not DATABASE_URL,
     reason=(
@@ -579,6 +586,7 @@ async def test_different_tokens_cannot_concurrently_replace_the_same_registratio
     now = datetime.now(UTC)
     pepper = "44" * 32
     node_id = "relay-concurrent-reenrollment"
+    cipher = AesGcmRelaySecretCipher(bytes.fromhex("55" * 32))
     async with isolated_postgres_engine() as engine:
         sessions = async_sessionmaker(engine, expire_on_commit=False)
         async with sessions() as setup_session:
@@ -601,7 +609,11 @@ async def test_different_tokens_cannot_concurrently_replace_the_same_registratio
             token: str, csr_pem: str
         ) -> tuple[str, str, str | None]:
             async with sessions() as session:
-                registry = RelayRegistry(session, enrollment_token_pepper=pepper)
+                registry = RelayRegistry(
+                    session,
+                    enrollment_token_pepper=pepper,
+                    turn_secret_cipher=cipher,
+                )
                 await start.wait()
                 try:
                     requested = await registry.request_enrollment(
@@ -615,6 +627,7 @@ async def test_different_tokens_cannot_concurrently_replace_the_same_registratio
                         max_allocations=10,
                         max_egress_bps=1_000_000,
                         csr_pem=csr_pem,
+                        turn_rest_secret=TURN_REST_SECRET,
                         receipt_ttl_seconds=3600,
                         now=now,
                     )
@@ -674,7 +687,9 @@ async def test_pickup_and_revoke_serialize_without_deadlock() -> None:
         sessions = async_sessionmaker(engine, expire_on_commit=False)
         async with sessions() as setup_session:
             registry = RelayRegistry(
-                setup_session, enrollment_token_pepper=pepper
+                setup_session,
+                enrollment_token_pepper=pepper,
+                turn_secret_cipher=cipher,
             )
             token, _ = await registry.issue_enrollment_token(
                 ttl_seconds=300, actor_id="admin", now=now
@@ -688,12 +703,19 @@ async def test_pickup_and_revoke_serialize_without_deadlock() -> None:
                 max_allocations=10,
                 max_egress_bps=1_000_000,
                 csr_pem=csr_pem,
+                turn_rest_secret=TURN_REST_SECRET,
                 receipt_ttl_seconds=3600,
                 now=now,
             )
             enrollment_id = requested.registration.enrollment_id
             receipt = requested.receipt
-            await registry.approve(node_id=node_id, actor_id="admin", now=now)
+            await registry.approve(
+                node_id=node_id,
+                actor_id="admin",
+                failure_domain="rack-race",
+                physical_host_id="host-race",
+                now=now,
+            )
             await setup_session.commit()
 
         start = asyncio.Event()
@@ -1111,7 +1133,7 @@ async def test_v4_behaviorally_upgrades_v2_schema_and_serializes_concurrent_upgr
             assert "healthy_heartbeat_streak" in node_columns
             assert set(registration_v3_columns).issubset(registration_columns)
             assert set(registration_v4_columns).issubset(registration_columns)
-            assert versions == [1, 2, 3, 4, 5]
+            assert versions == [1, 2, 3, 4, 5, 6]
     finally:
         await first.dispose()
         await second.dispose()

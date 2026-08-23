@@ -21,7 +21,9 @@ class TurnCredentialConfigurationError(RuntimeError):
 
 
 class RelaySecretDecryptor(Protocol):
-    def decrypt(self, ciphertext: bytes, *, associated_data: bytes) -> bytes: ...
+    def decrypt_mutable(
+        self, ciphertext: bytes, *, associated_data: bytes
+    ) -> bytearray: ...
 
 
 @dataclass(frozen=True)
@@ -167,12 +169,14 @@ class NodeTurnCredentialService:
         if expires_at <= now:
             raise TurnCredentialExpired("relay authorization has expired")
         username = f"{expires_at}:{user_id}:{session_id}:{node_id}"
-        plaintext = self._cipher.decrypt(
+        secret = self._cipher.decrypt_mutable(
             encrypted_secret, associated_data=node_id.encode("utf-8")
         )
-        secret = bytearray(plaintext)
-        del plaintext
         try:
+            if not isinstance(secret, bytearray):
+                raise TurnCredentialConfigurationError(
+                    "relay credential material is unavailable"
+                )
             if not 16 <= len(secret) <= 512:
                 raise TurnCredentialConfigurationError(
                     "relay credential material is unavailable"

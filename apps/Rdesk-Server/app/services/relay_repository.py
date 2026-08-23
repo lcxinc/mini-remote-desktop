@@ -70,6 +70,10 @@ class RelaySecretCipher(Protocol):
 
     def decrypt(self, ciphertext: bytes, *, associated_data: bytes) -> bytes: ...
 
+    def decrypt_mutable(
+        self, ciphertext: bytes, *, associated_data: bytes
+    ) -> bytearray: ...
+
 
 class AesGcmRelaySecretCipher:
     """Versioned AES-GCM boundary; callers must inject an application-managed key."""
@@ -170,6 +174,18 @@ class AesGcmRelaySecretCipher:
             raise RelaySecretCipherError(
                 "AUTHENTICATION_FAILED", "relay secret authentication failed"
             ) from None
+
+    def decrypt_mutable(
+        self, ciphertext: bytes, *, associated_data: bytes
+    ) -> bytearray:
+        # AESGCM returns one unavoidable immutable bytes object. Convert it at the
+        # cipher boundary and drop that reference immediately; callers own and
+        # clear the only retained mutable copy.
+        plaintext = self.decrypt(ciphertext, associated_data=associated_data)
+        try:
+            return bytearray(plaintext)
+        finally:
+            del plaintext
 
 
 class RelayRepository:
@@ -466,6 +482,7 @@ class RelayRepository:
         ordered_node_ids: list[str],
         now: datetime,
         ttl_seconds: int = 30,
+        result_limit: int | None = None,
     ) -> list[RelayReservation]:
         """Reserve up to primary plus one backup, preserving candidate order.
 
@@ -489,6 +506,12 @@ class RelayRepository:
             )
         if not isinstance(ordered_node_ids, list):
             raise RelayRepositoryError("INVALID_NODE_ID", "invalid candidate nodes")
+        if result_limit is None:
+            result_limit = self._max_reservations
+        if not _integer_in_range(result_limit, minimum=1, maximum=8):
+            raise RelayRepositoryError(
+                "INVALID_RESULT_LIMIT", "result limit must be between 1 and 8"
+            )
         if len(ordered_node_ids) > 8:
             raise RelayRepositoryError(
                 "TOO_MANY_CANDIDATES", "at most eight relay candidates are allowed"
@@ -517,6 +540,7 @@ class RelayRepository:
                 ordered_node_ids=ordered_unique,
                 now=now,
                 expires_at=reservation_expires_at,
+                result_limit=result_limit,
             )
 
         # This lock is only an equivalent for single-process unit stores. It is not
@@ -529,6 +553,7 @@ class RelayRepository:
                 ordered_node_ids=ordered_unique,
                 now=now,
                 expires_at=reservation_expires_at,
+                result_limit=result_limit,
             )
 
     async def _reserve_capacity_locked(
@@ -539,6 +564,7 @@ class RelayRepository:
         ordered_node_ids: list[str],
         now: datetime,
         expires_at: datetime,
+        result_limit: int,
     ) -> list[RelayReservation]:
 
         locked_nodes = await self._session.scalars(
@@ -577,7 +603,7 @@ class RelayRepository:
 
         result: list[RelayReservation] = []
         for node_id in ordered_node_ids:
-            if len(result) >= self._max_reservations:
+            if len(result) >= result_limit:
                 break
             node = nodes_by_id.get(node_id)
             if node is None:

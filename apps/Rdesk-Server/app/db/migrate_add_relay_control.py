@@ -17,7 +17,7 @@ _CHECK_CAST = re.compile(
     flags=re.IGNORECASE,
 )
 _MIGRATION_LOCK_CONTEXT = b"MRD_RELAY_SCHEMA_MIGRATION_V1\x00"
-_RELAY_SCHEMA_VERSIONS = (1, 2, 3, 4, 5)
+_RELAY_SCHEMA_VERSIONS = (1, 2, 3, 4, 5, 6)
 
 
 class RelaySchemaMismatchError(RuntimeError):
@@ -41,7 +41,7 @@ async def migrate(
     *,
     schema: str | None = None,
 ) -> None:
-    """Apply and verify relay schema through v5 in the caller's transaction."""
+    """Apply and verify relay schema through v6 in the caller's transaction."""
     if isinstance(bind, AsyncEngine):
         async with bind.begin() as connection:
             await _migrate_connection(connection, schema=schema)
@@ -94,6 +94,7 @@ async def _migrate_connection(
             node_id VARCHAR(128) PRIMARY KEY,
             region VARCHAR(64) NOT NULL,
             failure_domain VARCHAR(128) NOT NULL,
+            physical_host_id VARCHAR(128),
             state VARCHAR(16) NOT NULL DEFAULT 'unavailable',
             endpoints JSONB NOT NULL,
             certificate_fingerprint VARCHAR(71) NOT NULL,
@@ -131,6 +132,9 @@ async def _migrate_connection(
             ),
             CONSTRAINT ck_relay_nodes_recent_failure CHECK (
                 recent_failure_bps >= 0 AND recent_failure_bps <= 10000
+            ),
+            CONSTRAINT ck_relay_nodes_physical_host CHECK (
+                physical_host_id IS NULL OR length(physical_host_id) BETWEEN 1 AND 128
             )
         )
         """,
@@ -168,11 +172,14 @@ async def _migrate_connection(
             enrollment_id VARCHAR(36) NOT NULL REFERENCES {enrollments}(id) ON DELETE RESTRICT,
             region VARCHAR(64) NOT NULL,
             failure_domain VARCHAR(128) NOT NULL,
+            physical_host_id VARCHAR(128),
+            topology_approved_at TIMESTAMPTZ,
             endpoints JSONB NOT NULL,
             max_allocations INTEGER NOT NULL,
             max_egress_bps BIGINT NOT NULL,
             csr_pem BYTEA NOT NULL,
             signing_public_key BYTEA NOT NULL,
+            encrypted_turn_secret BYTEA,
             status VARCHAR(16) NOT NULL DEFAULT 'pending',
             certificate_pem BYTEA,
             certificate_expires_at TIMESTAMPTZ,
@@ -194,6 +201,13 @@ async def _migrate_connection(
             CONSTRAINT relay_node_registrations_enrollment_id_key UNIQUE (enrollment_id),
             CONSTRAINT ck_relay_node_registrations_status CHECK (
                 status IN ('pending', 'approved', 'revoked')
+            ),
+            CONSTRAINT ck_relay_node_registrations_topology CHECK (
+                (topology_approved_at IS NULL AND physical_host_id IS NULL) OR
+                (topology_approved_at IS NOT NULL AND physical_host_id IS NOT NULL)
+            ),
+            CONSTRAINT ck_relay_node_registrations_turn_secret CHECK (
+                encrypted_turn_secret IS NULL OR length(encrypted_turn_secret) >= 30
             )
         )
         """,
@@ -210,6 +224,7 @@ async def _migrate_connection(
         f"CREATE INDEX IF NOT EXISTS ix_relay_nodes_region ON {nodes} (region)",
         f"CREATE INDEX IF NOT EXISTS ix_relay_nodes_state ON {nodes} (state)",
         f"CREATE INDEX IF NOT EXISTS ix_relay_nodes_lease ON {nodes} (lease_expires_at)",
+        f"CREATE INDEX IF NOT EXISTS ix_relay_nodes_physical_host ON {nodes} (physical_host_id)",
         f"CREATE INDEX IF NOT EXISTS ix_relay_enrollments_expiry ON {enrollments} (expires_at)",
         f"CREATE INDEX IF NOT EXISTS ix_relay_reservations_session ON {reservations} (session_id)",
         f"CREATE INDEX IF NOT EXISTS ix_relay_reservations_user ON {reservations} (user_id)",
@@ -238,6 +253,7 @@ async def _migrate_connection(
         f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS measured_rtt_ms BIGINT",
         f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS "
         "recent_failure_bps INTEGER NOT NULL DEFAULT 0",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS physical_host_id VARCHAR(128)",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS receipt_digest VARCHAR(64)",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS request_digest VARCHAR(64)",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS receipt_expires_at TIMESTAMPTZ",
@@ -256,6 +272,9 @@ async def _migrate_connection(
         "renewal_certificate_expires_at TIMESTAMPTZ",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS "
         "renewal_record_expires_at TIMESTAMPTZ",
+        f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS physical_host_id VARCHAR(128)",
+        f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS topology_approved_at TIMESTAMPTZ",
+        f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS encrypted_turn_secret BYTEA",
     ):
         await connection.execute(text(statement))
     # v3 used previous_auth_expires_at for both old-certificate retry and
@@ -303,6 +322,10 @@ async def _migrate_connection(
             "ck_relay_nodes_recent_failure",
             "recent_failure_bps >= 0 AND recent_failure_bps <= 10000",
         ),
+        (
+            "ck_relay_nodes_physical_host",
+            "physical_host_id IS NULL OR length(physical_host_id) BETWEEN 1 AND 128",
+        ),
     ):
         await connection.execute(
             text(
@@ -314,6 +337,33 @@ async def _migrate_connection(
                 """
             )
         )
+    for name, expression in (
+        (
+            "ck_relay_node_registrations_topology",
+            "(topology_approved_at IS NULL AND physical_host_id IS NULL) OR "
+            "(topology_approved_at IS NOT NULL AND physical_host_id IS NOT NULL)",
+        ),
+        (
+            "ck_relay_node_registrations_turn_secret",
+            "encrypted_turn_secret IS NULL OR length(encrypted_turn_secret) >= 30",
+        ),
+    ):
+        await connection.execute(
+            text(
+                f"""
+                DO $$ BEGIN
+                    ALTER TABLE {registrations} ADD CONSTRAINT {name} CHECK ({expression});
+                EXCEPTION WHEN duplicate_object THEN NULL;
+                END $$
+                """
+            )
+        )
+    await connection.execute(
+        text(
+            f"CREATE INDEX IF NOT EXISTS ix_relay_nodes_physical_host "
+            f"ON {nodes} (physical_host_id)"
+        )
+    )
 
     await connection.run_sync(
         lambda sync_connection: _assert_schema_conforms(sync_connection, schema)
@@ -381,7 +431,13 @@ def _preflight_existing_schema(sync_connection: object, schema: str | None) -> N
         v5_additions = {
             "relay_nodes": {"measured_rtt_ms", "recent_failure_bps"},
         }.get(table_name, set())
-        allowed = expected | v3_additions | v4_additions | v5_additions
+        v6_additions = {
+            "relay_nodes": {"physical_host_id"},
+            "relay_node_registrations": {
+                "physical_host_id", "topology_approved_at", "encrypted_turn_secret",
+            },
+        }.get(table_name, set())
+        allowed = expected | v3_additions | v4_additions | v5_additions | v6_additions
         if not expected.issubset(actual) or not actual.issubset(allowed):
             raise RelaySchemaMismatchError(
                 f"relay schema mismatch for {table_name}: column set differs"
@@ -433,6 +489,7 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             "node_id": (String, 128, False),
             "region": (String, 64, False),
             "failure_domain": (String, 128, False),
+            "physical_host_id": (String, 128, True),
             "state": (String, 16, False),
             "endpoints": (JSONB, None, False),
             "certificate_fingerprint": (String, 71, False),
@@ -471,11 +528,14 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             "enrollment_id": (String, 36, False),
             "region": (String, 64, False),
             "failure_domain": (String, 128, False),
+            "physical_host_id": (String, 128, True),
+            "topology_approved_at": (DateTime, None, True),
             "endpoints": (JSONB, None, False),
             "max_allocations": (Integer, None, False),
             "max_egress_bps": (BigInteger, None, False),
             "csr_pem": (LargeBinary, None, False),
             "signing_public_key": (LargeBinary, None, False),
+            "encrypted_turn_secret": (LargeBinary, None, True),
             "status": (String, 16, False),
             "certificate_pem": (LargeBinary, None, True),
             "certificate_expires_at": (DateTime, None, True),
@@ -584,6 +644,10 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
         "ck_relay_nodes_recent_failure": (
             "recent_failure_bps >= 0 AND recent_failure_bps <= 10000"
         ),
+        "ck_relay_nodes_physical_host": (
+            "physical_host_id IS NULL OR "
+            "(length(physical_host_id) >= 1 AND length(physical_host_id) <= 128)"
+        ),
     }
     checks = {
         constraint["name"]: _normalize_check_expression(constraint["sqltext"])
@@ -601,12 +665,21 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             "relay_node_registrations", schema=schema
         )
     }
-    expected_registration_check = _normalize_check_expression(
-        "status = ANY (ARRAY['pending', 'approved', 'revoked'])"
-    )
-    if (
-        registration_checks.get("ck_relay_node_registrations_status")
-        != expected_registration_check
+    expected_registration_checks = {
+        "ck_relay_node_registrations_status": (
+            "status = ANY (ARRAY['pending', 'approved', 'revoked'])"
+        ),
+        "ck_relay_node_registrations_topology": (
+            "(topology_approved_at IS NULL AND physical_host_id IS NULL) OR "
+            "(topology_approved_at IS NOT NULL AND physical_host_id IS NOT NULL)"
+        ),
+        "ck_relay_node_registrations_turn_secret": (
+            "encrypted_turn_secret IS NULL OR length(encrypted_turn_secret) >= 30"
+        ),
+    }
+    if any(
+        registration_checks.get(name) != _normalize_check_expression(expression)
+        for name, expression in expected_registration_checks.items()
     ):
         raise RelaySchemaMismatchError("relay registration check constraints differ")
 
@@ -683,6 +756,7 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             "ix_relay_nodes_region": ("region",),
             "ix_relay_nodes_state": ("state",),
             "ix_relay_nodes_lease": ("lease_expires_at",),
+            "ix_relay_nodes_physical_host": ("physical_host_id",),
         },
         "relay_enrollments": {
             "ix_relay_enrollments_expiry": ("expires_at",),

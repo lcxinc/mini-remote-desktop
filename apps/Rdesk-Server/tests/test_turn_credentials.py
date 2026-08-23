@@ -87,6 +87,45 @@ class RecordingCipher:
         self.decrypt_calls.append((ciphertext, associated_data))
         return self.secrets_by_node[associated_data.decode()]
 
+    def decrypt_mutable(
+        self, ciphertext: bytes, *, associated_data: bytes
+    ) -> bytearray:
+        return bytearray(self.decrypt(ciphertext, associated_data=associated_data))
+
+
+class MutableRecordingCipher:
+    def __init__(self) -> None:
+        self.buffer: bytearray | None = None
+
+    def decrypt_mutable(
+        self, ciphertext: bytes, *, associated_data: bytes
+    ) -> bytearray:
+        assert ciphertext == b"ciphertext-a"
+        assert associated_data == b"relay-a"
+        self.buffer = bytearray(b"relay-a-unique-secret")
+        return self.buffer
+
+
+def test_node_credential_uses_and_clears_the_cipher_mutable_buffer() -> None:
+    cipher = MutableRecordingCipher()
+    issuer = NodeTurnCredentialService(
+        cipher=cipher, ttl_seconds=600, now=lambda: NOW
+    )
+    credential = issuer.issue(
+        user_id="user-42",
+        session_id="session-7",
+        node_id="relay-a",
+        urls=["turn:relay-a.example.test:3478?transport=udp"],
+        encrypted_secret=b"ciphertext-a",
+        grant_deadline_unix_seconds=NOW + 300,
+        directory_deadline_unix_seconds=NOW + 300,
+        policy_deadline_unix_seconds=NOW + 300,
+        node_deadline_unix_seconds=NOW + 300,
+    )
+    assert credential.username == f"{NOW + 300}:user-42:session-7:relay-a"
+    assert cipher.buffer is not None
+    assert cipher.buffer == bytearray(len(cipher.buffer))
+
 
 @pytest.mark.parametrize(
     ("deadlines", "expected"),
