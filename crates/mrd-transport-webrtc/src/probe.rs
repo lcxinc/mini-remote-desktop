@@ -1,8 +1,9 @@
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 
 use mrd_pipeline_core::{EncodedAccessUnit, VideoCodec};
 
 use crate::{
+    config::{ice_server_secret_values, normalize_secret_values},
     CandidateKind, ControlLane, IceServerConfig, IceTransportPolicy, PeerConnectionConfig,
     PeerConnectionRole, SelectedCandidatePairStats, TransportError, WebRtcPeerConnection,
 };
@@ -91,33 +92,48 @@ pub async fn probe_turn_relay(
         ));
     }
     let secrets = secret_values(&config.ice_servers);
-    let offerer = WebRtcPeerConnection::new(probe_peer_config(
-        PeerConnectionRole::Offerer,
-        config.ice_servers.clone(),
-    ))
-    .await
-    .map_err(|error| redact(error, &secrets))?;
-    let answerer = match WebRtcPeerConnection::new(probe_peer_config(
-        PeerConnectionRole::Answerer,
-        config.ice_servers,
-    ))
-    .await
-    {
-        Ok(peer) => peer,
-        Err(error) => {
-            let _ = offerer.close().await;
-            return Err(redact(error, &secrets));
-        }
-    };
+    let deadline = tokio::time::Instant::now() + config.timeout;
+    run_before_probe_deadline(deadline, async move {
+        let offerer_config =
+            probe_peer_config(PeerConnectionRole::Offerer, config.ice_servers.clone());
+        let answerer_config = probe_peer_config(PeerConnectionRole::Answerer, config.ice_servers);
+        // Separate tasks prevent either peer's CPU-heavy synchronous setup from serializing the
+        // pair or starving the deadline driver. Detached task outputs are dropped on completion,
+        // which invokes the peer's cancellation-safe shutdown when a deadline wins.
+        let offerer_task =
+            tokio::spawn(async move { WebRtcPeerConnection::new(offerer_config).await });
+        let answerer_task =
+            tokio::spawn(async move { WebRtcPeerConnection::new(answerer_config).await });
+        let (offerer, answerer) = tokio::join!(offerer_task, answerer_task);
+        let offerer = offerer
+            .map_err(|_| TransportError::Message("TURN offerer creation task failed".into()))?;
+        let answerer = answerer
+            .map_err(|_| TransportError::Message("TURN answerer creation task failed".into()))?;
+        let offerer = offerer.map_err(|error| redact(error, &secrets))?;
+        let answerer = answerer.map_err(|error| redact(error, &secrets))?;
+        let result = run_live_probe(&offerer, &answerer)
+            .await
+            .map_err(|error| redact(error, &secrets));
 
-    let result = tokio::time::timeout(config.timeout, run_live_probe(&offerer, &answerer))
+        // Shutdown is deliberately started, not awaited. Each peer's physical shutdown owns its
+        // resources and keeps running if this deadline or its caller cancels this future.
+        offerer.terminate_now();
+        answerer.terminate_now();
+        result
+    })
+    .await
+}
+
+async fn run_before_probe_deadline<T, F>(
+    deadline: tokio::time::Instant,
+    operation: F,
+) -> Result<T, TransportError>
+where
+    F: Future<Output = Result<T, TransportError>>,
+{
+    tokio::time::timeout_at(deadline, operation)
         .await
-        .map_err(|_| TransportError::Message("TURN probe timed out".into()))
-        .and_then(|result| result)
-        .map_err(|error| redact(error, &secrets));
-    let _ = offerer.close().await;
-    let _ = answerer.close().await;
-    result
+        .map_err(|_| TransportError::Message("TURN probe timed out".into()))?
 }
 
 fn probe_peer_config(
@@ -200,27 +216,13 @@ async fn run_live_probe(
 }
 
 fn secret_values(servers: &[IceServerConfig]) -> Vec<String> {
-    servers
-        .iter()
-        .flat_map(|server| {
-            std::iter::once(server.username.clone())
-                .chain(std::iter::once(server.credential.clone()))
-                .chain(server.urls.iter().flat_map(|url| {
-                    std::iter::once(url.clone()).chain(
-                        url.split(['/', '?', '#', '&', '=', '@', ':'])
-                            .filter(|part| !part.is_empty())
-                            .map(str::to_owned),
-                    )
-                }))
-        })
-        .filter(|value| !value.is_empty())
-        .collect()
+    ice_server_secret_values(servers)
 }
 
 fn redact(error: TransportError, secrets: &[String]) -> TransportError {
     let mut message = error.to_string();
-    for secret in secrets {
-        message = message.replace(secret, "[REDACTED]");
+    for secret in normalize_secret_values(secrets.to_vec()) {
+        message = message.replace(&secret, "[REDACTED]");
     }
     TransportError::Message(message)
 }
@@ -228,6 +230,10 @@ fn redact(error: TransportError, secrets: &[String]) -> TransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
 
     fn pair(local: CandidateKind, remote: CandidateKind) -> SelectedCandidatePairStats {
         SelectedCandidatePairStats {
@@ -271,5 +277,33 @@ mod tests {
         let selected = pair(CandidateKind::Relay, CandidateKind::Relay);
         assert!(TurnRelayProbeEvidence::from_observation(selected.clone(), false, true).is_err());
         assert!(TurnRelayProbeEvidence::from_observation(selected, true, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn one_deadline_cancels_the_whole_probe_and_hands_off_owned_resources() {
+        struct OwnedResource(Arc<AtomicBool>);
+
+        impl Drop for OwnedResource {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let timeout = Duration::from_millis(5);
+        let started = tokio::time::Instant::now();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let owned = OwnedResource(Arc::clone(&dropped));
+        let result = run_before_probe_deadline(started + timeout, async move {
+            let _owned = owned;
+            std::future::pending::<Result<(), TransportError>>().await
+        })
+        .await;
+
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(
+            started.elapsed() <= timeout + Duration::from_millis(100),
+            "probe exceeded the single deadline by more than scheduling tolerance"
+        );
     }
 }

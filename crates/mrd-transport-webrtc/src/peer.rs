@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::sync::Weak;
 use std::{
     fmt,
     future::Future,
@@ -10,8 +12,9 @@ use std::{
 
 use bytes::Bytes;
 use mrd_pipeline_core::{EncodedAccessUnit, VideoCodec};
+use sha2::{Digest, Sha256};
 use tokio::{
-    sync::{mpsc, watch, Mutex, OwnedSemaphorePermit, Semaphore},
+    sync::{mpsc, watch, Mutex, Notify, OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
 };
 use webrtc::{
@@ -31,7 +34,10 @@ use webrtc::{
 };
 
 use crate::{
-    config::{IceServerConfig, IceTransportPolicy, PeerConnectionConfig, PeerConnectionRole},
+    config::{
+        ice_server_secret_values, normalize_secret_values, IceServerConfig, IceTransportPolicy,
+        PeerConnectionConfig, PeerConnectionRole,
+    },
     control::{
         channel_info, realtime_channel_init, reliable_channel_init, weak_callback_owner,
         ControlChannels, ControlLane, ControlState, QueuedBytes, BULK_LABEL, CTRL_REL_LABEL,
@@ -286,6 +292,7 @@ enum PendingRestart {
     Building {
         generation: u64,
         route_token: RestartRouteToken,
+        request_fingerprint: Option<[u8; 32]>,
     },
     Ready {
         generation: u64,
@@ -293,6 +300,7 @@ enum PendingRestart {
         route_id: u64,
         peer: Arc<WebRtcPeerConnection>,
         local_description: SessionDescription,
+        request_fingerprint: Option<[u8; 32]>,
         validated: bool,
     },
 }
@@ -325,11 +333,13 @@ impl PendingRestart {
 
 #[derive(Default)]
 struct RestartState {
+    terminated: bool,
     active_generation: u64,
     highest_seen_generation: u64,
     active_route_token: Option<RestartRouteToken>,
     active_replacement: Option<Arc<WebRtcPeerConnection>>,
     pending: Option<PendingRestart>,
+    last_aborted_route: Option<(u64, RestartRouteToken)>,
 }
 
 impl RestartState {
@@ -345,6 +355,155 @@ impl RestartState {
             self.active_route_token.clone(),
             self.active_replacement.as_ref().map(Arc::clone),
         )
+    }
+}
+
+struct RestartBuildGuard<'a> {
+    owner: &'a WebRtcPeerConnection,
+    generation: u64,
+    route_token: RestartRouteToken,
+    armed: bool,
+}
+
+impl<'a> RestartBuildGuard<'a> {
+    fn new(
+        owner: &'a WebRtcPeerConnection,
+        generation: u64,
+        route_token: RestartRouteToken,
+    ) -> Self {
+        Self {
+            owner,
+            generation,
+            route_token,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RestartBuildGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.owner.abort_build(self.generation, &self.route_token);
+        }
+    }
+}
+
+struct RestartValidationGuard<'a> {
+    owner: &'a WebRtcPeerConnection,
+    generation: u64,
+    route_token: RestartRouteToken,
+    route_id: u64,
+    armed: bool,
+}
+
+impl<'a> RestartValidationGuard<'a> {
+    fn new(
+        owner: &'a WebRtcPeerConnection,
+        generation: u64,
+        route_token: RestartRouteToken,
+        route_id: u64,
+    ) -> Self {
+        Self {
+            owner,
+            generation,
+            route_token,
+            route_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RestartValidationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.owner.detach_pending_restart(
+                self.generation,
+                &self.route_token,
+                Some(self.route_id),
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PhysicalShutdownState {
+    Open,
+    Closing,
+    Closed { error: Option<String> },
+}
+
+#[derive(Debug)]
+struct PhysicalShutdown {
+    state: StdMutex<PhysicalShutdownState>,
+    completed: Notify,
+}
+
+impl Default for PhysicalShutdown {
+    fn default() -> Self {
+        Self {
+            state: StdMutex::new(PhysicalShutdownState::Open),
+            completed: Notify::new(),
+        }
+    }
+}
+
+impl PhysicalShutdown {
+    fn begin(&self) -> bool {
+        let mut state = self.state.lock().expect("shutdown state lock poisoned");
+        if matches!(*state, PhysicalShutdownState::Open) {
+            *state = PhysicalShutdownState::Closing;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn is_started(&self) -> bool {
+        !matches!(
+            *self.state.lock().expect("shutdown state lock poisoned"),
+            PhysicalShutdownState::Open
+        )
+    }
+
+    fn is_finished(&self) -> bool {
+        matches!(
+            *self.state.lock().expect("shutdown state lock poisoned"),
+            PhysicalShutdownState::Closed { .. }
+        )
+    }
+
+    fn complete(&self, error: Option<String>) {
+        *self.state.lock().expect("shutdown state lock poisoned") =
+            PhysicalShutdownState::Closed { error };
+        self.completed.notify_waiters();
+    }
+
+    async fn wait(&self) -> Result<(), TransportError> {
+        loop {
+            let notified = self.completed.notified();
+            let outcome = {
+                let state = self.state.lock().expect("shutdown state lock poisoned");
+                match &*state {
+                    PhysicalShutdownState::Closed { error } => Some(error.clone()),
+                    PhysicalShutdownState::Open | PhysicalShutdownState::Closing => None,
+                }
+            };
+            if let Some(error) = outcome {
+                return match error {
+                    Some(error) => Err(TransportError::Message(error)),
+                    None => Ok(()),
+                };
+            }
+            notified.await;
+        }
     }
 }
 
@@ -373,11 +532,21 @@ pub struct WebRtcPeerConnection {
     tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     active_tasks: Arc<AtomicUsize>,
     completed_video_drops: Arc<VideoDropCounter>,
-    closed: Arc<AtomicBool>,
+    shutdown: Arc<PhysicalShutdown>,
     restart: StdMutex<RestartState>,
-    restart_cleanup_failures: AtomicU64,
+    restart_cleanup_failures: Arc<AtomicU64>,
     #[cfg(test)]
     fail_close_for_test: AtomicBool,
+    #[cfg(test)]
+    restart_build_gate_for_test: StdMutex<Option<Arc<Semaphore>>>,
+    #[cfg(test)]
+    last_built_peer_for_test: StdMutex<Option<Weak<WebRtcPeerConnection>>>,
+    #[cfg(test)]
+    physical_close_gate_for_test: StdMutex<Option<Arc<Semaphore>>>,
+    #[cfg(test)]
+    restart_validation_gate_for_test: StdMutex<Option<Arc<Semaphore>>>,
+    #[cfg(test)]
+    restart_validation_entered_for_test: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -429,7 +598,7 @@ impl fmt::Debug for WebRtcPeerConnection {
         f.debug_struct("WebRtcPeerConnection")
             .field("role", &self.config.role)
             .field("active_tasks", &self.active_task_count())
-            .field("closed", &self.closed.load(Ordering::Acquire))
+            .field("closed", &self.shutdown.is_finished())
             .field("generation", &self.current_generation_now())
             .finish_non_exhaustive()
     }
@@ -535,13 +704,13 @@ impl WebRtcPeerConnection {
         let tasks = Arc::new(Mutex::new(Vec::new()));
         let active_tasks = Arc::new(AtomicUsize::new(0));
         let completed_video_drops = Arc::new(VideoDropCounter::default());
-        let closed = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(PhysicalShutdown::default());
         let (h264_tx, h264_rx) = mpsc::channel(capacity);
         let h264_queue_budget = Arc::new(Semaphore::new(config.video_queue_bytes));
         let remote_tasks = Arc::clone(&tasks);
         let remote_active_tasks = Arc::clone(&active_tasks);
         let remote_completed_video_drops = Arc::clone(&completed_video_drops);
-        let remote_closed = Arc::clone(&closed);
+        let remote_shutdown = Arc::clone(&shutdown);
         let max_h264_access_unit_bytes = config.max_h264_access_unit_bytes;
         pc.on_track(Box::new(move |track, _receiver, _transceiver| {
             let h264_tx = h264_tx.clone();
@@ -549,10 +718,10 @@ impl WebRtcPeerConnection {
             let tasks = Arc::clone(&remote_tasks);
             let active_tasks = Arc::clone(&remote_active_tasks);
             let completed_video_drops = Arc::clone(&remote_completed_video_drops);
-            let closed = Arc::clone(&remote_closed);
+            let shutdown = Arc::clone(&remote_shutdown);
             Box::pin(async move {
                 let mut tasks = tasks.lock().await;
-                if closed.load(Ordering::Acquire) {
+                if shutdown.is_started() {
                     return;
                 }
                 let task_counter = Arc::clone(&active_tasks);
@@ -645,11 +814,21 @@ impl WebRtcPeerConnection {
             tasks,
             active_tasks,
             completed_video_drops,
-            closed,
+            shutdown,
             restart: StdMutex::new(RestartState::default()),
-            restart_cleanup_failures: AtomicU64::new(0),
+            restart_cleanup_failures: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             fail_close_for_test: AtomicBool::new(false),
+            #[cfg(test)]
+            restart_build_gate_for_test: StdMutex::new(None),
+            #[cfg(test)]
+            last_built_peer_for_test: StdMutex::new(None),
+            #[cfg(test)]
+            physical_close_gate_for_test: StdMutex::new(None),
+            #[cfg(test)]
+            restart_validation_gate_for_test: StdMutex::new(None),
+            #[cfg(test)]
+            restart_validation_entered_for_test: AtomicBool::new(false),
         })
     }
 
@@ -937,7 +1116,7 @@ impl WebRtcPeerConnection {
             // interactive control streams to run between large messages.
             tokio::time::sleep(BULK_SEND_PACING_INTERVAL).await;
             while channel.buffered_amount().await >= BULK_BUFFER_HIGH_WATERMARK {
-                if self.closed.load(Ordering::Acquire) {
+                if self.shutdown.is_started() {
                     return Err(TransportError::Message(
                         "peer connection closed while waiting for bulk capacity".into(),
                     ));
@@ -1035,21 +1214,19 @@ impl WebRtcPeerConnection {
         validate_turn_servers(&ice_servers)?;
         let secrets = secret_values(&ice_servers);
         let route_token = RestartRouteToken::generate()?;
-        let (config, loser) = self.begin_restart(generation, route_token.clone())?;
+        let (config, loser) = self.begin_restart(generation, route_token.clone(), None)?;
+        let mut build_guard = RestartBuildGuard::new(self, generation, route_token.clone());
         let config = restart_peer_config(config, ice_servers);
         close_loser(loser).await;
 
         let pending = match Self::new(config).await {
             Ok(peer) => Arc::new(peer),
-            Err(error) => {
-                self.abort_build(generation, &route_token);
-                return Err(redact_transport_error(error, &secrets));
-            }
+            Err(error) => return Err(redact_transport_error(error, &secrets)),
         };
+        self.wait_restart_build_gate_for_test(&pending).await;
         let mut offer = match pending.create_offer_physical().await {
             Ok(offer) => offer,
             Err(error) => {
-                self.abort_build(generation, &route_token);
                 close_route_best_effort(&pending).await;
                 return Err(redact_transport_error(error, &secrets));
             }
@@ -1060,10 +1237,12 @@ impl WebRtcPeerConnection {
             &route_token,
             Arc::clone(&pending),
             offer.clone(),
+            None,
         ) {
             close_route_best_effort(&pending).await;
-            return Err(stale_generation_error(generation, "restart offer"));
+            return Err(self.restart_build_rejection(generation, "restart offer"));
         }
+        build_guard.disarm();
         Ok(offer)
     }
 
@@ -1078,26 +1257,29 @@ impl WebRtcPeerConnection {
         require_generation(generation, offer.generation, "restart offer")?;
         let route_token = require_route_token(&offer.restart_route_token, "restart offer")?.clone();
         validate_turn_servers(&ice_servers)?;
-        if let Some(answer) = self.existing_restart_description(generation, &route_token)? {
+        let request_fingerprint =
+            restart_offer_fingerprint(generation, &route_token, &offer, &ice_servers);
+        if let Some(answer) =
+            self.existing_restart_description(generation, &route_token, &request_fingerprint)?
+        {
             return Ok(answer);
         }
         let secrets = secret_values(&ice_servers);
-        let (config, loser) = self.begin_restart(generation, route_token.clone())?;
+        let (config, loser) =
+            self.begin_restart(generation, route_token.clone(), Some(request_fingerprint))?;
+        let mut build_guard = RestartBuildGuard::new(self, generation, route_token.clone());
         let config = restart_peer_config(config, ice_servers);
         close_loser(loser).await;
 
         let pending = match Self::new(config).await {
             Ok(peer) => Arc::new(peer),
-            Err(error) => {
-                self.abort_build(generation, &route_token);
-                return Err(redact_transport_error(error, &secrets));
-            }
+            Err(error) => return Err(redact_transport_error(error, &secrets)),
         };
+        self.wait_restart_build_gate_for_test(&pending).await;
         offer.clear_restart_binding();
         let mut answer = match pending.accept_offer_physical(offer).await {
             Ok(answer) => answer,
             Err(error) => {
-                self.abort_build(generation, &route_token);
                 close_route_best_effort(&pending).await;
                 return Err(redact_transport_error(error, &secrets));
             }
@@ -1108,10 +1290,12 @@ impl WebRtcPeerConnection {
             &route_token,
             Arc::clone(&pending),
             answer.clone(),
+            Some(request_fingerprint),
         ) {
             close_route_best_effort(&pending).await;
-            return Err(stale_generation_error(generation, "restart offer"));
+            return Err(self.restart_build_rejection(generation, "restart offer"));
         }
+        build_guard.disarm();
         Ok(answer)
     }
 
@@ -1164,7 +1348,10 @@ impl WebRtcPeerConnection {
         &self,
         generation: u64,
     ) -> Result<RestartRouteEvidence, TransportError> {
-        let (route_id, _, peer) = self.ready_restart(generation)?;
+        let (route_id, route_token, peer) = self.ready_restart(generation)?;
+        let mut validation_guard =
+            RestartValidationGuard::new(self, generation, route_token, route_id);
+        self.wait_restart_validation_gate_for_test().await;
         tokio::time::timeout(RESTART_VALIDATION_TIMEOUT, peer.wait_connected_physical())
             .await
             .map_err(|_| {
@@ -1225,13 +1412,15 @@ impl WebRtcPeerConnection {
         }
 
         self.mark_restart_validated(generation, route_id)?;
-        Ok(RestartRouteEvidence {
+        let evidence = RestartRouteEvidence {
             generation,
             route_id,
             selected_pair: pair,
             control_round_trip: true,
             media_round_trip: true,
-        })
+        };
+        validation_guard.disarm();
+        Ok(evidence)
     }
 
     /// Atomically publish a validated pending peer and then close the losing active route.
@@ -1242,6 +1431,9 @@ impl WebRtcPeerConnection {
     ) -> Result<(), TransportError> {
         let (replacement, previous) = {
             let mut state = self.restart_state();
+            if state.terminated {
+                return Err(terminated_error());
+            }
             let pending = state
                 .pending
                 .take()
@@ -1252,6 +1444,7 @@ impl WebRtcPeerConnection {
                 route_id,
                 peer,
                 local_description,
+                request_fingerprint,
                 validated,
             } = pending
             else {
@@ -1273,6 +1466,7 @@ impl WebRtcPeerConnection {
                     route_id,
                     peer,
                     local_description,
+                    request_fingerprint,
                     validated,
                 });
                 return Err(stale_generation_error(generation, "restart evidence"));
@@ -1283,20 +1477,25 @@ impl WebRtcPeerConnection {
             (peer, previous)
         };
 
-        let cleanup_result = if let Some(previous) = previous {
-            let result = previous.close_physical().await;
-            if result.is_err() {
-                previous.force_terminate_physical_now();
-            }
-            result
+        let cleanup = if let Some(previous) = previous {
+            previous.start_physical_shutdown();
+            Arc::clone(&previous.shutdown)
         } else {
-            let result = self.close_physical().await;
-            if result.is_err() {
-                self.force_terminate_physical_now();
-            }
-            result
+            self.start_physical_shutdown();
+            Arc::clone(&self.shutdown)
         };
-        if cleanup_result.is_err() {
+        let failure_recorded = Arc::new(AtomicBool::new(false));
+        let background_recorded = Arc::clone(&failure_recorded);
+        let background_failures = Arc::clone(&self.restart_cleanup_failures);
+        let background_cleanup = Arc::clone(&cleanup);
+        tokio::spawn(async move {
+            if background_cleanup.wait().await.is_err()
+                && !background_recorded.swap(true, Ordering::AcqRel)
+            {
+                background_failures.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+        if cleanup.wait().await.is_err() && !failure_recorded.swap(true, Ordering::AcqRel) {
             self.restart_cleanup_failures.fetch_add(1, Ordering::AcqRel);
         }
         debug_assert_eq!(replacement.config.role, self.config.role);
@@ -1314,6 +1513,16 @@ impl WebRtcPeerConnection {
             .map(PendingRestart::generation)
     }
 
+    /// Abort one pending route without allowing stale signaling to affect a newer route.
+    /// Returns `false` when the same route was already aborted.
+    pub fn abort_restart(
+        &self,
+        generation: u64,
+        route_token: &RestartRouteToken,
+    ) -> Result<bool, TransportError> {
+        self.abort_restart_bound(generation, route_token, None)
+    }
+
     /// Number of old-route close failures recovered after a replacement was published.
     pub fn restart_cleanup_failure_count(&self) -> u64 {
         self.restart_cleanup_failures.load(Ordering::Acquire)
@@ -1321,52 +1530,88 @@ impl WebRtcPeerConnection {
 
     /// Begin idempotent transport termination without requiring an async caller.
     pub fn terminate_now(&self) {
-        if let Ok(state) = self.restart.lock() {
-            if let Some(active) = &state.active_replacement {
-                active.terminate_physical_now();
-            }
-            if let Some(PendingRestart::Ready { peer, .. }) = &state.pending {
-                peer.terminate_physical_now();
-            }
+        let (active, pending) = if let Ok(mut state) = self.restart.lock() {
+            state.terminated = true;
+            let active = state.active_replacement.take();
+            let pending = match state.pending.take() {
+                Some(PendingRestart::Ready { peer, .. }) => Some(peer),
+                _ => None,
+            };
+            (active, pending)
+        } else {
+            (None, None)
+        };
+        if let Some(active) = active {
+            active.terminate_physical_now();
+        }
+        if let Some(pending) = pending {
+            pending.terminate_physical_now();
         }
         self.terminate_physical_now();
     }
 
     fn terminate_physical_now(&self) {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        self.force_terminate_physical_now();
+        self.start_physical_shutdown();
     }
 
     fn force_terminate_physical_now(&self) {
-        self.completed_video_drops.seal();
-        if let Ok(mut tasks) = self.tasks.try_lock() {
-            for task in tasks.iter() {
-                task.abort();
-            }
-            tasks.clear();
-        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let tasks = Arc::clone(&self.tasks);
-            runtime.spawn(async move {
-                let mut tasks = tasks.lock().await;
-                for task in tasks.iter() {
-                    task.abort();
-                }
-                tasks.clear();
-            });
+        self.start_physical_shutdown();
+    }
+
+    fn start_physical_shutdown(&self) {
+        if !self.shutdown.begin() {
+            return;
         }
+        self.completed_video_drops.seal();
+        let shutdown = Arc::clone(&self.shutdown);
+        let tasks = Arc::clone(&self.tasks);
+        let control = Arc::clone(&self.control);
+        let pc = Arc::clone(&self.pc);
+        #[cfg(test)]
+        let close_gate = self
+            .physical_close_gate_for_test
+            .lock()
+            .expect("physical close gate lock poisoned")
+            .clone();
+        #[cfg(not(test))]
+        let close_gate = None;
+        #[cfg(test)]
+        let injected_failure = self.fail_close_for_test.load(Ordering::Acquire);
+        #[cfg(not(test))]
+        let injected_failure = false;
+        let cleanup = async move {
+            let error =
+                run_physical_shutdown(tasks, control, pc, close_gate, injected_failure).await;
+            shutdown.complete(error);
+        };
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let pc = Arc::clone(&self.pc);
-            runtime.spawn(async move {
-                let _ = pc.close().await;
-            });
+            runtime.spawn(cleanup);
+        } else {
+            let shutdown_on_spawn_failure = Arc::clone(&self.shutdown);
+            if std::thread::Builder::new()
+                .name("mrd-webrtc-shutdown".into())
+                .spawn(move || {
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime.block_on(cleanup),
+                        Err(error) => shutdown_on_spawn_failure
+                            .complete(Some(format!("create shutdown runtime failed: {error}"))),
+                    }
+                })
+                .is_err()
+            {
+                self.shutdown
+                    .complete(Some("spawn shutdown fallback thread failed".into()));
+            }
         }
     }
 
     pub async fn close(&self) -> Result<(), TransportError> {
         let (active, pending) = {
             let mut state = self.restart_state();
+            state.terminated = true;
             let active = state.active_replacement.take();
             let pending = match state.pending.take() {
                 Some(PendingRestart::Ready { peer, .. }) => Some(peer),
@@ -1374,47 +1619,40 @@ impl WebRtcPeerConnection {
             };
             (active, pending)
         };
+        if let Some(pending) = &pending {
+            pending.start_physical_shutdown();
+        }
+        if let Some(active) = &active {
+            active.start_physical_shutdown();
+        }
+        self.start_physical_shutdown();
+        let mut errors = Vec::new();
         if let Some(pending) = pending {
-            pending.close_physical().await?;
+            if let Err(error) = pending.shutdown.wait().await {
+                errors.push(error.to_string());
+            }
         }
         if let Some(active) = active {
-            active.close_physical().await?;
+            if let Err(error) = active.shutdown.wait().await {
+                errors.push(error.to_string());
+            }
         }
-        self.close_physical().await
+        if let Err(error) = self.shutdown.wait().await {
+            errors.push(error.to_string());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(TransportError::Message(format!(
+                "WebRTC shutdown failures: {}",
+                errors.join("; ")
+            )))
+        }
     }
 
     async fn close_physical(&self) -> Result<(), TransportError> {
-        self.completed_video_drops.seal();
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
-        let mut tasks = self.tasks.lock().await;
-        for task in tasks.iter() {
-            task.abort();
-        }
-        for task in tasks.drain(..) {
-            let _ = task.await;
-        }
-        drop(tasks);
-        if let Some(channel) = self.control.channel(ControlLane::Reliable).await {
-            let _ = channel.close().await;
-        }
-        if let Some(channel) = self.control.channel(ControlLane::Realtime).await {
-            let _ = channel.close().await;
-        }
-        if let Some(channel) = self.control.channel(ControlLane::Bulk).await {
-            let _ = channel.close().await;
-        }
-        #[cfg(test)]
-        if self.fail_close_for_test.load(Ordering::Acquire) {
-            return Err(TransportError::Message(
-                "injected old-route close failure".into(),
-            ));
-        }
-        self.pc
-            .close()
-            .await
-            .map_err(peer_error("close peer connection"))
+        self.start_physical_shutdown();
+        self.shutdown.wait().await
     }
 
     fn require_role(&self, expected: PeerConnectionRole) -> Result<(), TransportError> {
@@ -1461,14 +1699,26 @@ impl WebRtcPeerConnection {
         &self,
         generation: u64,
         route_token: RestartRouteToken,
+        request_fingerprint: Option<[u8; 32]>,
     ) -> Result<(PeerConnectionConfig, Option<Arc<WebRtcPeerConnection>>), TransportError> {
-        if generation == 0 {
-            return Err(TransportError::Message(
-                "restart generation must be greater than zero".into(),
-            ));
-        }
         let mut state = self.restart_state();
-        if generation <= state.highest_seen_generation {
+        if state.terminated {
+            return Err(terminated_error());
+        }
+        let Some(expected_generation) = state.highest_seen_generation.checked_add(1) else {
+            return Err(TransportError::Message(
+                "restart generation exhausted; create a new session".into(),
+            ));
+        };
+        if generation != expected_generation {
+            if generation < expected_generation {
+                return Err(stale_generation_error(generation, "restart request"));
+            }
+            return Err(TransportError::Message(format!(
+                "invalid restart generation {generation}; expected generation {expected_generation}"
+            )));
+        }
+        if generation <= state.active_generation {
             return Err(stale_generation_error(generation, "restart request"));
         }
         state.highest_seen_generation = generation;
@@ -1484,6 +1734,7 @@ impl WebRtcPeerConnection {
         state.pending = Some(PendingRestart::Building {
             generation,
             route_token,
+            request_fingerprint,
         });
         Ok((config, loser))
     }
@@ -1494,6 +1745,7 @@ impl WebRtcPeerConnection {
         route_token: &RestartRouteToken,
         peer: Arc<WebRtcPeerConnection>,
         local_description: SessionDescription,
+        request_fingerprint: Option<[u8; 32]>,
     ) -> bool {
         let mut state = self.restart_state();
         let matches_pending = matches!(
@@ -1501,15 +1753,17 @@ impl WebRtcPeerConnection {
             Some(PendingRestart::Building {
                 generation: pending,
                 route_token: pending_token,
+                ..
             }) if *pending == generation && pending_token == route_token
         );
-        if matches_pending && generation > state.active_generation {
+        if matches_pending && generation > state.active_generation && !state.terminated {
             state.pending = Some(PendingRestart::Ready {
                 generation,
                 route_token: route_token.clone(),
                 route_id: NEXT_RESTART_ROUTE_ID.fetch_add(1, Ordering::Relaxed),
                 peer,
                 local_description,
+                request_fingerprint,
                 validated: false,
             });
             true
@@ -1525,18 +1779,197 @@ impl WebRtcPeerConnection {
             Some(PendingRestart::Building {
                 generation: pending,
                 route_token: pending_token,
+                ..
             }) if *pending == generation && pending_token == route_token
         ) {
             state.pending = None;
         }
     }
 
+    fn detach_pending_restart(
+        &self,
+        generation: u64,
+        route_token: &RestartRouteToken,
+        route_id: Option<u64>,
+    ) {
+        let _ = self.abort_restart_bound(generation, route_token, route_id);
+    }
+
+    fn abort_restart_bound(
+        &self,
+        generation: u64,
+        route_token: &RestartRouteToken,
+        route_id: Option<u64>,
+    ) -> Result<bool, TransportError> {
+        let peer = {
+            let mut state = self.restart_state();
+            if state.terminated {
+                return Err(terminated_error());
+            }
+            let matches = match state.pending.as_ref() {
+                Some(PendingRestart::Building {
+                    generation: pending_generation,
+                    route_token: pending_token,
+                    ..
+                }) => {
+                    route_id.is_none()
+                        && *pending_generation == generation
+                        && pending_token == route_token
+                }
+                Some(PendingRestart::Ready {
+                    generation: pending_generation,
+                    route_token: pending_token,
+                    route_id: pending_route_id,
+                    ..
+                }) => {
+                    *pending_generation == generation
+                        && pending_token == route_token
+                        && route_id.is_none_or(|route_id| route_id == *pending_route_id)
+                }
+                None => false,
+            };
+            if matches {
+                let pending = state.pending.take().expect("matching pending route");
+                state.last_aborted_route = Some((generation, route_token.clone()));
+                match pending {
+                    PendingRestart::Ready { peer, .. } => Some(peer),
+                    PendingRestart::Building { .. } => None,
+                }
+            } else if state.last_aborted_route.as_ref().is_some_and(
+                |(aborted_generation, aborted_token)| {
+                    *aborted_generation == generation && aborted_token == route_token
+                },
+            ) && state.pending.is_none()
+            {
+                return Ok(false);
+            } else {
+                return Err(TransportError::Message(
+                    "stale or losing restart route abort".into(),
+                ));
+            }
+        };
+        if let Some(peer) = peer {
+            peer.terminate_physical_now();
+        }
+        Ok(true)
+    }
+
+    fn restart_build_rejection(&self, generation: u64, context: &'static str) -> TransportError {
+        if self.restart_state().terminated {
+            terminated_error()
+        } else {
+            stale_generation_error(generation, context)
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn wait_restart_build_gate_for_test(&self, _peer: &Arc<WebRtcPeerConnection>) {}
+
+    #[cfg(test)]
+    async fn wait_restart_build_gate_for_test(&self, peer: &Arc<WebRtcPeerConnection>) {
+        *self
+            .last_built_peer_for_test
+            .lock()
+            .expect("last built peer lock poisoned") = Some(Arc::downgrade(peer));
+        let gate = self
+            .restart_build_gate_for_test
+            .lock()
+            .expect("restart build gate lock poisoned")
+            .clone();
+        if let Some(gate) = gate {
+            let _ = gate.acquire().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn install_restart_build_gate_for_test(&self, gate: Arc<Semaphore>) {
+        *self
+            .restart_build_gate_for_test
+            .lock()
+            .expect("restart build gate lock poisoned") = Some(gate);
+        *self
+            .last_built_peer_for_test
+            .lock()
+            .expect("last built peer lock poisoned") = None;
+    }
+
+    #[cfg(test)]
+    fn clear_restart_build_gate_for_test(&self) {
+        *self
+            .restart_build_gate_for_test
+            .lock()
+            .expect("restart build gate lock poisoned") = None;
+    }
+
+    #[cfg(test)]
+    fn last_built_peer_for_test(&self) -> Option<Weak<WebRtcPeerConnection>> {
+        self.last_built_peer_for_test
+            .lock()
+            .expect("last built peer lock poisoned")
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn install_physical_close_gate_for_test(&self, gate: Arc<Semaphore>) {
+        *self
+            .physical_close_gate_for_test
+            .lock()
+            .expect("physical close gate lock poisoned") = Some(gate);
+    }
+
+    #[cfg(test)]
+    fn physical_shutdown_started_for_test(&self) -> bool {
+        self.shutdown.is_started()
+    }
+
+    #[cfg(test)]
+    fn physical_shutdown_finished_for_test(&self) -> bool {
+        self.shutdown.is_finished()
+    }
+
+    #[cfg(not(test))]
+    async fn wait_restart_validation_gate_for_test(&self) {}
+
+    #[cfg(test)]
+    async fn wait_restart_validation_gate_for_test(&self) {
+        self.restart_validation_entered_for_test
+            .store(true, Ordering::Release);
+        let gate = self
+            .restart_validation_gate_for_test
+            .lock()
+            .expect("restart validation gate lock poisoned")
+            .clone();
+        if let Some(gate) = gate {
+            let _ = gate.acquire().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn install_restart_validation_gate_for_test(&self, gate: Arc<Semaphore>) {
+        *self
+            .restart_validation_gate_for_test
+            .lock()
+            .expect("restart validation gate lock poisoned") = Some(gate);
+        self.restart_validation_entered_for_test
+            .store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn restart_validation_entered_for_test(&self) -> bool {
+        self.restart_validation_entered_for_test
+            .load(Ordering::Acquire)
+    }
+
     fn existing_restart_description(
         &self,
         generation: u64,
         route_token: &RestartRouteToken,
+        request_fingerprint: &[u8; 32],
     ) -> Result<Option<SessionDescription>, TransportError> {
         let state = self.restart_state();
+        if state.terminated {
+            return Err(terminated_error());
+        }
         if generation < state.highest_seen_generation {
             return Err(stale_generation_error(generation, "restart offer"));
         }
@@ -1548,18 +1981,40 @@ impl WebRtcPeerConnection {
                 generation: pending_generation,
                 route_token: pending_token,
                 local_description,
+                request_fingerprint: pending_fingerprint,
                 ..
-            }) if *pending_generation == generation && pending_token == route_token => {
+            }) if *pending_generation == generation
+                && pending_token == route_token
+                && pending_fingerprint.as_ref() == Some(request_fingerprint) =>
+            {
                 Ok(Some(local_description.clone()))
             }
+            Some(PendingRestart::Ready {
+                generation: pending_generation,
+                route_token: pending_token,
+                ..
+            }) if *pending_generation == generation && pending_token == route_token => Err(
+                TransportError::Message("restart route payload conflict".into()),
+            ),
             Some(PendingRestart::Building {
                 generation: pending_generation,
                 route_token: pending_token,
-            }) if *pending_generation == generation && pending_token == route_token => {
+                request_fingerprint: pending_fingerprint,
+            }) if *pending_generation == generation
+                && pending_token == route_token
+                && pending_fingerprint.as_ref() == Some(request_fingerprint) =>
+            {
                 Err(TransportError::Message(format!(
                     "restart generation {generation} is still being built"
                 )))
             }
+            Some(PendingRestart::Building {
+                generation: pending_generation,
+                route_token: pending_token,
+                ..
+            }) if *pending_generation == generation && pending_token == route_token => Err(
+                TransportError::Message("restart route payload conflict".into()),
+            ),
             _ => Err(stale_generation_error(generation, "restart route")),
         }
     }
@@ -1569,6 +2024,9 @@ impl WebRtcPeerConnection {
         generation: u64,
     ) -> Result<(u64, RestartRouteToken, Arc<WebRtcPeerConnection>), TransportError> {
         let state = self.restart_state();
+        if state.terminated {
+            return Err(terminated_error());
+        }
         match state.pending.as_ref() {
             Some(pending) if pending.generation() == generation => {
                 pending.ready_peer().ok_or_else(|| {
@@ -1587,6 +2045,9 @@ impl WebRtcPeerConnection {
         route_token: &RestartRouteToken,
     ) -> Result<(u64, RestartRouteToken, Arc<WebRtcPeerConnection>), TransportError> {
         let state = self.restart_state();
+        if state.terminated {
+            return Err(terminated_error());
+        }
         match state.pending.as_ref() {
             Some(pending)
                 if pending.generation() == generation && pending.route_token() == route_token =>
@@ -1603,6 +2064,9 @@ impl WebRtcPeerConnection {
 
     fn require_ready_route(&self, generation: u64, route_id: u64) -> Result<(), TransportError> {
         let state = self.restart_state();
+        if state.terminated {
+            return Err(terminated_error());
+        }
         match state.pending.as_ref() {
             Some(PendingRestart::Ready {
                 generation: pending_generation,
@@ -1615,6 +2079,9 @@ impl WebRtcPeerConnection {
 
     fn mark_restart_validated(&self, generation: u64, route_id: u64) -> Result<(), TransportError> {
         let mut state = self.restart_state();
+        if state.terminated {
+            return Err(terminated_error());
+        }
         match state.pending.as_mut() {
             Some(PendingRestart::Ready {
                 generation: pending_generation,
@@ -1653,6 +2120,45 @@ impl WebRtcPeerConnection {
 async fn close_loser(loser: Option<Arc<WebRtcPeerConnection>>) {
     if let Some(loser) = loser {
         close_route_best_effort(&loser).await;
+    }
+}
+
+async fn run_physical_shutdown(
+    tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    control: Arc<ControlState>,
+    pc: Arc<RTCPeerConnection>,
+    close_gate: Option<Arc<Semaphore>>,
+    injected_failure: bool,
+) -> Option<String> {
+    if let Some(close_gate) = close_gate {
+        let _ = close_gate.acquire().await;
+    }
+    let mut tasks = tasks.lock().await;
+    for task in tasks.iter() {
+        task.abort();
+    }
+    for task in tasks.drain(..) {
+        let _ = task.await;
+    }
+    drop(tasks);
+    if let Some(channel) = control.channel(ControlLane::Reliable).await {
+        let _ = channel.close().await;
+    }
+    if let Some(channel) = control.channel(ControlLane::Realtime).await {
+        let _ = channel.close().await;
+    }
+    if let Some(channel) = control.channel(ControlLane::Bulk).await {
+        let _ = channel.close().await;
+    }
+    let close_error = pc
+        .close()
+        .await
+        .err()
+        .map(|error| format!("close peer connection failed: {error}"));
+    if injected_failure {
+        Some("injected old-route close failure".into())
+    } else {
+        close_error
     }
 }
 
@@ -1732,6 +2238,46 @@ fn stale_generation_error(generation: u64, context: &'static str) -> TransportEr
     TransportError::Message(format!("stale or losing {context} generation {generation}"))
 }
 
+fn terminated_error() -> TransportError {
+    TransportError::Message("WebRTC session is terminated".into())
+}
+
+fn restart_offer_fingerprint(
+    generation: u64,
+    route_token: &RestartRouteToken,
+    offer: &SessionDescription,
+    ice_servers: &[IceServerConfig],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    fingerprint_field(&mut digest, b"mrd-restart-offer-v1");
+    fingerprint_field(&mut digest, &generation.to_be_bytes());
+    fingerprint_field(&mut digest, &route_token.0);
+    fingerprint_field(
+        &mut digest,
+        &[match offer.kind {
+            SessionDescriptionType::Offer => 1,
+            SessionDescriptionType::Answer => 2,
+        }],
+    );
+    fingerprint_field(&mut digest, offer.sdp.as_bytes());
+    fingerprint_field(&mut digest, b"relay-only");
+    fingerprint_field(&mut digest, &(ice_servers.len() as u64).to_be_bytes());
+    for server in ice_servers {
+        fingerprint_field(&mut digest, &(server.urls.len() as u64).to_be_bytes());
+        for url in &server.urls {
+            fingerprint_field(&mut digest, url.as_bytes());
+        }
+        fingerprint_field(&mut digest, server.username.as_bytes());
+        fingerprint_field(&mut digest, server.credential.as_bytes());
+    }
+    digest.finalize().into()
+}
+
+fn fingerprint_field(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
+}
+
 fn restart_peer_config(
     mut config: PeerConnectionConfig,
     ice_servers: Vec<IceServerConfig>,
@@ -1776,21 +2322,7 @@ fn validate_turn_servers(ice_servers: &[IceServerConfig]) -> Result<(), Transpor
 }
 
 fn secret_values(ice_servers: &[IceServerConfig]) -> Vec<String> {
-    ice_servers
-        .iter()
-        .flat_map(|server| {
-            std::iter::once(server.username.clone())
-                .chain(std::iter::once(server.credential.clone()))
-                .chain(server.urls.iter().flat_map(|url| {
-                    std::iter::once(url.clone()).chain(
-                        url.split(['/', '?', '#', '&', '=', '@', ':'])
-                            .filter(|part| !part.is_empty())
-                            .map(str::to_owned),
-                    )
-                }))
-        })
-        .filter(|value| !value.is_empty())
-        .collect()
+    ice_server_secret_values(ice_servers)
 }
 
 fn candidate_secret_values(candidate: &IceCandidate) -> Vec<String> {
@@ -1807,13 +2339,13 @@ fn candidate_secret_values(candidate: &IceCandidate) -> Vec<String> {
             secrets.push(pair[1].to_owned());
         }
     }
-    secrets
+    normalize_secret_values(secrets)
 }
 
 fn redact_transport_error(error: TransportError, secrets: &[String]) -> TransportError {
     let mut message = error.to_string();
-    for secret in secrets {
-        message = message.replace(secret, "[REDACTED]");
+    for secret in normalize_secret_values(secrets.to_vec()) {
+        message = message.replace(&secret, "[REDACTED]");
     }
     TransportError::Message(message)
 }
@@ -1947,6 +2479,33 @@ mod tests {
         assert!(!output.contains("temporary-user"));
         assert!(!output.contains("temporary-password"));
         assert_eq!(output.matches("[REDACTED]").count(), 2);
+    }
+
+    #[test]
+    fn transport_error_redaction_handles_overlapping_secrets_and_the_error_chain() {
+        let server = IceServerConfig::new(
+            vec!["turn:relay.example.test:3478?transport=udp".into()],
+            "prefix".into(),
+            "prefix-long-secret".into(),
+        );
+        let error = TransportError::Message(
+            "TURN setup failed for prefix-long-secret owned by prefix".into(),
+        );
+
+        let redacted = redact_transport_error(error, &secret_values(&[server]));
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&redacted);
+        while let Some(error) = source {
+            let display = error.to_string();
+            let debug = format!("{error:?}");
+            for leaked in ["prefix", "long-secret"] {
+                assert!(
+                    !display.contains(leaked),
+                    "Display leaked {leaked}: {display}"
+                );
+                assert!(!debug.contains(leaked), "Debug leaked {leaked}: {debug}");
+            }
+            source = error.source();
+        }
     }
 
     #[test]
@@ -2124,6 +2683,7 @@ mod tests {
             route_id: offer_route_id,
             peer: Arc::clone(&pending_offerer),
             local_description: bound_offer,
+            request_fingerprint: None,
             validated: false,
         });
         root_answerer.restart_state().pending = Some(PendingRestart::Ready {
@@ -2132,6 +2692,7 @@ mod tests {
             route_id: answer_route_id,
             peer: Arc::clone(&pending_answerer),
             local_description: bound_answer,
+            request_fingerprint: None,
             validated: false,
         });
 
@@ -2148,67 +2709,10 @@ mod tests {
             assert!(error.to_string().contains("relay/relay"));
         }
 
-        // The remaining assertions exercise only the private publication harness. Production
-        // callers cannot construct evidence or mark a route validated, and the checks above
-        // prove this host pair cannot produce evidence through validate_pending_restart.
-        for root in [&root_offerer, &root_answerer] {
-            let mut state = root.restart_state();
-            let Some(PendingRestart::Ready { validated, .. }) = state.pending.as_mut() else {
-                panic!("private pending route")
-            };
-            *validated = true;
-        }
-        let state_evidence = |route_id| RestartRouteEvidence {
-            generation: 1,
-            route_id,
-            selected_pair: SelectedCandidatePairStats {
-                local_candidate_id: "private-state-harness-local".into(),
-                remote_candidate_id: "private-state-harness-remote".into(),
-                local_candidate_kind: crate::CandidateKind::Relay,
-                remote_candidate_kind: crate::CandidateKind::Relay,
-                nominated: true,
-                packets_sent: 1,
-                packets_received: 1,
-                bytes_sent: 1,
-                bytes_received: 1,
-                current_round_trip_time: 0.01,
-            },
-            control_round_trip: true,
-            media_round_trip: true,
-        };
-        root_offerer
-            .commit_restart(1, state_evidence(offer_route_id))
-            .await
-            .expect("private offerer publication");
-        root_answerer
-            .commit_restart(1, state_evidence(answer_route_id))
-            .await
-            .expect("private answerer publication");
-        root_offerer
-            .send_control(ControlLane::Reliable, b"private-state-harness-control")
-            .await
-            .expect("control through published peer");
-        let control = tokio::time::timeout(
-            Duration::from_secs(5),
-            root_answerer.next_control(ControlLane::Reliable),
-        )
-        .await
-        .expect("control receive timeout")
-        .expect("control through published peer");
-        assert_eq!(control.as_ref(), b"private-state-harness-control");
-        let media = restart_media_probe(1);
-        root_offerer
-            .send_h264_access_unit(&media)
-            .await
-            .expect("media through published peer");
-        let received = tokio::time::timeout(
-            Duration::from_secs(5),
-            root_answerer.next_h264_access_unit(),
-        )
-        .await
-        .expect("media receive timeout")
-        .expect("media through published peer");
-        assert_eq!(received.bytes, media.bytes);
+        assert_eq!(root_offerer.pending_restart_generation().await, None);
+        assert_eq!(root_answerer.pending_restart_generation().await, None);
+        assert!(pending_offerer.physical_shutdown_started_for_test());
+        assert!(pending_answerer.physical_shutdown_started_for_test());
         root_offerer.close().await.expect("close root offerer");
         root_answerer.close().await.expect("close root answerer");
     }
@@ -2221,11 +2725,13 @@ mod tests {
                 .expect("peer"),
         );
         let state = RestartState {
+            terminated: false,
             active_generation: 9,
             highest_seen_generation: 9,
             active_route_token: Some(RestartRouteToken::generate().expect("route token")),
             active_replacement: Some(Arc::clone(&peer)),
             pending: None,
+            last_aborted_route: None,
         };
 
         let (generation, route_token, route) = state.active_snapshot();
@@ -2257,6 +2763,7 @@ mod tests {
             route_id,
             peer: Arc::clone(&replacement),
             local_description: description,
+            request_fingerprint: None,
             validated: true,
         });
         active.fail_close_for_test.store(true, Ordering::Release);
@@ -2290,6 +2797,381 @@ mod tests {
             &active.active_route().expect("published replacement"),
             &replacement
         ));
-        active.close().await.expect("close state harness");
+        let cleanup = active
+            .close()
+            .await
+            .expect_err("later close still reports the recorded physical cleanup failure");
+        assert!(cleanup.to_string().contains("injected"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_commit_caller_cannot_cancel_old_route_cleanup_after_publication() {
+        let active = Arc::new(
+            WebRtcPeerConnection::new(PeerConnectionConfig::default())
+                .await
+                .expect("active peer"),
+        );
+        let replacement = Arc::new(
+            WebRtcPeerConnection::new(PeerConnectionConfig::default())
+                .await
+                .expect("replacement peer"),
+        );
+        let route_token = RestartRouteToken::generate().expect("route token");
+        let route_id = NEXT_RESTART_ROUTE_ID.fetch_add(1, Ordering::Relaxed);
+        let mut description =
+            SessionDescription::initial(SessionDescriptionType::Offer, "state-only".into());
+        description.bind_restart(1, route_token.clone());
+        active.restart_state().pending = Some(PendingRestart::Ready {
+            generation: 1,
+            route_token,
+            route_id,
+            peer: Arc::clone(&replacement),
+            local_description: description,
+            request_fingerprint: None,
+            validated: true,
+        });
+        let gate = Arc::new(Semaphore::new(0));
+        active.install_physical_close_gate_for_test(Arc::clone(&gate));
+        active.fail_close_for_test.store(true, Ordering::Release);
+        let evidence = RestartRouteEvidence {
+            generation: 1,
+            route_id,
+            selected_pair: SelectedCandidatePairStats {
+                local_candidate_id: "state-local".into(),
+                remote_candidate_id: "state-remote".into(),
+                local_candidate_kind: crate::CandidateKind::Relay,
+                remote_candidate_kind: crate::CandidateKind::Relay,
+                nominated: true,
+                packets_sent: 1,
+                packets_received: 1,
+                bytes_sent: 1,
+                bytes_received: 1,
+                current_round_trip_time: 0.01,
+            },
+            control_round_trip: true,
+            media_round_trip: true,
+        };
+        let committing_peer = Arc::clone(&active);
+        let commit = tokio::spawn(async move { committing_peer.commit_restart(1, evidence).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while active.current_generation().await != 1
+                || !active.physical_shutdown_started_for_test()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("route published and cleanup transferred");
+
+        commit.abort();
+        assert!(commit.await.unwrap_err().is_cancelled());
+        gate.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !active.physical_shutdown_finished_for_test()
+                || active.restart_cleanup_failure_count() != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old root cleanup finishes");
+
+        assert_eq!(active.current_generation().await, 1);
+        assert!(Arc::ptr_eq(
+            &active.active_route().expect("published replacement"),
+            &replacement
+        ));
+        assert_eq!(active.restart_cleanup_failure_count(), 1);
+        let cleanup = active
+            .close()
+            .await
+            .expect_err("recorded root cleanup failure remains observable");
+        assert!(cleanup.to_string().contains("injected"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_restart_build_removes_building_but_keeps_generation_consumed() {
+        let peer = Arc::new(
+            WebRtcPeerConnection::new(PeerConnectionConfig::default())
+                .await
+                .expect("peer"),
+        );
+        let gate = Arc::new(Semaphore::new(0));
+        peer.install_restart_build_gate_for_test(Arc::clone(&gate));
+        let building_peer = Arc::clone(&peer);
+        let build = tokio::spawn(async move {
+            building_peer
+                .create_restart_offer(
+                    1,
+                    vec![IceServerConfig::new(
+                        vec!["turn:relay.example.test:3478".into()],
+                        "user".into(),
+                        "credential".into(),
+                    )],
+                )
+                .await
+        });
+        let built = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(built) = peer.last_built_peer_for_test() {
+                    break built;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending physical peer built");
+
+        build.abort();
+        assert!(build.await.unwrap_err().is_cancelled());
+
+        assert_eq!(peer.pending_restart_generation().await, None);
+        assert_eq!(built.strong_count(), 0);
+        let stale = peer
+            .create_restart_offer(
+                1,
+                vec![IceServerConfig::new(
+                    vec!["turn:relay.example.test:3478".into()],
+                    "user".into(),
+                    "credential".into(),
+                )],
+            )
+            .await
+            .expect_err("cancelled generation remains consumed");
+        assert!(stale.to_string().contains("generation"));
+        peer.clear_restart_build_gate_for_test();
+        peer.create_restart_offer(
+            2,
+            vec![IceServerConfig::new(
+                vec!["turn:relay.example.test:3478".into()],
+                "user".into(),
+                "credential".into(),
+            )],
+        )
+        .await
+        .expect("next generation can proceed");
+        peer.close().await.expect("close peer");
+    }
+
+    #[tokio::test]
+    async fn maximum_generation_exhausts_the_session_without_wrapping() {
+        let peer = WebRtcPeerConnection::new(PeerConnectionConfig::default())
+            .await
+            .expect("peer");
+        peer.restart_state().highest_seen_generation = u64::MAX;
+
+        let error = peer
+            .create_restart_offer(
+                u64::MAX,
+                vec![IceServerConfig::new(
+                    vec!["turn:relay.example.test:3478".into()],
+                    "user".into(),
+                    "credential".into(),
+                )],
+            )
+            .await
+            .expect_err("generation counter cannot wrap");
+
+        assert!(error.to_string().contains("exhausted"));
+        assert_eq!(peer.pending_restart_generation().await, None);
+        peer.close().await.expect("close peer");
+    }
+
+    #[tokio::test]
+    async fn close_racing_a_blocked_build_cannot_leave_a_pending_peer() {
+        let peer = Arc::new(
+            WebRtcPeerConnection::new(PeerConnectionConfig::default())
+                .await
+                .expect("peer"),
+        );
+        let gate = Arc::new(Semaphore::new(0));
+        peer.install_restart_build_gate_for_test(Arc::clone(&gate));
+        let building_peer = Arc::clone(&peer);
+        let build = tokio::spawn(async move {
+            building_peer
+                .create_restart_offer(
+                    1,
+                    vec![IceServerConfig::new(
+                        vec!["turn:relay.example.test:3478".into()],
+                        "user".into(),
+                        "credential".into(),
+                    )],
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while peer.last_built_peer_for_test().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending physical peer built");
+
+        peer.close().await.expect("close wins termination race");
+        gate.add_permits(1);
+        let error = build
+            .await
+            .expect("build task joins")
+            .expect_err("terminated build cannot publish");
+
+        assert!(error.to_string().contains("terminated"));
+        assert_eq!(peer.pending_restart_generation().await, None);
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_caller_does_not_cancel_physical_shutdown() {
+        let peer = Arc::new(
+            WebRtcPeerConnection::new(PeerConnectionConfig::default())
+                .await
+                .expect("peer"),
+        );
+        let gate = Arc::new(Semaphore::new(0));
+        peer.install_physical_close_gate_for_test(Arc::clone(&gate));
+        let closing_peer = Arc::clone(&peer);
+        let caller = tokio::spawn(async move { closing_peer.close().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !peer.physical_shutdown_started_for_test() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown task starts");
+
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(!peer.physical_shutdown_finished_for_test());
+        gate.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !peer.physical_shutdown_finished_for_test() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached shutdown finishes after caller cancellation");
+        assert_eq!(peer.pc.connection_state(), RTCPeerConnectionState::Closed);
+    }
+
+    #[test]
+    fn terminate_without_an_ambient_runtime_uses_owned_fallback_cleanup() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("setup runtime");
+        let peer = runtime
+            .block_on(WebRtcPeerConnection::new(PeerConnectionConfig::default()))
+            .expect("peer");
+        drop(runtime);
+
+        peer.terminate_now();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !peer.physical_shutdown_finished_for_test() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(peer.physical_shutdown_finished_for_test());
+        assert_eq!(peer.pc.connection_state(), RTCPeerConnectionState::Closed);
+    }
+
+    #[tokio::test]
+    async fn cancelled_validation_detaches_and_cleans_only_its_bound_route() {
+        let peer = Arc::new(
+            WebRtcPeerConnection::new(PeerConnectionConfig::default())
+                .await
+                .expect("peer"),
+        );
+        peer.create_restart_offer(
+            1,
+            vec![IceServerConfig::new(
+                vec!["turn:relay.example.test:3478".into()],
+                "user".into(),
+                "credential".into(),
+            )],
+        )
+        .await
+        .expect("pending route");
+        let pending = peer
+            .last_built_peer_for_test()
+            .and_then(|pending| pending.upgrade())
+            .expect("pending physical peer");
+        let gate = Arc::new(Semaphore::new(0));
+        peer.install_restart_validation_gate_for_test(Arc::clone(&gate));
+        let validating_peer = Arc::clone(&peer);
+        let validation =
+            tokio::spawn(async move { validating_peer.validate_pending_restart(1).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !peer.restart_validation_entered_for_test() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("validation entered route-bound section");
+
+        validation.abort();
+        assert!(validation.await.unwrap_err().is_cancelled());
+
+        assert_eq!(peer.pending_restart_generation().await, None);
+        assert!(pending.physical_shutdown_started_for_test());
+        peer.create_restart_offer(
+            2,
+            vec![IceServerConfig::new(
+                vec!["turn:relay.example.test:3478".into()],
+                "user".into(),
+                "credential".into(),
+            )],
+        )
+        .await
+        .expect("new generation survives stale validation cleanup");
+        gate.add_permits(1);
+        peer.close().await.expect("close peer");
+    }
+
+    #[tokio::test]
+    async fn close_starts_all_resource_cleanup_before_reporting_aggregate_error() {
+        let root = WebRtcPeerConnection::new(PeerConnectionConfig::default())
+            .await
+            .expect("root");
+        let active = Arc::new(
+            WebRtcPeerConnection::new(PeerConnectionConfig::default())
+                .await
+                .expect("active"),
+        );
+        let pending = Arc::new(
+            WebRtcPeerConnection::new(PeerConnectionConfig::default())
+                .await
+                .expect("pending"),
+        );
+        active.fail_close_for_test.store(true, Ordering::Release);
+        let route_token = RestartRouteToken::generate().expect("route token");
+        let mut description =
+            SessionDescription::initial(SessionDescriptionType::Offer, "state-only".into());
+        description.bind_restart(2, route_token.clone());
+        {
+            let mut state = root.restart_state();
+            state.active_generation = 1;
+            state.highest_seen_generation = 2;
+            state.active_route_token = Some(RestartRouteToken::generate().expect("active token"));
+            state.active_replacement = Some(Arc::clone(&active));
+            state.pending = Some(PendingRestart::Ready {
+                generation: 2,
+                route_token,
+                route_id: NEXT_RESTART_ROUTE_ID.fetch_add(1, Ordering::Relaxed),
+                peer: Arc::clone(&pending),
+                local_description: description,
+                request_fingerprint: None,
+                validated: false,
+            });
+        }
+
+        let error = root.close().await.expect_err("one cleanup reports failure");
+
+        assert!(error.to_string().contains("injected"));
+        assert!(root.physical_shutdown_finished_for_test());
+        assert!(active.physical_shutdown_finished_for_test());
+        assert!(pending.physical_shutdown_finished_for_test());
+        assert_eq!(root.pc.connection_state(), RTCPeerConnectionState::Closed);
+        assert_eq!(
+            pending.pc.connection_state(),
+            RTCPeerConnectionState::Closed
+        );
     }
 }

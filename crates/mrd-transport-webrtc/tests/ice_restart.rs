@@ -81,6 +81,38 @@ async fn restart_requires_authenticated_turn_servers() {
 }
 
 #[tokio::test]
+async fn closed_peer_rejects_restart_without_creating_a_pending_route() {
+    let peer = WebRtcPeerConnection::new(loopback_config(PeerConnectionRole::Offerer))
+        .await
+        .expect("peer");
+    peer.close().await.expect("close peer");
+
+    let error = peer
+        .create_restart_offer(1, fake_turn_servers())
+        .await
+        .expect_err("terminated session cannot restart");
+
+    assert!(error.to_string().contains("terminated"));
+    assert_eq!(peer.pending_restart_generation().await, None);
+}
+
+#[tokio::test]
+async fn restart_generation_must_be_the_strict_next_value() {
+    let peer = WebRtcPeerConnection::new(loopback_config(PeerConnectionRole::Offerer))
+        .await
+        .expect("peer");
+
+    let error = peer
+        .create_restart_offer(1_000_000, fake_turn_servers())
+        .await
+        .expect_err("arbitrary generation jump must be rejected");
+
+    assert!(error.to_string().contains("expected generation 1"));
+    assert_eq!(peer.pending_restart_generation().await, None);
+    peer.close().await.expect("close peer");
+}
+
+#[tokio::test]
 async fn same_generation_answers_and_candidates_are_bound_to_an_opaque_route_token() {
     let first_peer = WebRtcPeerConnection::new(loopback_config(PeerConnectionRole::Offerer))
         .await
@@ -166,11 +198,36 @@ async fn same_generation_is_idempotent_only_for_the_existing_route() {
         .expect("first acceptance");
 
     let duplicate = answerer
-        .accept_restart_offer(1, fake_turn_servers(), offer)
+        .accept_restart_offer(1, fake_turn_servers(), offer.clone())
         .await
         .expect("same route retry returns the existing answer");
 
     assert_eq!(duplicate, answer);
+    let mut conflicting_sdp = offer.sdp.clone();
+    conflicting_sdp.push_str("a=x-conflicting-payload:1\r\n");
+    let original_token = answer.restart_route_token().unwrap().to_wire();
+    let conflicting_payload = SessionDescription::from_wire(
+        SessionDescriptionType::Offer,
+        conflicting_sdp,
+        1,
+        Some(&original_token),
+    )
+    .unwrap();
+    let conflict = answerer
+        .accept_restart_offer(1, fake_turn_servers(), conflicting_payload)
+        .await
+        .expect_err("same route token cannot make a different offer idempotent");
+    assert!(conflict.to_string().contains("conflict"));
+    let mut conflicting_servers = fake_turn_servers();
+    conflicting_servers[0].credential = "different-temporary-credential".into();
+    let conflict = answerer
+        .accept_restart_offer(1, conflicting_servers, offer.clone())
+        .await
+        .expect_err("same route token cannot change its negotiated TURN inputs");
+    assert!(conflict.to_string().contains("conflict"));
+    assert!(!conflict
+        .to_string()
+        .contains("different-temporary-credential"));
     let wrong_route_offer = SessionDescription::from_wire(
         SessionDescriptionType::Offer,
         "v=0\r\na=ice-pwd:must-not-parse\r\n".into(),
@@ -219,6 +276,37 @@ async fn candidate_parse_errors_redact_raw_candidate_and_ufrag_extensions() {
     let output = error.to_string();
     assert!(!output.contains(candidate_secret));
     assert!(!output.contains(extension_secret));
+    peer.close().await.expect("close peer");
+}
+
+#[tokio::test]
+async fn explicit_abort_is_route_bound_and_idempotent() {
+    let peer = WebRtcPeerConnection::new(loopback_config(PeerConnectionRole::Offerer))
+        .await
+        .expect("peer");
+    let offer = peer
+        .create_restart_offer(1, fake_turn_servers())
+        .await
+        .expect("restart offer");
+    let route_token = offer.restart_route_token().unwrap().clone();
+    let wrong_token = RestartRouteToken::from_wire(&token('c')).unwrap();
+
+    let wrong = peer
+        .abort_restart(1, &wrong_token)
+        .expect_err("wrong route cannot abort current pending peer");
+    assert!(wrong.to_string().contains("route"));
+    assert_eq!(peer.pending_restart_generation().await, Some(1));
+    assert!(peer
+        .abort_restart(1, &route_token)
+        .expect("matching route aborts pending peer"));
+    assert_eq!(peer.pending_restart_generation().await, None);
+    assert!(!peer
+        .abort_restart(1, &route_token)
+        .expect("same abort is idempotent"));
+
+    peer.create_restart_offer(2, fake_turn_servers())
+        .await
+        .expect("next generation proceeds after explicit abort");
     peer.close().await.expect("close peer");
 }
 
@@ -376,7 +464,7 @@ async fn concurrent_restart_builds_keep_only_the_highest_generation() {
 #[test]
 fn temporary_credentials_route_tokens_candidates_and_urls_are_redacted() {
     let server = IceServerConfig::new(
-        vec!["turn:embedded-user:embedded-pass@relay.example.test/private-path?api_key=query-secret#fragment-secret".to_owned()],
+        vec!["turn:embedded-user:embedded-pass@relay.example.test:3478/private-path?transport=udp&api_key=query-secret#fragment-secret".to_owned()],
         "temporary-user".to_owned(),
         "temporary-password".to_owned(),
     );
@@ -393,6 +481,18 @@ fn temporary_credentials_route_tokens_candidates_and_urls_are_redacted() {
             assert!(!output.contains(secret), "leaked {secret}: {output}");
         }
         assert!(output.contains("REDACTED"));
+        assert!(
+            output.contains("turn:"),
+            "scheme is useful diagnostics: {output}"
+        );
+        assert!(
+            output.contains("relay.example.test:3478"),
+            "host and port are useful diagnostics: {output}"
+        );
+        assert!(
+            output.contains("transport=udp"),
+            "TURN transport is useful diagnostics: {output}"
+        );
     }
 
     let route_token = token('a');

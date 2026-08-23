@@ -39,7 +39,7 @@ impl fmt::Debug for IceServerConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("IceServerConfig")
-            .field("urls", &RedactedUrls(self.urls.len()))
+            .field("urls", &RedactedUrls(&self.urls))
             .field("username", &"[REDACTED]")
             .field("credential", &"[REDACTED]")
             .finish()
@@ -48,19 +48,170 @@ impl fmt::Debug for IceServerConfig {
 
 impl fmt::Display for IceServerConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let urls = self
+            .urls
+            .iter()
+            .map(|url| redact_ice_server_url(url))
+            .collect::<Vec<_>>()
+            .join(", ");
         write!(
             formatter,
-            "IceServerConfig {{ urls: [REDACTED; {}], username: [REDACTED], credential: [REDACTED] }}",
-            self.urls.len()
+            "IceServerConfig {{ urls: [{urls}], username: [REDACTED], credential: [REDACTED] }}"
         )
     }
 }
 
-struct RedactedUrls(usize);
+struct RedactedUrls<'a>(&'a [String]);
 
-impl fmt::Debug for RedactedUrls {
+impl fmt::Debug for RedactedUrls<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "[REDACTED; {}]", self.0)
+        formatter
+            .debug_list()
+            .entries(self.0.iter().map(|url| RedactedUrl(url)))
+            .finish()
+    }
+}
+
+struct RedactedUrl<'a>(&'a str);
+
+impl fmt::Debug for RedactedUrl<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&redact_ice_server_url(self.0))
+    }
+}
+
+/// Preserve the endpoint fields operators need while suppressing every URI component that can
+/// carry credentials. TURN's URI syntax is deliberately parsed here instead of using a generic
+/// URL formatter because `turn:host:port` is an opaque URI in common URL libraries.
+pub(crate) fn redact_ice_server_url(url: &str) -> String {
+    let trimmed = url.trim();
+    let Some((scheme, remainder)) = trimmed.split_once(':') else {
+        return "[REDACTED]".into();
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "turn" | "turns") {
+        return format!("{scheme}:[REDACTED]");
+    }
+
+    let (without_fragment, fragment) = remainder
+        .split_once('#')
+        .map_or((remainder, None), |(base, value)| (base, Some(value)));
+    let (endpoint_and_path, query) = without_fragment
+        .split_once('?')
+        .map_or((without_fragment, None), |(base, value)| {
+            (base, Some(value))
+        });
+    let path_offset = endpoint_and_path.find('/');
+    let endpoint = path_offset.map_or(endpoint_and_path, |offset| &endpoint_and_path[..offset]);
+    let has_path = path_offset.is_some();
+    let (had_userinfo, endpoint) = endpoint
+        .rsplit_once('@')
+        .map_or((false, endpoint), |(_, public_endpoint)| {
+            (true, public_endpoint)
+        });
+
+    let mut output = format!("{scheme}:");
+    if had_userinfo {
+        output.push_str("[REDACTED]@");
+    }
+    if endpoint.is_empty() {
+        output.push_str("[REDACTED]");
+    } else {
+        output.push_str(endpoint);
+    }
+    if has_path {
+        output.push_str("/[REDACTED]");
+    }
+    if let Some(query) = query {
+        output.push('?');
+        output.push_str(
+            &query
+                .split('&')
+                .map(|parameter| {
+                    let Some((name, value)) = parameter.split_once('=') else {
+                        return "[REDACTED]";
+                    };
+                    if name.eq_ignore_ascii_case("transport")
+                        && matches!(value.to_ascii_lowercase().as_str(), "udp" | "tcp")
+                    {
+                        if value.eq_ignore_ascii_case("udp") {
+                            "transport=udp"
+                        } else {
+                            "transport=tcp"
+                        }
+                    } else {
+                        "[REDACTED]"
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("&"),
+        );
+    }
+    if fragment.is_some() {
+        output.push_str("#[REDACTED]");
+    }
+    output
+}
+
+pub(crate) fn ice_server_secret_values(ice_servers: &[IceServerConfig]) -> Vec<String> {
+    let mut secrets = Vec::new();
+    for server in ice_servers {
+        secrets.push(server.username.clone());
+        secrets.push(server.credential.clone());
+        for url in &server.urls {
+            collect_url_secrets(url, &mut secrets);
+        }
+    }
+    normalize_secret_values(secrets)
+}
+
+pub(crate) fn normalize_secret_values(mut secrets: Vec<String>) -> Vec<String> {
+    secrets.retain(|secret| !secret.is_empty());
+    secrets
+        .sort_unstable_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    secrets.dedup();
+    secrets
+}
+
+fn collect_url_secrets(url: &str, secrets: &mut Vec<String>) {
+    let Some((_, remainder)) = url.trim().split_once(':') else {
+        secrets.push(url.to_owned());
+        return;
+    };
+    let (without_fragment, fragment) = remainder
+        .split_once('#')
+        .map_or((remainder, None), |(base, value)| (base, Some(value)));
+    if let Some(fragment) = fragment {
+        secrets.push(fragment.to_owned());
+    }
+    let (endpoint_and_path, query) = without_fragment
+        .split_once('?')
+        .map_or((without_fragment, None), |(base, value)| {
+            (base, Some(value))
+        });
+    if let Some(query) = query {
+        for parameter in query.split('&') {
+            let is_public_transport = parameter.split_once('=').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("transport")
+                    && matches!(value.to_ascii_lowercase().as_str(), "udp" | "tcp")
+            });
+            if !is_public_transport {
+                secrets.push(parameter.to_owned());
+                if let Some((_, value)) = parameter.split_once('=') {
+                    secrets.push(value.to_owned());
+                }
+            }
+        }
+    }
+    let path_offset = endpoint_and_path.find('/');
+    let endpoint = path_offset.map_or(endpoint_and_path, |offset| &endpoint_and_path[..offset]);
+    if let Some(offset) = path_offset {
+        let path = &endpoint_and_path[offset + 1..];
+        secrets.push(path.to_owned());
+        secrets.extend(path.split('/').map(str::to_owned));
+    }
+    if let Some((userinfo, _)) = endpoint.rsplit_once('@') {
+        secrets.push(userinfo.to_owned());
+        secrets.extend(userinfo.split(':').map(str::to_owned));
     }
 }
 
