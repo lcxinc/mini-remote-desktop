@@ -202,9 +202,18 @@ async fn run_live_probe(
 fn secret_values(servers: &[IceServerConfig]) -> Vec<String> {
     servers
         .iter()
-        .flat_map(|server| [&server.username, &server.credential])
+        .flat_map(|server| {
+            std::iter::once(server.username.clone())
+                .chain(std::iter::once(server.credential.clone()))
+                .chain(server.urls.iter().flat_map(|url| {
+                    std::iter::once(url.clone()).chain(
+                        url.split(['/', '?', '#', '&', '=', '@', ':'])
+                            .filter(|part| !part.is_empty())
+                            .map(str::to_owned),
+                    )
+                }))
+        })
         .filter(|value| !value.is_empty())
-        .cloned()
         .collect()
 }
 

@@ -30,8 +30,8 @@ pub use control::{
     ControlChannelInfo, ControlChannels, ControlLane, BULK_LABEL, CTRL_REL_LABEL, CTRL_RT_LABEL,
 };
 pub use peer::{
-    IceCandidate, RestartRouteEvidence, SessionDescription, SessionDescriptionType,
-    WebRtcPeerConnection,
+    IceCandidate, RestartRouteEvidence, RestartRouteToken, SessionDescription,
+    SessionDescriptionType, WebRtcPeerConnection,
 };
 pub use probe::{probe_turn_relay, TurnRelayProbeConfig, TurnRelayProbeEvidence};
 pub use stats::{CandidateKind, SelectedCandidatePairStats};

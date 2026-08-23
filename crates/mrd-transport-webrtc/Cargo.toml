@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 mrd-pipeline-core = { path = "../mrd-pipeline-core" }
 bytes.workspace = true
+getrandom = "0.3"
 rtp = "0.12"
 thiserror.workspace = true
 tokio.workspace = true
