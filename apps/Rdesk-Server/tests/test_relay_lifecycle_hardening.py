@@ -1,9 +1,10 @@
+# ruff: noqa: F811
+
 from __future__ import annotations
 
 import base64
 import hashlib
 import hmac
-import json
 import logging
 import threading
 import asyncio
@@ -32,13 +33,12 @@ from test_relay_node_api import (
     TLS_HEADERS,
     _approval_body,
     _approve,
-    _canonical_request,
     _csr,
     _enroll,
     _error_code,
     _heartbeat_request,
     _issue_token,
-    api,
+    api,  # noqa: F401 - pytest fixture re-export
 )
 
 
@@ -642,8 +642,17 @@ def test_renewal_lost_response_retry_rotates_once_and_old_cert_is_renew_only(
     first = client.post(
         f"/api/v1/relays/{NODE_ID}/renew", content=body, headers=headers
     )
+    retry_body, retry_headers = _renewal_request(
+        old_key,
+        old_fingerprint,
+        renewal_id=renewal_id,
+        csr_pem=csr_pem,
+        sequence=22,
+    )
     retry = client.post(
-        f"/api/v1/relays/{NODE_ID}/renew", content=body, headers=headers
+        f"/api/v1/relays/{NODE_ID}/renew",
+        content=retry_body,
+        headers=retry_headers,
     )
     assert first.status_code == retry.status_code == 200
     assert first.headers["cache-control"] == "no-store, private"
@@ -661,6 +670,7 @@ def test_renewal_lost_response_retry_rotates_once_and_old_cert_is_renew_only(
         assert node is not None
         assert node.identity_epoch == 2
         assert node.heartbeat_sequence == 0
+        assert node.previous_identity_sequence == 22
         assert registration.previous_certificate_expires_at is not None
         assert registration.renewal_record_expires_at is not None
         assert (
@@ -679,8 +689,17 @@ def test_renewal_lost_response_retry_rotates_once_and_old_cert_is_renew_only(
         assert registration is not None
         registration.previous_auth_expires_at = datetime.now(UTC) - timedelta(seconds=1)
         session.commit()
+    old_retry_body, old_retry_headers = _renewal_request(
+        old_key,
+        old_fingerprint,
+        renewal_id=renewal_id,
+        csr_pem=csr_pem,
+        sequence=23,
+    )
     old_retry = client.post(
-        f"/api/v1/relays/{NODE_ID}/renew", content=body, headers=headers
+        f"/api/v1/relays/{NODE_ID}/renew",
+        content=old_retry_body,
+        headers=old_retry_headers,
     )
     assert old_retry.status_code == 200
     assert old_retry.json() == first.json()
@@ -690,7 +709,7 @@ def test_renewal_lost_response_retry_rotates_once_and_old_cert_is_renew_only(
         new_fingerprint,
         renewal_id=renewal_id,
         csr_pem=csr_pem,
-        sequence=22,
+        sequence=1,
     )
     current_retry = client.post(
         f"/api/v1/relays/{NODE_ID}/renew",
@@ -706,7 +725,7 @@ def test_renewal_lost_response_retry_rotates_once_and_old_cert_is_renew_only(
         new_fingerprint,
         renewal_id=renewal_id,
         csr_pem=different_csr,
-        sequence=23,
+        sequence=2,
     )
     conflicting = client.post(
         f"/api/v1/relays/{NODE_ID}/renew",
@@ -732,7 +751,7 @@ def test_renewal_lost_response_retry_rotates_once_and_old_cert_is_renew_only(
     new_body, new_headers = _heartbeat_request(
         new_key,
         new_fingerprint,
-        sequence=1,
+        sequence=3,
         payload={"identity_epoch": 2},
     )
     new_heartbeat = client.post(
@@ -749,8 +768,17 @@ def test_renewal_lost_response_retry_rotates_once_and_old_cert_is_renew_only(
             seconds=1
         )
         session.commit()
+    expired_old_body, expired_old_headers = _renewal_request(
+        old_key,
+        old_fingerprint,
+        renewal_id=renewal_id,
+        csr_pem=csr_pem,
+        sequence=24,
+    )
     expired_old_retry = client.post(
-        f"/api/v1/relays/{NODE_ID}/renew", content=body, headers=headers
+        f"/api/v1/relays/{NODE_ID}/renew",
+        content=expired_old_body,
+        headers=expired_old_headers,
     )
     assert (expired_old_retry.status_code, _error_code(expired_old_retry)) == (
         401,
@@ -783,8 +811,11 @@ def test_renewal_revoke_conflict_and_concurrent_idempotency(
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         responses = [future.result() for future in [executor.submit(renew) for _ in range(2)]]
-    assert [response.status_code for response in responses] == [200, 200]
-    assert responses[0].json()["fingerprint"] == responses[1].json()["fingerprint"]
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    successful = next(response for response in responses if response.status_code == 200)
+    replayed = next(response for response in responses if response.status_code == 409)
+    assert successful.json()["fingerprint"]
+    assert _error_code(replayed) == "relay_heartbeat_replayed"
 
     different_csr, _ = _csr(NODE_ID)
     conflict_body, conflict_headers = _renewal_request(

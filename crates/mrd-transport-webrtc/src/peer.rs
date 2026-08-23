@@ -34,7 +34,7 @@ use webrtc::{
     },
     track::track_local::TrackLocal,
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::{
     cleanup::{
@@ -42,8 +42,9 @@ use crate::{
         CleanupPhase,
     },
     config::{
-        ice_server_secret_values, normalize_secret_values, IceServerConfig, IceTransportPolicy,
-        PeerConnectionConfig, PeerConnectionRole, SecretValues,
+        ice_server_secret_values, is_public_turn_endpoint, normalize_secret_values,
+        redact_error_with_secrets, IceServerConfig, IceTransportPolicy, PeerConnectionConfig,
+        PeerConnectionRole, SecretValues,
     },
     control::{
         channel_info, realtime_channel_init, reliable_channel_init, weak_callback_owner,
@@ -64,17 +65,57 @@ const RESTART_VALIDATION_TIMEOUT: Duration = Duration::from_secs(10);
 const RESTART_PROBE_PREFIX: &[u8] = b"mrd-webrtc-restart-probe-v1:";
 static NEXT_RESTART_ROUTE_ID: AtomicU64 = AtomicU64::new(1);
 const RESTART_ROUTE_TOKEN_BYTES: usize = 32;
+const SCRUBBED_ICE_SERVER_URL: &str = "stun:0.0.0.0:9";
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+struct UpstreamIceServers(Vec<RTCIceServer>);
+
+impl UpstreamIceServers {
+    fn from_configs(servers: &[IceServerConfig]) -> Self {
+        let mut owner = Self(Vec::with_capacity(servers.len()));
+        for server in servers {
+            owner.0.push(RTCIceServer {
+                urls: server.urls.clone(),
+                username: server.username.clone(),
+                credential: server.credential.clone(),
+            });
+        }
+        owner
+    }
+
+    fn take(&mut self) -> Vec<RTCIceServer> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Zeroize for UpstreamIceServers {
+    fn zeroize(&mut self) {
+        for server in &mut self.0 {
+            server.urls.zeroize();
+            server.username.zeroize();
+            server.credential.zeroize();
+        }
+        self.0.clear();
+    }
+}
+
+impl ZeroizeOnDrop for UpstreamIceServers {}
+
+impl Drop for UpstreamIceServers {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Zeroize, ZeroizeOnDrop)]
 pub struct RestartRouteToken([u8; RESTART_ROUTE_TOKEN_BYTES]);
 
 impl RestartRouteToken {
     fn generate() -> Result<Self, TransportError> {
-        let mut bytes = [0_u8; RESTART_ROUTE_TOKEN_BYTES];
-        getrandom::fill(&mut bytes).map_err(|_| {
+        let mut bytes = Zeroizing::new([0_u8; RESTART_ROUTE_TOKEN_BYTES]);
+        getrandom::fill(&mut *bytes).map_err(|_| {
             TransportError::Message("secure restart route token generation failed".into())
         })?;
-        Ok(Self(bytes))
+        Ok(Self(*bytes))
     }
 
     pub fn from_wire(value: &str) -> Result<Self, TransportError> {
@@ -83,18 +124,18 @@ impl RestartRouteToken {
                 "invalid restart route token encoding".into(),
             ));
         }
-        let mut bytes = [0_u8; RESTART_ROUTE_TOKEN_BYTES];
+        let mut bytes = Zeroizing::new([0_u8; RESTART_ROUTE_TOKEN_BYTES]);
         for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
             let high = decode_hex(pair[0]).ok_or_else(invalid_route_token)?;
             let low = decode_hex(pair[1]).ok_or_else(invalid_route_token)?;
             bytes[index] = (high << 4) | low;
         }
-        Ok(Self(bytes))
+        Ok(Self(*bytes))
     }
 
-    pub fn to_wire(&self) -> String {
+    pub fn to_wire(&self) -> Zeroizing<String> {
         const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut output = String::with_capacity(RESTART_ROUTE_TOKEN_BYTES * 2);
+        let mut output = Zeroizing::new(String::with_capacity(RESTART_ROUTE_TOKEN_BYTES * 2));
         for byte in self.0 {
             output.push(char::from(HEX[usize::from(byte >> 4)]));
             output.push(char::from(HEX[usize::from(byte & 0x0f)]));
@@ -121,11 +162,13 @@ pub enum SessionDescriptionType {
     Answer,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct SessionDescription {
+    #[zeroize(skip)]
     pub kind: SessionDescriptionType,
     pub sdp: String,
     /// Authenticated signaling generation. Initial negotiation is generation zero.
+    #[zeroize(skip)]
     generation: u64,
     restart_route_token: Option<RestartRouteToken>,
 }
@@ -189,13 +232,15 @@ impl fmt::Debug for SessionDescription {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct IceCandidate {
     pub candidate: String,
     pub sdp_mid: Option<String>,
+    #[zeroize(skip)]
     pub sdp_mline_index: Option<u16>,
     pub username_fragment: Option<String>,
     /// Authenticated signaling generation. Initial negotiation is generation zero.
+    #[zeroize(skip)]
     generation: u64,
     restart_route_token: Option<RestartRouteToken>,
 }
@@ -905,12 +950,12 @@ impl Drop for PeerConstructionGuard {
 }
 
 impl From<IceCandidate> for RTCIceCandidateInit {
-    fn from(value: IceCandidate) -> Self {
+    fn from(mut value: IceCandidate) -> Self {
         Self {
-            candidate: value.candidate,
-            sdp_mid: value.sdp_mid,
+            candidate: std::mem::take(&mut value.candidate),
+            sdp_mid: std::mem::take(&mut value.sdp_mid),
             sdp_mline_index: value.sdp_mline_index,
-            username_fragment: value.username_fragment,
+            username_fragment: std::mem::take(&mut value.username_fragment),
         }
     }
 }
@@ -1073,7 +1118,7 @@ impl WebRtcPeerConnection {
     }
 
     async fn new_inner(
-        config: PeerConnectionConfig,
+        mut config: PeerConnectionConfig,
         construction_hook: Option<(Arc<AtomicBool>, Arc<Semaphore>)>,
         #[cfg(test)] cleanup_supervisor: Option<Arc<CleanupSupervisor>>,
         #[cfg(test)] blocking_close_interceptor: Option<BlockingCloseInterceptorHook>,
@@ -1090,7 +1135,7 @@ impl WebRtcPeerConnection {
         let cleanup_permit = cleanup_permit.map_err(|error| {
             TransportError::Message(format!("WebRTC cleanup capacity unavailable: {error}"))
         })?;
-        let config_secrets = secret_values(&config.ice_servers);
+        let mut config_secrets = secret_values(&config.ice_servers);
         let mut media_engine = MediaEngine::default();
         media_engine
             .register_default_codecs()
@@ -1135,22 +1180,14 @@ impl WebRtcPeerConnection {
             .with_interceptor_registry(registry)
             .with_setting_engine(settings)
             .build();
-        let ice_servers = config
-            .ice_servers
-            .iter()
-            .map(|server| RTCIceServer {
-                urls: server.urls.clone(),
-                username: server.username.clone(),
-                credential: server.credential.clone(),
-            })
-            .collect();
+        let mut upstream_ice_servers = UpstreamIceServers::from_configs(&config.ice_servers);
         let ice_transport_policy = match config.ice_transport_policy {
             IceTransportPolicy::All => RTCIceTransportPolicy::All,
             IceTransportPolicy::Relay => RTCIceTransportPolicy::Relay,
         };
-        let pc = Arc::new(
-            api.new_peer_connection(RTCConfiguration {
-                ice_servers,
+        let pc = api
+            .new_peer_connection(RTCConfiguration {
+                ice_servers: upstream_ice_servers.take(),
                 ice_transport_policy,
                 ..Default::default()
             })
@@ -1158,8 +1195,14 @@ impl WebRtcPeerConnection {
             .map_err(peer_error_redacted(
                 "create peer connection",
                 &config_secrets,
-            ))?,
-        );
+            ))?;
+        scrub_accessible_upstream_ice_servers(&pc, ice_transport_policy)
+            .await
+            .map_err(peer_error("scrub peer ICE server configuration"))?;
+        config.ice_servers.zeroize();
+        config_secrets.zeroize();
+        drop(config_secrets);
+        let pc = Arc::new(pc);
 
         let capacity = config.event_queue_capacity;
         let (control, reliable_rx, realtime_rx, bulk_rx) = ControlState::new(
@@ -1398,10 +1441,9 @@ impl WebRtcPeerConnection {
             .map_err(peer_error("create offer"))?;
         let description =
             SessionDescription::initial(SessionDescriptionType::Offer, offer.sdp.clone());
-        let sdp = offer.sdp.clone();
-        pc.set_local_description(offer)
-            .await
-            .map_err(|error| redact_sdp_error(peer_error("set local offer")(error), &sdp))?;
+        pc.set_local_description(offer).await.map_err(|error| {
+            redact_sdp_error(peer_error("set local offer")(error), &description.sdp)
+        })?;
         Ok(description)
     }
 
@@ -1424,18 +1466,20 @@ impl WebRtcPeerConnection {
 
     async fn accept_offer_physical(
         &self,
-        offer: SessionDescription,
+        mut offer: SessionDescription,
     ) -> Result<SessionDescription, TransportError> {
         self.require_role(PeerConnectionRole::Answerer)?;
         if offer.kind != SessionDescriptionType::Offer {
             return Err(TransportError::Message("expected an SDP offer".into()));
         }
-        let remote_sdp = offer.sdp;
-        let offer = RTCSessionDescription::offer(remote_sdp.clone())
-            .map_err(|error| redact_sdp_error(peer_error("parse offer")(error), &remote_sdp))?;
+        let remote_secrets = sdp_secret_values(&offer.sdp);
+        let offer =
+            RTCSessionDescription::offer(std::mem::take(&mut offer.sdp)).map_err(|error| {
+                redact_transport_error(peer_error("parse offer")(error), &remote_secrets)
+            })?;
         let pc = self.physical_snapshot()?.pc;
         pc.set_remote_description(offer).await.map_err(|error| {
-            redact_sdp_error(peer_error("set remote offer")(error), &remote_sdp)
+            redact_transport_error(peer_error("set remote offer")(error), &remote_secrets)
         })?;
         let answer = pc
             .create_answer(None)
@@ -1443,10 +1487,9 @@ impl WebRtcPeerConnection {
             .map_err(peer_error("create answer"))?;
         let description =
             SessionDescription::initial(SessionDescriptionType::Answer, answer.sdp.clone());
-        let local_sdp = answer.sdp.clone();
-        pc.set_local_description(answer)
-            .await
-            .map_err(|error| redact_sdp_error(peer_error("set local answer")(error), &local_sdp))?;
+        pc.set_local_description(answer).await.map_err(|error| {
+            redact_sdp_error(peer_error("set local answer")(error), &description.sdp)
+        })?;
         Ok(description)
     }
 
@@ -1470,20 +1513,24 @@ impl WebRtcPeerConnection {
 
     async fn accept_answer_physical(
         &self,
-        answer: SessionDescription,
+        mut answer: SessionDescription,
     ) -> Result<(), TransportError> {
         self.require_role(PeerConnectionRole::Offerer)?;
         if answer.kind != SessionDescriptionType::Answer {
             return Err(TransportError::Message("expected an SDP answer".into()));
         }
-        let remote_sdp = answer.sdp;
-        let answer = RTCSessionDescription::answer(remote_sdp.clone())
-            .map_err(|error| redact_sdp_error(peer_error("parse answer")(error), &remote_sdp))?;
+        let remote_secrets = sdp_secret_values(&answer.sdp);
+        let answer =
+            RTCSessionDescription::answer(std::mem::take(&mut answer.sdp)).map_err(|error| {
+                redact_transport_error(peer_error("parse answer")(error), &remote_secrets)
+            })?;
         self.physical_snapshot()?
             .pc
             .set_remote_description(answer)
             .await
-            .map_err(|error| redact_sdp_error(peer_error("set remote answer")(error), &remote_sdp))
+            .map_err(|error| {
+                redact_transport_error(peer_error("set remote answer")(error), &remote_secrets)
+            })
     }
 
     pub async fn next_local_candidate(&self) -> Option<IceCandidate> {
@@ -2170,6 +2217,8 @@ impl WebRtcPeerConnection {
                 }),
                 _ => None,
             };
+            state.active_route_token = None;
+            state.last_aborted_route = None;
             (active, pending)
         } else {
             (None, None)
@@ -2332,6 +2381,8 @@ impl WebRtcPeerConnection {
                 }),
                 _ => None,
             };
+            state.active_route_token = None;
+            state.last_aborted_route = None;
             (active, pending)
         };
         let mut errors = Vec::new();
@@ -3023,6 +3074,10 @@ async fn close_physical_payload(payload: &mut PhysicalCleanupPayload) -> Result<
     for task in tasks {
         let _ = task.await;
     }
+    // webrtc-rs retains private parsed ICE/agent copies which this crate cannot access. Replace
+    // the public configuration copy again before close; the construction path already did this
+    // immediately after the gatherer consumed its configuration.
+    let _ = scrub_accessible_upstream_ice_servers(&owners.pc, RTCIceTransportPolicy::All).await;
     let close_channels = async {
         if let Some(channel) = owners.control.channel(ControlLane::Reliable).await {
             let _ = channel.close().await;
@@ -3191,17 +3246,7 @@ fn validate_turn_servers(ice_servers: &[IceServerConfig]) -> Result<(), Transpor
                 "relay restart requires authenticated TURN server URLs".into(),
             ));
         }
-        if server.urls.iter().any(|url| {
-            let normalized = url.trim().to_ascii_lowercase();
-            let endpoint = normalized
-                .strip_prefix("turn:")
-                .or_else(|| normalized.strip_prefix("turns:"));
-            endpoint.is_none_or(|endpoint| {
-                endpoint.is_empty()
-                    || endpoint.starts_with('?')
-                    || endpoint.chars().any(char::is_whitespace)
-            })
-        }) {
+        if server.urls.iter().any(|url| !is_public_turn_endpoint(url)) {
             return Err(TransportError::Message(
                 "relay restart accepts only trusted turn: or turns: URLs".into(),
             ));
@@ -3232,25 +3277,25 @@ fn candidate_secret_values(candidate: &IceCandidate) -> SecretValues {
 }
 
 fn redact_transport_error(error: TransportError, secrets: &SecretValues) -> TransportError {
-    let mut message = error.to_string();
-    for secret in secrets.iter() {
-        message = message.replace(secret.as_str(), "[REDACTED]");
-    }
-    TransportError::Message(message)
+    redact_error_with_secrets(error, secrets)
 }
 
 fn redact_sdp_error(error: TransportError, sdp: &str) -> TransportError {
-    let secrets = sdp
-        .lines()
-        .filter_map(|line| {
-            line.strip_prefix("a=ice-ufrag:")
-                .or_else(|| line.strip_prefix("a=ice-pwd:"))
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(|value| Zeroizing::new(value.to_owned()))
-        })
-        .collect::<Vec<_>>();
-    redact_transport_error(error, &Zeroizing::new(secrets))
+    redact_transport_error(error, &sdp_secret_values(sdp))
+}
+
+fn sdp_secret_values(sdp: &str) -> SecretValues {
+    Zeroizing::new(
+        sdp.lines()
+            .filter_map(|line| {
+                line.strip_prefix("a=ice-ufrag:")
+                    .or_else(|| line.strip_prefix("a=ice-pwd:"))
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| Zeroizing::new(value.to_owned()))
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn validate_selected_pair(
@@ -3315,6 +3360,22 @@ fn peer_error(context: &'static str) -> impl FnOnce(webrtc::Error) -> TransportE
     move |error| TransportError::Message(format!("{context} failed: {error}"))
 }
 
+async fn scrub_accessible_upstream_ice_servers(
+    pc: &RTCPeerConnection,
+    ice_transport_policy: RTCIceTransportPolicy,
+) -> Result<(), webrtc::Error> {
+    pc.set_configuration(RTCConfiguration {
+        ice_servers: vec![RTCIceServer {
+            urls: vec![SCRUBBED_ICE_SERVER_URL.into()],
+            username: String::new(),
+            credential: String::new(),
+        }],
+        ice_transport_policy,
+        ..Default::default()
+    })
+    .await
+}
+
 fn peer_error_redacted<'a>(
     context: &'static str,
     secrets: &'a SecretValues,
@@ -3326,6 +3387,150 @@ fn peer_error_redacted<'a>(
 mod tests {
     use super::*;
     use tokio::sync::Semaphore;
+    use zeroize::{Zeroize, ZeroizeOnDrop};
+
+    fn assert_zeroizing_owner<T: Zeroize + ZeroizeOnDrop>() {}
+
+    fn assert_zeroizing_value<T: Zeroize + ZeroizeOnDrop>(_: &mut T) {}
+
+    #[test]
+    fn signaling_secret_owners_and_clones_zeroize_observably() {
+        assert_zeroizing_owner::<RestartRouteToken>();
+        assert_zeroizing_owner::<SessionDescription>();
+        assert_zeroizing_owner::<IceCandidate>();
+
+        let token_wire = "ab".repeat(RESTART_ROUTE_TOKEN_BYTES);
+        let mut token = RestartRouteToken::from_wire(&token_wire).expect("route token");
+        let mut description = SessionDescription::from_wire(
+            SessionDescriptionType::Offer,
+            "v=0\r\na=ice-ufrag:temporary-user\r\na=ice-pwd:temporary-password\r\n".into(),
+            1,
+            Some(&token_wire),
+        )
+        .expect("description");
+        let mut description_clone = description.clone();
+        let mut candidate = IceCandidate::from_wire(
+            "candidate:1 1 udp 1 127.0.0.1 9 typ relay ufrag candidate-secret".into(),
+            Some("data".into()),
+            Some(0),
+            Some("username-fragment-secret".into()),
+            1,
+            Some(&token_wire),
+        )
+        .expect("candidate");
+        let mut candidate_clone = candidate.clone();
+        let mut emitted_token = token.to_wire();
+        assert_zeroizing_value(&mut emitted_token);
+
+        token.zeroize();
+        description.zeroize();
+        description_clone.zeroize();
+        candidate.zeroize();
+        candidate_clone.zeroize();
+        emitted_token.zeroize();
+
+        assert_eq!(token.0, [0; RESTART_ROUTE_TOKEN_BYTES]);
+        assert!(emitted_token.is_empty());
+        for owner in [&description, &description_clone] {
+            assert!(owner.sdp.is_empty());
+            assert!(owner.restart_route_token.is_none());
+        }
+        for owner in [&candidate, &candidate_clone] {
+            assert!(owner.candidate.is_empty());
+            assert!(owner.sdp_mid.is_none());
+            assert!(owner.username_fragment.is_none());
+            assert!(owner.restart_route_token.is_none());
+        }
+    }
+
+    #[test]
+    fn temporary_upstream_ice_server_owner_zeroizes_observably() {
+        assert_zeroizing_owner::<UpstreamIceServers>();
+        let server = IceServerConfig::new(
+            vec!["turn:relay.example.test:3478?transport=udp".into()],
+            "temporary-upstream-user".into(),
+            "temporary-upstream-credential".into(),
+        );
+        let mut owner = UpstreamIceServers::from_configs(&[server]);
+
+        owner.zeroize();
+
+        assert!(owner.0.is_empty());
+    }
+
+    #[test]
+    fn relay_restart_rejects_every_credential_bearing_turn_url_component() {
+        for malicious in [
+            "turn:user:password@relay.example.test:3478?transport=udp",
+            "turn:relay.example.test:3478/private-secret",
+            "turn:relay.example.test:3478?api_key=query-secret",
+            "turn:relay.example.test:3478?transport=udp&api_key=query-secret",
+            "turn:relay.example.test:3478?transport=udp#fragment-secret",
+        ] {
+            let servers = [IceServerConfig::new(
+                vec![malicious.into()],
+                "ephemeral-user".into(),
+                "ephemeral-credential".into(),
+            )];
+            assert!(
+                validate_turn_servers(&servers).is_err(),
+                "accepted credential-bearing TURN URL: {malicious}"
+            );
+        }
+        assert!(validate_turn_servers(&[IceServerConfig::new(
+            vec!["turn:relay.example.test:3478?transport=udp".into()],
+            "ephemeral-user".into(),
+            "ephemeral-credential".into(),
+        )])
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn peer_replaces_its_accessible_upstream_ice_server_configuration_copy() {
+        let credential = "upstream-configuration-secret";
+        let peer = WebRtcPeerConnection::new(PeerConnectionConfig {
+            ice_servers: vec![IceServerConfig::new(
+                vec!["turn:relay.example.test:3478?transport=udp".into()],
+                "upstream-user-secret".into(),
+                credential.into(),
+            )],
+            ..PeerConnectionConfig::default()
+        })
+        .await
+        .expect("peer");
+        let physical = peer.physical_pc_for_test().expect("physical PC");
+        let upstream = physical.get_configuration().await;
+
+        assert!(peer.config.ice_servers.is_empty());
+        assert!(upstream.ice_servers.iter().all(|server| {
+            server.username.is_empty()
+                && server.credential.is_empty()
+                && server.urls.iter().all(|url| !url.contains(credential))
+        }));
+        peer.close().await.expect("close peer");
+    }
+
+    #[tokio::test]
+    async fn close_clears_owned_restart_tokens_before_the_peer_owner_drops() {
+        let peer = WebRtcPeerConnection::new(PeerConnectionConfig::default())
+            .await
+            .expect("peer");
+        {
+            let mut state = peer.restart_state();
+            state.active_route_token =
+                Some(RestartRouteToken::from_wire(&"ab".repeat(32)).expect("active token"));
+            state.last_aborted_route = Some((
+                1,
+                RestartRouteToken::from_wire(&"cd".repeat(32)).expect("aborted token"),
+            ));
+        }
+
+        peer.close().await.expect("close peer");
+
+        let state = peer.restart_state();
+        assert!(state.active_route_token.is_none());
+        assert!(state.last_aborted_route.is_none());
+    }
 
     #[test]
     fn completed_video_budget_is_bounded_by_retained_bytes() {
@@ -3698,7 +3903,7 @@ mod tests {
         assert_eq!(cleanup_failure.job_kind, "commit-old-route");
         assert_eq!(cleanup_failure.generation, Some(0));
         assert_eq!(cleanup_failure.route_id_summary, None);
-        assert!(!cleanup_failure.reason.contains(&route_secret));
+        assert!(!cleanup_failure.reason.contains(route_secret.as_str()));
         assert!(Arc::ptr_eq(
             &active.active_route().expect("published replacement"),
             &replacement

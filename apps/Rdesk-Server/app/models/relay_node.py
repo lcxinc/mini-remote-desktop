@@ -41,6 +41,10 @@ class RelayNode(Base):
         ),
         CheckConstraint("identity_epoch >= 1", name="ck_relay_nodes_identity_epoch"),
         CheckConstraint(
+            "previous_identity_sequence IS NULL OR previous_identity_sequence >= 0",
+            name="ck_relay_nodes_previous_identity_sequence",
+        ),
+        CheckConstraint(
             "process_health IN ('healthy', 'degraded', 'failed') AND "
             "listener_health IN ('healthy', 'degraded', 'failed') AND "
             "probe_health IN ('healthy', 'failed', 'non_evidence')",
@@ -146,6 +150,9 @@ class RelayNode(Base):
     )
     identity_epoch: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=1, server_default=text("1")
+    )
+    previous_identity_sequence: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
     )
     last_boot_id: Mapped[str | None] = mapped_column(String(22), nullable=True)
     last_heartbeat_nonce: Mapped[str | None] = mapped_column(String(43), nullable=True)

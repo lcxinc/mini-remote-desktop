@@ -3,7 +3,7 @@ use std::{future::Future, sync::OnceLock, time::Duration};
 use mrd_pipeline_core::{EncodedAccessUnit, VideoCodec};
 
 use crate::{
-    config::{ice_server_secret_values, SecretValues},
+    config::{ice_server_secret_values, redact_error_with_secrets, SecretValues},
     CandidateKind, ControlLane, IceServerConfig, IceTransportPolicy, PeerConnectionConfig,
     PeerConnectionRole, SelectedCandidatePairStats, TransportError, WebRtcPeerConnection,
 };
@@ -246,11 +246,7 @@ fn secret_values(servers: &[IceServerConfig]) -> SecretValues {
 }
 
 fn redact(error: TransportError, secrets: &SecretValues) -> TransportError {
-    let mut message = error.to_string();
-    for secret in secrets.iter() {
-        message = message.replace(secret.as_str(), "[REDACTED]");
-    }
-    TransportError::Message(message)
+    redact_error_with_secrets(error, secrets)
 }
 
 #[cfg(test)]

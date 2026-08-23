@@ -48,6 +48,36 @@ ENDPOINTS = [
 ]
 
 
+def test_turn_secret_validator_clears_controllable_base64_codec_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_decode = base64.urlsafe_b64decode
+    real_encode = base64.urlsafe_b64encode
+    codec_buffers: list[bytearray] = []
+
+    def tracked_decode(value: object) -> bytearray:
+        buffer = bytearray(real_decode(value))
+        codec_buffers.append(buffer)
+        return buffer
+
+    def tracked_encode(value: object) -> bytearray:
+        buffer = bytearray(real_encode(value))
+        codec_buffers.append(buffer)
+        return buffer
+
+    monkeypatch.setattr(
+        relay_repository_module.base64, "urlsafe_b64decode", tracked_decode
+    )
+    monkeypatch.setattr(
+        relay_repository_module.base64, "urlsafe_b64encode", tracked_encode
+    )
+    assert relay_repository_module._validated_turn_secret(TURN_SECRET) == (  # noqa: SLF001
+        TURN_SECRET.encode("ascii")
+    )
+    assert codec_buffers
+    assert all(buffer == bytearray(len(buffer)) for buffer in codec_buffers)
+
+
 class AsyncSessionShim:
     """Exercise async repository code against SQLite without weakening Postgres tests."""
 

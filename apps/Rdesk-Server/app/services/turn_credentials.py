@@ -234,7 +234,15 @@ def _coturn_wire_secret(secret: bytearray) -> tuple[bytearray, bool]:
     """Return canonical string bytes and whether a legacy raw envelope was read."""
 
     if len(secret) == 32 and _raw_turn_secret_has_minimum_quality(secret):
-        return bytearray(base64.urlsafe_b64encode(secret).rstrip(b"=")), True
+        encoded_result = base64.urlsafe_b64encode(secret)
+        encoded = (
+            encoded_result
+            if isinstance(encoded_result, bytearray)
+            else bytearray(encoded_result)
+        )
+        while encoded.endswith(b"="):
+            encoded.pop()
+        return encoded, True
     if (
         len(secret) != 43
         or any(byte > 0x7F for byte in secret)
@@ -243,10 +251,25 @@ def _coturn_wire_secret(secret: bytearray) -> tuple[bytearray, bool]:
         raise TurnCredentialConfigurationError(
             "relay credential material is unavailable"
         )
-    decoded = bytearray()
+    padded = bytearray(secret)
+    padded.extend(b"=")
+    decoded: bytearray | None = None
+    canonical: bytearray | None = None
     try:
-        decoded = bytearray(base64.urlsafe_b64decode(bytes(secret) + b"="))
-        canonical = base64.urlsafe_b64encode(decoded).rstrip(b"=")
+        decoded_result = base64.urlsafe_b64decode(padded)
+        decoded = (
+            decoded_result
+            if isinstance(decoded_result, bytearray)
+            else bytearray(decoded_result)
+        )
+        canonical_result = base64.urlsafe_b64encode(decoded)
+        canonical = (
+            canonical_result
+            if isinstance(canonical_result, bytearray)
+            else bytearray(canonical_result)
+        )
+        while canonical.endswith(b"="):
+            canonical.pop()
         if (
             len(decoded) != 32
             or not hmac.compare_digest(canonical, secret)
@@ -261,8 +284,10 @@ def _coturn_wire_secret(secret: bytearray) -> tuple[bytearray, bool]:
             "relay credential material is unavailable"
         ) from None
     finally:
-        for index in range(len(decoded)):
-            decoded[index] = 0
+        for buffer in (canonical, decoded, padded):
+            if buffer is not None:
+                for index in range(len(buffer)):
+                    buffer[index] = 0
 
 
 def _raw_turn_secret_has_minimum_quality(secret: bytes | bytearray) -> bool:

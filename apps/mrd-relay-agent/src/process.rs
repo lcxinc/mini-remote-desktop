@@ -16,6 +16,10 @@ pub enum ProcessHealth {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoturnSnapshot {
+    /// Changes whenever the process instance or applied configuration changes.
+    /// A PID alone is insufficient because coturn can hot-reload credentials.
+    pub generation: u64,
+    pub applied_secret_version: u64,
     pub health: ProcessHealth,
     pub active_allocations: u32,
     pub current_egress_bps: u64,
@@ -24,10 +28,18 @@ pub struct CoturnSnapshot {
 impl CoturnSnapshot {
     pub fn healthy(active_allocations: u32, current_egress_bps: u64) -> Self {
         Self {
+            generation: 1,
+            applied_secret_version: 1,
             health: ProcessHealth::Healthy,
             active_allocations,
             current_egress_bps,
         }
+    }
+
+    pub fn with_generation(mut self, generation: u64, applied_secret_version: u64) -> Self {
+        self.generation = generation;
+        self.applied_secret_version = applied_secret_version;
+        self
     }
 }
 
@@ -55,6 +67,15 @@ impl AllocationProbeEvidence {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveAllocationEvidence {
     proof_sha256: [u8; 32],
+}
+
+impl LiveAllocationEvidence {
+    /// Constructs evidence only after the caller has completed the production
+    /// allocation + bidirectional relay roundtrip. Kept crate-private so
+    /// downstream adapters and external tests cannot manufacture `Live`.
+    pub(crate) fn from_verified_roundtrip(proof_sha256: [u8; 32]) -> Self {
+        Self { proof_sha256 }
+    }
 }
 
 #[async_trait]
@@ -168,9 +189,9 @@ impl LocalAllocationProbePort for WebRtcLocalAllocationProbe {
         hasher.update(pair.bytes_sent.to_be_bytes());
         hasher.update(pair.bytes_received.to_be_bytes());
         let proof_sha256: [u8; 32] = hasher.finalize().into();
-        Ok(AllocationProbeEvidence::Live(LiveAllocationEvidence {
-            proof_sha256,
-        }))
+        Ok(AllocationProbeEvidence::Live(
+            LiveAllocationEvidence::from_verified_roundtrip(proof_sha256),
+        ))
     }
 }
 

@@ -6,8 +6,17 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use ed25519_dalek::{
+    pkcs8::{EncodePrivateKey as _, SecretDocument},
+    SigningKey,
+};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType, PKCS_ED25519};
-use ring::{hmac, rand::SystemRandom, signature, signature::KeyPair as _};
+use ring::{
+    hmac,
+    rand::{SecureRandom as _, SystemRandom},
+    signature,
+    signature::KeyPair as _,
+};
 use rustls_pki_types::PrivatePkcs8KeyDer;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -24,10 +33,11 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::{
     backend::{
         rotation_proof_message, serialize_renewal_body, serialize_secret_commit_body,
-        serialize_secret_upload_body, sign_relay_request, BackendError, EnrollmentRequest,
-        EnrollmentStatus, HeartbeatPayload, NodeCertificate, PickupRequest,
-        RelayBackendClientFactoryPort, RelayBackendPort, RenewalRequest, RequestAuthentication,
-        SecretCommitRequest, SecretUploadRequest, SignedHeartbeat, SwappableRelayBackend,
+        serialize_secret_rotation_status_body, serialize_secret_upload_body, sign_relay_request,
+        BackendError, EnrollmentRequest, EnrollmentStatus, HeartbeatPayload, NodeCertificate,
+        PickupRequest, RelayBackendClientFactoryPort, RelayBackendPort, RenewalRequest,
+        RequestAuthentication, SecretCommitRequest, SecretRotationStatusRequest,
+        SecretUploadRequest, SignedHeartbeat, SwappableRelayBackend,
     },
     runtime::{ClockPort, RuntimeError},
 };
@@ -348,13 +358,9 @@ fn generate_identity(node_id: &str) -> Result<StoredIdentity, RuntimeError> {
     if !valid_node_id(node_id) {
         return Err(RuntimeError::IdentityInvalid);
     }
-    let generated = signature::Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
-        .map_err(|_| RuntimeError::IdentityInvalid)?;
-    let key = signature::Ed25519KeyPair::from_pkcs8(generated.as_ref())
-        .map_err(|_| RuntimeError::IdentityInvalid)?;
-    let pkcs8 = PrivatePkcs8KeyDer::from(generated.as_ref().to_vec());
-    let rcgen_key = KeyPair::from_pkcs8_der_and_sign_algo(&pkcs8, &PKCS_ED25519)
-        .map_err(|_| RuntimeError::IdentityInvalid)?;
+    let (signing_key, generated) = generate_zeroizing_pkcs8()?;
+    let pkcs8 = PrivatePkcs8KeyDer::from(generated.as_bytes());
+    let rcgen_key = zeroizing_rcgen_key_pair(&pkcs8)?;
     let mut params = CertificateParams::default();
     let mut distinguished_name = DistinguishedName::new();
     distinguished_name.push(DnType::CommonName, node_id);
@@ -369,8 +375,8 @@ fn generate_identity(node_id: &str) -> Result<StoredIdentity, RuntimeError> {
         .map_err(|_| RuntimeError::IdentityInvalid)?;
     Ok(StoredIdentity {
         node_id: node_id.to_owned(),
-        private_pkcs8_b64: STANDARD.encode(generated.as_ref()),
-        public_key_b64: STANDARD.encode(key.public_key().as_ref()),
+        private_pkcs8_b64: STANDARD.encode(generated.as_bytes()),
+        public_key_b64: STANDARD.encode(signing_key.verifying_key().as_bytes()),
         csr_pem: csr.pem().map_err(|_| RuntimeError::IdentityInvalid)?,
         certificate: None,
         pending_enrollment: None,
@@ -378,6 +384,26 @@ fn generate_identity(node_id: &str) -> Result<StoredIdentity, RuntimeError> {
         request_sequence: 0,
         identity_epoch: initial_identity_epoch(),
     })
+}
+
+fn generate_zeroizing_pkcs8() -> Result<(SigningKey, SecretDocument), RuntimeError> {
+    let mut seed = Zeroizing::new([0_u8; ed25519_dalek::SECRET_KEY_LENGTH]);
+    SystemRandom::new()
+        .fill(seed.as_mut())
+        .map_err(|_| RuntimeError::IdentityInvalid)?;
+    let signing_key = SigningKey::from_bytes(&seed);
+    let document = signing_key
+        .to_pkcs8_der()
+        .map_err(|_| RuntimeError::IdentityInvalid)?;
+    Ok((signing_key, document))
+}
+
+fn zeroizing_rcgen_key_pair(
+    pkcs8: &PrivatePkcs8KeyDer<'_>,
+) -> Result<Zeroizing<KeyPair>, RuntimeError> {
+    KeyPair::from_pkcs8_der_and_sign_algo(pkcs8, &PKCS_ED25519)
+        .map(Zeroizing::new)
+        .map_err(|_| RuntimeError::IdentityInvalid)
 }
 
 fn validate_stored_identity(stored: &StoredIdentity, node_id: &str) -> Result<(), RuntimeError> {
@@ -390,7 +416,15 @@ fn validate_stored_identity(stored: &StoredIdentity, node_id: &str) -> Result<()
         &stored.csr_pem,
         node_id,
     )?;
+    if stored.pending_enrollment.as_ref().is_some_and(|pending| {
+        !valid_operation_id(&pending.enrollment_id) || !valid_enrollment_receipt(&pending.receipt)
+    }) {
+        return Err(RuntimeError::IdentityInvalid);
+    }
     if let Some(pending) = &stored.pending_renewal {
+        if !valid_operation_id(&pending.renewal_id) {
+            return Err(RuntimeError::IdentityInvalid);
+        }
         validate_key_and_csr(
             &pending.private_pkcs8_b64,
             &pending.public_key_b64,
@@ -408,6 +442,18 @@ fn valid_node_id(node_id: &str) -> bool {
         && node_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_operation_id(value: &str) -> bool {
+    (8..=128).contains(&value.len())
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_enrollment_receipt(value: &str) -> bool {
+    (20..=512).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
 fn validate_key_and_csr(
@@ -555,6 +601,7 @@ impl<F: IdentityFsPort> CertificateState<F> {
         factory: &dyn RelayBackendClientFactoryPort,
         slot: &SwappableRelayBackend,
     ) -> Result<(), RuntimeError> {
+        self.validate_active_certificate_at(self.clock.unix_seconds())?;
         let certificate = self
             .active_certificate()
             .ok_or(RuntimeError::EnrollmentMissing)?;
@@ -564,6 +611,22 @@ impl<F: IdentityFsPort> CertificateState<F> {
             .map_err(RuntimeError::Backend)?;
         slot.swap(backend);
         Ok(())
+    }
+
+    pub(crate) fn validate_active_certificate_at(
+        &self,
+        now_unix_seconds: i64,
+    ) -> Result<(), RuntimeError> {
+        let certificate = self
+            .active_certificate()
+            .ok_or(RuntimeError::EnrollmentMissing)?;
+        validate_node_certificate(
+            &certificate,
+            &self.identity.stored.node_id,
+            &self.identity.public_key(),
+            &self.trusted_ca_der,
+            now_unix_seconds,
+        )
     }
 
     pub fn prepare_secret_upload(
@@ -643,6 +706,61 @@ impl<F: IdentityFsPort> CertificateState<F> {
         };
         let body = serialize_secret_commit_body(&request).map_err(RuntimeError::Backend)?;
         let path = format!("/api/v1/relays/{node_id}/secret-rotation/commit");
+        request.authentication = self.consume_signed_request("POST", &path, timestamp, &body)?;
+        Ok(request)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_secret_rotation_status(
+        &mut self,
+        timestamp: i64,
+        rotation_id: String,
+        secret_version: u64,
+        rotation_challenge: String,
+        pending_secret_digest: [u8; 32],
+        proof_sha256: [u8; 32],
+        canonical_secret: &str,
+    ) -> Result<SecretRotationStatusRequest, RuntimeError> {
+        let node_id = self.identity.stored.node_id.clone();
+        let identity_epoch = self.identity.stored.identity_epoch;
+        let proof_message = rotation_proof_message(
+            &node_id,
+            identity_epoch,
+            &rotation_id,
+            secret_version,
+            &rotation_challenge,
+            &pending_secret_digest,
+            &proof_sha256,
+        )
+        .map_err(RuntimeError::Backend)?;
+        let proof_mac = hmac::sign(
+            &hmac::Key::new(hmac::HMAC_SHA256, canonical_secret.as_bytes()),
+            &proof_message,
+        );
+        let mut request = SecretRotationStatusRequest {
+            node_id: node_id.clone(),
+            identity_epoch,
+            rotation_id,
+            secret_version,
+            rotation_challenge,
+            probe_evidence_sha256: proof_sha256
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            proof_mac: proof_mac
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            authentication: RequestAuthentication {
+                timestamp,
+                sequence: 0,
+                signature_b64: String::new(),
+            },
+        };
+        let body =
+            serialize_secret_rotation_status_body(&request).map_err(RuntimeError::Backend)?;
+        let path = format!("/api/v1/relays/{node_id}/secret-rotation/status");
         request.authentication = self.consume_signed_request("POST", &path, timestamp, &body)?;
         Ok(request)
     }
@@ -799,6 +917,9 @@ impl<F: IdentityFsPort> CertificateState<F> {
         timestamp: i64,
         activation: Option<(&dyn RelayBackendClientFactoryPort, &SwappableRelayBackend)>,
     ) -> Result<(), RuntimeError> {
+        if !valid_operation_id(renewal_id) {
+            return Err(RuntimeError::IdentityInvalid);
+        }
         if let Some(pending) = self.identity.stored.pending_renewal.clone() {
             if pending.renewal_id != renewal_id {
                 return Err(RuntimeError::RenewalConflict);
@@ -998,6 +1119,7 @@ fn validate_node_certificate(
         || leaf.issuer() != ca.subject()
         || leaf.verify_signature(Some(ca.public_key())).is_err()
         || !leaf.validity().is_valid_at(now)
+        || !ca.validity().is_valid_at(now)
         || certificate.expires_at_unix_seconds != leaf.validity().not_after.timestamp()
         || validate_exact_common_name(leaf.subject(), node_id).is_err()
         || leaf
@@ -1119,5 +1241,42 @@ impl From<&StoredCertificate> for NodeCertificate {
 impl From<BackendError> for RuntimeError {
     fn from(value: BackendError) -> Self {
         RuntimeError::Backend(value)
+    }
+}
+
+#[cfg(test)]
+mod zeroizing_pkcs8_tests {
+    use super::{
+        generate_zeroizing_pkcs8, signature, zeroizing_rcgen_key_pair, CertificateParams,
+        PrivatePkcs8KeyDer,
+    };
+    use ring::signature::KeyPair as _;
+    use zeroize::ZeroizeOnDrop;
+
+    fn assert_zeroize_on_drop<T: ZeroizeOnDrop>(_value: &T) {}
+
+    #[test]
+    fn generated_pkcs8_uses_zeroizing_owners_and_remains_ring_compatible() {
+        let (signing_key, pkcs8) = generate_zeroizing_pkcs8().unwrap();
+        assert_zeroize_on_drop(&signing_key);
+        assert_zeroize_on_drop(&pkcs8);
+
+        let ring_key = signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_bytes()).unwrap();
+        assert_eq!(
+            ring_key.public_key().as_ref(),
+            signing_key.verifying_key().as_bytes()
+        );
+    }
+
+    #[test]
+    fn rcgen_private_key_copy_has_zeroizing_owner_and_remains_csr_compatible() {
+        let (_signing_key, pkcs8) = generate_zeroizing_pkcs8().unwrap();
+        let pkcs8 = PrivatePkcs8KeyDer::from(pkcs8.as_bytes());
+        let rcgen_key = zeroizing_rcgen_key_pair(&pkcs8).unwrap();
+        assert_zeroize_on_drop(&rcgen_key);
+
+        CertificateParams::default()
+            .serialize_request(&rcgen_key)
+            .unwrap();
     }
 }

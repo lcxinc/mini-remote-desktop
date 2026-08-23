@@ -64,7 +64,10 @@ impl ReqwestCoturnMetrics {
             None => false,
         };
         if !loopback
-            || !matches!(url.scheme(), "http" | "https")
+            // Metrics are a loopback-only plaintext endpoint. Accepting HTTPS
+            // here without a separately pinned private CA would silently
+            // re-enable the platform WebPKI root set outside the backend pin.
+            || url.scheme() != "http"
             || !url.username().is_empty()
             || url.password().is_some()
             || url.query().is_some()

@@ -922,27 +922,46 @@ def _validated_turn_secret(value: object) -> bytes:
         or re.fullmatch(r"[A-Za-z0-9_-]{43}", value) is None
     ):
         raise RelayRepositoryError("INVALID_TURN_SECRET", "TURN secret required")
+    padded = bytearray(value.encode("ascii"))
+    padded.extend(b"=")
+    decoded: bytearray | None = None
+    canonical: bytearray | None = None
     try:
-        decoded = bytearray(base64.urlsafe_b64decode(value + "="))
-    except (ValueError, binascii.Error):
-        raise RelayRepositoryError(
-            "INVALID_TURN_SECRET", "TURN secret required"
-        ) from None
-    try:
-        canonical = base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii")
+        try:
+            decoded_result = base64.urlsafe_b64decode(padded)
+            decoded = (
+                decoded_result
+                if isinstance(decoded_result, bytearray)
+                else bytearray(decoded_result)
+            )
+            canonical_result = base64.urlsafe_b64encode(decoded)
+            canonical = (
+                canonical_result
+                if isinstance(canonical_result, bytearray)
+                else bytearray(canonical_result)
+            )
+            while canonical.endswith(b"="):
+                canonical.pop()
+            padded.pop()
+        except (ValueError, binascii.Error):
+            raise RelayRepositoryError(
+                "INVALID_TURN_SECRET", "TURN secret required"
+            ) from None
         if (
             len(decoded) != 32
-            or not hmac.compare_digest(canonical, value)
+            or not hmac.compare_digest(canonical, padded)
             or not _turn_secret_has_minimum_quality(decoded)
         ):
             raise RelayRepositoryError("INVALID_TURN_SECRET", "TURN secret required")
         # coturn's static-auth-secret is the configured string, not its decoded
         # entropy bytes. The representation is canonical, so preserving it is
         # unambiguous and keeps the agent/server/coturn HMAC keys identical.
-        return value.encode("ascii")
+        return bytes(padded)
     finally:
-        for index in range(len(decoded)):
-            decoded[index] = 0
+        for buffer in (canonical, decoded, padded):
+            if buffer is not None:
+                for index in range(len(buffer)):
+                    buffer[index] = 0
 
 
 def _turn_secret_has_minimum_quality(secret: bytes | bytearray) -> bool:

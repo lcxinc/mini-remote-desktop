@@ -17,17 +17,48 @@ from pydantic import (
 )
 
 
-def _canonical_base64url_32(value: str) -> str:
+def _canonical_base64url(value: str, decoded_length: int) -> str:
+    padded = bytearray(value.encode("ascii"))
+    padded.extend(b"=" * ((4 - len(value) % 4) % 4))
+    decoded: bytearray | None = None
+    canonical: bytearray | None = None
     try:
-        decoded = base64.urlsafe_b64decode(value + "=")
-    except (ValueError, binascii.Error):
-        raise ValueError("value must be canonical base64url") from None
-    if (
-        len(decoded) != 32
-        or base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii") != value
-    ):
-        raise ValueError("value must be canonical base64url")
-    return value
+        try:
+            decoded_result = base64.urlsafe_b64decode(padded)
+            decoded = (
+                decoded_result
+                if isinstance(decoded_result, bytearray)
+                else bytearray(decoded_result)
+            )
+            canonical_result = base64.urlsafe_b64encode(decoded)
+            canonical = (
+                canonical_result
+                if isinstance(canonical_result, bytearray)
+                else bytearray(canonical_result)
+            )
+            while canonical.endswith(b"="):
+                canonical.pop()
+        except (ValueError, binascii.Error):
+            raise ValueError("value must be canonical base64url") from None
+        if (
+            len(decoded) != decoded_length
+            or canonical.decode("ascii") != value
+        ):
+            raise ValueError("value must be canonical base64url")
+        return value
+    finally:
+        for buffer in (canonical, decoded, padded):
+            if buffer is not None:
+                for index in range(len(buffer)):
+                    buffer[index] = 0
+
+
+def _canonical_base64url_16(value: str) -> str:
+    return _canonical_base64url(value, 16)
+
+
+def _canonical_base64url_32(value: str) -> str:
+    return _canonical_base64url(value, 32)
 
 
 RelayId = Annotated[
@@ -62,7 +93,9 @@ RotationId = Annotated[
     ),
 ]
 BootId = Annotated[
-    str, StringConstraints(min_length=22, max_length=22, pattern=r"^[A-Za-z0-9_-]{22}$")
+    str,
+    StringConstraints(min_length=22, max_length=22, pattern=r"^[A-Za-z0-9_-]{22}$"),
+    AfterValidator(_canonical_base64url_16),
 ]
 RequestNonce = Annotated[
     str,
@@ -87,7 +120,7 @@ class RelayEnrollmentRequest(BaseModel):
     node_id: CredentialSafeRelayId
     region: Region
     failure_domain: RelayId
-    endpoints: list[Endpoint] = Field(min_length=1, max_length=4)
+    endpoints: list[Endpoint] = Field(min_length=1, max_length=4, repr=False)
     max_allocations: int = Field(ge=1, le=2**31 - 1)
     max_egress_bps: int = Field(ge=1, le=2**63 - 1)
     csr_pem: str = Field(min_length=100, max_length=16_384, repr=False)
@@ -174,7 +207,7 @@ class RelayHeartbeatRequest(BaseModel):
         default=None, strict=True, ge=0, le=2**32 - 1
     )
     recent_failure_bps: int = Field(default=0, strict=True, ge=0, le=10_000)
-    endpoints: list[Endpoint] = Field(min_length=1, max_length=4)
+    endpoints: list[Endpoint] = Field(min_length=1, max_length=4, repr=False)
     applied_secret_version: int = Field(strict=True, ge=1, le=2**63 - 1)
 
 
@@ -276,6 +309,28 @@ class RelaySecretCommitResponse(BaseModel):
     rotation_id: RotationId
     active_secret_version: int
     status: Literal["committed"]
+
+
+class RelaySecretRotationStatusRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    identity_epoch: int = Field(strict=True, ge=1, le=2**63 - 1)
+    rotation_id: RotationId
+    secret_version: int = Field(strict=True, ge=2, le=2**63 - 1)
+    rotation_challenge: RequestNonce
+    probe_evidence_sha256: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    proof_mac: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+
+class RelaySecretRotationStatusResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: RelayId
+    identity_epoch: int
+    active_secret_version: int
+    status: Literal["committed_exact", "pending", "unknown"]
 
 
 class RelayNodeResponse(BaseModel):

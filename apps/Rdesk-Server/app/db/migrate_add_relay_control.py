@@ -41,6 +41,10 @@ def _v8_constraints_sql(nodes: str) -> str:
         ("ck_relay_nodes_current_ingress", "current_ingress_bps >= 0"),
         ("ck_relay_nodes_identity_epoch", "identity_epoch >= 1"),
         (
+            "ck_relay_nodes_previous_identity_sequence",
+            "previous_identity_sequence IS NULL OR previous_identity_sequence >= 0",
+        ),
+        (
             "ck_relay_nodes_health",
             "process_health IN ('healthy', 'degraded', 'failed') AND "
             "listener_health IN ('healthy', 'degraded', 'failed') AND "
@@ -185,6 +189,7 @@ async def _migrate_connection(
                     ALTER TABLE {nodes}
                         ADD COLUMN current_ingress_bps BIGINT NOT NULL DEFAULT 0,
                         ADD COLUMN identity_epoch BIGINT NOT NULL DEFAULT 1,
+                        ADD COLUMN previous_identity_sequence BIGINT,
                         ADD COLUMN last_boot_id VARCHAR(22),
                         ADD COLUMN last_heartbeat_nonce VARCHAR(43),
                         ADD COLUMN process_health VARCHAR(16) NOT NULL DEFAULT 'failed',
@@ -252,6 +257,7 @@ async def _migrate_connection(
             current_ingress_bps BIGINT NOT NULL DEFAULT 0,
             current_egress_bps BIGINT NOT NULL DEFAULT 0,
             identity_epoch BIGINT NOT NULL DEFAULT 1,
+            previous_identity_sequence BIGINT,
             last_boot_id VARCHAR(22),
             last_heartbeat_nonce VARCHAR(43),
             process_health VARCHAR(16) NOT NULL DEFAULT 'failed',
@@ -298,6 +304,9 @@ async def _migrate_connection(
             CONSTRAINT ck_relay_nodes_current_ingress CHECK (current_ingress_bps >= 0),
             CONSTRAINT ck_relay_nodes_current_egress CHECK (current_egress_bps >= 0),
             CONSTRAINT ck_relay_nodes_identity_epoch CHECK (identity_epoch >= 1),
+            CONSTRAINT ck_relay_nodes_previous_identity_sequence CHECK (
+                previous_identity_sequence IS NULL OR previous_identity_sequence >= 0
+            ),
             CONSTRAINT ck_relay_nodes_health CHECK (
                 process_health IN ('healthy', 'degraded', 'failed') AND
                 listener_health IN ('healthy', 'degraded', 'failed') AND
@@ -492,6 +501,7 @@ async def _migrate_connection(
         "current_ingress_bps BIGINT NOT NULL DEFAULT 0",
         f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS "
         "identity_epoch BIGINT NOT NULL DEFAULT 1",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS previous_identity_sequence BIGINT",
         f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS last_boot_id VARCHAR(22)",
         f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS last_heartbeat_nonce VARCHAR(43)",
         f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS "
@@ -605,6 +615,10 @@ async def _migrate_connection(
         ("ck_relay_nodes_current_ingress", "current_ingress_bps >= 0"),
         ("ck_relay_nodes_identity_epoch", "identity_epoch >= 1"),
         (
+            "ck_relay_nodes_previous_identity_sequence",
+            "previous_identity_sequence IS NULL OR previous_identity_sequence >= 0",
+        ),
+        (
             "ck_relay_nodes_health",
             "process_health IN ('healthy', 'degraded', 'failed') AND "
             "listener_health IN ('healthy', 'degraded', 'failed') AND "
@@ -634,6 +648,25 @@ async def _migrate_connection(
             "length(pending_secret_digest) = 32 AND "
             "pending_rotation_id IS NOT NULL AND "
             "pending_secret_uploaded_at IS NOT NULL)",
+        ),
+        (
+            "ck_relay_nodes_rotation_challenge",
+            "(desired_secret_version = active_secret_version AND "
+            "rotation_challenge IS NULL) OR "
+            "(desired_secret_version > active_secret_version AND "
+            "rotation_challenge IS NOT NULL AND length(rotation_challenge) = 43)",
+        ),
+        (
+            "ck_relay_nodes_rotation_committed_proof",
+            "(committed_rotation_id IS NULL AND committed_identity_epoch IS NULL AND "
+            "committed_rotation_challenge IS NULL AND "
+            "committed_probe_evidence_sha256 IS NULL AND committed_proof_mac IS NULL) OR "
+            "(committed_rotation_id IS NOT NULL AND committed_identity_epoch >= 1 AND "
+            "committed_rotation_challenge IS NOT NULL AND "
+            "length(committed_rotation_challenge) = 43 AND "
+            "committed_probe_evidence_sha256 IS NOT NULL AND "
+            "length(committed_probe_evidence_sha256) = 32 AND "
+            "committed_proof_mac IS NOT NULL AND length(committed_proof_mac) = 32)",
         ),
     ):
         await connection.execute(
@@ -778,6 +811,7 @@ def _preflight_existing_schema(sync_connection: object, schema: str | None) -> N
             "relay_nodes": {
                 "current_ingress_bps",
                 "identity_epoch",
+                "previous_identity_sequence",
                 "last_boot_id",
                 "last_heartbeat_nonce",
                 "process_health",
@@ -1107,6 +1141,7 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             "current_ingress_bps": (BigInteger, None, False),
             "current_egress_bps": (BigInteger, None, False),
             "identity_epoch": (BigInteger, None, False),
+            "previous_identity_sequence": (BigInteger, None, True),
             "last_boot_id": (String, 22, True),
             "last_heartbeat_nonce": (String, 43, True),
             "process_health": (String, 16, False),
@@ -1293,6 +1328,9 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             "ck_relay_nodes_current_ingress": "current_ingress_bps >= 0",
             "ck_relay_nodes_current_egress": "current_egress_bps >= 0",
             "ck_relay_nodes_identity_epoch": "identity_epoch >= 1",
+            "ck_relay_nodes_previous_identity_sequence": (
+                "previous_identity_sequence IS NULL OR previous_identity_sequence >= 0"
+            ),
             "ck_relay_nodes_health": (
                 "process_health = ANY (ARRAY['healthy', 'degraded', 'failed'])) AND ("
                 "listener_health = ANY (ARRAY['healthy', 'degraded', 'failed'])) AND ("

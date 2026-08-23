@@ -54,6 +54,8 @@ from app.schemas.relay import (
     RelaySecretCommitResponse,
     RelaySecretRotationDirective,
     RelaySecretRotationRequest,
+    RelaySecretRotationStatusRequest,
+    RelaySecretRotationStatusResponse,
     RelaySecretUploadRequest,
     RelaySecretUploadResponse,
 )
@@ -117,6 +119,13 @@ router = APIRouter(
 _HEARTBEAT_OPENAPI_PATH = "/api/v1/relays/{node_id}/heartbeat"
 _RENEWAL_OPENAPI_PATH = "/api/v1/relays/{node_id}/renew"
 _PICKUP_OPENAPI_PATH = "/api/v1/relays/enrollments/{enrollment_id}/pickup"
+_SIGNED_ROTATION_OPENAPI_PATHS = frozenset(
+    {
+        "/api/v1/relays/{node_id}/secret-rotation/upload",
+        "/api/v1/relays/{node_id}/secret-rotation/commit",
+        "/api/v1/relays/{node_id}/secret-rotation/status",
+    }
+)
 _HEARTBEAT_AUTH_HEADERS = {
     "X-Rdesk-Client-Cert-Sha256",
     "X-Relay-Node-Id",
@@ -166,6 +175,8 @@ def install_relay_openapi(app: FastAPI) -> None:
                     _RENEWAL_OPENAPI_PATH: _RENEWAL_AUTH_HEADERS,
                     _PICKUP_OPENAPI_PATH: _PICKUP_AUTH_HEADERS,
                 }.get(path)
+                if path in _SIGNED_ROTATION_OPENAPI_PATHS:
+                    required_headers = _HEARTBEAT_AUTH_HEADERS
                 if required_headers is None or method != "post":
                     continue
                 parameters = operation.get("parameters")
@@ -602,6 +613,7 @@ async def renew_relay_certificate(
             )
         renewed = await _registry(db).renew(
             identity=identity,
+            sequence=request.state.relay_sequence,
             renewal_id=payload.renewal_id,
             csr_pem=payload.csr_pem,
             ca_certificate_pem=settings.relay_ca_certificate_pem,
@@ -729,6 +741,33 @@ async def commit_relay_secret(
         active_secret_version=node.active_secret_version,
         status="committed",
     )
+
+
+@router.post(
+    "/{node_id}/secret-rotation/status",
+    response_model=RelaySecretRotationStatusResponse,
+    openapi_extra={"security": ({"TrustedMTLSProxy": [], "RelayEd25519": []},)},
+)
+async def get_relay_secret_rotation_status(
+    node_id: str,
+    payload: RelaySecretRotationStatusRequest,
+    identity: RelayIdentity = Depends(get_verified_relay_node),
+    db: AsyncSession = Depends(get_db),
+) -> RelaySecretRotationStatusResponse:
+    try:
+        result = await _registry(db).secret_rotation_status(
+            identity=identity,
+            identity_epoch=payload.identity_epoch,
+            rotation_id=payload.rotation_id,
+            secret_version=payload.secret_version,
+            rotation_challenge=payload.rotation_challenge,
+            probe_evidence_sha256=payload.probe_evidence_sha256,
+            proof_mac=payload.proof_mac,
+            now=_now(),
+        )
+    except RelayRegistryError as error:
+        _raise_domain(error)
+    return RelaySecretRotationStatusResponse(**result.__dict__)
 
 
 @router.get("", response_model=list[RelayNodeResponse])

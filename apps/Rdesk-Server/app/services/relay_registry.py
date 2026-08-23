@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from typing import AsyncIterator, NoReturn
 
 from pydantic import SecretStr
-from sqlalchemy import and_, case, event, select, text, update
+from sqlalchemy import event, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -70,16 +70,38 @@ def rotation_proof_message(
         or len(probe_evidence_sha256) != 32
     ):
         raise ValueError("relay rotation proof fields are invalid")
+    padded_challenge = bytearray(rotation_challenge.encode("ascii"))
+    padded_challenge.extend(b"=")
+    decoded_challenge: bytearray | None = None
+    canonical_challenge: bytearray | None = None
     try:
-        decoded_challenge = base64.urlsafe_b64decode(rotation_challenge + "=")
-    except (ValueError, binascii.Error):
-        raise ValueError("relay rotation proof fields are invalid") from None
-    if (
-        len(decoded_challenge) != 32
-        or base64.urlsafe_b64encode(decoded_challenge).rstrip(b"=").decode("ascii")
-        != rotation_challenge
-    ):
-        raise ValueError("relay rotation proof fields are invalid")
+        try:
+            decoded_result = base64.urlsafe_b64decode(padded_challenge)
+            decoded_challenge = (
+                decoded_result
+                if isinstance(decoded_result, bytearray)
+                else bytearray(decoded_result)
+            )
+            canonical_result = base64.urlsafe_b64encode(decoded_challenge)
+            canonical_challenge = (
+                canonical_result
+                if isinstance(canonical_result, bytearray)
+                else bytearray(canonical_result)
+            )
+            while canonical_challenge.endswith(b"="):
+                canonical_challenge.pop()
+        except (ValueError, binascii.Error):
+            raise ValueError("relay rotation proof fields are invalid") from None
+        if (
+            len(decoded_challenge) != 32
+            or canonical_challenge.decode("ascii") != rotation_challenge
+        ):
+            raise ValueError("relay rotation proof fields are invalid")
+    finally:
+        for buffer in (canonical_challenge, decoded_challenge, padded_challenge):
+            if buffer is not None:
+                for index in range(len(buffer)):
+                    buffer[index] = 0
     fields = (
         node_id.encode("ascii"),
         str(identity_epoch).encode("ascii"),
@@ -136,6 +158,14 @@ class RelayEnrollmentPickup:
 class RevokedRelay:
     node_id: str
     state: str
+
+
+@dataclass(frozen=True)
+class RelayRotationStatus:
+    node_id: str
+    identity_epoch: int
+    active_secret_version: int
+    status: str
 
 
 class RelayRegistry:
@@ -541,6 +571,7 @@ class RelayRegistry:
         self,
         *,
         identity: RelayIdentity,
+        sequence: int,
         renewal_id: str,
         csr_pem: str,
         ca_certificate_pem: str,
@@ -560,8 +591,23 @@ class RelayRegistry:
             node, registration = await self._locked_node_and_registration(
                 identity.node_id
             )
-            return await self._renew_locked(
+            identity_kind = self._locked_identity_kind(
                 identity=identity,
+                node=node,
+                registration=registration,
+                allow_previous=True,
+                now=now,
+            )
+            locked_identity = RelayIdentity(
+                node_id=identity.node_id,
+                certificate_fingerprint=identity.certificate_fingerprint,
+                signing_public_key=identity.signing_public_key,
+                state=node.state if node is not None else identity.state,
+                is_previous=identity_kind == "previous",
+            )
+            return await self._renew_locked(
+                identity=locked_identity,
+                sequence=sequence,
                 renewal_id=renewal_id,
                 canonical_csr=canonical_csr,
                 signing_public_key=signing_public_key,
@@ -582,6 +628,7 @@ class RelayRegistry:
         self,
         *,
         identity: RelayIdentity,
+        sequence: int,
         renewal_id: str,
         canonical_csr: bytes,
         signing_public_key: bytes,
@@ -601,6 +648,10 @@ class RelayRegistry:
             self._error("relay_certificate_invalid", 401, "relay certificate invalid")
         if node.state == "revoked" or registration.status == "revoked":
             self._error("relay_node_revoked", 403, "relay node revoked")
+        previous_sequence = node.previous_identity_sequence or 0
+        last_sequence = previous_sequence if identity.is_previous else node.heartbeat_sequence
+        if not 1 <= sequence <= 2**63 - 1 or sequence <= last_sequence:
+            self._error("relay_heartbeat_replayed", 409, "relay heartbeat replayed")
         if identity.is_previous and (
             registration.previous_certificate_expires_at is None
             or self._as_utc(registration.previous_certificate_expires_at) <= now
@@ -645,6 +696,12 @@ class RelayRegistry:
                         registration.renewal_certificate_expires_at
                     ),
                 )
+                if identity.is_previous:
+                    node.previous_identity_sequence = sequence
+                else:
+                    node.heartbeat_sequence = sequence
+                node.updated_at = now
+                await self._session.flush()
                 return ApprovedRelay(node=node, certificate=certificate)
             if existing_renewal_id == renewal_id or identity.is_previous:
                 self._error("relay_renewal_conflict", 409, "relay renewal conflicts")
@@ -698,6 +755,7 @@ class RelayRegistry:
         )
         node.certificate_fingerprint = certificate.fingerprint
         node.identity_epoch += 1
+        node.previous_identity_sequence = sequence
         node.heartbeat_sequence = 0
         # Desired-state messages are scoped to the certificate identity epoch.
         # A grace-period identity may retry renewal, but it cannot carry a
@@ -757,11 +815,6 @@ class RelayRegistry:
         now: datetime,
     ) -> RelayNode:
         canonical_endpoints = self._endpoints(endpoints, "relay_metrics_invalid")
-        node = await self._session.get(RelayNode, identity.node_id)
-        if node is None:
-            self._error("relay_certificate_invalid", 401, "relay certificate invalid")
-        if node.state == "revoked":
-            self._error("relay_node_revoked", 403, "relay node revoked")
         invalid_selection_metrics = (
             measured_rtt_ms is not None
             and (
@@ -777,114 +830,93 @@ class RelayRegistry:
             and listener_health in {"healthy", "degraded", "failed"}
             and probe_health in {"healthy", "failed", "non_evidence"}
         )
-        if (
-            identity_epoch != node.identity_epoch
-            or active_allocations > node.max_allocations
-            or max_allocations != node.max_allocations
-            or max_egress_bps != node.max_egress_bps
-            or applied_secret_version != node.applied_secret_version
-            or not health_values_valid
-            or invalid_selection_metrics
-        ):
-            self._error("relay_metrics_invalid", 400, "relay metrics invalid")
-        heartbeat_healthy = (
-            process_health == "healthy"
-            and listener_health == "healthy"
-            and probe_health == "healthy"
-        )
-        lease_expires_at = (
-            now + timedelta(seconds=15) if heartbeat_healthy else now
-        )
-        fresh_ready = and_(
-            RelayNode.state.in_(("available", "degraded")),
-            RelayNode.lease_expires_at.is_not(None),
-            RelayNode.lease_expires_at > now,
-        )
-        if heartbeat_healthy:
-            next_streak = case(
-                (RelayNode.state == "draining", RelayNode.healthy_heartbeat_streak),
-                (fresh_ready, 3),
-                (
-                    RelayNode.state == "unavailable",
-                    case(
-                        (
-                            RelayNode.healthy_heartbeat_streak < 3,
-                            RelayNode.healthy_heartbeat_streak + 1,
-                        ),
-                        else_=3,
-                    ),
-                ),
-                else_=1,
+        async with self._node_identity_lock(identity.node_id):
+            node, registration = await self._locked_node_and_registration(
+                identity.node_id
             )
-            next_state = case(
-                (RelayNode.state == "draining", "draining"),
-                (fresh_ready, RelayNode.state),
-                (
-                    and_(
-                        RelayNode.state == "unavailable",
-                        RelayNode.healthy_heartbeat_streak >= 2,
-                    ),
-                    "available",
-                ),
-                else_="unavailable",
+            self._locked_identity_kind(
+                identity=identity,
+                node=node,
+                registration=registration,
+                allow_previous=False,
+                now=now,
             )
-        else:
-            next_streak = 0
-            next_state = "unavailable"
-        result = await self._session.execute(
-            update(RelayNode)
-            .where(
-                RelayNode.node_id == identity.node_id,
-                RelayNode.certificate_fingerprint == identity.certificate_fingerprint,
-                RelayNode.identity_epoch == identity_epoch,
-                RelayNode.state != "revoked",
-                RelayNode.heartbeat_sequence < sequence,
+            assert node is not None
+            if sequence <= node.heartbeat_sequence:
+                self._error(
+                    "relay_heartbeat_replayed", 409, "relay heartbeat replayed"
+                )
+            if (
+                identity_epoch != node.identity_epoch
+                or active_allocations > node.max_allocations
+                or max_allocations != node.max_allocations
+                or max_egress_bps != node.max_egress_bps
+                or applied_secret_version != node.applied_secret_version
+                or not health_values_valid
+                or invalid_selection_metrics
+            ):
+                self._error("relay_metrics_invalid", 400, "relay metrics invalid")
+            heartbeat_healthy = (
+                process_health == "healthy"
+                and listener_health == "healthy"
+                and probe_health == "healthy"
             )
-            .values(
-                heartbeat_sequence=sequence,
-                active_allocations=active_allocations,
-                current_ingress_bps=current_ingress_bps,
-                current_egress_bps=current_egress_bps,
-                last_boot_id=boot_id,
-                last_heartbeat_nonce=nonce,
-                process_health=process_health,
-                listener_health=listener_health,
-                probe_health=probe_health,
-                packet_loss_bps=packet_loss_bps,
-                cpu_usage_bps=cpu_usage_bps,
-                memory_usage_bps=memory_usage_bps,
-                measured_rtt_ms=measured_rtt_ms,
-                recent_failure_bps=recent_failure_bps,
-                endpoints=canonical_endpoints,
-                lease_expires_at=lease_expires_at,
-                updated_at=now,
-                healthy_heartbeat_streak=next_streak,
-                state=next_state,
+            fresh_ready = (
+                node.state in {"available", "degraded"}
+                and node.lease_expires_at is not None
+                and self._as_utc(node.lease_expires_at) > now
             )
-            .returning(RelayNode.node_id)
-        )
-        if result.scalar_one_or_none() is None:
-            current = await self._session.scalar(
-                select(RelayNode)
-                .where(RelayNode.node_id == identity.node_id)
-                .execution_options(populate_existing=True)
+            if heartbeat_healthy:
+                lease_expires_at = now + timedelta(seconds=15)
+                if node.desired_draining or node.state == "draining":
+                    next_streak = node.healthy_heartbeat_streak
+                    next_state = "draining"
+                elif fresh_ready:
+                    next_streak = 3
+                    next_state = node.state
+                elif node.state == "unavailable":
+                    next_streak = min(node.healthy_heartbeat_streak + 1, 3)
+                    next_state = (
+                        "available"
+                        if node.healthy_heartbeat_streak >= 2
+                        else "unavailable"
+                    )
+                else:
+                    next_streak = 1
+                    next_state = "unavailable"
+            else:
+                lease_expires_at = now
+                next_streak = 0
+                next_state = "unavailable"
+
+            node.heartbeat_sequence = sequence
+            node.active_allocations = active_allocations
+            node.current_ingress_bps = current_ingress_bps
+            node.current_egress_bps = current_egress_bps
+            node.last_boot_id = boot_id
+            node.last_heartbeat_nonce = nonce
+            node.process_health = process_health
+            node.listener_health = listener_health
+            node.probe_health = probe_health
+            node.packet_loss_bps = packet_loss_bps
+            node.cpu_usage_bps = cpu_usage_bps
+            node.memory_usage_bps = memory_usage_bps
+            node.measured_rtt_ms = measured_rtt_ms
+            node.recent_failure_bps = recent_failure_bps
+            node.endpoints = canonical_endpoints
+            node.lease_expires_at = lease_expires_at
+            node.updated_at = now
+            node.healthy_heartbeat_streak = next_streak
+            node.state = next_state
+            self._audit(
+                action="relay_heartbeat_recorded",
+                node_id=identity.node_id,
+                actor_id=None,
+                details={"sequence": sequence},
+                now=now,
             )
-            if current is not None and current.state == "revoked":
-                self._error("relay_node_revoked", 403, "relay node revoked")
-            self._error("relay_heartbeat_replayed", 409, "relay heartbeat replayed")
-        self._audit(
-            action="relay_heartbeat_recorded",
-            node_id=identity.node_id,
-            actor_id=None,
-            details={"sequence": sequence},
-            now=now,
-        )
-        await self._session.flush()
-        refreshed = await self._session.get(RelayNode, identity.node_id)
-        if refreshed is None:  # pragma: no cover - guarded by atomic update
-            self._error("relay_certificate_invalid", 401, "relay certificate invalid")
-        await self._session.refresh(refreshed)
-        return refreshed
+            await self._session.flush()
+            return node
 
     async def list_nodes(self) -> list[RelayNode]:
         nodes = await self._session.scalars(
@@ -903,7 +935,7 @@ class RelayRegistry:
         if not 60 <= credential_ttl_seconds <= 3600:
             self._error("relay_secret_rotation_invalid", 400, "relay secret rotation invalid")
         async with self._node_identity_lock(node_id):
-            node = await self._session.get(RelayNode, node_id)
+            node, _ = await self._locked_node_and_registration(node_id)
             if node is None:
                 self._error("relay_node_not_found", 404, "relay node not found")
             if node.state == "revoked":
@@ -952,24 +984,31 @@ class RelayRegistry:
         turn_rest_secret: SecretStr,
         now: datetime,
     ) -> RelayNode:
-        if identity.is_previous:
-            self._error("relay_identity_epoch_invalid", 409, "relay identity epoch invalid")
         secret_digest, encrypted_secret = self._protect_turn_secret(
             turn_rest_secret, node_id=identity.node_id
         )
         async with self._node_identity_lock(identity.node_id):
-            node = await self._session.get(RelayNode, identity.node_id)
-            if node is None or node.certificate_fingerprint != identity.certificate_fingerprint:
-                self._error("relay_certificate_invalid", 401, "relay certificate invalid")
-            if node.state == "revoked":
-                self._error("relay_node_revoked", 403, "relay node revoked")
+            node, registration = await self._locked_node_and_registration(
+                identity.node_id
+            )
+            identity_kind = self._locked_identity_kind(
+                identity=identity,
+                node=node,
+                registration=registration,
+                allow_previous=True,
+                now=now,
+            )
+            assert node is not None
+            if identity_kind == "previous":
+                self._error(
+                    "relay_identity_epoch_invalid", 409, "relay identity epoch invalid"
+                )
             if identity_epoch != node.identity_epoch:
                 self._error("relay_identity_epoch_invalid", 409, "relay identity epoch invalid")
             if sequence <= node.heartbeat_sequence:
                 self._error("relay_heartbeat_replayed", 409, "relay heartbeat replayed")
             if (
                 not node.desired_draining
-                or node.state != "draining"
                 or secret_version != node.desired_secret_version
                 or secret_version <= node.active_secret_version
                 or node.rotation_challenge is None
@@ -1018,8 +1057,6 @@ class RelayRegistry:
         proof_mac: str,
         now: datetime,
     ) -> RelayNode:
-        if identity.is_previous:
-            self._error("relay_identity_epoch_invalid", 409, "relay identity epoch invalid")
         if re.fullmatch(r"[0-9a-f]{64}", probe_evidence_sha256) is None:
             self._error("relay_probe_invalid", 400, "relay allocation probe invalid")
         if re.fullmatch(r"[0-9a-f]{64}", proof_mac) is None:
@@ -1030,11 +1067,21 @@ class RelayRegistry:
         except ValueError:
             self._error("relay_rotation_proof_invalid", 400, "relay rotation proof invalid")
         async with self._node_identity_lock(identity.node_id):
-            node = await self._session.get(RelayNode, identity.node_id)
-            if node is None or node.certificate_fingerprint != identity.certificate_fingerprint:
-                self._error("relay_certificate_invalid", 401, "relay certificate invalid")
-            if node.state == "revoked":
-                self._error("relay_node_revoked", 403, "relay node revoked")
+            node, registration = await self._locked_node_and_registration(
+                identity.node_id
+            )
+            identity_kind = self._locked_identity_kind(
+                identity=identity,
+                node=node,
+                registration=registration,
+                allow_previous=True,
+                now=now,
+            )
+            assert node is not None
+            if identity_kind == "previous":
+                self._error(
+                    "relay_identity_epoch_invalid", 409, "relay identity epoch invalid"
+                )
             if identity_epoch != node.identity_epoch:
                 self._error("relay_identity_epoch_invalid", 409, "relay identity epoch invalid")
             if sequence <= node.heartbeat_sequence:
@@ -1065,8 +1112,7 @@ class RelayRegistry:
                 else None
             )
             if (
-                node.state != "draining"
-                or not node.desired_draining
+                not node.desired_draining
                 or node.active_allocations != 0
                 or deadline is None
                 or now < deadline
@@ -1091,8 +1137,14 @@ class RelayRegistry:
             try:
                 padded_secret = bytearray(canonical_secret)
                 padded_secret.extend(b"=")
+                decoded_secret: bytearray | None = None
                 try:
-                    decoded_secret = bytearray(base64.urlsafe_b64decode(padded_secret))
+                    decoded_result = base64.urlsafe_b64decode(padded_secret)
+                    decoded_secret = (
+                        decoded_result
+                        if isinstance(decoded_result, bytearray)
+                        else bytearray(decoded_result)
+                    )
                 except (ValueError, binascii.Error):
                     self._error(
                         "relay_rotation_proof_invalid", 409, "relay rotation proof invalid"
@@ -1100,9 +1152,17 @@ class RelayRegistry:
                 finally:
                     for index in range(len(padded_secret)):
                         padded_secret[index] = 0
+                canonical_encoding: bytearray | None = None
                 try:
                     pending_digest = hashlib.sha256(decoded_secret).digest()
-                    canonical_encoding = base64.urlsafe_b64encode(decoded_secret).rstrip(b"=")
+                    canonical_result = base64.urlsafe_b64encode(decoded_secret)
+                    canonical_encoding = (
+                        canonical_result
+                        if isinstance(canonical_result, bytearray)
+                        else bytearray(canonical_result)
+                    )
+                    while canonical_encoding.endswith(b"="):
+                        canonical_encoding.pop()
                     if (
                         len(decoded_secret) != 32
                         or not hmac.compare_digest(canonical_encoding, canonical_secret)
@@ -1113,8 +1173,10 @@ class RelayRegistry:
                             "relay rotation proof invalid",
                         )
                 finally:
-                    for index in range(len(decoded_secret)):
-                        decoded_secret[index] = 0
+                    for buffer in (canonical_encoding, decoded_secret):
+                        if buffer is not None:
+                            for index in range(len(buffer)):
+                                buffer[index] = 0
                 if not hmac.compare_digest(pending_digest, node.pending_secret_digest):
                     self._error(
                         "relay_rotation_proof_invalid", 409, "relay rotation proof invalid"
@@ -1175,6 +1237,76 @@ class RelayRegistry:
             await self._session.flush()
             return node
 
+    async def secret_rotation_status(
+        self,
+        *,
+        identity: RelayIdentity,
+        identity_epoch: int,
+        rotation_id: str,
+        secret_version: int,
+        rotation_challenge: str,
+        probe_evidence_sha256: str,
+        proof_mac: str,
+        now: datetime,
+    ) -> RelayRotationStatus:
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", probe_evidence_sha256) is None
+            or re.fullmatch(r"[0-9a-f]{64}", proof_mac) is None
+        ):
+            self._error("relay_rotation_proof_invalid", 400, "relay rotation proof invalid")
+        try:
+            evidence = bytes.fromhex(probe_evidence_sha256)
+            supplied_proof = bytes.fromhex(proof_mac)
+        except ValueError:
+            self._error("relay_rotation_proof_invalid", 400, "relay rotation proof invalid")
+        async with self._node_identity_lock(identity.node_id):
+            node, registration = await self._locked_node_and_registration(
+                identity.node_id
+            )
+            self._locked_identity_kind(
+                identity=identity,
+                node=node,
+                registration=registration,
+                allow_previous=False,
+                now=now,
+            )
+            assert node is not None
+            committed_exact = (
+                node.active_secret_version == secret_version
+                and node.applied_secret_version == secret_version
+                and node.committed_rotation_id == rotation_id
+                and node.committed_identity_epoch == identity_epoch
+                and node.committed_rotation_challenge == rotation_challenge
+                and node.committed_probe_evidence_sha256 is not None
+                and hmac.compare_digest(node.committed_probe_evidence_sha256, evidence)
+                and node.committed_proof_mac is not None
+                and hmac.compare_digest(node.committed_proof_mac, supplied_proof)
+                and node.pending_secret_version is None
+                and node.pending_encrypted_turn_secret is None
+            )
+            pending = (
+                node.identity_epoch == identity_epoch
+                and node.pending_rotation_id == rotation_id
+                and node.pending_secret_version == secret_version
+                and node.desired_secret_version == secret_version
+                and node.rotation_challenge == rotation_challenge
+                and node.pending_encrypted_turn_secret is not None
+                and node.pending_secret_digest is not None
+            )
+            status = (
+                "committed_exact"
+                if committed_exact
+                else "pending"
+                if pending
+                else "unknown"
+            )
+            return RelayRotationStatus(
+                node_id=node.node_id,
+                identity_epoch=node.identity_epoch,
+                active_secret_version=node.active_secret_version,
+                status=status,
+            )
+
     async def transition(
         self, *, node_id: str, action: str, actor_id: str, now: datetime
     ) -> RelayNode:
@@ -1185,10 +1317,25 @@ class RelayRegistry:
             if node.state == "revoked":
                 self._error("relay_node_revoked", 409, "relay node revoked")
             audit_action: str
+            should_audit: bool
             if action == "drain":
+                should_audit = not node.desired_draining
+                node.desired_draining = True
                 node.state = "draining"
                 audit_action = "relay_node_drained"
             elif action == "resume":
+                if (
+                    node.desired_secret_version > node.active_secret_version
+                    or node.pending_secret_version is not None
+                    or node.rotation_challenge is not None
+                ):
+                    self._error(
+                        "relay_secret_rotation_conflict",
+                        409,
+                        "relay secret rotation conflict",
+                    )
+                should_audit = node.desired_draining or node.state == "draining"
+                node.desired_draining = False
                 node.state = "unavailable"
                 node.healthy_heartbeat_streak = 0
                 node.lease_expires_at = None
@@ -1196,13 +1343,14 @@ class RelayRegistry:
             else:  # pragma: no cover - route constants only
                 raise ValueError("unknown relay transition")
             node.updated_at = now
-            self._audit(
-                action=audit_action,
-                node_id=node_id,
-                actor_id=actor_id,
-                details={},
-                now=now,
-            )
+            if should_audit:
+                self._audit(
+                    action=audit_action,
+                    node_id=node_id,
+                    actor_id=actor_id,
+                    details={},
+                    now=now,
+                )
             await self._session.flush()
             return node
 
@@ -1318,6 +1466,53 @@ class RelayRegistry:
         )
         return node, registration
 
+    def _locked_identity_kind(
+        self,
+        *,
+        identity: RelayIdentity,
+        node: RelayNode | None,
+        registration: RelayNodeRegistration | None,
+        allow_previous: bool,
+        now: datetime,
+    ) -> str:
+        """Reclassify preliminary authentication from freshly locked rows."""
+
+        if node is None or registration is None or registration.status not in {
+            "approved",
+            "revoked",
+        }:
+            self._error("relay_certificate_invalid", 401, "relay certificate invalid")
+        current_matches = (
+            hmac.compare_digest(
+                node.certificate_fingerprint, identity.certificate_fingerprint
+            )
+            and hmac.compare_digest(
+                registration.signing_public_key, identity.signing_public_key
+            )
+            and registration.certificate_expires_at is not None
+            and self._as_utc(registration.certificate_expires_at) > now
+        )
+        previous_matches = (
+            allow_previous
+            and registration.previous_certificate_fingerprint is not None
+            and registration.previous_signing_public_key is not None
+            and registration.previous_certificate_expires_at is not None
+            and self._as_utc(registration.previous_certificate_expires_at) > now
+            and hmac.compare_digest(
+                registration.previous_certificate_fingerprint,
+                identity.certificate_fingerprint,
+            )
+            and hmac.compare_digest(
+                registration.previous_signing_public_key,
+                identity.signing_public_key,
+            )
+        )
+        if not current_matches and not previous_matches:
+            self._error("relay_certificate_invalid", 401, "relay certificate invalid")
+        if node.state == "revoked" or registration.status == "revoked":
+            self._error("relay_node_revoked", 403, "relay node revoked")
+        return "current" if current_matches else "previous"
+
     def _token_digest(self, token: str) -> str:
         if not isinstance(token, str) or not 20 <= len(token) <= 512 or not token.isascii():
             self._error("relay_enrollment_invalid", 400, "relay enrollment invalid")
@@ -1351,15 +1546,32 @@ class RelayRegistry:
             or re.fullmatch(r"[A-Za-z0-9_-]{43}", encoded) is None
         ):
             self._error("relay_enrollment_invalid", 400, "relay enrollment invalid")
+        padded = bytearray(encoded.encode("ascii"))
+        padded.extend(b"=")
+        decoded: bytearray | None = None
+        canonical: bytearray | None = None
         try:
-            decoded = bytearray(base64.urlsafe_b64decode(encoded + "="))
-        except (ValueError, binascii.Error):
-            self._error("relay_enrollment_invalid", 400, "relay enrollment invalid")
-        try:
-            canonical = base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii")
+            try:
+                decoded_result = base64.urlsafe_b64decode(padded)
+                decoded = (
+                    decoded_result
+                    if isinstance(decoded_result, bytearray)
+                    else bytearray(decoded_result)
+                )
+                canonical_result = base64.urlsafe_b64encode(decoded)
+                canonical = (
+                    canonical_result
+                    if isinstance(canonical_result, bytearray)
+                    else bytearray(canonical_result)
+                )
+                while canonical.endswith(b"="):
+                    canonical.pop()
+                padded.pop()
+            except (ValueError, binascii.Error):
+                self._error("relay_enrollment_invalid", 400, "relay enrollment invalid")
             if (
                 len(decoded) != 32
-                or not hmac.compare_digest(canonical, encoded)
+                or not hmac.compare_digest(canonical, padded)
                 or not _turn_secret_has_minimum_quality(decoded)
             ):
                 self._error(
@@ -1369,7 +1581,7 @@ class RelayRegistry:
             # Preserve the canonical configured value as coturn's actual HMAC
             # key. The decoded bytes are used only for quality validation and
             # the stable enrollment request digest.
-            plaintext = bytearray(encoded.encode("ascii"))
+            plaintext = bytearray(padded)
             try:
                 encrypted = cipher.encrypt(
                     bytes(plaintext), associated_data=node_id.encode("utf-8")
@@ -1379,8 +1591,10 @@ class RelayRegistry:
                     plaintext[index] = 0
             return digest, encrypted
         finally:
-            for index in range(len(decoded)):
-                decoded[index] = 0
+            for buffer in (canonical, decoded, padded):
+                if buffer is not None:
+                    for index in range(len(buffer)):
+                        buffer[index] = 0
 
     def _derive_receipt(
         self, token: str, enrollment_id: str, request_digest: str
@@ -1497,11 +1711,11 @@ class RelayRegistry:
     @staticmethod
     def _length_prefixed(fields: Iterable[bytes]) -> bytes:
         encoded = bytearray()
-        for field in fields:
-            if len(field) > 2**32 - 1:
+        for field_bytes in fields:
+            if len(field_bytes) > 2**32 - 1:
                 raise ValueError("relay enrollment field is too large")
-            encoded.extend(len(field).to_bytes(4, "big"))
-            encoded.extend(field)
+            encoded.extend(len(field_bytes).to_bytes(4, "big"))
+            encoded.extend(field_bytes)
         return bytes(encoded)
 
     def _require_pepper(self) -> None:

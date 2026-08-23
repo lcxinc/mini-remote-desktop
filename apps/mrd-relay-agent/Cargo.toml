@@ -7,6 +7,10 @@ license.workspace = true
 [dependencies]
 async-trait = "0.1"
 base64 = "0.22"
+# Dalek's PKCS#8 encoder uses ed25519::pkcs8::KeypairBytes internally. Enable
+# its zeroizing Drop in addition to Dalek's zeroizing SigningKey owner.
+ed25519 = { version = "2.2", default-features = false, features = ["zeroize"] }
+ed25519-dalek = { workspace = true, features = ["pkcs8"] }
 mrd-transport-webrtc = { path = "../../crates/mrd-transport-webrtc" }
 rand = "0.8"
 rcgen = { version = "0.13.2", features = ["zeroize", "x509-parser"] }
@@ -27,6 +31,7 @@ x509-parser = { version = "0.16", features = ["verify"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio-rustls = "0.26"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }

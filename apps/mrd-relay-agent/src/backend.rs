@@ -40,7 +40,7 @@ impl std::fmt::Debug for EnrollmentRequest {
             .field("node_id", &self.node_id)
             .field("region", &self.region)
             .field("failure_domain", &self.failure_domain)
-            .field("endpoints", &self.endpoints)
+            .field("endpoint_count", &self.endpoints.len())
             .field("max_allocations", &self.max_allocations)
             .field("max_egress_bps", &self.max_egress_bps)
             .field("csr_pem", &"REDACTED")
@@ -166,7 +166,7 @@ impl std::fmt::Debug for SecretUploadRequest {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SecretCommitRequest {
     pub node_id: String,
     pub identity_epoch: u64,
@@ -178,6 +178,57 @@ pub struct SecretCommitRequest {
     pub authentication: RequestAuthentication,
 }
 
+impl std::fmt::Debug for SecretCommitRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecretCommitRequest")
+            .field("node_id", &self.node_id)
+            .field("identity_epoch", &self.identity_epoch)
+            .field("rotation_id", &self.rotation_id)
+            .field("secret_version", &self.secret_version)
+            .field("rotation_challenge", &"REDACTED")
+            .field("probe_evidence_sha256", &"REDACTED")
+            .field("proof_mac", &"REDACTED")
+            .field("authentication", &self.authentication)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct SecretRotationStatusRequest {
+    pub node_id: String,
+    pub identity_epoch: u64,
+    pub rotation_id: String,
+    pub secret_version: u64,
+    pub rotation_challenge: String,
+    pub probe_evidence_sha256: String,
+    pub proof_mac: String,
+    pub authentication: RequestAuthentication,
+}
+
+impl std::fmt::Debug for SecretRotationStatusRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecretRotationStatusRequest")
+            .field("node_id", &self.node_id)
+            .field("identity_epoch", &self.identity_epoch)
+            .field("rotation_id", &self.rotation_id)
+            .field("secret_version", &self.secret_version)
+            .field("rotation_challenge", &"REDACTED")
+            .field("probe_evidence_sha256", &"REDACTED")
+            .field("proof_mac", &"REDACTED")
+            .field("authentication", &self.authentication)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecretRotationStatus {
+    CommittedExact { active_secret_version: u64 },
+    Pending { active_secret_version: u64 },
+    Unknown { active_secret_version: u64 },
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RelayHealth {
@@ -187,7 +238,7 @@ pub enum RelayHealth {
     NonEvidence,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HeartbeatPayload {
     pub identity_epoch: u64,
@@ -217,6 +268,7 @@ impl HeartbeatPayload {
             || !is_canonical_base64url(&self.nonce, 32)
             || self.process_health == RelayHealth::NonEvidence
             || self.listener_health == RelayHealth::NonEvidence
+            || self.probe_health == RelayHealth::Degraded
             || self.max_allocations == 0
             || self.active_allocations > self.max_allocations
             || self.max_egress_bps == 0
@@ -230,11 +282,37 @@ impl HeartbeatPayload {
             || self
                 .endpoints
                 .iter()
-                .any(|endpoint| endpoint.is_empty() || endpoint.len() > 512)
+                .any(|endpoint| !crate::config::is_public_turn_endpoint(endpoint))
         {
             return Err(BackendError::ProtocolInvalid);
         }
         Ok(())
+    }
+}
+
+impl std::fmt::Debug for HeartbeatPayload {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HeartbeatPayload")
+            .field("identity_epoch", &self.identity_epoch)
+            .field("boot_id", &self.boot_id)
+            .field("nonce", &"REDACTED")
+            .field("process_health", &self.process_health)
+            .field("listener_health", &self.listener_health)
+            .field("probe_health", &self.probe_health)
+            .field("active_allocations", &self.active_allocations)
+            .field("current_ingress_bps", &self.current_ingress_bps)
+            .field("current_egress_bps", &self.current_egress_bps)
+            .field("max_allocations", &self.max_allocations)
+            .field("max_egress_bps", &self.max_egress_bps)
+            .field("packet_loss_bps", &self.packet_loss_bps)
+            .field("cpu_usage_bps", &self.cpu_usage_bps)
+            .field("memory_usage_bps", &self.memory_usage_bps)
+            .field("measured_rtt_ms", &self.measured_rtt_ms)
+            .field("recent_failure_bps", &self.recent_failure_bps)
+            .field("endpoint_count", &self.endpoints.len())
+            .field("applied_secret_version", &self.applied_secret_version)
+            .finish()
     }
 }
 
@@ -281,13 +359,32 @@ impl RelayNodeState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DesiredNodeState {
     pub draining: bool,
     pub secret_version: u64,
     pub not_before_unix_seconds: Option<i64>,
     pub old_credential_deadline_unix_seconds: Option<i64>,
     pub rotation_challenge: Option<String>,
+}
+
+impl std::fmt::Debug for DesiredNodeState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DesiredNodeState")
+            .field("draining", &self.draining)
+            .field("secret_version", &self.secret_version)
+            .field("not_before_unix_seconds", &self.not_before_unix_seconds)
+            .field(
+                "old_credential_deadline_unix_seconds",
+                &self.old_credential_deadline_unix_seconds,
+            )
+            .field(
+                "rotation_challenge",
+                &self.rotation_challenge.as_ref().map(|_| "REDACTED"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -383,6 +480,12 @@ pub trait RelayBackendPort: Send + Sync {
     async fn commit_secret(&self, _request: SecretCommitRequest) -> Result<(), BackendError> {
         Err(BackendError::Unavailable)
     }
+    async fn rotation_status(
+        &self,
+        _request: SecretRotationStatusRequest,
+    ) -> Result<SecretRotationStatus, BackendError> {
+        Err(BackendError::Unavailable)
+    }
 }
 
 pub trait RelayBackendClientFactoryPort: Send + Sync {
@@ -448,6 +551,13 @@ impl RelayBackendPort for SwappableRelayBackend {
 
     async fn commit_secret(&self, request: SecretCommitRequest) -> Result<(), BackendError> {
         self.current().commit_secret(request).await
+    }
+
+    async fn rotation_status(
+        &self,
+        request: SecretRotationStatusRequest,
+    ) -> Result<SecretRotationStatus, BackendError> {
+        self.current().rotation_status(request).await
     }
 }
 
@@ -529,7 +639,7 @@ pub(crate) fn serialize_renewal_body(
 
 pub(crate) fn serialize_secret_upload_body(
     request: &SecretUploadRequest,
-) -> Result<Vec<u8>, BackendError> {
+) -> Result<Zeroizing<Vec<u8>>, BackendError> {
     #[derive(Serialize)]
     struct Wire<'a> {
         identity_epoch: u64,
@@ -550,11 +660,43 @@ pub(crate) fn serialize_secret_upload_body(
         secret_version: request.secret_version,
         turn_rest_secret: request.turn_rest_secret.expose_secret(),
     })
+    .map(Zeroizing::new)
     .map_err(|_| BackendError::ProtocolInvalid)
 }
 
 pub(crate) fn serialize_secret_commit_body(
     request: &SecretCommitRequest,
+) -> Result<Vec<u8>, BackendError> {
+    serialize_rotation_proof_body(
+        request.identity_epoch,
+        &request.rotation_id,
+        request.secret_version,
+        &request.rotation_challenge,
+        &request.probe_evidence_sha256,
+        &request.proof_mac,
+    )
+}
+
+pub(crate) fn serialize_secret_rotation_status_body(
+    request: &SecretRotationStatusRequest,
+) -> Result<Vec<u8>, BackendError> {
+    serialize_rotation_proof_body(
+        request.identity_epoch,
+        &request.rotation_id,
+        request.secret_version,
+        &request.rotation_challenge,
+        &request.probe_evidence_sha256,
+        &request.proof_mac,
+    )
+}
+
+fn serialize_rotation_proof_body(
+    identity_epoch: u64,
+    rotation_id: &str,
+    secret_version: u64,
+    rotation_challenge: &str,
+    probe_evidence_sha256: &str,
+    proof_mac: &str,
 ) -> Result<Vec<u8>, BackendError> {
     #[derive(Serialize)]
     struct Wire<'a> {
@@ -565,30 +707,28 @@ pub(crate) fn serialize_secret_commit_body(
         probe_evidence_sha256: &'a str,
         proof_mac: &'a str,
     }
-    if request.identity_epoch == 0
-        || request.secret_version < 2
-        || !is_urlsafe_identifier(&request.rotation_id)
-        || !is_canonical_base64url(&request.rotation_challenge, 32)
-        || request.probe_evidence_sha256.len() != 64
-        || !request
-            .probe_evidence_sha256
+    if identity_epoch == 0
+        || secret_version < 2
+        || !is_urlsafe_identifier(rotation_id)
+        || !is_canonical_base64url(rotation_challenge, 32)
+        || probe_evidence_sha256.len() != 64
+        || !probe_evidence_sha256
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        || request.proof_mac.len() != 64
-        || !request
-            .proof_mac
+        || proof_mac.len() != 64
+        || !proof_mac
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         return Err(BackendError::ProtocolInvalid);
     }
     serde_json::to_vec(&Wire {
-        identity_epoch: request.identity_epoch,
-        rotation_id: &request.rotation_id,
-        secret_version: request.secret_version,
-        rotation_challenge: &request.rotation_challenge,
-        probe_evidence_sha256: &request.probe_evidence_sha256,
-        proof_mac: &request.proof_mac,
+        identity_epoch,
+        rotation_id,
+        secret_version,
+        rotation_challenge,
+        probe_evidence_sha256,
+        proof_mac,
     })
     .map_err(|_| BackendError::ProtocolInvalid)
 }
@@ -606,7 +746,7 @@ pub fn rotation_proof_message(
 ) -> Result<Vec<u8>, BackendError> {
     if identity_epoch == 0
         || secret_version < 2
-        || !is_urlsafe_identifier(node_id)
+        || !is_node_identifier(node_id)
         || !is_urlsafe_identifier(rotation_id)
         || !is_canonical_base64url(rotation_challenge, 32)
     {
@@ -663,10 +803,7 @@ impl RelayBackendClientFactoryPort for ReqwestRelayBackendFactory {
         certificate: &NodeCertificate,
         private_pkcs8: &[u8],
     ) -> Result<Arc<dyn RelayBackendPort>, BackendError> {
-        let private = rustls_pki_types::PrivatePkcs8KeyDer::from(private_pkcs8.to_vec());
-        let key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&private, &rcgen::PKCS_ED25519)
-            .map_err(|_| BackendError::TlsInvalid)?;
-        let private_pem = Zeroizing::new(key.serialize_pem());
+        let private_pem = encode_private_pkcs8_pem(private_pkcs8)?;
         let backend = ReqwestRelayBackend::new(self.base_url.clone(), &self.ca_certificate_pem)?
             .with_mtls_identity(
                 certificate.certificate_pem.as_bytes(),
@@ -674,6 +811,21 @@ impl RelayBackendClientFactoryPort for ReqwestRelayBackendFactory {
             )?;
         Ok(Arc::new(backend))
     }
+}
+
+fn encode_private_pkcs8_pem(private_pkcs8: &[u8]) -> Result<Zeroizing<String>, BackendError> {
+    if private_pkcs8.is_empty() || private_pkcs8.len() > 64 * 1024 {
+        return Err(BackendError::TlsInvalid);
+    }
+    let encoded = Zeroizing::new(STANDARD.encode(private_pkcs8));
+    let mut pem = Zeroizing::new(String::with_capacity(encoded.len().saturating_add(64)));
+    pem.push_str("-----BEGIN PRIVATE KEY-----\n");
+    for line in encoded.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(line).map_err(|_| BackendError::TlsInvalid)?);
+        pem.push('\n');
+    }
+    pem.push_str("-----END PRIVATE KEY-----\n");
+    Ok(pem)
 }
 
 impl ReqwestRelayBackend {
@@ -730,6 +882,7 @@ fn secure_client(
     let mut builder = Client::builder()
         .https_only(true)
         .use_rustls_tls()
+        .tls_built_in_root_certs(false)
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none());
@@ -812,6 +965,47 @@ struct SecretCommitResponse {
     rotation_id: String,
     active_secret_version: u64,
     status: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretRotationStatusResponse {
+    node_id: String,
+    identity_epoch: u64,
+    active_secret_version: u64,
+    status: String,
+}
+
+pub fn decode_secret_rotation_status_response(
+    body: &[u8],
+    expected_node_id: &str,
+    expected_identity_epoch: u64,
+    target_secret_version: u64,
+) -> Result<SecretRotationStatus, BackendError> {
+    let body: SecretRotationStatusResponse = decode_json(body)?;
+    if body.node_id != expected_node_id
+        || body.identity_epoch != expected_identity_epoch
+        || body.active_secret_version == 0
+        || target_secret_version < 2
+    {
+        return Err(BackendError::ProtocolInvalid);
+    }
+    match body.status.as_str() {
+        "committed_exact" if body.active_secret_version == target_secret_version => {
+            Ok(SecretRotationStatus::CommittedExact {
+                active_secret_version: body.active_secret_version,
+            })
+        }
+        "pending" if body.active_secret_version < target_secret_version => {
+            Ok(SecretRotationStatus::Pending {
+                active_secret_version: body.active_secret_version,
+            })
+        }
+        "unknown" => Ok(SecretRotationStatus::Unknown {
+            active_secret_version: body.active_secret_version,
+        }),
+        _ => Err(BackendError::ProtocolInvalid),
+    }
 }
 
 pub fn decode_enrollment_response(
@@ -938,6 +1132,15 @@ fn decode_json<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, BackendEr
 
 fn is_urlsafe_identifier(value: &str) -> bool {
     (8..=128).contains(&value.len())
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn is_node_identifier(value: &str) -> bool {
+    (1..=128).contains(&value.len())
+        && value.as_bytes()[0].is_ascii_alphanumeric()
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
@@ -964,6 +1167,21 @@ async fn read_bounded_response(
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+fn backend_status_error(status: StatusCode) -> Option<BackendError> {
+    if status.is_success() {
+        return None;
+    }
+    if matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504) {
+        Some(BackendError::Unavailable)
+    } else {
+        Some(BackendError::Rejected)
+    }
+}
+
+fn require_success_status(status: StatusCode) -> Result<(), BackendError> {
+    backend_status_error(status).map_or(Ok(()), Err)
 }
 
 #[async_trait]
@@ -1001,7 +1219,9 @@ impl RelayBackendPort for ReqwestRelayBackend {
             .await
             .map_err(|_| BackendError::Unavailable)?;
         if response.status() != StatusCode::ACCEPTED {
-            return Err(BackendError::Rejected);
+            return Err(
+                backend_status_error(response.status()).unwrap_or(BackendError::ProtocolInvalid)
+            );
         }
         require_private_no_store(&response)?;
         let body = read_bounded_response(response).await?;
@@ -1027,9 +1247,7 @@ impl RelayBackendPort for ReqwestRelayBackend {
             .send()
             .await
             .map_err(|_| BackendError::Unavailable)?;
-        if !response.status().is_success() {
-            return Err(BackendError::Rejected);
-        }
+        require_success_status(response.status())?;
         require_private_no_store(&response)?;
         let body = read_bounded_response(response).await?;
         decode_pickup_response(&body, &expected_enrollment_id, &expected_node_id)
@@ -1055,9 +1273,7 @@ impl RelayBackendPort for ReqwestRelayBackend {
             .send()
             .await
             .map_err(|_| BackendError::Unavailable)?;
-        if !response.status().is_success() {
-            return Err(BackendError::Rejected);
-        }
+        require_success_status(response.status())?;
         require_private_no_store(&response)?;
         let body = read_bounded_response(response).await?;
         let body: RenewalResponse = decode_json(&body)?;
@@ -1099,9 +1315,8 @@ impl RelayBackendPort for ReqwestRelayBackend {
             .send()
             .await
             .map_err(|_| BackendError::Unavailable)?;
-        if !response.status().is_success() {
-            return Err(BackendError::Rejected);
-        }
+        require_success_status(response.status())?;
+        require_private_no_store(&response)?;
         let body = read_bounded_response(response).await?;
         decode_heartbeat_response(
             &body,
@@ -1113,7 +1328,7 @@ impl RelayBackendPort for ReqwestRelayBackend {
 
     async fn upload_secret(&self, request: SecretUploadRequest) -> Result<(), BackendError> {
         let path = format!("/api/v1/relays/{}/secret-rotation/upload", request.node_id);
-        let body = serialize_secret_upload_body(&request)?;
+        let mut body = serialize_secret_upload_body(&request)?;
         let response = self
             .mtls_client
             .as_ref()
@@ -1124,12 +1339,17 @@ impl RelayBackendPort for ReqwestRelayBackend {
             .header("X-Relay-Sequence", request.authentication.sequence)
             .header("X-Relay-Signature", &request.authentication.signature_b64)
             .header("Content-Type", "application/json")
-            .body(body)
+            // Transfer the single allocation into reqwest without creating a
+            // second controllable plaintext JSON buffer. The Zeroizing owner
+            // is empty after the move.
+            .body(std::mem::take(&mut *body))
             .send()
             .await
             .map_err(|_| BackendError::Unavailable)?;
         if response.status() != StatusCode::ACCEPTED {
-            return Err(BackendError::Rejected);
+            return Err(
+                backend_status_error(response.status()).unwrap_or(BackendError::ProtocolInvalid)
+            );
         }
         require_private_no_store(&response)?;
         let body = read_bounded_response(response).await?;
@@ -1162,9 +1382,7 @@ impl RelayBackendPort for ReqwestRelayBackend {
             .send()
             .await
             .map_err(|_| BackendError::Unavailable)?;
-        if !response.status().is_success() {
-            return Err(BackendError::Rejected);
-        }
+        require_success_status(response.status())?;
         require_private_no_store(&response)?;
         let body = read_bounded_response(response).await?;
         let body: SecretCommitResponse = decode_json(&body)?;
@@ -1177,6 +1395,37 @@ impl RelayBackendPort for ReqwestRelayBackend {
             return Err(BackendError::ProtocolInvalid);
         }
         Ok(())
+    }
+
+    async fn rotation_status(
+        &self,
+        request: SecretRotationStatusRequest,
+    ) -> Result<SecretRotationStatus, BackendError> {
+        let path = format!("/api/v1/relays/{}/secret-rotation/status", request.node_id);
+        let body = serialize_secret_rotation_status_body(&request)?;
+        let response = self
+            .mtls_client
+            .as_ref()
+            .ok_or(BackendError::TlsInvalid)?
+            .post(self.url(path.trim_start_matches('/'))?)
+            .header("X-Relay-Node-Id", &request.node_id)
+            .header("X-Relay-Timestamp", request.authentication.timestamp)
+            .header("X-Relay-Sequence", request.authentication.sequence)
+            .header("X-Relay-Signature", &request.authentication.signature_b64)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|_| BackendError::Unavailable)?;
+        require_success_status(response.status())?;
+        require_private_no_store(&response)?;
+        let body = read_bounded_response(response).await?;
+        decode_secret_rotation_status_response(
+            &body,
+            &request.node_id,
+            request.identity_epoch,
+            request.secret_version,
+        )
     }
 }
 
@@ -1236,8 +1485,75 @@ fn parse_rfc3339_unix_seconds(value: &str) -> Result<i64, BackendError> {
 
 #[cfg(test)]
 mod response_security_tests {
-    use super::headers_are_private_no_store;
+    use std::{net::IpAddr, sync::Arc};
+
+    use super::{backend_status_error, headers_are_private_no_store, secure_client, BackendError};
+    use rcgen::{
+        BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
+        ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType, PKCS_ED25519,
+    };
     use reqwest::header::{HeaderMap, HeaderValue, CACHE_CONTROL, PRAGMA};
+    use rustls_pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
+
+    struct TestTlsAuthority {
+        certificate: Certificate,
+        key: KeyPair,
+    }
+
+    impl TestTlsAuthority {
+        fn new(common_name: &str) -> Self {
+            let key = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+            let mut params = CertificateParams::default();
+            let mut name = DistinguishedName::new();
+            name.push(DnType::CommonName, common_name);
+            params.distinguished_name = name;
+            params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+            params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+            let certificate = params.self_signed(&key).unwrap();
+            Self { certificate, key }
+        }
+
+        fn server_config(&self, san: IpAddr) -> ServerConfig {
+            let key = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+            let mut params = CertificateParams::default();
+            params.is_ca = IsCa::ExplicitNoCa;
+            params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+            params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+            params.subject_alt_names = vec![SanType::IpAddress(san)];
+            let certificate = params
+                .signed_by(&key, &self.certificate, &self.key)
+                .unwrap();
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![certificate.der().clone()],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+                )
+                .unwrap()
+        }
+    }
+
+    async fn spawn_https_server(config: ServerConfig) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let acceptor = TlsAcceptor::from(Arc::new(config));
+            let Ok(mut stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        });
+        address
+    }
 
     #[test]
     fn sensitive_responses_require_private_no_store_and_pragma_no_cache() {
@@ -1258,5 +1574,79 @@ mod response_security_tests {
         headers.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
         headers.insert(PRAGMA, HeaderValue::from_static("cache"));
         assert!(!headers_are_private_no_store(&headers));
+    }
+
+    #[test]
+    fn transient_http_statuses_are_retryable_but_auth_and_protocol_fail_closed() {
+        for status in [408, 425, 429, 500, 502, 503, 504] {
+            assert_eq!(
+                backend_status_error(reqwest::StatusCode::from_u16(status).unwrap()),
+                Some(BackendError::Unavailable)
+            );
+        }
+        for status in [400, 401, 403, 404, 409, 422] {
+            assert_eq!(
+                backend_status_error(reqwest::StatusCode::from_u16(status).unwrap()),
+                Some(BackendError::Rejected)
+            );
+        }
+        assert_eq!(backend_status_error(reqwest::StatusCode::OK), None);
+    }
+
+    #[test]
+    fn strict_clients_disable_builtin_roots_and_heartbeat_checks_sensitive_headers() {
+        let source = include_str!("backend.rs");
+        let disable_builtin = ["tls_built_", "in_root_certs(false)"].concat();
+        assert!(source.contains(&disable_builtin));
+
+        let implementation = source
+            .split_once("impl RelayBackendPort for ReqwestRelayBackend")
+            .unwrap()
+            .1;
+        let heartbeat_start = implementation.find("async fn heartbeat(&self").unwrap();
+        let heartbeat_end = implementation[heartbeat_start..]
+            .find("async fn upload_secret(&self")
+            .map(|offset| heartbeat_start + offset)
+            .unwrap();
+        let heartbeat = &implementation[heartbeat_start..heartbeat_end];
+        assert!(heartbeat.contains("require_private_no_store(&response)?"));
+    }
+
+    #[tokio::test]
+    async fn configured_private_ca_is_exclusive_and_hostname_is_still_verified() {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let configured = TestTlsAuthority::new("configured private root");
+        let unrelated = TestTlsAuthority::new("unrelated root");
+        let root = reqwest::Certificate::from_pem(configured.certificate.pem().as_bytes()).unwrap();
+        let client = secure_client(Some(root), None).unwrap();
+
+        let trusted_address =
+            spawn_https_server(configured.server_config(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
+                .await;
+        let trusted = client
+            .get(format!("https://{trusted_address}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(trusted.status(), reqwest::StatusCode::NO_CONTENT);
+
+        let unrelated_address =
+            spawn_https_server(unrelated.server_config(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
+                .await;
+        assert!(client
+            .get(format!("https://{unrelated_address}/"))
+            .send()
+            .await
+            .is_err());
+
+        let wrong_san_address = spawn_https_server(
+            configured.server_config(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2))),
+        )
+        .await;
+        assert!(client
+            .get(format!("https://{wrong_san_address}/"))
+            .send()
+            .await
+            .is_err());
     }
 }

@@ -146,7 +146,7 @@ impl AgentConfig {
             || self
                 .endpoints
                 .iter()
-                .any(|endpoint| endpoint.is_empty() || endpoint.len() > MAX_ENDPOINT_BYTES)
+                .any(|endpoint| !is_public_turn_endpoint(endpoint))
             || self.max_allocations == 0
             || self.max_egress_bps == 0
             || !safe_absolute_file(&self.identity_path)
@@ -174,6 +174,68 @@ impl AgentConfig {
     }
 }
 
+pub(crate) fn is_public_turn_endpoint(value: &str) -> bool {
+    if value.is_empty() || value.len() > MAX_ENDPOINT_BYTES || !value.is_ascii() {
+        return false;
+    }
+    let (scheme, remainder) = if let Some(remainder) = value.strip_prefix("turn:") {
+        ("turn", remainder)
+    } else if let Some(remainder) = value.strip_prefix("turns:") {
+        ("turns", remainder)
+    } else {
+        return false;
+    };
+    if remainder.contains(['@', '/', '#']) {
+        return false;
+    }
+    let mut query_parts = remainder.split('?');
+    let authority = query_parts.next().unwrap_or_default();
+    let transport = match query_parts.next() {
+        None => {
+            if scheme == "turn" {
+                "udp"
+            } else {
+                "tcp"
+            }
+        }
+        Some("transport=udp") => "udp",
+        Some("transport=tcp") => "tcp",
+        Some(_) => return false,
+    };
+    if query_parts.next().is_some() || (scheme == "turns" && transport != "tcp") {
+        return false;
+    }
+    let (host, port) = if let Some(ipv6) = authority.strip_prefix('[') {
+        let Some((host, port)) = ipv6.split_once("]:") else {
+            return false;
+        };
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        (host, port)
+    } else {
+        let Some((host, port)) = authority.rsplit_once(':') else {
+            return false;
+        };
+        if host.is_empty()
+            || host.len() > 253
+            || host.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || !label.as_bytes()[0].is_ascii_alphanumeric()
+                    || !label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                    || !label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            })
+        {
+            return false;
+        }
+        (host, port)
+    };
+    !host.is_empty() && port.parse::<u16>().is_ok_and(|port| port != 0)
+}
+
 fn safe_absolute_file(path: &std::path::Path) -> bool {
     !path.as_os_str().is_empty()
         && path.is_absolute()
@@ -191,7 +253,7 @@ fn loopback_metrics_url(url: &Url) -> bool {
         None => false,
     };
     loopback
-        && matches!(url.scheme(), "http" | "https")
+        && url.scheme() == "http"
         && url.username().is_empty()
         && url.password().is_none()
         && url.query().is_none()

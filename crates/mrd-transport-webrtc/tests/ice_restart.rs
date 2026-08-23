@@ -144,7 +144,7 @@ async fn same_generation_answers_and_candidates_are_bound_to_an_opaque_route_tok
             .to_wire(),
         first_token
     );
-    assert!(!format!("{:?}", first_offer.restart_route_token()).contains(&first_token));
+    assert!(!format!("{:?}", first_offer.restart_route_token()).contains(first_token.as_str()));
 
     let wrong_answer = SessionDescription::from_wire(
         SessionDescriptionType::Answer,

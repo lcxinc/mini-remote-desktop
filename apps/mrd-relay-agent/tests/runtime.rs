@@ -10,11 +10,12 @@ use async_trait::async_trait;
 use mrd_relay_agent::{
     backend::{
         canonical_relay_request, decode_enrollment_response, decode_heartbeat_response,
-        decode_pickup_response, rotation_proof_message, BackendError, DesiredNodeState,
-        EnrollmentRequest, EnrollmentStatus, HeartbeatPayload, NodeCertificate, NodeDirective,
-        PickupRequest, RelayBackendClientFactoryPort, RelayBackendPort, RelayHealth,
-        RelayNodeState, RenewalRequest, ReqwestRelayBackend, SecretCommitRequest,
-        SecretUploadRequest, SignedHeartbeat, SwappableRelayBackend,
+        decode_pickup_response, decode_secret_rotation_status_response, rotation_proof_message,
+        BackendError, DesiredNodeState, EnrollmentRequest, EnrollmentStatus, HeartbeatPayload,
+        NodeCertificate, NodeDirective, PickupRequest, RelayBackendClientFactoryPort,
+        RelayBackendPort, RelayHealth, RelayNodeState, RenewalRequest, ReqwestRelayBackend,
+        ReqwestRelayBackendFactory, SecretCommitRequest, SecretRotationStatus,
+        SecretRotationStatusRequest, SecretUploadRequest, SignedHeartbeat, SwappableRelayBackend,
     },
     config::{AgentConfig, ConfigError},
     identity::{load_or_create_identity, CertificateState, IdentityFsPort, StoredIdentity},
@@ -27,11 +28,12 @@ use mrd_relay_agent::{
         ProcessError, ProcessHealth, SecretBytes, WebRtcLocalAllocationProbe,
     },
     runtime::{
-        backend_worker_once, run_agent, AgentRuntime, ClockPort, CoturnSupervisor,
-        HeartbeatSampler, HostPressureSnapshot, IdentityLifecycle, IdentityMaintenance, JitterPort,
-        PortableRelayAgentConfig, PortableRelayAgentDeps, RandomJitter, RuntimeError,
-        RuntimeStateSnapshot, RuntimeStateStorePort, SecretRotationPhase, SharedRelayHealth,
-        SleeperPort, StdRuntimeStateStore, SystemClock,
+        backend_worker_once, run_agent, run_backend_worker, AgentRuntime, ClockPort,
+        CoturnSupervisor, HeartbeatSampler, HostPressureSnapshot, IdentityLifecycle,
+        IdentityMaintenance, JitterPort, PortableRelayAgent, PortableRelayAgentConfig,
+        PortableRelayAgentDeps, RandomJitter, RuntimeError, RuntimeStateSnapshot,
+        RuntimeStateStorePort, SecretRotationPhase, SharedRelayHealth, SleeperPort,
+        StdRuntimeStateStore, SystemClock,
     },
 };
 use rcgen::{
@@ -152,8 +154,10 @@ struct FakeBackend {
     heartbeat_results: Mutex<VecDeque<Result<NodeDirective, BackendError>>>,
     uploads: Mutex<Vec<SecretUploadRequest>>,
     commits: Mutex<Vec<SecretCommitRequest>>,
+    statuses: Mutex<Vec<SecretRotationStatusRequest>>,
     upload_results: Mutex<VecDeque<Result<(), BackendError>>>,
     commit_results: Mutex<VecDeque<Result<(), BackendError>>>,
+    status_results: Mutex<VecDeque<Result<SecretRotationStatus, BackendError>>>,
     auto_issue_pickup: Mutex<bool>,
 }
 
@@ -171,8 +175,10 @@ impl Default for FakeBackend {
             heartbeat_results: Mutex::default(),
             uploads: Mutex::default(),
             commits: Mutex::default(),
+            statuses: Mutex::default(),
             upload_results: Mutex::default(),
             commit_results: Mutex::default(),
+            status_results: Mutex::default(),
             auto_issue_pickup: Mutex::new(false),
         }
     }
@@ -247,10 +253,108 @@ impl RelayBackendPort for FakeBackend {
             .pop_front()
             .unwrap_or(Ok(()))
     }
+
+    async fn rotation_status(
+        &self,
+        request: SecretRotationStatusRequest,
+    ) -> Result<SecretRotationStatus, BackendError> {
+        self.statuses.lock().unwrap().push(request);
+        self.status_results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Err(BackendError::Unavailable))
+    }
 }
 
 struct PendingHeartbeatBackend {
     entered: Arc<tokio::sync::Semaphore>,
+}
+
+struct PendingRenewBackend {
+    renewal_entered: Arc<tokio::sync::Semaphore>,
+    heartbeat_sent: Arc<tokio::sync::Semaphore>,
+}
+
+struct UnavailableRenewBackend {
+    heartbeat_sent: Arc<tokio::sync::Semaphore>,
+}
+
+struct PendingApprovalBackend {
+    pickup_attempted: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait]
+impl RelayBackendPort for PendingRenewBackend {
+    async fn enroll(&self, _request: EnrollmentRequest) -> Result<EnrollmentStatus, BackendError> {
+        Err(BackendError::Unavailable)
+    }
+
+    async fn pickup(
+        &self,
+        _request: PickupRequest,
+    ) -> Result<Option<NodeCertificate>, BackendError> {
+        Err(BackendError::Unavailable)
+    }
+
+    async fn renew(&self, _request: RenewalRequest) -> Result<NodeCertificate, BackendError> {
+        self.renewal_entered.add_permits(1);
+        std::future::pending().await
+    }
+
+    async fn heartbeat(&self, heartbeat: SignedHeartbeat) -> Result<NodeDirective, BackendError> {
+        self.heartbeat_sent.add_permits(1);
+        Ok(NodeDirective::state(heartbeat.sequence, false))
+    }
+}
+
+#[async_trait]
+impl RelayBackendPort for UnavailableRenewBackend {
+    async fn enroll(&self, _request: EnrollmentRequest) -> Result<EnrollmentStatus, BackendError> {
+        Err(BackendError::Unavailable)
+    }
+
+    async fn pickup(
+        &self,
+        _request: PickupRequest,
+    ) -> Result<Option<NodeCertificate>, BackendError> {
+        Err(BackendError::Unavailable)
+    }
+
+    async fn renew(&self, _request: RenewalRequest) -> Result<NodeCertificate, BackendError> {
+        Err(BackendError::Unavailable)
+    }
+
+    async fn heartbeat(&self, heartbeat: SignedHeartbeat) -> Result<NodeDirective, BackendError> {
+        self.heartbeat_sent.add_permits(1);
+        Ok(NodeDirective::state(heartbeat.sequence, false))
+    }
+}
+
+#[async_trait]
+impl RelayBackendPort for PendingApprovalBackend {
+    async fn enroll(&self, _request: EnrollmentRequest) -> Result<EnrollmentStatus, BackendError> {
+        Ok(EnrollmentStatus::Pending {
+            enrollment_id: "enrollment-pending-0001".into(),
+            receipt: secrecy::SecretString::from("pending-enrollment-receipt"),
+        })
+    }
+
+    async fn pickup(
+        &self,
+        _request: PickupRequest,
+    ) -> Result<Option<NodeCertificate>, BackendError> {
+        self.pickup_attempted.add_permits(1);
+        Ok(None)
+    }
+
+    async fn renew(&self, _request: RenewalRequest) -> Result<NodeCertificate, BackendError> {
+        Err(BackendError::Unavailable)
+    }
+
+    async fn heartbeat(&self, _heartbeat: SignedHeartbeat) -> Result<NodeDirective, BackendError> {
+        Err(BackendError::ProtocolInvalid)
+    }
 }
 
 #[async_trait]
@@ -380,6 +484,41 @@ struct NotifyingCoturn {
     supervised: Arc<tokio::sync::Semaphore>,
 }
 
+#[derive(Default)]
+struct AlwaysFailedCoturn {
+    restarts: Mutex<u32>,
+}
+
+#[async_trait]
+impl CoturnRuntimePort for AlwaysFailedCoturn {
+    async fn snapshot(&self) -> Result<CoturnSnapshot, ProcessError> {
+        Ok(CoturnSnapshot {
+            generation: 0,
+            applied_secret_version: 0,
+            health: ProcessHealth::Failed,
+            active_allocations: 0,
+            current_egress_bps: 0,
+        })
+    }
+
+    async fn restart(&self) -> Result<(), ProcessError> {
+        *self.restarts.lock().unwrap() += 1;
+        Ok(())
+    }
+
+    async fn apply_secret(&self, _version: u64, _secret: SecretBytes) -> Result<(), ProcessError> {
+        Ok(())
+    }
+
+    async fn set_draining(&self, _draining: bool) -> Result<(), ProcessError> {
+        Ok(())
+    }
+
+    async fn probe_local_allocation(&self) -> Result<AllocationProbeEvidence, ProcessError> {
+        Err(ProcessError::ProbeUnavailable)
+    }
+}
+
 #[async_trait]
 impl CoturnRuntimePort for NotifyingCoturn {
     async fn snapshot(&self) -> Result<CoturnSnapshot, ProcessError> {
@@ -419,11 +558,34 @@ impl MetricsPort for FakeMetrics {
     }
 }
 
+struct FailingMetrics;
+
+#[async_trait]
+impl MetricsPort for FailingMetrics {
+    async fn collect(&self) -> Result<CoturnMetrics, MetricsError> {
+        Err(MetricsError::Invalid)
+    }
+}
+
 struct NonEvidenceProbe;
 
 #[async_trait]
 impl LocalAllocationProbePort for NonEvidenceProbe {
     async fn probe(&self) -> Result<AllocationProbeEvidence, ProcessError> {
+        Ok(AllocationProbeEvidence::NonEvidence)
+    }
+}
+
+struct BlockingNonEvidenceProbe {
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait]
+impl LocalAllocationProbePort for BlockingNonEvidenceProbe {
+    async fn probe(&self) -> Result<AllocationProbeEvidence, ProcessError> {
+        self.entered.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
         Ok(AllocationProbeEvidence::NonEvidence)
     }
 }
@@ -443,6 +605,15 @@ struct FakeSleeper {
     sleeps: Mutex<Vec<Duration>>,
 }
 
+struct YieldingSleeper;
+
+#[async_trait]
+impl SleeperPort for YieldingSleeper {
+    async fn sleep(&self, _duration: Duration) {
+        tokio::task::yield_now().await;
+    }
+}
+
 #[async_trait]
 impl SleeperPort for FakeSleeper {
     async fn sleep(&self, duration: Duration) {
@@ -453,6 +624,28 @@ impl SleeperPort for FakeSleeper {
 struct AdvancingSleeper {
     clock: Arc<FakeClock>,
     sleeps: Mutex<Vec<Duration>>,
+}
+
+struct HealthChangingSleeper {
+    clock: Arc<FakeClock>,
+    health: SharedRelayHealth,
+}
+
+#[async_trait]
+impl SleeperPort for HealthChangingSleeper {
+    async fn sleep(&self, duration: Duration) {
+        let delta = u64::try_from(duration.as_millis()).unwrap();
+        let mut monotonic = self.clock.monotonic_ms.lock().unwrap();
+        *monotonic = monotonic.saturating_add(delta);
+        if !duration.is_zero() {
+            self.health
+                .set(mrd_relay_agent::runtime::RelayHealthSnapshot {
+                    process: ProcessHealth::Failed,
+                    listener: ProcessHealth::Failed,
+                    probe: RelayHealth::NonEvidence,
+                });
+        }
+    }
 }
 
 #[async_trait]
@@ -522,7 +715,9 @@ fn enrollment_request() -> EnrollmentRequest {
         max_allocations: 100,
         max_egress_bps: 1_000_000,
         csr_pem: String::new(),
-        turn_rest_secret: secrecy::SecretString::from("test-only-redacted"),
+        turn_rest_secret: secrecy::SecretString::from(
+            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+        ),
     }
 }
 
@@ -803,6 +998,49 @@ fn configured_ca_rejects_expired_future_and_missing_key_cert_sign() {
 }
 
 #[tokio::test]
+async fn pickup_rechecks_trusted_ca_validity_at_install_wall_clock() {
+    let issuer = TestCertificateAuthority::with_settings(
+        date_time_ymd(2025, 1, 1),
+        date_time_ymd(2028, 1, 1),
+        vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign],
+    );
+    let backend = Arc::new(FakeBackend {
+        issuer,
+        ..FakeBackend::default()
+    });
+    let fs = Arc::new(MemoryIdentityFs::default());
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = date_time_ymd(2027, 1, 1).unix_timestamp();
+    let mut state =
+        CertificateState::new(fs, "relay-hkg-1", &backend.issuer.pem(), clock.clone()).unwrap();
+    backend
+        .enrollment_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(EnrollmentStatus::Pending {
+            enrollment_id: "enrollment-ca-expiry".into(),
+            receipt: secrecy::SecretString::from("one-use-ca-expiry-receipt"),
+        }));
+    state
+        .enroll(backend.as_ref(), enrollment_request())
+        .await
+        .unwrap();
+    let csr = backend.enrollments.lock().unwrap()[0].csr_pem.clone();
+    backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(backend.issuer.issue(&csr, LeafProfile::Client))));
+
+    *clock.unix_seconds.lock().unwrap() = date_time_ymd(2028, 1, 2).unix_timestamp();
+    assert_eq!(
+        state.pickup(backend.as_ref()).await,
+        Err(RuntimeError::CertificateInvalid)
+    );
+    assert!(state.active_certificate().is_none());
+}
+
+#[tokio::test]
 async fn certificate_reload_revalidates_active_and_pending_pairs() {
     let (fs, backend, mut state, csr) = pending_certificate_state().await;
     backend
@@ -851,6 +1089,195 @@ async fn certificate_reload_revalidates_active_and_pending_pairs() {
         CertificateState::new(fs, "relay-hkg-1", &backend.issuer.pem(), clock),
         Err(RuntimeError::CertificateInvalid)
     ));
+}
+
+#[tokio::test]
+async fn identity_reload_rejects_persisted_operation_ids_that_can_normalize_paths() {
+    let (enrollment_fs, enrollment_backend, _state, _csr) = pending_certificate_state().await;
+    let stored = enrollment_fs.identity.lock().unwrap().clone().unwrap();
+    let mut invalid_enrollment = serde_json::to_value(stored.clone()).unwrap();
+    invalid_enrollment["pending_enrollment"]["enrollment_id"] =
+        serde_json::Value::String("../pickup".into());
+    *enrollment_fs.identity.lock().unwrap() =
+        Some(serde_json::from_value(invalid_enrollment).unwrap());
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = CERT_NOW_UNIX_SECONDS;
+    assert!(matches!(
+        CertificateState::new(
+            enrollment_fs.clone(),
+            "relay-hkg-1",
+            &enrollment_backend.issuer.pem(),
+            clock.clone(),
+        ),
+        Err(RuntimeError::IdentityInvalid)
+    ));
+
+    let mut invalid_receipt = serde_json::to_value(stored).unwrap();
+    invalid_receipt["pending_enrollment"]["receipt"] =
+        serde_json::Value::String("valid-prefix\r\nforged-header-value".into());
+    *enrollment_fs.identity.lock().unwrap() =
+        Some(serde_json::from_value(invalid_receipt).unwrap());
+    assert!(matches!(
+        CertificateState::new(
+            enrollment_fs,
+            "relay-hkg-1",
+            &enrollment_backend.issuer.pem(),
+            clock,
+        ),
+        Err(RuntimeError::IdentityInvalid)
+    ));
+
+    let (renewal_fs, renewal_backend, mut renewal_state, csr) = pending_certificate_state().await;
+    renewal_backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(
+            renewal_backend.issuer.issue(&csr, LeafProfile::Client),
+        )));
+    renewal_state
+        .pickup(renewal_backend.as_ref())
+        .await
+        .unwrap();
+    renewal_backend
+        .renewal_results
+        .lock()
+        .unwrap()
+        .push_back(Err(BackendError::Unavailable));
+    assert_eq!(
+        renewal_state
+            .renew(
+                renewal_backend.as_ref(),
+                "renewal-valid-0001",
+                CERT_NOW_UNIX_SECONDS,
+            )
+            .await,
+        Err(RuntimeError::Backend(BackendError::Unavailable))
+    );
+    let mut invalid_renewal =
+        serde_json::to_value(renewal_fs.identity.lock().unwrap().clone().unwrap()).unwrap();
+    invalid_renewal["pending_renewal"]["renewal_id"] =
+        serde_json::Value::String("../renewal".into());
+    *renewal_fs.identity.lock().unwrap() = Some(serde_json::from_value(invalid_renewal).unwrap());
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = CERT_NOW_UNIX_SECONDS;
+    assert!(matches!(
+        CertificateState::new(
+            renewal_fs,
+            "relay-hkg-1",
+            &renewal_backend.issuer.pem(),
+            clock,
+        ),
+        Err(RuntimeError::IdentityInvalid)
+    ));
+}
+
+#[tokio::test]
+async fn active_identity_chain_is_revalidated_at_current_time_before_each_heartbeat() {
+    let issuer = TestCertificateAuthority::with_settings(
+        date_time_ymd(2025, 1, 1),
+        date_time_ymd(2028, 1, 1),
+        vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign],
+    );
+    let backend = Arc::new(FakeBackend {
+        issuer,
+        ..FakeBackend::default()
+    });
+    let fs = Arc::new(MemoryIdentityFs::default());
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = date_time_ymd(2027, 1, 1).unix_timestamp();
+    let mut identity =
+        CertificateState::new(fs, "relay-hkg-1", &backend.issuer.pem(), clock.clone()).unwrap();
+    backend
+        .enrollment_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(EnrollmentStatus::Pending {
+            enrollment_id: "enrollment-current-chain".into(),
+            receipt: secrecy::SecretString::from("one-use-current-chain-receipt"),
+        }));
+    identity
+        .enroll(backend.as_ref(), enrollment_request())
+        .await
+        .unwrap();
+    let csr = backend.enrollments.lock().unwrap()[0].csr_pem.clone();
+    backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(backend.issuer.issue(&csr, LeafProfile::Client))));
+    identity.pickup(backend.as_ref()).await.unwrap();
+    backend
+        .heartbeat_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(NodeDirective::state(1, false)));
+
+    let state_store = Arc::new(FakeRuntimeStateStore::default());
+    *state_store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([1; 32]),
+        ..RuntimeStateSnapshot::default()
+    };
+    let slot = Arc::new(SwappableRelayBackend::new(backend.clone()));
+    let mut runtime = AgentRuntime::new_with_state_store(
+        slot.clone(),
+        Arc::new(FakeCoturn::default()),
+        clock.clone(),
+        Arc::new(FakeSleeper::default()),
+        Arc::new(FixedJitter(0)),
+        state_store,
+    )
+    .unwrap();
+    let sampler = HeartbeatSampler::new(
+        Arc::new(FakeMetrics(CoturnMetrics::default())),
+        vec!["turn:relay.example:3478?transport=udp".into()],
+        100,
+        1_000_000,
+    )
+    .unwrap();
+    let factory = FakeBackendFactory::new(0, backend.clone());
+    let mut lifecycle = IdentityLifecycle::new(Duration::from_secs(86_400)).unwrap();
+
+    backend_worker_once(
+        &mut lifecycle,
+        &mut identity,
+        backend.as_ref(),
+        slot.as_ref(),
+        &factory,
+        None,
+        &mut runtime,
+        &sampler,
+        ProcessHealth::Healthy,
+        ProcessHealth::Healthy,
+        RelayHealth::Healthy,
+        HostPressureSnapshot::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(backend.heartbeats.lock().unwrap().len(), 1);
+
+    *clock.unix_seconds.lock().unwrap() = date_time_ymd(2028, 1, 2).unix_timestamp();
+    assert_eq!(
+        backend_worker_once(
+            &mut lifecycle,
+            &mut identity,
+            backend.as_ref(),
+            slot.as_ref(),
+            &factory,
+            None,
+            &mut runtime,
+            &sampler,
+            ProcessHealth::Healthy,
+            ProcessHealth::Healthy,
+            RelayHealth::Healthy,
+            HostPressureSnapshot::default(),
+        )
+        .await,
+        Err(RuntimeError::CertificateInvalid)
+    );
+    assert_eq!(backend.heartbeats.lock().unwrap().len(), 1);
 }
 
 fn dummy_heartbeat(sequence: u64) -> SignedHeartbeat {
@@ -1447,6 +1874,7 @@ async fn heartbeat_cycle_connects_identity_metrics_probe_and_backend_directive()
         identity_epoch: 1,
         secret_version: 1,
         secret_digest: Some([1; 32]),
+        bootstrap_secret: None,
         ..RuntimeStateSnapshot::default()
     };
     let clock = Arc::new(FakeClock::default());
@@ -1522,15 +1950,10 @@ async fn backend_worker_automatically_enrolls_picks_up_installs_and_renews_ident
     let clock = Arc::new(FakeClock::default());
     *clock.unix_seconds.lock().unwrap() = CERT_NOW_UNIX_SECONDS;
     let state_store = Arc::new(FakeRuntimeStateStore::default());
-    *state_store.state.lock().unwrap() = RuntimeStateSnapshot {
-        identity_epoch: 1,
-        secret_version: 1,
-        secret_digest: Some([1; 32]),
-        ..RuntimeStateSnapshot::default()
-    };
+    let coturn = Arc::new(FakeCoturn::default());
     let mut runtime = AgentRuntime::new_with_state_store(
         slot.clone(),
-        Arc::new(FakeCoturn::default()),
+        coturn.clone(),
         clock.clone(),
         Arc::new(FakeSleeper::default()),
         Arc::new(FixedJitter(0)),
@@ -1569,6 +1992,13 @@ async fn backend_worker_automatically_enrolls_picks_up_installs_and_renews_ident
     assert_eq!(backend.pickups.lock().unwrap().len(), 1);
     assert_eq!(backend.heartbeats.lock().unwrap().len(), 1);
     assert!(initial_backend.heartbeats.lock().unwrap().is_empty());
+    assert_eq!(*coturn.secret_versions.lock().unwrap(), vec![1]);
+    let initialized = state_store.state.lock().unwrap().clone();
+    assert_eq!(initialized.secret_version, 1);
+    assert_eq!(
+        initialized.secret_digest,
+        Some(sha2::Sha256::digest([1; 32]).into())
+    );
 
     let expires_at = identity
         .active_certificate()
@@ -1605,6 +2035,169 @@ async fn backend_worker_automatically_enrolls_picks_up_installs_and_renews_ident
     assert_eq!(backend.heartbeats.lock().unwrap().len(), 2);
     assert_eq!(backend.heartbeats.lock().unwrap()[1].identity_epoch, 2);
     assert_eq!(backend.heartbeats.lock().unwrap()[1].sequence, 1);
+}
+
+#[tokio::test]
+async fn active_identity_recovers_staged_v1_secret_before_first_heartbeat_after_crash() {
+    let (_fs, backend, mut identity, csr) = pending_certificate_state().await;
+    backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(backend.issuer.issue(&csr, LeafProfile::Client))));
+    identity.pickup(backend.as_ref()).await.unwrap();
+    backend
+        .heartbeat_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(NodeDirective::state(1, false)));
+
+    let store = Arc::new(FakeRuntimeStateStore::default());
+    let coturn = Arc::new(FakeCoturn::default());
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = CERT_NOW_UNIX_SECONDS;
+    let secret = secrecy::SecretString::from("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE");
+    let mut before_crash = AgentRuntime::new_with_state_store(
+        backend.clone(),
+        coturn.clone(),
+        clock.clone(),
+        Arc::new(FakeSleeper::default()),
+        Arc::new(FixedJitter(0)),
+        store.clone(),
+    )
+    .unwrap();
+    before_crash.stage_initial_secret(&secret).unwrap();
+    drop(before_crash);
+
+    let slot = Arc::new(SwappableRelayBackend::new(backend.clone()));
+    let mut restarted = AgentRuntime::new_with_state_store(
+        slot.clone(),
+        coturn.clone(),
+        clock,
+        Arc::new(FakeSleeper::default()),
+        Arc::new(FixedJitter(0)),
+        store.clone(),
+    )
+    .unwrap();
+    let sampler = HeartbeatSampler::new(
+        Arc::new(FakeMetrics(CoturnMetrics::default())),
+        vec!["turn:relay.example:3478?transport=udp".into()],
+        100,
+        1_000_000,
+    )
+    .unwrap();
+    let mut lifecycle = IdentityLifecycle::new(Duration::from_secs(24 * 60 * 60)).unwrap();
+    let factory = FakeBackendFactory::new(0, backend.clone());
+    let result = backend_worker_once(
+        &mut lifecycle,
+        &mut identity,
+        backend.as_ref(),
+        slot.as_ref(),
+        &factory,
+        None,
+        &mut restarted,
+        &sampler,
+        ProcessHealth::Healthy,
+        ProcessHealth::Healthy,
+        RelayHealth::Healthy,
+        HostPressureSnapshot::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, IdentityMaintenance::Ready { identity_epoch: 1 });
+    assert_eq!(*coturn.secret_versions.lock().unwrap(), vec![1]);
+    assert_eq!(backend.heartbeats.lock().unwrap().len(), 1);
+    let payload: HeartbeatPayload =
+        serde_json::from_slice(&backend.heartbeats.lock().unwrap()[0].body).unwrap();
+    assert_eq!(payload.applied_secret_version, 1);
+    assert!(store.state.lock().unwrap().bootstrap_secret.is_none());
+}
+
+#[tokio::test]
+async fn bootstrap_secret_requires_the_matching_enrollment_crash_window() {
+    let (_active_fs, active_backend, mut active_identity, csr) = pending_certificate_state().await;
+    active_backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(
+            active_backend.issuer.issue(&csr, LeafProfile::Client),
+        )));
+    active_identity
+        .pickup(active_backend.as_ref())
+        .await
+        .unwrap();
+    let active_store = Arc::new(FakeRuntimeStateStore::default());
+    let active_clock = Arc::new(FakeClock::default());
+    *active_clock.unix_seconds.lock().unwrap() = CERT_NOW_UNIX_SECONDS;
+    let active_backend_dyn: Arc<dyn RelayBackendPort> = active_backend.clone();
+    assert!(matches!(
+        PortableRelayAgent::new(
+            active_identity,
+            active_backend.clone(),
+            active_backend_dyn.clone(),
+            Arc::new(StaticBackendFactory(active_backend_dyn)),
+            Some(enrollment_request()),
+            Arc::new(FakeCoturn::default()),
+            active_clock,
+            Arc::new(FakeSleeper::default()),
+            Arc::new(FixedJitter(0)),
+            active_store,
+            Arc::new(FakeMetrics(CoturnMetrics::default())),
+            Arc::new(NonEvidenceProbe),
+            vec!["turn:relay.example:3478?transport=udp".into()],
+            100,
+            1_000_000,
+            HostPressureSnapshot::default(),
+            Duration::from_secs(86_400),
+            Duration::from_secs(30),
+        ),
+        Err(RuntimeError::StateInvalid)
+    ));
+
+    let inactive_fs = Arc::new(MemoryIdentityFs::default());
+    let inactive_backend = Arc::new(FakeBackend::default());
+    let inactive_clock = Arc::new(FakeClock::default());
+    *inactive_clock.unix_seconds.lock().unwrap() = CERT_NOW_UNIX_SECONDS;
+    let inactive_identity = CertificateState::new(
+        inactive_fs,
+        "relay-hkg-1",
+        &inactive_backend.issuer.pem(),
+        inactive_clock.clone(),
+    )
+    .unwrap();
+    let inactive_store = Arc::new(FakeRuntimeStateStore::default());
+    *inactive_store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([7; 32]),
+        ..RuntimeStateSnapshot::default()
+    };
+    let inactive_backend_dyn: Arc<dyn RelayBackendPort> = inactive_backend.clone();
+    assert!(matches!(
+        PortableRelayAgent::new(
+            inactive_identity,
+            inactive_backend.clone(),
+            inactive_backend_dyn.clone(),
+            Arc::new(StaticBackendFactory(inactive_backend_dyn)),
+            Some(enrollment_request()),
+            Arc::new(FakeCoturn::default()),
+            inactive_clock,
+            Arc::new(FakeSleeper::default()),
+            Arc::new(FixedJitter(0)),
+            inactive_store,
+            Arc::new(FakeMetrics(CoturnMetrics::default())),
+            Arc::new(NonEvidenceProbe),
+            vec!["turn:relay.example:3478?transport=udp".into()],
+            100,
+            1_000_000,
+            HostPressureSnapshot::default(),
+            Duration::from_secs(86_400),
+            Duration::from_secs(30),
+        ),
+        Err(RuntimeError::StateInvalid)
+    ));
+    assert!(inactive_backend.enrollments.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1776,6 +2369,174 @@ async fn successful_backend_cycles_follow_exact_monotonic_five_second_deadlines(
 }
 
 #[tokio::test]
+async fn production_worker_samples_health_after_the_five_second_cadence_wait() {
+    let (_fs, backend, mut identity, csr) = pending_certificate_state().await;
+    backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(backend.issuer.issue(&csr, LeafProfile::Client))));
+    identity.pickup(backend.as_ref()).await.unwrap();
+    backend
+        .heartbeat_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(NodeDirective::state(1, false)));
+    backend
+        .heartbeat_results
+        .lock()
+        .unwrap()
+        .push_back(Err(BackendError::ProtocolInvalid));
+    let slot = Arc::new(SwappableRelayBackend::new(backend.clone()));
+    let factory = FakeBackendFactory::new(0, backend.clone());
+    let clock = Arc::new(FakeClock::default());
+    *clock.monotonic_ms.lock().unwrap() = 10_000;
+    *clock.unix_seconds.lock().unwrap() = CERT_NOW_UNIX_SECONDS;
+    let health = SharedRelayHealth::default();
+    health.set(mrd_relay_agent::runtime::RelayHealthSnapshot {
+        process: ProcessHealth::Healthy,
+        listener: ProcessHealth::Healthy,
+        probe: RelayHealth::Healthy,
+    });
+    let sleeper = Arc::new(HealthChangingSleeper {
+        clock: clock.clone(),
+        health: health.clone(),
+    });
+    let store = Arc::new(FakeRuntimeStateStore::default());
+    *store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([1; 32]),
+        ..RuntimeStateSnapshot::default()
+    };
+    let mut runtime = AgentRuntime::new_with_state_store(
+        slot.clone(),
+        Arc::new(FakeCoturn::default()),
+        clock,
+        sleeper,
+        Arc::new(FixedJitter(0)),
+        store,
+    )
+    .unwrap();
+    let sampler = HeartbeatSampler::new(
+        Arc::new(FakeMetrics(CoturnMetrics::default())),
+        vec!["turn:relay.example:3478?transport=udp".into()],
+        100,
+        1_000_000,
+    )
+    .unwrap();
+    let mut lifecycle = IdentityLifecycle::new(Duration::from_secs(86_400)).unwrap();
+    assert_eq!(
+        run_backend_worker(
+            &mut lifecycle,
+            &mut identity,
+            backend.as_ref(),
+            slot.as_ref(),
+            &factory,
+            None,
+            &mut runtime,
+            &sampler,
+            &health,
+            HostPressureSnapshot::default(),
+        )
+        .await,
+        Err(RuntimeError::Backend(BackendError::ProtocolInvalid))
+    );
+    let heartbeats = backend.heartbeats.lock().unwrap();
+    assert_eq!(heartbeats.len(), 2);
+    let second: HeartbeatPayload = serde_json::from_slice(&heartbeats[1].body).unwrap();
+    assert_eq!(second.process_health, RelayHealth::Failed);
+    assert_eq!(second.listener_health, RelayHealth::Failed);
+    assert_eq!(second.probe_health, RelayHealth::NonEvidence);
+}
+
+#[tokio::test]
+async fn production_worker_success_cycles_use_exact_absolute_five_second_deadlines() {
+    let (_fs, backend, mut identity, csr) = pending_certificate_state().await;
+    backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(backend.issuer.issue(&csr, LeafProfile::Client))));
+    identity.pickup(backend.as_ref()).await.unwrap();
+    backend
+        .heartbeat_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(NodeDirective::state(1, false)));
+    backend
+        .heartbeat_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(NodeDirective::state(2, false)));
+    backend
+        .heartbeat_results
+        .lock()
+        .unwrap()
+        .push_back(Err(BackendError::ProtocolInvalid));
+    let slot = Arc::new(SwappableRelayBackend::new(backend.clone()));
+    let factory = FakeBackendFactory::new(0, backend.clone());
+    let clock = Arc::new(FakeClock::default());
+    *clock.monotonic_ms.lock().unwrap() = 10_000;
+    *clock.unix_seconds.lock().unwrap() = CERT_NOW_UNIX_SECONDS;
+    let sleeper = Arc::new(AdvancingSleeper {
+        clock: clock.clone(),
+        sleeps: Mutex::default(),
+    });
+    let store = Arc::new(FakeRuntimeStateStore::default());
+    *store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([1; 32]),
+        ..RuntimeStateSnapshot::default()
+    };
+    let mut runtime = AgentRuntime::new_with_state_store(
+        slot.clone(),
+        Arc::new(FakeCoturn::default()),
+        clock.clone(),
+        sleeper.clone(),
+        Arc::new(FixedJitter(0)),
+        store,
+    )
+    .unwrap();
+    let sampler = HeartbeatSampler::new(
+        Arc::new(FakeMetrics(CoturnMetrics::default())),
+        vec!["turn:relay.example:3478?transport=udp".into()],
+        100,
+        1_000_000,
+    )
+    .unwrap();
+    let mut lifecycle = IdentityLifecycle::new(Duration::from_secs(86_400)).unwrap();
+    let health = SharedRelayHealth::default();
+    assert_eq!(
+        run_backend_worker(
+            &mut lifecycle,
+            &mut identity,
+            backend.as_ref(),
+            slot.as_ref(),
+            &factory,
+            None,
+            &mut runtime,
+            &sampler,
+            &health,
+            HostPressureSnapshot::default(),
+        )
+        .await,
+        Err(RuntimeError::Backend(BackendError::ProtocolInvalid))
+    );
+    assert_eq!(backend.heartbeats.lock().unwrap().len(), 3);
+    assert_eq!(
+        *sleeper.sleeps.lock().unwrap(),
+        vec![
+            Duration::ZERO,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        ]
+    );
+    assert_eq!(*clock.monotonic_ms.lock().unwrap(), 20_000);
+}
+
+#[tokio::test]
 async fn heartbeat_once_applies_backend_directive() {
     let backend = Arc::new(FakeBackend::default());
     backend
@@ -1854,6 +2615,7 @@ async fn run_agent_keeps_supervisor_live_while_backend_heartbeat_never_returns()
         max_egress_bps: 1_000_000,
         pressure: HostPressureSnapshot::default(),
         renewal_window: Duration::from_secs(24 * 60 * 60),
+        backend_backoff_cap: Duration::from_secs(30),
     };
     let task = tokio::spawn(run_agent(dependencies, config));
     tokio::time::timeout(Duration::from_secs(1), backend_entered.acquire())
@@ -1868,6 +2630,367 @@ async fn run_agent_keeps_supervisor_live_while_backend_heartbeat_never_returns()
         .forget();
     assert!(!task.is_finished());
     task.abort();
+}
+
+#[tokio::test]
+async fn transient_metrics_failure_does_not_cancel_the_coturn_supervisor() {
+    let (_fs, enrollment_backend, mut identity, csr) = pending_certificate_state().await;
+    enrollment_backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(
+            enrollment_backend.issuer.issue(&csr, LeafProfile::Client),
+        )));
+    identity.pickup(enrollment_backend.as_ref()).await.unwrap();
+    let supervised = Arc::new(tokio::sync::Semaphore::new(0));
+    let backend = Arc::new(FakeBackend::default());
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = CERT_NOW_UNIX_SECONDS;
+    let state_store = Arc::new(FakeRuntimeStateStore::default());
+    *state_store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([1; 32]),
+        ..RuntimeStateSnapshot::default()
+    };
+    let dependencies = PortableRelayAgentDeps {
+        identity,
+        enrollment_backend,
+        initial_backend: backend.clone(),
+        factory: Arc::new(StaticBackendFactory(backend)),
+        coturn: Arc::new(NotifyingCoturn {
+            supervised: supervised.clone(),
+        }),
+        clock,
+        sleeper: Arc::new(FakeSleeper::default()),
+        jitter: Arc::new(FixedJitter(0)),
+        state_store,
+        metrics: Arc::new(FailingMetrics),
+        probe: Arc::new(NonEvidenceProbe),
+    };
+    let config = PortableRelayAgentConfig {
+        enrollment: None,
+        endpoints: vec!["turn:relay.example:3478?transport=udp".into()],
+        max_allocations: 100,
+        max_egress_bps: 1_000_000,
+        pressure: HostPressureSnapshot::default(),
+        renewal_window: Duration::from_secs(86_400),
+        backend_backoff_cap: Duration::from_secs(1),
+    };
+    let task = tokio::spawn(run_agent(dependencies, config));
+    tokio::time::timeout(Duration::from_secs(1), supervised.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    tokio::task::yield_now().await;
+    assert!(!task.is_finished());
+    task.abort();
+}
+
+#[tokio::test]
+async fn renewal_timeout_does_not_block_old_identity_heartbeats_or_supervision() {
+    let (_fs, enrollment_backend, mut identity, csr) = pending_certificate_state().await;
+    enrollment_backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(
+            enrollment_backend.issuer.issue(&csr, LeafProfile::Client),
+        )));
+    identity.pickup(enrollment_backend.as_ref()).await.unwrap();
+    let expires_at = identity
+        .active_certificate()
+        .unwrap()
+        .expires_at_unix_seconds;
+    let renewal_entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let heartbeat_sent = Arc::new(tokio::sync::Semaphore::new(0));
+    let supervised = Arc::new(tokio::sync::Semaphore::new(0));
+    let backend = Arc::new(PendingRenewBackend {
+        renewal_entered: renewal_entered.clone(),
+        heartbeat_sent: heartbeat_sent.clone(),
+    });
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = expires_at - 1;
+    let state_store = Arc::new(FakeRuntimeStateStore::default());
+    *state_store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([1; 32]),
+        ..RuntimeStateSnapshot::default()
+    };
+    let backend_port: Arc<dyn RelayBackendPort> = backend.clone();
+    let dependencies = PortableRelayAgentDeps {
+        identity,
+        enrollment_backend,
+        initial_backend: backend_port.clone(),
+        factory: Arc::new(StaticBackendFactory(backend_port)),
+        coturn: Arc::new(NotifyingCoturn {
+            supervised: supervised.clone(),
+        }),
+        clock,
+        sleeper: Arc::new(FakeSleeper::default()),
+        jitter: Arc::new(FixedJitter(0)),
+        state_store,
+        metrics: Arc::new(FakeMetrics(CoturnMetrics::default())),
+        probe: Arc::new(NonEvidenceProbe),
+    };
+    let config = PortableRelayAgentConfig {
+        enrollment: None,
+        endpoints: vec!["turn:relay.example:3478?transport=udp".into()],
+        max_allocations: 100,
+        max_egress_bps: 1_000_000,
+        pressure: HostPressureSnapshot::default(),
+        renewal_window: Duration::from_secs(86_400),
+        backend_backoff_cap: Duration::from_secs(1),
+    };
+    let task = tokio::spawn(run_agent(dependencies, config));
+    tokio::time::timeout(Duration::from_secs(1), renewal_entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    tokio::time::timeout(Duration::from_secs(2), heartbeat_sent.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    tokio::time::timeout(Duration::from_secs(1), supervised.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert!(!task.is_finished());
+    task.abort();
+}
+
+#[tokio::test]
+async fn retryable_renewal_rejection_keeps_old_identity_heartbeats_and_supervision_live() {
+    let (_fs, enrollment_backend, mut identity, csr) = pending_certificate_state().await;
+    enrollment_backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(
+            enrollment_backend.issuer.issue(&csr, LeafProfile::Client),
+        )));
+    identity.pickup(enrollment_backend.as_ref()).await.unwrap();
+    let expires_at = identity
+        .active_certificate()
+        .unwrap()
+        .expires_at_unix_seconds;
+    let heartbeat_sent = Arc::new(tokio::sync::Semaphore::new(0));
+    let supervised = Arc::new(tokio::sync::Semaphore::new(0));
+    let backend = Arc::new(UnavailableRenewBackend {
+        heartbeat_sent: heartbeat_sent.clone(),
+    });
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = expires_at - 1;
+    let state_store = Arc::new(FakeRuntimeStateStore::default());
+    *state_store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([1; 32]),
+        ..RuntimeStateSnapshot::default()
+    };
+    let backend_port: Arc<dyn RelayBackendPort> = backend.clone();
+    let dependencies = PortableRelayAgentDeps {
+        identity,
+        enrollment_backend,
+        initial_backend: backend_port.clone(),
+        factory: Arc::new(StaticBackendFactory(backend_port)),
+        coturn: Arc::new(NotifyingCoturn {
+            supervised: supervised.clone(),
+        }),
+        clock,
+        sleeper: Arc::new(YieldingSleeper),
+        jitter: Arc::new(FixedJitter(0)),
+        state_store,
+        metrics: Arc::new(FakeMetrics(CoturnMetrics::default())),
+        probe: Arc::new(NonEvidenceProbe),
+    };
+    let config = PortableRelayAgentConfig {
+        enrollment: None,
+        endpoints: vec!["turn:relay.example:3478?transport=udp".into()],
+        max_allocations: 100,
+        max_egress_bps: 1_000_000,
+        pressure: HostPressureSnapshot::default(),
+        renewal_window: Duration::from_secs(86_400),
+        backend_backoff_cap: Duration::from_secs(1),
+    };
+    let task = tokio::spawn(run_agent(dependencies, config));
+
+    tokio::time::timeout(Duration::from_secs(1), heartbeat_sent.acquire())
+        .await
+        .expect("retryable renewal failure must not suppress the old identity heartbeat")
+        .unwrap()
+        .forget();
+    tokio::time::timeout(Duration::from_secs(1), supervised.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert!(!task.is_finished());
+    task.abort();
+}
+
+#[tokio::test]
+async fn pending_enrollment_does_not_spend_coturn_restart_budget_before_secret_install() {
+    let fs = Arc::new(MemoryIdentityFs::default());
+    let issuer = TestCertificateAuthority::new();
+    let backend = Arc::new(PendingApprovalBackend {
+        pickup_attempted: Arc::new(tokio::sync::Semaphore::new(0)),
+    });
+    let coturn = Arc::new(AlwaysFailedCoturn::default());
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = CERT_NOW_UNIX_SECONDS;
+    let identity = CertificateState::new(fs, "relay-hkg-1", &issuer.pem(), clock.clone()).unwrap();
+    let state_store = Arc::new(FakeRuntimeStateStore::default());
+    let backend_port: Arc<dyn RelayBackendPort> = backend.clone();
+    let dependencies = PortableRelayAgentDeps {
+        identity,
+        enrollment_backend: backend.clone(),
+        initial_backend: backend_port.clone(),
+        factory: Arc::new(StaticBackendFactory(backend_port)),
+        coturn: coturn.clone(),
+        clock,
+        sleeper: Arc::new(YieldingSleeper),
+        jitter: Arc::new(FixedJitter(0)),
+        state_store,
+        metrics: Arc::new(FakeMetrics(CoturnMetrics::default())),
+        probe: Arc::new(NonEvidenceProbe),
+    };
+    let config = PortableRelayAgentConfig {
+        enrollment: Some(enrollment_request()),
+        endpoints: vec!["turn:relay.example:3478?transport=udp".into()],
+        max_allocations: 100,
+        max_egress_bps: 1_000_000,
+        pressure: HostPressureSnapshot::default(),
+        renewal_window: Duration::from_secs(86_400),
+        backend_backoff_cap: Duration::from_secs(1),
+    };
+    let pickup_attempted = backend.pickup_attempted.clone();
+    let task = tokio::spawn(run_agent(dependencies, config));
+
+    tokio::time::timeout(Duration::from_secs(1), pickup_attempted.acquire_many(3))
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(*coturn.restarts.lock().unwrap(), 0);
+    assert!(!task.is_finished());
+    task.abort();
+}
+
+#[tokio::test]
+async fn portable_agent_reconciles_an_exact_identity_epoch_crash_gap_before_network_work() {
+    let (fs, backend, mut initial_identity, csr) = pending_certificate_state().await;
+    backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(backend.issuer.issue(&csr, LeafProfile::Client))));
+    initial_identity.pickup(backend.as_ref()).await.unwrap();
+    drop(initial_identity);
+    let stored = fs.identity.lock().unwrap().clone().unwrap();
+    let mut value = serde_json::to_value(stored).unwrap();
+    value["identity_epoch"] = serde_json::json!(2);
+    *fs.identity.lock().unwrap() = Some(serde_json::from_value(value).unwrap());
+
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = CERT_NOW_UNIX_SECONDS;
+    let identity =
+        CertificateState::new(fs, "relay-hkg-1", &backend.issuer.pem(), clock.clone()).unwrap();
+    let state_store = Arc::new(FakeRuntimeStateStore::default());
+    *state_store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        last_directive_sequence: 73,
+        secret_version: 1,
+        secret_digest: Some([7; 32]),
+        draining: true,
+        ..RuntimeStateSnapshot::default()
+    };
+    let initial_backend: Arc<dyn RelayBackendPort> = backend.clone();
+    let _agent = PortableRelayAgent::new(
+        identity,
+        backend.clone(),
+        initial_backend.clone(),
+        Arc::new(StaticBackendFactory(initial_backend)),
+        None,
+        Arc::new(FakeCoturn::default()),
+        clock,
+        Arc::new(FakeSleeper::default()),
+        Arc::new(FixedJitter(0)),
+        state_store.clone(),
+        Arc::new(FakeMetrics(CoturnMetrics::default())),
+        Arc::new(NonEvidenceProbe),
+        vec!["turn:relay.example:3478?transport=udp".into()],
+        100,
+        1_000_000,
+        HostPressureSnapshot::default(),
+        Duration::from_secs(86_400),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+
+    let reconciled = state_store.state.lock().unwrap().clone();
+    assert_eq!(reconciled.identity_epoch, 2);
+    assert_eq!(reconciled.last_directive_sequence, 0);
+    assert!(reconciled.draining);
+    assert_eq!(reconciled.secret_version, 1);
+}
+
+#[tokio::test]
+async fn identity_epoch_crash_gap_never_discards_an_inflight_secret_rotation() {
+    let store = Arc::new(FakeRuntimeStateStore::default());
+    *store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([1; 32]),
+        ..RuntimeStateSnapshot::default()
+    };
+    let mut runtime = AgentRuntime::new_with_state_store(
+        Arc::new(FakeBackend::default()),
+        Arc::new(FakeCoturn::default()),
+        Arc::new(FakeClock::default()),
+        Arc::new(FakeSleeper::default()),
+        Arc::new(FixedJitter(0)),
+        store.clone(),
+    )
+    .unwrap();
+    runtime
+        .apply_directive(NodeDirective {
+            identity_epoch: 1,
+            sequence: 1,
+            state: RelayNodeState::Draining,
+            desired: DesiredNodeState {
+                draining: true,
+                secret_version: 2,
+                not_before_unix_seconds: Some(1_000),
+                old_credential_deadline_unix_seconds: Some(1_000),
+                rotation_challenge: Some(ROTATION_CHALLENGE.into()),
+            },
+            secret_update: None,
+        })
+        .await
+        .unwrap();
+    let before = store.state.lock().unwrap().clone();
+
+    assert_eq!(
+        runtime.reconcile_identity_epoch(2),
+        Err(RuntimeError::StateInvalid)
+    );
+    let after = store.state.lock().unwrap().clone();
+    assert_eq!(after.identity_epoch, 1);
+    assert_eq!(after.pending_rotation, before.pending_rotation);
+    assert_eq!(
+        after.last_directive_sequence,
+        before.last_directive_sequence
+    );
 }
 
 #[test]
@@ -1975,6 +3098,11 @@ fn production_metrics_source_is_restricted_to_loopback_and_clock_jitter_are_boun
         MetricsLimits::default(),
     )
     .is_err());
+    assert!(ReqwestCoturnMetrics::new(
+        "https://127.0.0.1:9641/metrics".parse().unwrap(),
+        MetricsLimits::default(),
+    )
+    .is_err());
 
     let clock = SystemClock::new();
     let first = clock.monotonic_ms();
@@ -1999,6 +3127,21 @@ fn reqwest_backend_can_enroll_before_mtls_and_only_installs_a_matching_identity_
     .unwrap();
     backend
         .with_mtls_identity(certificate.pem().as_bytes(), key.serialize_pem().as_bytes())
+        .unwrap();
+    let factory = ReqwestRelayBackendFactory::new(
+        "https://relay-control.example/".parse().unwrap(),
+        certificate.pem().as_bytes(),
+    )
+    .unwrap();
+    factory
+        .build_mtls(
+            &NodeCertificate {
+                certificate_pem: certificate.pem(),
+                ca_certificate_pem: certificate.pem(),
+                expires_at_unix_seconds: 1,
+            },
+            &key.serialize_der(),
+        )
         .unwrap();
 }
 
@@ -2051,6 +3194,8 @@ async fn coturn_restart_is_attempted_exactly_three_times_then_stays_failed() {
             .lock()
             .unwrap()
             .push_back(Ok(CoturnSnapshot {
+                generation: 1,
+                applied_secret_version: 1,
                 health: ProcessHealth::Failed,
                 active_allocations: 0,
                 current_egress_bps: 0,
@@ -2106,6 +3251,37 @@ async fn production_supervisor_does_not_reset_restart_budget_on_healthy_process_
     let health = shared.snapshot();
     assert_eq!(health.process, ProcessHealth::Healthy);
     assert_eq!(health.probe, RelayHealth::NonEvidence);
+}
+
+#[tokio::test]
+async fn supervisor_invalidates_old_healthy_evidence_before_a_new_probe_can_block() {
+    let coturn = Arc::new(FakeCoturn::default());
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let shared = SharedRelayHealth::default();
+    shared.set(mrd_relay_agent::runtime::RelayHealthSnapshot {
+        process: ProcessHealth::Healthy,
+        listener: ProcessHealth::Healthy,
+        probe: RelayHealth::Healthy,
+    });
+    let mut supervisor = CoturnSupervisor::new(
+        coturn,
+        Arc::new(FakeSleeper::default()),
+        Arc::new(BlockingNonEvidenceProbe {
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+        shared.clone(),
+    );
+    let task = tokio::spawn(async move { supervisor.supervise_once().await });
+    tokio::time::timeout(Duration::from_secs(1), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert_eq!(shared.snapshot().probe, RelayHealth::NonEvidence);
+    release.add_permits(1);
+    task.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -2168,6 +3344,25 @@ async fn backend_backoff_is_bounded_and_does_not_stop_local_supervision() {
     supervisor.supervise_once().await.unwrap();
     assert_eq!(shared.snapshot().process, ProcessHealth::Healthy);
     assert_eq!(shared.snapshot().probe, RelayHealth::NonEvidence);
+}
+
+#[test]
+fn configured_backend_backoff_cap_is_used_by_the_runtime() {
+    let runtime = AgentRuntime::new_with_state_store_and_backoff_cap(
+        Arc::new(FakeBackend::default()),
+        Arc::new(FakeCoturn::default()),
+        Arc::new(FakeClock::default()),
+        Arc::new(FakeSleeper::default()),
+        Arc::new(FixedJitter(17)),
+        Arc::new(FakeRuntimeStateStore::default()),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    for attempt in 0..20 {
+        let delay = runtime.backend_retry_delay(attempt);
+        assert!(!delay.is_zero());
+        assert!(delay <= Duration::from_secs(1));
+    }
 }
 
 #[tokio::test]
@@ -2256,6 +3451,7 @@ async fn generated_secret_rotation_persists_intent_uses_monotonic_window_and_req
         last_directive_sequence: 0,
         secret_version: 1,
         secret_digest: Some([1; 32]),
+        bootstrap_secret: None,
         draining: false,
         pending_rotation: None,
     };
@@ -2477,7 +3673,431 @@ async fn pending_generated_secret_is_reused_after_upload_failure_and_restart() {
 }
 
 #[tokio::test]
-async fn secret_upload_and_commit_requests_match_signed_python_wire() {
+async fn persisted_probe_evidence_is_never_trusted_after_process_restart() {
+    let store = Arc::new(FakeRuntimeStateStore::default());
+    *store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([1; 32]),
+        ..RuntimeStateSnapshot::default()
+    };
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = 1_000;
+    let mut runtime = AgentRuntime::new_with_state_store(
+        Arc::new(FakeBackend::default()),
+        Arc::new(FakeCoturn::default()),
+        clock.clone(),
+        Arc::new(FakeSleeper::default()),
+        Arc::new(FixedJitter(0)),
+        store.clone(),
+    )
+    .unwrap();
+    runtime
+        .apply_directive(NodeDirective {
+            identity_epoch: 1,
+            sequence: 1,
+            state: RelayNodeState::Draining,
+            desired: DesiredNodeState {
+                draining: true,
+                secret_version: 2,
+                not_before_unix_seconds: Some(1_000),
+                old_credential_deadline_unix_seconds: Some(1_000),
+                rotation_challenge: Some(ROTATION_CHALLENGE.into()),
+            },
+            secret_update: None,
+        })
+        .await
+        .unwrap();
+    drop(runtime);
+    {
+        let mut persisted = store.state.lock().unwrap();
+        let pending = persisted.pending_rotation.as_mut().unwrap();
+        pending.phase = SecretRotationPhase::Probed;
+        pending.probe_evidence_sha256 = Some([0x44; 32]);
+        pending.probe_generation = Some(91);
+    }
+
+    let _restarted = AgentRuntime::new_with_state_store(
+        Arc::new(FakeBackend::default()),
+        Arc::new(FakeCoturn::default()),
+        clock,
+        Arc::new(FakeSleeper::default()),
+        Arc::new(FixedJitter(0)),
+        store.clone(),
+    )
+    .unwrap();
+    let persisted = store.state.lock().unwrap();
+    let pending = persisted.pending_rotation.as_ref().unwrap();
+    assert_eq!(pending.phase, SecretRotationPhase::Applied);
+    assert_eq!(pending.probe_evidence_sha256, None);
+    assert_eq!(pending.probe_generation, None);
+}
+
+#[tokio::test]
+async fn commit_unknown_queries_status_before_any_retry_and_pending_requires_fresh_live_proof() {
+    let (_identity_fs, issuer_backend, mut identity, csr) = pending_certificate_state().await;
+    issuer_backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(
+            issuer_backend.issuer.issue(&csr, LeafProfile::Client),
+        )));
+    identity.pickup(issuer_backend.as_ref()).await.unwrap();
+    let store = Arc::new(FakeRuntimeStateStore::default());
+    *store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([1; 32]),
+        ..RuntimeStateSnapshot::default()
+    };
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = 1_000;
+    let mut staging = AgentRuntime::new_with_state_store(
+        Arc::new(FakeBackend::default()),
+        Arc::new(FakeCoturn::default()),
+        clock.clone(),
+        Arc::new(FakeSleeper::default()),
+        Arc::new(FixedJitter(0)),
+        store.clone(),
+    )
+    .unwrap();
+    staging
+        .apply_directive(NodeDirective {
+            identity_epoch: 1,
+            sequence: 1,
+            state: RelayNodeState::Draining,
+            desired: DesiredNodeState {
+                draining: true,
+                secret_version: 2,
+                not_before_unix_seconds: Some(1_000),
+                old_credential_deadline_unix_seconds: Some(1_000),
+                rotation_challenge: Some(ROTATION_CHALLENGE.into()),
+            },
+            secret_update: None,
+        })
+        .await
+        .unwrap();
+    drop(staging);
+    {
+        let mut state = store.state.lock().unwrap();
+        let pending = state.pending_rotation.as_mut().unwrap();
+        pending.phase = SecretRotationPhase::CommitUnknown;
+        pending.probe_evidence_sha256 = Some([0xab; 32]);
+        pending.probe_generation = Some(7);
+    }
+    let backend = Arc::new(FakeBackend::default());
+    backend
+        .status_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(SecretRotationStatus::Pending {
+            active_secret_version: 1,
+        }));
+    let mut restarted = AgentRuntime::new_with_state_store(
+        backend.clone(),
+        Arc::new(FakeCoturn::default()),
+        clock,
+        Arc::new(FakeSleeper::default()),
+        Arc::new(FixedJitter(0)),
+        store.clone(),
+    )
+    .unwrap();
+    assert!(restarted.rotation_requires_reconcile_before_heartbeat());
+    assert_eq!(
+        restarted.advance_secret_rotation(&mut identity).await,
+        Err(RuntimeError::Process(ProcessError::ProbeUnavailable))
+    );
+    assert_eq!(backend.statuses.lock().unwrap().len(), 1);
+    assert!(backend.commits.lock().unwrap().is_empty());
+    let state = store.state.lock().unwrap();
+    assert_eq!(state.secret_version, 1);
+    let pending = state.pending_rotation.as_ref().unwrap();
+    assert_eq!(pending.phase, SecretRotationPhase::Applied);
+    assert_eq!(pending.probe_evidence_sha256, None);
+    assert_eq!(pending.probe_generation, None);
+}
+
+#[tokio::test]
+async fn pending_rotation_blocks_identity_renewal_and_reconciles_before_epoch_change() {
+    let (_identity_fs, backend, mut identity, csr) = pending_certificate_state().await;
+    backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(backend.issuer.issue(&csr, LeafProfile::Client))));
+    identity.pickup(backend.as_ref()).await.unwrap();
+    let renewal_due_now = identity
+        .active_certificate()
+        .unwrap()
+        .expires_at_unix_seconds
+        - 1;
+    let store = Arc::new(FakeRuntimeStateStore::default());
+    *store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([1; 32]),
+        ..RuntimeStateSnapshot::default()
+    };
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = renewal_due_now;
+    let slot = Arc::new(SwappableRelayBackend::new(backend.clone()));
+    let coturn = Arc::new(FakeCoturn::default());
+    let sleeper = Arc::new(FakeSleeper::default());
+    let mut staging = AgentRuntime::new_with_state_store(
+        slot.clone(),
+        coturn.clone(),
+        clock.clone(),
+        sleeper.clone(),
+        Arc::new(FixedJitter(0)),
+        store.clone(),
+    )
+    .unwrap();
+    staging
+        .apply_directive(NodeDirective {
+            identity_epoch: 1,
+            sequence: 1,
+            state: RelayNodeState::Draining,
+            desired: DesiredNodeState {
+                draining: true,
+                secret_version: 2,
+                not_before_unix_seconds: Some(renewal_due_now),
+                old_credential_deadline_unix_seconds: Some(renewal_due_now),
+                rotation_challenge: Some(ROTATION_CHALLENGE.into()),
+            },
+            secret_update: None,
+        })
+        .await
+        .unwrap();
+    drop(staging);
+    {
+        let mut state = store.state.lock().unwrap();
+        let pending = state.pending_rotation.as_mut().unwrap();
+        pending.phase = SecretRotationPhase::CommitUnknown;
+        pending.probe_evidence_sha256 = Some([0xab; 32]);
+        pending.probe_generation = Some(7);
+    }
+    backend
+        .status_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(SecretRotationStatus::Pending {
+            active_secret_version: 1,
+        }));
+    let mut runtime = AgentRuntime::new_with_state_store(
+        slot.clone(),
+        coturn,
+        clock,
+        sleeper,
+        Arc::new(FixedJitter(0)),
+        store.clone(),
+    )
+    .unwrap();
+    let sampler = HeartbeatSampler::new(
+        Arc::new(FakeMetrics(CoturnMetrics::default())),
+        vec!["turn:relay.example:3478?transport=udp".into()],
+        100,
+        1_000_000,
+    )
+    .unwrap();
+    let factory = FakeBackendFactory::new(0, backend.clone());
+    let mut lifecycle = IdentityLifecycle::new(Duration::from_secs(86_400)).unwrap();
+
+    assert_eq!(
+        backend_worker_once(
+            &mut lifecycle,
+            &mut identity,
+            backend.as_ref(),
+            slot.as_ref(),
+            &factory,
+            None,
+            &mut runtime,
+            &sampler,
+            ProcessHealth::Healthy,
+            ProcessHealth::Healthy,
+            RelayHealth::Healthy,
+            HostPressureSnapshot::default(),
+        )
+        .await,
+        Err(RuntimeError::Process(ProcessError::ProbeUnavailable))
+    );
+    assert!(backend.renewals.lock().unwrap().is_empty());
+    assert_eq!(backend.statuses.lock().unwrap().len(), 1);
+    assert_eq!(identity.identity_epoch(), 1);
+    let state = store.state.lock().unwrap();
+    assert_eq!(state.secret_version, 1);
+    assert_eq!(
+        state.pending_rotation.as_ref().unwrap().phase,
+        SecretRotationPhase::Applied
+    );
+}
+
+#[tokio::test]
+async fn unknown_rotation_status_fails_closed_without_committing_or_advancing_version() {
+    let (_identity_fs, issuer_backend, mut identity, csr) = pending_certificate_state().await;
+    issuer_backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(
+            issuer_backend.issuer.issue(&csr, LeafProfile::Client),
+        )));
+    identity.pickup(issuer_backend.as_ref()).await.unwrap();
+    let store = Arc::new(FakeRuntimeStateStore::default());
+    *store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([1; 32]),
+        ..RuntimeStateSnapshot::default()
+    };
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = 1_000;
+    let mut staging = AgentRuntime::new_with_state_store(
+        Arc::new(FakeBackend::default()),
+        Arc::new(FakeCoturn::default()),
+        clock.clone(),
+        Arc::new(FakeSleeper::default()),
+        Arc::new(FixedJitter(0)),
+        store.clone(),
+    )
+    .unwrap();
+    staging
+        .apply_directive(NodeDirective {
+            identity_epoch: 1,
+            sequence: 1,
+            state: RelayNodeState::Draining,
+            desired: DesiredNodeState {
+                draining: true,
+                secret_version: 2,
+                not_before_unix_seconds: Some(1_000),
+                old_credential_deadline_unix_seconds: Some(1_000),
+                rotation_challenge: Some(ROTATION_CHALLENGE.into()),
+            },
+            secret_update: None,
+        })
+        .await
+        .unwrap();
+    drop(staging);
+    {
+        let mut state = store.state.lock().unwrap();
+        let pending = state.pending_rotation.as_mut().unwrap();
+        pending.phase = SecretRotationPhase::CommitUnknown;
+        pending.probe_evidence_sha256 = Some([0xab; 32]);
+        pending.probe_generation = Some(7);
+    }
+    let backend = Arc::new(FakeBackend::default());
+    backend
+        .status_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(SecretRotationStatus::Unknown {
+            active_secret_version: 2,
+        }));
+    let mut restarted = AgentRuntime::new_with_state_store(
+        backend.clone(),
+        Arc::new(FakeCoturn::default()),
+        clock,
+        Arc::new(FakeSleeper::default()),
+        Arc::new(FixedJitter(0)),
+        store.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        restarted.advance_secret_rotation(&mut identity).await,
+        Err(RuntimeError::Backend(BackendError::ProtocolInvalid))
+    );
+    assert!(backend.commits.lock().unwrap().is_empty());
+    assert_eq!(store.state.lock().unwrap().secret_version, 1);
+}
+
+#[tokio::test]
+async fn committed_exact_status_still_requires_current_process_live_evidence_before_finalize() {
+    let (_identity_fs, issuer_backend, mut identity, csr) = pending_certificate_state().await;
+    issuer_backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(
+            issuer_backend.issuer.issue(&csr, LeafProfile::Client),
+        )));
+    identity.pickup(issuer_backend.as_ref()).await.unwrap();
+    let store = Arc::new(FakeRuntimeStateStore::default());
+    *store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([1; 32]),
+        ..RuntimeStateSnapshot::default()
+    };
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = 1_000;
+    let mut staging = AgentRuntime::new_with_state_store(
+        Arc::new(FakeBackend::default()),
+        Arc::new(FakeCoturn::default()),
+        clock.clone(),
+        Arc::new(FakeSleeper::default()),
+        Arc::new(FixedJitter(0)),
+        store.clone(),
+    )
+    .unwrap();
+    staging
+        .apply_directive(NodeDirective {
+            identity_epoch: 1,
+            sequence: 1,
+            state: RelayNodeState::Draining,
+            desired: DesiredNodeState {
+                draining: true,
+                secret_version: 2,
+                not_before_unix_seconds: Some(1_000),
+                old_credential_deadline_unix_seconds: Some(1_000),
+                rotation_challenge: Some(ROTATION_CHALLENGE.into()),
+            },
+            secret_update: None,
+        })
+        .await
+        .unwrap();
+    drop(staging);
+    {
+        let mut state = store.state.lock().unwrap();
+        let pending = state.pending_rotation.as_mut().unwrap();
+        pending.phase = SecretRotationPhase::CommitUnknown;
+        pending.probe_evidence_sha256 = Some([0xab; 32]);
+        pending.probe_generation = Some(7);
+    }
+    let backend = Arc::new(FakeBackend::default());
+    backend
+        .status_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(SecretRotationStatus::CommittedExact {
+            active_secret_version: 2,
+        }));
+    let coturn = Arc::new(FakeCoturn::default());
+    let mut restarted = AgentRuntime::new_with_state_store(
+        backend.clone(),
+        coturn.clone(),
+        clock,
+        Arc::new(FakeSleeper::default()),
+        Arc::new(FixedJitter(0)),
+        store.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        restarted.advance_secret_rotation(&mut identity).await,
+        Err(RuntimeError::Process(ProcessError::ProbeUnavailable))
+    );
+    assert!(backend.commits.lock().unwrap().is_empty());
+    assert_eq!(*coturn.secret_versions.lock().unwrap(), vec![2]);
+    let state = store.state.lock().unwrap();
+    assert_eq!(state.secret_version, 1);
+    assert_eq!(
+        state.pending_rotation.as_ref().unwrap().phase,
+        SecretRotationPhase::CommitUnknown
+    );
+}
+
+#[tokio::test]
+async fn secret_upload_commit_and_status_requests_match_signed_python_wire() {
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
         "../../../tests/fixtures/relay_secret_rotation_wire_v1.json"
     ))
@@ -2581,7 +4201,95 @@ async fn secret_upload_and_commit_requests_match_signed_python_wire() {
     ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public_key)
         .verify(&commit_canonical, &commit_signature)
         .unwrap();
+    let status = identity
+        .prepare_secret_rotation_status(
+            fixture["status"]["timestamp"].as_i64().unwrap(),
+            "rotation-0001".into(),
+            2,
+            ROTATION_CHALLENGE.into(),
+            [
+                0x72, 0xcd, 0x6e, 0x84, 0x22, 0xc4, 0x07, 0xfb, 0x6d, 0x09, 0x86, 0x90, 0xf1, 0x13,
+                0x0b, 0x7d, 0xed, 0x7e, 0xc2, 0xf7, 0xf5, 0xe1, 0xd3, 0x0b, 0xd9, 0xd5, 0x21, 0xf0,
+                0x15, 0x36, 0x37, 0x93,
+            ],
+            [0xab; 32],
+            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+        )
+        .unwrap();
+    assert_eq!(status.authentication.sequence, 3);
+    assert_eq!(status.proof_mac, commit.proof_mac);
+    let status_body = fixture["status"]["body_json"].as_str().unwrap();
+    assert_eq!(status_body, commit_body);
+    let status_canonical = canonical_relay_request(
+        fixture["status"]["method"].as_str().unwrap(),
+        fixture["status"]["path"].as_str().unwrap(),
+        fixture["node_id"].as_str().unwrap(),
+        fixture["status"]["timestamp"].as_i64().unwrap(),
+        status.authentication.sequence,
+        status_body.as_bytes(),
+    )
+    .unwrap();
+    let status_signature = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        &status.authentication.signature_b64,
+    )
+    .unwrap();
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, identity.public_key())
+        .verify(&status_canonical, &status_signature)
+        .unwrap();
+    assert_eq!(
+        decode_secret_rotation_status_response(
+            fixture["status_responses"]["committed_exact"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+            "relay-hkg-1",
+            1,
+            2,
+        ),
+        Ok(SecretRotationStatus::CommittedExact {
+            active_secret_version: 2
+        })
+    );
+    assert_eq!(
+        decode_secret_rotation_status_response(
+            fixture["status_responses"]["pending"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+            "relay-hkg-1",
+            1,
+            2,
+        ),
+        Ok(SecretRotationStatus::Pending {
+            active_secret_version: 1
+        })
+    );
+    assert_eq!(
+        decode_secret_rotation_status_response(
+            fixture["status_responses"]["unknown"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+            "relay-hkg-1",
+            1,
+            2,
+        ),
+        Ok(SecretRotationStatus::Unknown {
+            active_secret_version: 2
+        })
+    );
+    assert_eq!(
+        decode_secret_rotation_status_response(
+            br#"{"node_id":"other","identity_epoch":1,"active_secret_version":2,"status":"committed_exact"}"#,
+            "relay-hkg-1",
+            1,
+            2,
+        ),
+        Err(BackendError::ProtocolInvalid)
+    );
     assert!(!format!("{upload:?}").contains(upload.turn_rest_secret.expose_secret()));
+    assert!(!format!("{status:?}").contains(&status.proof_mac));
 }
 
 #[tokio::test]
@@ -2659,7 +4367,9 @@ async fn identity_epoch_rotation_resets_sequence_and_rejects_old_epoch_directive
         .apply_directive(NodeDirective::state(5, true))
         .await
         .unwrap();
-    runtime.activate_identity_epoch(2).unwrap();
+    runtime.reconcile_identity_epoch(1).unwrap();
+    runtime.reconcile_identity_epoch(2).unwrap();
+    runtime.reconcile_identity_epoch(2).unwrap();
     assert_eq!(store.state.lock().unwrap().identity_epoch, 2);
     assert_eq!(store.state.lock().unwrap().last_directive_sequence, 0);
     assert!(store.state.lock().unwrap().draining);
@@ -2673,6 +4383,118 @@ async fn identity_epoch_rotation_resets_sequence_and_rejects_old_epoch_directive
     new_epoch.identity_epoch = 2;
     runtime.apply_directive(new_epoch).await.unwrap();
     assert!(!runtime.is_draining());
+    assert_eq!(
+        runtime.reconcile_identity_epoch(1),
+        Err(RuntimeError::StateInvalid)
+    );
+    assert_eq!(
+        runtime.reconcile_identity_epoch(4),
+        Err(RuntimeError::StateInvalid)
+    );
+}
+
+#[test]
+fn rotation_proof_accepts_the_full_node_id_contract_including_short_dot_ids() {
+    let node_ids = [
+        "a".to_owned(),
+        "a.b".to_owned(),
+        "n".to_owned(),
+        "z".repeat(128),
+    ];
+    for node_id in &node_ids {
+        let proof = rotation_proof_message(
+            node_id,
+            1,
+            "rotation-0001",
+            2,
+            ROTATION_CHALLENGE,
+            &[1; 32],
+            &[2; 32],
+        );
+        assert!(proof.is_ok(), "valid node id was rejected: {node_id}");
+    }
+}
+
+#[test]
+fn heartbeat_rejects_degraded_probe_health_and_redacts_public_endpoints() {
+    let credential_bearing_endpoint =
+        "turn:leak-user:leak-password@relay.example:3478?transport=udp".to_owned();
+    let payload = HeartbeatPayload {
+        identity_epoch: 1,
+        boot_id: "AAAAAAAAAAAAAAAAAAAAAA".into(),
+        nonce: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+        process_health: RelayHealth::Healthy,
+        listener_health: RelayHealth::Healthy,
+        probe_health: RelayHealth::Degraded,
+        active_allocations: 0,
+        current_ingress_bps: 0,
+        current_egress_bps: 0,
+        max_allocations: 1,
+        max_egress_bps: 1,
+        packet_loss_bps: 0,
+        cpu_usage_bps: 0,
+        memory_usage_bps: 0,
+        measured_rtt_ms: None,
+        recent_failure_bps: 0,
+        endpoints: vec![credential_bearing_endpoint.clone()],
+        applied_secret_version: 1,
+    };
+    assert_eq!(payload.validate(), Err(BackendError::ProtocolInvalid));
+    assert!(!format!("{payload:?}").contains(&credential_bearing_endpoint));
+
+    let request = EnrollmentRequest {
+        token: secrecy::SecretString::from("t".repeat(40)),
+        node_id: "a".into(),
+        region: "hkg".into(),
+        failure_domain: "hkg-a".into(),
+        endpoints: vec![credential_bearing_endpoint.clone()],
+        max_allocations: 1,
+        max_egress_bps: 1,
+        csr_pem: "REDACTED-CSR".into(),
+        turn_rest_secret: secrecy::SecretString::from(
+            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+        ),
+    };
+    assert!(!format!("{request:?}").contains(&credential_bearing_endpoint));
+}
+
+#[test]
+fn configuration_rejects_credential_bearing_or_noncanonical_turn_endpoints() {
+    let valid_turn_secret = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        (0u8..32).collect::<Vec<_>>(),
+    );
+    let base = || AgentConfig {
+        backend_url: "https://relay-control.example/".parse().unwrap(),
+        node_id: "a".into(),
+        region: "hkg".into(),
+        failure_domain: "hkg-a".into(),
+        endpoints: vec!["turn:relay.example:3478?transport=udp".into()],
+        max_allocations: 100,
+        max_egress_bps: 1_000_000,
+        identity_path: std::env::temp_dir().join("mrd-relay-agent-identity-endpoint.json"),
+        runtime_state_path: std::env::temp_dir().join("mrd-relay-agent-runtime-endpoint.json"),
+        trusted_ca_path: std::env::temp_dir().join("mrd-relay-agent-ca-endpoint.pem"),
+        metrics_url: "http://127.0.0.1:9641/metrics".parse().unwrap(),
+        enrollment_token: None,
+        turn_rest_secret: Some(secrecy::SecretString::from(valid_turn_secret.clone())),
+        heartbeat_interval: Duration::from_secs(5),
+        backend_backoff_cap: Duration::from_secs(30),
+    };
+    assert!(base().validate().is_ok());
+    for endpoint in [
+        "turn:user:password@relay.example:3478?transport=udp",
+        "turn:relay.example:3478/path?transport=udp",
+        "turn:relay.example:3478?transport=udp&credential=leak",
+        "turn:relay.example:3478?username=leak",
+        "turn:relay.example:3478?transport=tcp#leak",
+        "turns:relay.example:5349?transport=udp",
+    ] {
+        let mut config = base();
+        config.endpoints = vec![endpoint.into()];
+        assert_eq!(config.validate(), Err(ConfigError::Invalid), "{endpoint}");
+        assert!(!format!("{config:?}").contains(endpoint));
+    }
 }
 
 #[test]
@@ -2727,6 +4549,9 @@ fn configuration_requires_https_bounded_values_safe_absolute_path_and_redacts_se
     assert_eq!(config.validate(), Err(ConfigError::Invalid));
     config.node_id = "relay-hkg-1".into();
     config.trusted_ca_path = config.runtime_state_path.clone();
+    assert_eq!(config.validate(), Err(ConfigError::Invalid));
+    config.trusted_ca_path = std::env::temp_dir().join("mrd-relay-agent-ca.pem");
+    config.metrics_url = "https://127.0.0.1:9641/metrics".parse().unwrap();
     assert_eq!(config.validate(), Err(ConfigError::Invalid));
 }
 
@@ -2809,6 +4634,7 @@ fn production_runtime_state_store_is_atomic_bounded_and_requires_absolute_path()
         last_directive_sequence: 9,
         secret_version: 4,
         secret_digest: Some([0x5a; 32]),
+        bootstrap_secret: None,
         draining: true,
         pending_rotation: None,
     };
@@ -2853,6 +4679,52 @@ fn secret_and_error_rendering_are_always_redacted_and_reason_codes_are_stable() 
     let renewal_debug = format!("{renewal:?}");
     assert!(!renewal_debug.contains("sensitive"));
     assert!(renewal_debug.contains("REDACTED"));
+    let directive = NodeDirective {
+        identity_epoch: 1,
+        sequence: 2,
+        state: RelayNodeState::Draining,
+        desired: DesiredNodeState {
+            draining: true,
+            secret_version: 2,
+            not_before_unix_seconds: Some(1),
+            old_credential_deadline_unix_seconds: Some(2),
+            rotation_challenge: Some("sensitive-rotation-challenge".into()),
+        },
+        secret_update: None,
+    };
+    let directive_debug = format!("{directive:?}");
+    assert!(!directive_debug.contains("sensitive-rotation-challenge"));
+    assert!(directive_debug.contains("REDACTED"));
+    let commit = SecretCommitRequest {
+        node_id: "relay-hkg-1".into(),
+        identity_epoch: 1,
+        rotation_id: "rotation-redaction".into(),
+        secret_version: 2,
+        rotation_challenge: "sensitive-rotation-challenge".into(),
+        probe_evidence_sha256: "sensitive-evidence".into(),
+        proof_mac: "sensitive-proof".into(),
+        authentication: mrd_relay_agent::backend::RequestAuthentication {
+            timestamp: 1,
+            sequence: 2,
+            signature_b64: "sensitive-signature".into(),
+        },
+    };
+    let commit_debug = format!("{commit:?}");
+    assert!(!commit_debug.contains("sensitive"));
+    assert!(commit_debug.contains("REDACTED"));
+    let status = SecretRotationStatusRequest {
+        node_id: commit.node_id.clone(),
+        identity_epoch: commit.identity_epoch,
+        rotation_id: commit.rotation_id.clone(),
+        secret_version: commit.secret_version,
+        rotation_challenge: commit.rotation_challenge.clone(),
+        probe_evidence_sha256: commit.probe_evidence_sha256.clone(),
+        proof_mac: commit.proof_mac.clone(),
+        authentication: commit.authentication.clone(),
+    };
+    let status_debug = format!("{status:?}");
+    assert!(!status_debug.contains("sensitive"));
+    assert!(status_debug.contains("REDACTED"));
     assert_eq!(
         BackendError::Unavailable.reason_code(),
         "relay_backend_unavailable"

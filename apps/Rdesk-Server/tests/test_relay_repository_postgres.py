@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
 import os
 import re
 from contextlib import asynccontextmanager
@@ -33,6 +34,7 @@ from app.services.relay_registry import (
     RelayIdentity,
     RelayRegistry,
     RelayRegistryError,
+    rotation_proof_message,
 )
 from test_relay_node_api import _ca_material, _csr
 
@@ -132,6 +134,599 @@ async def enroll_postgres_node(
                 current_egress_bps=0,
                 now=now,
             )
+
+
+async def seed_registry_rotation_node(
+    session: object,
+    *,
+    node_id: str,
+    now: datetime,
+) -> tuple[RelayIdentity, AesGcmRelaySecretCipher, str]:
+    """Insert the smallest approved identity needed by registry race tests."""
+
+    csr_pem, _ = _csr(node_id)
+    canonical_csr, signing_public_key = validate_relay_csr(csr_pem, node_id)
+    cipher = AesGcmRelaySecretCipher(bytes.fromhex("66" * 32))
+    active_secret = canonical_turn_secret(f"active-{node_id}")
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(node_id.encode()).digest()).rstrip(
+        b"="
+    ).decode("ascii")
+    enrollment_id = str(uuid4())
+    session.add(
+        RelayEnrollment(
+            id=enrollment_id,
+            token_digest=hashlib.sha256(f"token-{node_id}".encode()).hexdigest(),
+            expires_at=now + timedelta(hours=2),
+            used_at=now,
+            enrolled_node_id=node_id,
+            created_at=now,
+        )
+    )
+    node = RelayNode(
+        node_id=node_id,
+        region="ap-east",
+        failure_domain="rack-race",
+        physical_host_id="host-race",
+        state="draining",
+        endpoints=["turn:relay.example.test:3478?transport=udp"],
+        certificate_fingerprint=fingerprint(f"current-{node_id}"),
+        encrypted_turn_secret=cipher.encrypt(
+            active_secret.encode("ascii"), associated_data=node_id.encode("ascii")
+        ),
+        max_allocations=10,
+        active_allocations=0,
+        max_egress_bps=1_000_000,
+        current_ingress_bps=0,
+        current_egress_bps=0,
+        identity_epoch=1,
+        active_secret_version=1,
+        applied_secret_version=1,
+        desired_secret_version=2,
+        desired_draining=True,
+        secret_not_before=now - timedelta(minutes=2),
+        old_credential_deadline=now - timedelta(minutes=1),
+        rotation_challenge=challenge,
+        heartbeat_sequence=0,
+        healthy_heartbeat_streak=0,
+        lease_expires_at=now,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(node)
+    session.add(
+        RelayNodeRegistration(
+            node_id=node_id,
+            enrollment_id=enrollment_id,
+            region="ap-east",
+            failure_domain="rack-race",
+            physical_host_id="host-race",
+            topology_approved_at=now,
+            endpoints=["turn:relay.example.test:3478?transport=udp"],
+            max_allocations=10,
+            max_egress_bps=1_000_000,
+            csr_pem=canonical_csr,
+            signing_public_key=signing_public_key,
+            encrypted_turn_secret=node.encrypted_turn_secret,
+            status="approved",
+            certificate_pem=b"CURRENT CERTIFICATE",
+            certificate_expires_at=now + timedelta(hours=1),
+            ca_certificate_pem=b"CURRENT CA",
+            receipt_digest=hashlib.sha256(f"receipt-{node_id}".encode()).hexdigest(),
+            receipt_expires_at=now + timedelta(hours=1),
+            created_at=now,
+            approved_at=now,
+        )
+    )
+    await session.commit()
+    return (
+        RelayIdentity(
+            node_id=node_id,
+            certificate_fingerprint=node.certificate_fingerprint,
+            signing_public_key=signing_public_key,
+            state=node.state,
+        ),
+        cipher,
+        challenge,
+    )
+
+
+async def wait_for_postgres_blocker(
+    engine: AsyncEngine,
+    *,
+    waiter_pid: int,
+    blocker_pid: int,
+) -> str | None:
+    """Wait on PostgreSQL's own lock graph, not a timing sleep."""
+
+    async with engine.connect() as observer:
+        async with asyncio.timeout(5):
+            while True:
+                row = (
+                    await observer.execute(
+                        text(
+                            "SELECT pg_blocking_pids(pid) AS blockers, wait_event "
+                            "FROM pg_stat_activity WHERE pid = :waiter_pid"
+                        ),
+                        {"waiter_pid": waiter_pid},
+                    )
+                ).mappings().one()
+                if blocker_pid in row["blockers"]:
+                    return row["wait_event"]
+
+
+@pytest.mark.anyio
+async def test_concurrent_rotation_requests_refresh_stale_identity_and_audit_once() -> None:
+    now = datetime.now(UTC)
+    node_id = "relay-stale-rotation-request"
+    pepper = "76" * 32
+    async with isolated_postgres_engine() as engine:
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as setup_session:
+            _, cipher, _ = await seed_registry_rotation_node(
+                setup_session, node_id=node_id, now=now
+            )
+            node = await setup_session.get(RelayNode, node_id)
+            assert node is not None
+            node.state = "unavailable"
+            node.desired_draining = False
+            node.desired_secret_version = node.active_secret_version
+            node.secret_not_before = None
+            node.old_credential_deadline = None
+            node.rotation_challenge = None
+            await setup_session.commit()
+
+        async with sessions() as first, sessions() as second:
+            first_registry = RelayRegistry(
+                first, enrollment_token_pepper=pepper, turn_secret_cipher=cipher
+            )
+            second_registry = RelayRegistry(
+                second, enrollment_token_pepper=pepper, turn_secret_cipher=cipher
+            )
+            stale_node = await second.get(RelayNode, node_id)
+            assert stale_node is not None
+            assert stale_node.desired_secret_version == 1
+            first_pid = int(await first.scalar(text("SELECT pg_backend_pid()")))
+            second_pid = int(await second.scalar(text("SELECT pg_backend_pid()")))
+
+            first_result = await first_registry.request_secret_rotation(
+                node_id=node_id,
+                actor_id="admin-first",
+                credential_ttl_seconds=60,
+                now=now,
+            )
+            first_challenge = first_result.rotation_challenge
+            second_request = asyncio.create_task(
+                second_registry.request_secret_rotation(
+                    node_id=node_id,
+                    actor_id="admin-second",
+                    credential_ttl_seconds=60,
+                    now=now + timedelta(microseconds=1),
+                )
+            )
+            wait_event = await wait_for_postgres_blocker(
+                engine, waiter_pid=second_pid, blocker_pid=first_pid
+            )
+            await first.commit()
+            second_result = await second_request
+            assert wait_event == "advisory"
+            assert second_result.desired_secret_version == 2
+            assert second_result.rotation_challenge == first_challenge
+            await second.commit()
+
+        async with sessions() as verification:
+            request_audits = await verification.scalar(
+                select(func.count())
+                .select_from(RelayAuditEvent)
+                .where(
+                    RelayAuditEvent.node_id == node_id,
+                    RelayAuditEvent.action == "relay_secret_rotation_requested",
+                )
+            )
+            assert request_audits == 1
+
+
+@pytest.mark.anyio
+async def test_conflicting_rotation_upload_refreshes_stale_identity_after_advisory_lock() -> None:
+    now = datetime.now(UTC)
+    node_id = "relay-stale-upload-race"
+    pepper = "77" * 32
+    async with isolated_postgres_engine() as engine:
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as setup_session:
+            identity, cipher, _ = await seed_registry_rotation_node(
+                setup_session, node_id=node_id, now=now
+            )
+
+        async with sessions() as first, sessions() as second:
+            first_registry = RelayRegistry(
+                first, enrollment_token_pepper=pepper, turn_secret_cipher=cipher
+            )
+            second_registry = RelayRegistry(
+                second, enrollment_token_pepper=pepper, turn_secret_cipher=cipher
+            )
+            # Simulate the API dependency authenticating both requests before either
+            # mutation acquires the per-node transaction lock.
+            first_identity = await first_registry.identity(
+                node_id=node_id,
+                certificate_fingerprint=identity.certificate_fingerprint,
+                now=now,
+            )
+            second_identity = await second_registry.identity(
+                node_id=node_id,
+                certificate_fingerprint=identity.certificate_fingerprint,
+                now=now,
+            )
+            stale_node = await second.get(RelayNode, node_id)
+            stale_registration = await second.get(RelayNodeRegistration, node_id)
+            assert stale_node is not None and stale_node.pending_rotation_id is None
+            assert stale_registration is not None
+            first_pid = int(await first.scalar(text("SELECT pg_backend_pid()")))
+            second_pid = int(await second.scalar(text("SELECT pg_backend_pid()")))
+
+            await first_registry.upload_secret_rotation(
+                identity=first_identity,
+                sequence=10,
+                identity_epoch=1,
+                rotation_id="rotation-first",
+                secret_version=2,
+                turn_rest_secret=SecretStr(canonical_turn_secret("first-secret")),
+                now=now,
+            )
+            second_upload = asyncio.create_task(
+                second_registry.upload_secret_rotation(
+                    identity=second_identity,
+                    sequence=11,
+                    identity_epoch=1,
+                    rotation_id="rotation-second",
+                    secret_version=2,
+                    turn_rest_secret=SecretStr(canonical_turn_secret("second-secret")),
+                    now=now + timedelta(microseconds=1),
+                )
+            )
+            wait_event = await wait_for_postgres_blocker(
+                engine, waiter_pid=second_pid, blocker_pid=first_pid
+            )
+            assert wait_event == "advisory"
+            await first.commit()
+
+            with pytest.raises(RelayRegistryError) as conflict:
+                await second_upload
+            assert conflict.value.code == "relay_secret_rotation_conflict"
+            await second.rollback()
+
+        async with sessions() as verification:
+            node = await verification.get(RelayNode, node_id)
+            assert node is not None
+            assert node.pending_rotation_id == "rotation-first"
+            assert node.heartbeat_sequence == 10
+            upload_audits = await verification.scalar(
+                select(func.count())
+                .select_from(RelayAuditEvent)
+                .where(
+                    RelayAuditEvent.node_id == node_id,
+                    RelayAuditEvent.action == "relay_secret_rotation_uploaded",
+                )
+            )
+            assert upload_audits == 1
+
+
+@pytest.mark.anyio
+async def test_heartbeat_waits_on_identity_lock_and_preserves_concurrent_rotation_upload() -> None:
+    now = datetime.now(UTC)
+    node_id = "relay-heartbeat-upload-race"
+    pepper = "78" * 32
+    async with isolated_postgres_engine() as engine:
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as setup_session:
+            identity, cipher, _ = await seed_registry_rotation_node(
+                setup_session, node_id=node_id, now=now
+            )
+
+        async with sessions() as first, sessions() as second:
+            first_registry = RelayRegistry(
+                first, enrollment_token_pepper=pepper, turn_secret_cipher=cipher
+            )
+            second_registry = RelayRegistry(
+                second, enrollment_token_pepper=pepper, turn_secret_cipher=cipher
+            )
+            first_identity = await first_registry.identity(
+                node_id=node_id,
+                certificate_fingerprint=identity.certificate_fingerprint,
+                now=now,
+            )
+            second_identity = await second_registry.identity(
+                node_id=node_id,
+                certificate_fingerprint=identity.certificate_fingerprint,
+                now=now,
+            )
+            stale_node = await second.get(RelayNode, node_id)
+            stale_registration = await second.get(RelayNodeRegistration, node_id)
+            assert stale_node is not None and stale_node.pending_rotation_id is None
+            assert stale_registration is not None
+            first_pid = int(await first.scalar(text("SELECT pg_backend_pid()")))
+            second_pid = int(await second.scalar(text("SELECT pg_backend_pid()")))
+
+            await first_registry.upload_secret_rotation(
+                identity=first_identity,
+                sequence=10,
+                identity_epoch=1,
+                rotation_id="rotation-heartbeat-race",
+                secret_version=2,
+                turn_rest_secret=SecretStr(canonical_turn_secret("heartbeat-race")),
+                now=now,
+            )
+            heartbeat = asyncio.create_task(
+                second_registry.record_heartbeat(
+                    identity=second_identity,
+                    sequence=11,
+                    identity_epoch=1,
+                    boot_id=base64.urlsafe_b64encode(b"b" * 16)
+                    .rstrip(b"=")
+                    .decode("ascii"),
+                    nonce=base64.urlsafe_b64encode(b"n" * 32)
+                    .rstrip(b"=")
+                    .decode("ascii"),
+                    process_health="healthy",
+                    listener_health="healthy",
+                    probe_health="healthy",
+                    active_allocations=0,
+                    current_ingress_bps=0,
+                    current_egress_bps=0,
+                    max_allocations=10,
+                    max_egress_bps=1_000_000,
+                    packet_loss_bps=0,
+                    cpu_usage_bps=0,
+                    memory_usage_bps=0,
+                    applied_secret_version=1,
+                    endpoints=["turn:relay.example.test:3478?transport=udp"],
+                    now=now + timedelta(microseconds=1),
+                )
+            )
+            wait_event = await wait_for_postgres_blocker(
+                engine, waiter_pid=second_pid, blocker_pid=first_pid
+            )
+            await first.commit()
+            result = await heartbeat
+            assert wait_event == "advisory"
+            assert result.heartbeat_sequence == 11
+            await second.commit()
+
+        async with sessions() as verification:
+            node = await verification.get(RelayNode, node_id)
+            assert node is not None
+            assert node.pending_rotation_id == "rotation-heartbeat-race"
+            assert node.desired_draining is True
+            assert node.state == "draining"
+            assert node.heartbeat_sequence == 11
+
+
+@pytest.mark.anyio
+async def test_duplicate_rotation_commit_refreshes_locked_row_and_audits_once() -> None:
+    now = datetime.now(UTC)
+    node_id = "relay-stale-commit-race"
+    pepper = "79" * 32
+    new_secret = canonical_turn_secret("commit-race-secret")
+    rotation_id = "rotation-commit-race"
+    evidence = hashlib.sha256(b"commit-race-probe").digest()
+    async with isolated_postgres_engine() as engine:
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as setup_session:
+            identity, cipher, challenge = await seed_registry_rotation_node(
+                setup_session, node_id=node_id, now=now
+            )
+            setup_registry = RelayRegistry(
+                setup_session,
+                enrollment_token_pepper=pepper,
+                turn_secret_cipher=cipher,
+            )
+            setup_identity = await setup_registry.identity(
+                node_id=node_id,
+                certificate_fingerprint=identity.certificate_fingerprint,
+                now=now,
+            )
+            await setup_registry.upload_secret_rotation(
+                identity=setup_identity,
+                sequence=5,
+                identity_epoch=1,
+                rotation_id=rotation_id,
+                secret_version=2,
+                turn_rest_secret=SecretStr(new_secret),
+                now=now,
+            )
+            await setup_session.commit()
+
+        pending_digest = hashlib.sha256(
+            base64.urlsafe_b64decode(new_secret + "=")
+        ).digest()
+        proof_message = rotation_proof_message(
+            node_id=node_id,
+            identity_epoch=1,
+            rotation_id=rotation_id,
+            secret_version=2,
+            rotation_challenge=challenge,
+            pending_secret_digest=pending_digest,
+            probe_evidence_sha256=evidence,
+        )
+        proof_mac = hmac.new(
+            new_secret.encode("ascii"), proof_message, hashlib.sha256
+        ).hexdigest()
+        commit_kwargs = {
+            "identity_epoch": 1,
+            "rotation_id": rotation_id,
+            "secret_version": 2,
+            "rotation_challenge": challenge,
+            "probe_evidence_sha256": evidence.hex(),
+            "proof_mac": proof_mac,
+        }
+
+        async with sessions() as first, sessions() as second:
+            first_registry = RelayRegistry(
+                first, enrollment_token_pepper=pepper, turn_secret_cipher=cipher
+            )
+            second_registry = RelayRegistry(
+                second, enrollment_token_pepper=pepper, turn_secret_cipher=cipher
+            )
+            first_identity = await first_registry.identity(
+                node_id=node_id,
+                certificate_fingerprint=identity.certificate_fingerprint,
+                now=now,
+            )
+            second_identity = await second_registry.identity(
+                node_id=node_id,
+                certificate_fingerprint=identity.certificate_fingerprint,
+                now=now,
+            )
+            stale_node = await second.get(RelayNode, node_id)
+            stale_registration = await second.get(RelayNodeRegistration, node_id)
+            assert stale_node is not None and stale_node.pending_rotation_id == rotation_id
+            assert stale_registration is not None
+            first_pid = int(await first.scalar(text("SELECT pg_backend_pid()")))
+            second_pid = int(await second.scalar(text("SELECT pg_backend_pid()")))
+
+            await first_registry.commit_secret_rotation(
+                identity=first_identity,
+                sequence=10,
+                now=now,
+                **commit_kwargs,
+            )
+            duplicate_commit = asyncio.create_task(
+                second_registry.commit_secret_rotation(
+                    identity=second_identity,
+                    sequence=11,
+                    now=now + timedelta(microseconds=1),
+                    **commit_kwargs,
+                )
+            )
+            wait_event = await wait_for_postgres_blocker(
+                engine, waiter_pid=second_pid, blocker_pid=first_pid
+            )
+            await first.commit()
+            duplicate = await duplicate_commit
+            assert wait_event == "advisory"
+            assert duplicate.active_secret_version == 2
+            await second.commit()
+
+        async with sessions() as verification:
+            node = await verification.get(RelayNode, node_id)
+            assert node is not None
+            assert node.heartbeat_sequence == 11
+            assert node.committed_rotation_id == rotation_id
+            commit_audits = await verification.scalar(
+                select(func.count())
+                .select_from(RelayAuditEvent)
+                .where(
+                    RelayAuditEvent.node_id == node_id,
+                    RelayAuditEvent.action == "relay_secret_rotation_committed",
+                )
+            )
+            assert commit_audits == 1
+
+
+@pytest.mark.anyio
+async def test_renewal_serializes_old_epoch_heartbeat_and_records_previous_sequence() -> None:
+    now = datetime.now(UTC)
+    node_id = "relay-renewal-epoch-race"
+    pepper = "7a" * 32
+    renewal_csr, _ = _csr(node_id)
+    ca_certificate, ca_private_key, _, _ = _ca_material()
+    async with isolated_postgres_engine() as engine:
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        async with sessions() as setup_session:
+            identity, cipher, _ = await seed_registry_rotation_node(
+                setup_session, node_id=node_id, now=now
+            )
+
+        async with sessions() as first, sessions() as second:
+            first_registry = RelayRegistry(
+                first, enrollment_token_pepper=pepper, turn_secret_cipher=cipher
+            )
+            second_registry = RelayRegistry(
+                second, enrollment_token_pepper=pepper, turn_secret_cipher=cipher
+            )
+            first_identity = await first_registry.identity(
+                node_id=node_id,
+                certificate_fingerprint=identity.certificate_fingerprint,
+                now=now,
+            )
+            second_identity = await second_registry.identity(
+                node_id=node_id,
+                certificate_fingerprint=identity.certificate_fingerprint,
+                now=now,
+            )
+            stale_node = await second.get(RelayNode, node_id)
+            stale_registration = await second.get(RelayNodeRegistration, node_id)
+            assert stale_node is not None and stale_node.identity_epoch == 1
+            assert stale_registration is not None
+            first_pid = int(await first.scalar(text("SELECT pg_backend_pid()")))
+            second_pid = int(await second.scalar(text("SELECT pg_backend_pid()")))
+
+            renewed = await first_registry.renew(
+                identity=first_identity,
+                sequence=10,
+                renewal_id="renewal-epoch-race",
+                csr_pem=renewal_csr,
+                ca_certificate_pem=ca_certificate,
+                ca_private_key_pem=ca_private_key,
+                ca_private_key_password="",
+                validity_seconds=3600,
+                renew_before_seconds=3600,
+                previous_auth_grace_seconds=300,
+                renewal_record_retention_seconds=3600,
+                now=now,
+            )
+            assert renewed.node.identity_epoch == 2
+            old_epoch_heartbeat = asyncio.create_task(
+                second_registry.record_heartbeat(
+                    identity=second_identity,
+                    sequence=11,
+                    identity_epoch=1,
+                    boot_id=base64.urlsafe_b64encode(b"r" * 16)
+                    .rstrip(b"=")
+                    .decode("ascii"),
+                    nonce=base64.urlsafe_b64encode(b"s" * 32)
+                    .rstrip(b"=")
+                    .decode("ascii"),
+                    process_health="healthy",
+                    listener_health="healthy",
+                    probe_health="healthy",
+                    active_allocations=0,
+                    current_ingress_bps=0,
+                    current_egress_bps=0,
+                    max_allocations=10,
+                    max_egress_bps=1_000_000,
+                    packet_loss_bps=0,
+                    cpu_usage_bps=0,
+                    memory_usage_bps=0,
+                    applied_secret_version=1,
+                    endpoints=["turn:relay.example.test:3478?transport=udp"],
+                    now=now + timedelta(microseconds=1),
+                )
+            )
+            wait_event = await wait_for_postgres_blocker(
+                engine, waiter_pid=second_pid, blocker_pid=first_pid
+            )
+            await first.commit()
+            with pytest.raises(RelayRegistryError) as stale_epoch:
+                await old_epoch_heartbeat
+            assert wait_event == "advisory"
+            assert stale_epoch.value.code == "relay_certificate_invalid"
+            await second.rollback()
+
+        async with sessions() as verification:
+            node = await verification.get(RelayNode, node_id)
+            assert node is not None
+            assert node.identity_epoch == 2
+            assert node.heartbeat_sequence == 0
+            assert node.previous_identity_sequence == 10
+            heartbeat_audits = await verification.scalar(
+                select(func.count())
+                .select_from(RelayAuditEvent)
+                .where(
+                    RelayAuditEvent.node_id == node_id,
+                    RelayAuditEvent.action == "relay_heartbeat_recorded",
+                )
+            )
+            assert heartbeat_audits == 0
 
 
 @pytest.mark.anyio
@@ -920,7 +1515,9 @@ async def test_migration_with_only_v8_missing_executes_only_v8_step() -> None:
                 text(
                     "ALTER TABLE relay_nodes "
                     "DROP COLUMN current_ingress_bps, "
-                    "DROP COLUMN identity_epoch, DROP COLUMN last_boot_id, "
+                    "DROP COLUMN identity_epoch, "
+                    "DROP COLUMN previous_identity_sequence, "
+                    "DROP COLUMN last_boot_id, "
                     "DROP COLUMN last_heartbeat_nonce, DROP COLUMN process_health, "
                     "DROP COLUMN listener_health, DROP COLUMN probe_health, "
                     "DROP COLUMN packet_loss_bps, DROP COLUMN cpu_usage_bps, "
@@ -1002,7 +1599,9 @@ async def test_v7_to_v8_failure_rolls_back_columns_constraints_and_ledger(
                 text(
                     "ALTER TABLE relay_nodes "
                     "DROP COLUMN current_ingress_bps, "
-                    "DROP COLUMN identity_epoch, DROP COLUMN last_boot_id, "
+                    "DROP COLUMN identity_epoch, "
+                    "DROP COLUMN previous_identity_sequence, "
+                    "DROP COLUMN last_boot_id, "
                     "DROP COLUMN last_heartbeat_nonce, DROP COLUMN process_health, "
                     "DROP COLUMN listener_health, DROP COLUMN probe_health, "
                     "DROP COLUMN packet_loss_bps, DROP COLUMN cpu_usage_bps, "
@@ -1055,6 +1654,106 @@ async def test_v7_to_v8_failure_rolls_back_columns_constraints_and_ledger(
             column_exists = await connection.run_sync(has_v8_column)
         assert version == 7
         assert column_exists is False
+
+
+@pytest.mark.anyio
+async def test_genuine_v6_schema_upgrades_through_v8_with_all_rotation_constraints() -> None:
+    async with isolated_postgres_engine() as engine:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("DELETE FROM relay_schema_migrations WHERE version >= 7")
+            )
+            await connection.execute(
+                text(
+                    "ALTER TABLE relay_reservations "
+                    "DROP COLUMN superseded_at, DROP COLUMN directory_generation"
+                )
+            )
+            await connection.execute(
+                text(
+                    "ALTER TABLE relay_nodes "
+                    "DROP COLUMN current_ingress_bps, "
+                    "DROP COLUMN identity_epoch, "
+                    "DROP COLUMN previous_identity_sequence, "
+                    "DROP COLUMN last_boot_id, DROP COLUMN last_heartbeat_nonce, "
+                    "DROP COLUMN process_health, DROP COLUMN listener_health, "
+                    "DROP COLUMN probe_health, DROP COLUMN packet_loss_bps, "
+                    "DROP COLUMN cpu_usage_bps, DROP COLUMN memory_usage_bps, "
+                    "DROP COLUMN active_secret_version, "
+                    "DROP COLUMN applied_secret_version, "
+                    "DROP COLUMN desired_secret_version, DROP COLUMN desired_draining, "
+                    "DROP COLUMN secret_not_before, DROP COLUMN old_credential_deadline, "
+                    "DROP COLUMN pending_secret_version, "
+                    "DROP COLUMN pending_encrypted_turn_secret, "
+                    "DROP COLUMN pending_secret_digest, DROP COLUMN pending_rotation_id, "
+                    "DROP COLUMN pending_secret_uploaded_at, "
+                    "DROP COLUMN rotation_challenge, DROP COLUMN committed_rotation_id, "
+                    "DROP COLUMN committed_identity_epoch, "
+                    "DROP COLUMN committed_rotation_challenge, "
+                    "DROP COLUMN committed_probe_evidence_sha256, "
+                    "DROP COLUMN committed_proof_mac"
+                )
+            )
+
+        await migrate(engine)
+
+        async with engine.connect() as connection:
+            versions = list(
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT version FROM relay_schema_migrations "
+                            "ORDER BY version"
+                        )
+                    )
+                ).scalars()
+            )
+
+            def inspect_upgrade(sync_connection: object) -> tuple[set[str], set[str]]:
+                inspector = inspect(sync_connection)
+                columns = {
+                    column["name"]
+                    for column in inspector.get_columns("relay_nodes")
+                }
+                checks = {
+                    constraint["name"]
+                    for constraint in inspector.get_check_constraints("relay_nodes")
+                }
+                return columns, checks
+
+            columns, checks = await connection.run_sync(inspect_upgrade)
+        assert versions == list(range(1, 9))
+        assert "previous_identity_sequence" in columns
+        assert {
+            "ck_relay_nodes_previous_identity_sequence",
+            "ck_relay_nodes_rotation_pending",
+            "ck_relay_nodes_rotation_challenge",
+            "ck_relay_nodes_rotation_committed_proof",
+        }.issubset(checks)
+
+        statements: list[str] = []
+
+        def capture_sql(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: bool,
+        ) -> None:
+            statements.append(" ".join(statement.upper().split()))
+
+        event.listen(engine.sync_engine, "before_cursor_execute", capture_sql)
+        try:
+            await migrate(engine)
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", capture_sql)
+        assert not any(
+            statement.startswith(
+                ("ALTER ", "CREATE ", "DELETE ", "DO ", "DROP ", "INSERT ", "UPDATE ")
+            )
+            for statement in statements
+        )
 
 
 @pytest.mark.anyio
@@ -1575,6 +2274,7 @@ async def test_v4_backfills_only_complete_v3_inflight_renewals_without_extending
                 is_previous=True,
             )
             renewal_kwargs = {
+                "sequence": 1,
                 "renewal_id": f"renewal-{active_node_id}",
                 "csr_pem": active_csr,
                 "ca_certificate_pem": "must-not-be-used",
@@ -1614,6 +2314,7 @@ async def test_v4_backfills_only_complete_v3_inflight_renewals_without_extending
             with pytest.raises(RelayRegistryError) as expired_retry:
                 await registry.renew(
                     identity=expired_current,
+                    sequence=1,
                     renewal_id=f"renewal-{expired_node_id}",
                     csr_pem=expired_csr,
                     ca_certificate_pem="must-not-be-used",

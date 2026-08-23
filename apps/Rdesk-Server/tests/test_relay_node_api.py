@@ -34,6 +34,8 @@ from app.schemas.relay import (
     RelayHeartbeatResponse,
     RelayNodeResponse,
     RelaySecretCommitRequest,
+    RelaySecretRotationStatusRequest,
+    RelaySecretRotationStatusResponse,
     RelaySecretUploadRequest,
 )
 
@@ -43,6 +45,14 @@ NODE_ID = "relay-ap-east-1"
 NODE_TURN_SECRET = base64.urlsafe_b64encode(b"node-held-turn-secret-material!!").rstrip(
     b"="
 ).decode("ascii")
+
+
+def _fixture_heartbeat_payload() -> dict[str, object]:
+    fixture_path = (
+        Path(__file__).parents[3] / "tests" / "fixtures" / "relay_heartbeat_wire_v1.json"
+    )
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    return json.loads(fixture["request_body_json"])
 
 
 def test_shared_heartbeat_fixture_is_exact_and_accepts_available_state() -> None:
@@ -71,7 +81,60 @@ def test_shared_heartbeat_fixture_is_exact_and_accepts_available_state() -> None
     assert response.desired.secret_version == 4
 
 
-def test_shared_secret_rotation_fixture_is_exact_for_upload_and_commit() -> None:
+def test_boot_id_is_exactly_canonical_base64url_for_sixteen_bytes() -> None:
+    payload = _fixture_heartbeat_payload()
+    payload["boot_id"] = "A" * 21 + "B"
+    with pytest.raises(ValidationError):
+        RelayHeartbeatRequest.model_validate(payload)
+
+
+def test_boot_id_validator_clears_controllable_base64_codec_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.schemas.relay as relay_schemas
+
+    real_decode = base64.urlsafe_b64decode
+    real_encode = base64.urlsafe_b64encode
+    codec_buffers: list[bytearray] = []
+
+    def tracked_decode(value: object) -> bytearray:
+        buffer = bytearray(real_decode(value))
+        codec_buffers.append(buffer)
+        return buffer
+
+    def tracked_encode(value: object) -> bytearray:
+        buffer = bytearray(real_encode(value))
+        codec_buffers.append(buffer)
+        return buffer
+
+    monkeypatch.setattr(relay_schemas.base64, "urlsafe_b64decode", tracked_decode)
+    monkeypatch.setattr(relay_schemas.base64, "urlsafe_b64encode", tracked_encode)
+    RelayHeartbeatRequest.model_validate(_fixture_heartbeat_payload())
+    assert codec_buffers
+    assert all(buffer == bytearray(len(buffer)) for buffer in codec_buffers)
+
+
+def test_relay_request_repr_never_renders_public_endpoints() -> None:
+    credential_url = "turn:log-user:log-password@relay.invalid:3478?transport=udp"
+    enrollment = RelayEnrollmentRequest(
+        token="x" * 40,
+        node_id="a",
+        region="hkg",
+        failure_domain="rack-a",
+        endpoints=[credential_url],
+        max_allocations=10,
+        max_egress_bps=1_000,
+        csr_pem="x" * 100,
+        turn_rest_secret=NODE_TURN_SECRET,
+    )
+    heartbeat_payload = _fixture_heartbeat_payload()
+    heartbeat_payload["endpoints"] = [credential_url]
+    heartbeat = RelayHeartbeatRequest.model_validate(heartbeat_payload)
+    assert credential_url not in repr(enrollment)
+    assert credential_url not in repr(heartbeat)
+
+
+def test_shared_secret_rotation_fixture_is_exact_for_upload_commit_and_status() -> None:
     from app.services.relay_registry import rotation_proof_message
 
     fixture_path = (
@@ -130,6 +193,106 @@ def test_shared_secret_rotation_fixture_is_exact_for_upload_and_commit() -> None
         commit["sequence"],
         commit["body_json"].encode("utf-8"),
     ).startswith(b"MRD_RELAY_REQUEST_V1\x00")
+
+    rotation_status = fixture["status"]
+    status_payload = RelaySecretRotationStatusRequest.model_validate_json(
+        rotation_status["body_json"]
+    )
+    assert status_payload.model_dump() == commit_payload.model_dump()
+    assert _canonical_request(
+        rotation_status["method"],
+        rotation_status["path"],
+        fixture["node_id"],
+        rotation_status["timestamp"],
+        rotation_status["sequence"],
+        rotation_status["body_json"].encode("utf-8"),
+    ).startswith(b"MRD_RELAY_REQUEST_V1\x00")
+    expected_statuses = {
+        "committed_exact": 2,
+        "pending": 1,
+        "unknown": 2,
+    }
+    for expected_status, active_version in expected_statuses.items():
+        response = RelaySecretRotationStatusResponse.model_validate_json(
+            fixture["status_responses"][expected_status]
+        )
+        assert response.node_id == fixture["node_id"]
+        assert response.identity_epoch == 1
+        assert response.active_secret_version == active_version
+        assert response.status == expected_status
+
+
+def test_rotation_proof_clears_controllable_base64_codec_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.relay_registry as relay_registry
+
+    real_decode = base64.urlsafe_b64decode
+    real_encode = base64.urlsafe_b64encode
+    challenge = real_encode(b"c" * 32).rstrip(b"=").decode("ascii")
+    codec_buffers: list[bytearray] = []
+
+    def tracked_decode(value: object) -> bytearray:
+        buffer = bytearray(real_decode(value))
+        codec_buffers.append(buffer)
+        return buffer
+
+    def tracked_encode(value: object) -> bytearray:
+        buffer = bytearray(real_encode(value))
+        codec_buffers.append(buffer)
+        return buffer
+
+    monkeypatch.setattr(relay_registry.base64, "urlsafe_b64decode", tracked_decode)
+    monkeypatch.setattr(relay_registry.base64, "urlsafe_b64encode", tracked_encode)
+    relay_registry.rotation_proof_message(
+        node_id=NODE_ID,
+        identity_epoch=1,
+        rotation_id="rotation-buffer-test",
+        secret_version=2,
+        rotation_challenge=challenge,
+        pending_secret_digest=b"d" * 32,
+        probe_evidence_sha256=b"e" * 32,
+    )
+    assert codec_buffers
+    assert all(buffer == bytearray(len(buffer)) for buffer in codec_buffers)
+
+
+def test_turn_secret_validation_clears_controllable_base64_codec_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.services.relay_registry as relay_registry
+    from app.services.relay_repository import AesGcmRelaySecretCipher
+    from pydantic import SecretStr
+
+    real_decode = base64.urlsafe_b64decode
+    real_encode = base64.urlsafe_b64encode
+    encoded_secret = real_encode(hashlib.sha256(b"buffer-owned-secret").digest()).rstrip(
+        b"="
+    ).decode("ascii")
+    codec_buffers: list[bytearray] = []
+
+    def tracked_decode(value: object) -> bytearray:
+        buffer = bytearray(real_decode(value))
+        codec_buffers.append(buffer)
+        return buffer
+
+    def tracked_encode(value: object) -> bytearray:
+        buffer = bytearray(real_encode(value))
+        codec_buffers.append(buffer)
+        return buffer
+
+    monkeypatch.setattr(relay_registry.base64, "urlsafe_b64decode", tracked_decode)
+    monkeypatch.setattr(relay_registry.base64, "urlsafe_b64encode", tracked_encode)
+    registry = relay_registry.RelayRegistry(
+        object(),
+        enrollment_token_pepper="11" * 32,
+        turn_secret_cipher=AesGcmRelaySecretCipher(bytes.fromhex("22" * 32)),
+    )
+    registry._protect_turn_secret(  # noqa: SLF001 - secret-lifetime invariant
+        SecretStr(encoded_secret), node_id=NODE_ID
+    )
+    assert codec_buffers
+    assert all(buffer == bytearray(len(buffer)) for buffer in codec_buffers)
 
 
 def _approval_body(node_id: str = NODE_ID) -> dict[str, str]:
@@ -762,6 +925,7 @@ def test_extended_heartbeat_is_epoch_bound_and_returns_strict_desired_state(
 
 def test_node_generated_secret_rotation_is_authenticated_encrypted_and_atomic(
     api: tuple[TestClient, object],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from app.models.relay_audit_event import RelayAuditEvent
     from app.models.relay_node import RelayNode
@@ -926,8 +1090,35 @@ def test_node_generated_secret_rotation_is_authenticated_encrypted_and_atomic(
         payload=commit_payload,
         replace_payload=True,
     )
-    committed = client.post(commit_path, content=commit_body, headers=commit_headers)
+    import app.services.relay_registry as relay_registry
+
+    real_decode = base64.urlsafe_b64decode
+    real_encode = base64.urlsafe_b64encode
+    codec_buffers: list[bytearray] = []
+
+    def tracked_decode(value: object) -> bytearray:
+        buffer = bytearray(real_decode(value))
+        codec_buffers.append(buffer)
+        return buffer
+
+    def tracked_encode(value: object) -> bytearray:
+        buffer = bytearray(real_encode(value))
+        codec_buffers.append(buffer)
+        return buffer
+
+    with monkeypatch.context() as codec_patch:
+        codec_patch.setattr(
+            relay_registry.base64, "urlsafe_b64decode", tracked_decode
+        )
+        codec_patch.setattr(
+            relay_registry.base64, "urlsafe_b64encode", tracked_encode
+        )
+        committed = client.post(
+            commit_path, content=commit_body, headers=commit_headers
+        )
     assert committed.status_code == 200, committed.text
+    assert codec_buffers
+    assert all(buffer == bytearray(len(buffer)) for buffer in codec_buffers)
     assert committed.json()["active_secret_version"] == 2
     retry_commit_body, retry_commit_headers = _heartbeat_request(
         key,
@@ -974,6 +1165,292 @@ def test_node_generated_secret_rotation_is_authenticated_encrypted_and_atomic(
             )
         ).all()
         assert len(events) == 1
+
+
+def test_admin_drain_and_resume_persist_desired_state_and_audit_idempotently(
+    api: tuple[TestClient, object],
+) -> None:
+    from app.models.relay_audit_event import RelayAuditEvent
+    from app.models.relay_node import RelayNode
+
+    client, engine = api
+    _enroll(client)
+    _approve(client)
+
+    first_drain = client.post(f"/api/v1/relays/{NODE_ID}/drain")
+    repeated_drain = client.post(f"/api/v1/relays/{NODE_ID}/drain")
+    assert first_drain.status_code == repeated_drain.status_code == 200
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        assert node.state == "draining"
+        assert node.desired_draining is True
+        drain_audits = session.scalars(
+            select(RelayAuditEvent).where(
+                RelayAuditEvent.node_id == NODE_ID,
+                RelayAuditEvent.action == "relay_node_drained",
+            )
+        ).all()
+        assert len(drain_audits) == 1
+
+    first_resume = client.post(f"/api/v1/relays/{NODE_ID}/resume")
+    repeated_resume = client.post(f"/api/v1/relays/{NODE_ID}/resume")
+    assert first_resume.status_code == repeated_resume.status_code == 200
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        assert node.state == "unavailable"
+        assert node.desired_draining is False
+        resume_audits = session.scalars(
+            select(RelayAuditEvent).where(
+                RelayAuditEvent.node_id == NODE_ID,
+                RelayAuditEvent.action == "relay_node_resumed",
+            )
+        ).all()
+        assert len(resume_audits) == 1
+
+
+def test_non_evidence_heartbeat_keeps_rotation_drain_and_resume_is_rejected(
+    api: tuple[TestClient, object],
+) -> None:
+    from app.models.relay_node import RelayNode
+    from app.services.relay_registry import rotation_proof_message
+
+    client, engine = api
+    key, _ = _enroll(client)
+    _, fingerprint = _approve(client)
+    directive_response = client.post(
+        f"/api/v1/relays/{NODE_ID}/rotate-secret",
+        json={"credential_ttl_seconds": 60},
+    )
+    assert directive_response.status_code == 202
+    directive = directive_response.json()
+
+    non_evidence_payload = _extended_heartbeat_payload()
+    non_evidence_payload["probe_health"] = "non_evidence"
+    non_evidence_payload["active_allocations"] = 0
+    heartbeat_body, heartbeat_headers = _heartbeat_request(
+        key,
+        fingerprint,
+        sequence=1,
+        payload=non_evidence_payload,
+        replace_payload=True,
+    )
+    heartbeat = client.post(
+        f"/api/v1/relays/{NODE_ID}/heartbeat",
+        content=heartbeat_body,
+        headers=heartbeat_headers,
+    )
+    assert heartbeat.status_code == 200, heartbeat.text
+    assert heartbeat.json()["state"] == "unavailable"
+    assert heartbeat.json()["desired"]["draining"] is True
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        assert node.desired_draining is True
+        assert node.state == "unavailable"
+
+    resume = client.post(f"/api/v1/relays/{NODE_ID}/resume")
+    assert resume.status_code == 409
+    assert _error_code(resume) == "relay_secret_rotation_conflict"
+
+    upload_path = f"/api/v1/relays/{NODE_ID}/secret-rotation/upload"
+    upload_payload = {
+        "identity_epoch": 1,
+        "rotation_id": "rotation-after-non-evidence",
+        "secret_version": directive["secret_version"],
+        "turn_rest_secret": base64.urlsafe_b64encode(
+            hashlib.sha256(b"non-evidence-rotation-secret").digest()
+        )
+        .rstrip(b"=")
+        .decode("ascii"),
+    }
+    upload_body, upload_headers = _heartbeat_request(
+        key,
+        fingerprint,
+        sequence=2,
+        path=upload_path,
+        payload=upload_payload,
+        replace_payload=True,
+    )
+    uploaded = client.post(upload_path, content=upload_body, headers=upload_headers)
+    assert uploaded.status_code == 202, uploaded.text
+
+    new_secret = upload_payload["turn_rest_secret"]
+    pending_digest = hashlib.sha256(
+        base64.urlsafe_b64decode(new_secret + "=")
+    ).digest()
+    evidence = hashlib.sha256(b"non-evidence-followup-probe").digest()
+    commit_payload = {
+        "identity_epoch": 1,
+        "rotation_id": upload_payload["rotation_id"],
+        "secret_version": directive["secret_version"],
+        "rotation_challenge": directive["rotation_challenge"],
+        "probe_evidence_sha256": evidence.hex(),
+        "proof_mac": "",
+    }
+    proof_message = rotation_proof_message(
+        node_id=NODE_ID,
+        identity_epoch=1,
+        rotation_id=commit_payload["rotation_id"],
+        secret_version=commit_payload["secret_version"],
+        rotation_challenge=commit_payload["rotation_challenge"],
+        pending_secret_digest=pending_digest,
+        probe_evidence_sha256=evidence,
+    )
+    commit_payload["proof_mac"] = hmac.new(
+        new_secret.encode("ascii"), proof_message, hashlib.sha256
+    ).hexdigest()
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        node.old_credential_deadline = datetime.now(UTC) - timedelta(seconds=1)
+        session.commit()
+    commit_path = f"/api/v1/relays/{NODE_ID}/secret-rotation/commit"
+    commit_body, commit_headers = _heartbeat_request(
+        key,
+        fingerprint,
+        sequence=3,
+        path=commit_path,
+        payload=commit_payload,
+        replace_payload=True,
+    )
+    committed = client.post(commit_path, content=commit_body, headers=commit_headers)
+    assert committed.status_code == 200, committed.text
+    assert committed.json()["active_secret_version"] == directive["secret_version"]
+
+
+def test_signed_rotation_status_is_exact_and_does_not_consume_request_sequence(
+    api: tuple[TestClient, object],
+) -> None:
+    from app.models.relay_audit_event import RelayAuditEvent
+    from app.models.relay_node import RelayNode
+    from app.services.relay_registry import rotation_proof_message
+
+    client, engine = api
+    key, _ = _enroll(client)
+    _, fingerprint = _approve(client)
+    directive_response = client.post(
+        f"/api/v1/relays/{NODE_ID}/rotate-secret",
+        json={"credential_ttl_seconds": 60},
+    )
+    assert directive_response.status_code == 202
+    directive = directive_response.json()
+    rotation_id = "rotation-status-0001"
+    new_secret = base64.urlsafe_b64encode(
+        hashlib.sha256(b"rotation-status-secret").digest()
+    ).rstrip(b"=").decode("ascii")
+    upload_path = f"/api/v1/relays/{NODE_ID}/secret-rotation/upload"
+    upload_payload = {
+        "identity_epoch": 1,
+        "rotation_id": rotation_id,
+        "secret_version": 2,
+        "turn_rest_secret": new_secret,
+    }
+    upload_body, upload_headers = _heartbeat_request(
+        key,
+        fingerprint,
+        sequence=1,
+        path=upload_path,
+        payload=upload_payload,
+        replace_payload=True,
+    )
+    uploaded = client.post(upload_path, content=upload_body, headers=upload_headers)
+    assert uploaded.status_code == 202, uploaded.text
+
+    evidence = hashlib.sha256(b"rotation-status-probe").digest()
+    pending_digest = hashlib.sha256(
+        base64.urlsafe_b64decode(new_secret + "=")
+    ).digest()
+    proof_message = rotation_proof_message(
+        node_id=NODE_ID,
+        identity_epoch=1,
+        rotation_id=rotation_id,
+        secret_version=2,
+        rotation_challenge=directive["rotation_challenge"],
+        pending_secret_digest=pending_digest,
+        probe_evidence_sha256=evidence,
+    )
+    proof_mac = hmac.new(
+        new_secret.encode("ascii"), proof_message, hashlib.sha256
+    ).hexdigest()
+    status_path = f"/api/v1/relays/{NODE_ID}/secret-rotation/status"
+    status_payload = {
+        "identity_epoch": 1,
+        "rotation_id": rotation_id,
+        "secret_version": 2,
+        "rotation_challenge": directive["rotation_challenge"],
+        "probe_evidence_sha256": evidence.hex(),
+        "proof_mac": proof_mac,
+    }
+    status_body, status_headers = _heartbeat_request(
+        key,
+        fingerprint,
+        sequence=2,
+        path=status_path,
+        payload=status_payload,
+        replace_payload=True,
+    )
+    pending = client.post(status_path, content=status_body, headers=status_headers)
+    assert pending.status_code == 200, pending.text
+    assert pending.json()["status"] == "pending"
+    assert pending.json()["active_secret_version"] == 1
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        assert node.heartbeat_sequence == 1
+        node.old_credential_deadline = datetime.now(UTC) - timedelta(seconds=1)
+        session.commit()
+
+    commit_path = f"/api/v1/relays/{NODE_ID}/secret-rotation/commit"
+    commit_body, commit_headers = _heartbeat_request(
+        key,
+        fingerprint,
+        sequence=2,
+        path=commit_path,
+        payload=status_payload,
+        replace_payload=True,
+    )
+    committed = client.post(commit_path, content=commit_body, headers=commit_headers)
+    assert committed.status_code == 200, committed.text
+
+    exact_body, exact_headers = _heartbeat_request(
+        key,
+        fingerprint,
+        sequence=3,
+        path=status_path,
+        payload=status_payload,
+        replace_payload=True,
+    )
+    exact = client.post(status_path, content=exact_body, headers=exact_headers)
+    assert exact.status_code == 200, exact.text
+    assert exact.json()["status"] == "committed_exact"
+    assert exact.json()["active_secret_version"] == 2
+
+    mismatched_payload = dict(status_payload)
+    mismatched_payload["proof_mac"] = "00" * 32
+    mismatch_body, mismatch_headers = _heartbeat_request(
+        key,
+        fingerprint,
+        sequence=3,
+        path=status_path,
+        payload=mismatched_payload,
+        replace_payload=True,
+    )
+    unknown = client.post(status_path, content=mismatch_body, headers=mismatch_headers)
+    assert unknown.status_code == 200, unknown.text
+    assert unknown.json()["status"] == "unknown"
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        assert node.heartbeat_sequence == 2
+        status_audits = session.scalars(
+            select(RelayAuditEvent).where(
+                RelayAuditEvent.node_id == NODE_ID,
+                RelayAuditEvent.action == "relay_secret_rotation_status_read",
+            )
+        ).all()
+        assert status_audits == []
 
 
 def test_node_requires_three_consecutive_healthy_heartbeats_to_recover(
@@ -1437,7 +1914,7 @@ def test_openapi_documents_relay_authentication_headers_and_stable_errors(
 ) -> None:
     client, _ = api
     schema = client.get("/openapi.json").json()
-    heartbeat = schema["paths"][f"/api/v1/relays/{{node_id}}/heartbeat"]["post"]
+    heartbeat = schema["paths"]["/api/v1/relays/{node_id}/heartbeat"]["post"]
     expected_authentication_headers = {
         "X-Rdesk-Client-Cert-Sha256",
         "X-Relay-Node-Id",
@@ -1477,6 +1954,21 @@ def test_openapi_documents_relay_authentication_headers_and_stable_errors(
     assert renewal["security"] == [
         {"TrustedMTLSProxy": [], "RelayEd25519": []}
     ]
+
+    for suffix in ("upload", "commit", "status"):
+        rotation_operation = schema["paths"][
+            f"/api/v1/relays/{{node_id}}/secret-rotation/{suffix}"
+        ]["post"]
+        rotation_headers = {
+            parameter["name"]: parameter
+            for parameter in rotation_operation["parameters"]
+            if parameter.get("in") == "header"
+        }
+        for name in authentication_headers:
+            assert rotation_headers[name]["required"] is True
+        assert rotation_operation["security"] == [
+            {"TrustedMTLSProxy": [], "RelayEd25519": []}
+        ]
 
     pickup = schema["paths"][
         "/api/v1/relays/enrollments/{enrollment_id}/pickup"

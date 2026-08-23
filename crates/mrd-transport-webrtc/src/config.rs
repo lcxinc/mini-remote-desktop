@@ -1,7 +1,7 @@
-use std::fmt;
+use std::{fmt, net::Ipv6Addr};
 
 use mrd_pipeline_core::VideoCodec;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::{H264Profile, TransportError, DEFAULT_MAX_H264_ACCESS_UNIT_BYTES};
 
@@ -19,7 +19,7 @@ pub enum IceTransportPolicy {
     Relay,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct IceServerConfig {
     pub urls: Vec<String>,
     pub username: String,
@@ -33,17 +33,6 @@ impl Clone for IceServerConfig {
             username: self.username.clone(),
             credential: self.credential.clone(),
         }
-    }
-}
-
-impl Drop for IceServerConfig {
-    fn drop(&mut self) {
-        for url in &mut self.urls {
-            url.zeroize();
-        }
-        self.urls.clear();
-        self.username.zeroize();
-        self.credential.zeroize();
     }
 }
 
@@ -110,8 +99,8 @@ pub(crate) fn redact_ice_server_url(url: &str) -> String {
     let Some((scheme, remainder)) = trimmed.split_once(':') else {
         return "[REDACTED]".into();
     };
-    if !matches!(scheme.to_ascii_lowercase().as_str(), "turn" | "turns") {
-        return format!("{scheme}:[REDACTED]");
+    if !scheme.eq_ignore_ascii_case("turn") && !scheme.eq_ignore_ascii_case("turns") {
+        return "[REDACTED]".into();
     }
 
     let (without_fragment, fragment) = remainder
@@ -153,7 +142,7 @@ pub(crate) fn redact_ice_server_url(url: &str) -> String {
                         return "[REDACTED]";
                     };
                     if name.eq_ignore_ascii_case("transport")
-                        && matches!(value.to_ascii_lowercase().as_str(), "udp" | "tcp")
+                        && (value.eq_ignore_ascii_case("udp") || value.eq_ignore_ascii_case("tcp"))
                     {
                         if value.eq_ignore_ascii_case("udp") {
                             "transport=udp"
@@ -176,6 +165,85 @@ pub(crate) fn redact_ice_server_url(url: &str) -> String {
 
 pub(crate) type SecretValues = Zeroizing<Vec<Zeroizing<String>>>;
 
+pub(crate) fn is_public_turn_endpoint(value: &str) -> bool {
+    if value.is_empty()
+        || value.trim().len() != value.len()
+        || value.chars().any(char::is_whitespace)
+    {
+        return false;
+    }
+    let Some((scheme, remainder)) = value.split_once(':') else {
+        return false;
+    };
+    let is_turn = scheme.eq_ignore_ascii_case("turn");
+    let is_turns = scheme.eq_ignore_ascii_case("turns");
+    if (!is_turn && !is_turns) || remainder.is_empty() || remainder.contains(['@', '/', '#', '\\'])
+    {
+        return false;
+    }
+
+    let authority = match remainder.split_once('?') {
+        Some((authority, query)) => {
+            if authority.is_empty()
+                || query.contains(['?', '&'])
+                || !query.split_once('=').is_some_and(|(name, value)| {
+                    name.eq_ignore_ascii_case("transport")
+                        && (value.eq_ignore_ascii_case("udp") || value.eq_ignore_ascii_case("tcp"))
+                        && (!is_turns || value.eq_ignore_ascii_case("tcp"))
+                })
+            {
+                return false;
+            }
+            authority
+        }
+        None => remainder,
+    };
+
+    let Some((host, port)) = split_turn_authority(authority) else {
+        return false;
+    };
+    if port.parse::<u16>().ok().is_none_or(|port| port == 0) {
+        return false;
+    }
+    if let Some(ipv6) = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+    {
+        return ipv6.parse::<Ipv6Addr>().is_ok();
+    }
+    is_public_dns_name(host)
+}
+
+fn split_turn_authority(authority: &str) -> Option<(&str, &str)> {
+    if authority.starts_with('[') {
+        let closing = authority.find(']')?;
+        let host = authority.get(..=closing)?;
+        let port = authority.get(closing + 1..)?.strip_prefix(':')?;
+        return (!port.is_empty()).then_some((host, port));
+    }
+    let (host, port) = authority.rsplit_once(':')?;
+    (!host.is_empty() && !port.is_empty() && !host.contains(':')).then_some((host, port))
+}
+
+fn is_public_dns_name(host: &str) -> bool {
+    host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
 pub(crate) fn ice_server_secret_values(ice_servers: &[IceServerConfig]) -> SecretValues {
     let mut secrets = Zeroizing::new(Vec::new());
     for server in ice_servers {
@@ -192,6 +260,35 @@ pub(crate) fn normalize_secret_values(mut secrets: SecretValues) -> SecretValues
     secrets.retain(|secret| !secret.is_empty());
     secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
     secrets
+}
+
+pub(crate) fn redact_error_with_secrets(
+    error: TransportError,
+    secrets: &SecretValues,
+) -> TransportError {
+    let TransportError::Message(message) = error;
+    let mut message = Zeroizing::new(message);
+    for secret in secrets.iter() {
+        redact_secret_in_place(&mut message, secret);
+    }
+    TransportError::Message(std::mem::take(&mut *message))
+}
+
+fn redact_secret_in_place(message: &mut Zeroizing<String>, secret: &str) {
+    if secret.is_empty() || !message.contains(secret) {
+        return;
+    }
+    let source = Zeroizing::new(std::mem::take(&mut **message));
+    let mut output = Zeroizing::new(String::with_capacity(source.len()));
+    let mut cursor = 0;
+    while let Some(relative) = source[cursor..].find(secret) {
+        let start = cursor + relative;
+        output.push_str(&source[cursor..start]);
+        output.push_str("[REDACTED]");
+        cursor = start + secret.len();
+    }
+    output.push_str(&source[cursor..]);
+    **message = std::mem::take(&mut *output);
 }
 
 fn collect_url_secrets(url: &str, secrets: &mut SecretValues) {
@@ -214,7 +311,7 @@ fn collect_url_secrets(url: &str, secrets: &mut SecretValues) {
         for parameter in query.split('&') {
             let is_public_transport = parameter.split_once('=').is_some_and(|(name, value)| {
                 name.eq_ignore_ascii_case("transport")
-                    && matches!(value.to_ascii_lowercase().as_str(), "udp" | "tcp")
+                    && (value.eq_ignore_ascii_case("udp") || value.eq_ignore_ascii_case("tcp"))
             });
             if !is_public_transport {
                 secrets.push(Zeroizing::new(parameter.to_owned()));
@@ -327,6 +424,22 @@ impl Default for PeerConnectionConfig {
 
 impl PeerConnectionConfig {
     pub(crate) fn preflight(&self) -> Result<&H264CodecConfig, TransportError> {
+        if self
+            .ice_servers
+            .iter()
+            .flat_map(|server| &server.urls)
+            .any(|url| {
+                url.split_once(':').is_some_and(|(scheme, _)| {
+                    (scheme.eq_ignore_ascii_case("turn") || scheme.eq_ignore_ascii_case("turns"))
+                        && !is_public_turn_endpoint(url)
+                })
+            })
+        {
+            return Err(TransportError::Message(
+                "TURN URLs must be public host-and-port endpoints with only a transport query"
+                    .into(),
+            ));
+        }
         let codec = match &self.video_codec {
             VideoCodecConfig::H264(codec) => codec,
             VideoCodecConfig::Unsupported(codec) => {
@@ -351,10 +464,9 @@ impl PeerConnectionConfig {
                 "H.264 profile-level-id must contain exactly six hexadecimal digits".into(),
             ));
         }
-        let prefix = codec.profile_level_id[..2].to_ascii_lowercase();
         let profile_matches = match codec.profile {
-            H264CodecProfile::Baseline => prefix == "42",
-            H264CodecProfile::High => prefix == "64",
+            H264CodecProfile::Baseline => codec.profile_level_id[..2].eq_ignore_ascii_case("42"),
+            H264CodecProfile::High => codec.profile_level_id[..2].eq_ignore_ascii_case("64"),
         };
         if !profile_matches {
             return Err(TransportError::Message(format!(
@@ -407,17 +519,20 @@ impl PeerConnectionConfig {
 
 #[cfg(test)]
 mod secret_lifetime_tests {
-    use super::IceServerConfig;
+    use super::{IceServerConfig, PeerConnectionConfig};
+    use zeroize::{Zeroize, ZeroizeOnDrop};
+
+    fn assert_zeroizing_owner<T: Zeroize + ZeroizeOnDrop>() {}
 
     #[test]
-    fn ice_server_config_and_clones_have_zeroizing_drop_owners() {
-        assert!(std::mem::needs_drop::<IceServerConfig>());
-        let config = IceServerConfig::new(
+    fn ice_server_config_and_clones_are_observable_zeroizing_owners() {
+        assert_zeroizing_owner::<IceServerConfig>();
+        let mut config = IceServerConfig::new(
             vec!["turn:url-user-9x:url-pass-8y@relay.invalid?credential=url-secret-7z".into()],
             "sensitive-user".into(),
             "sensitive-credential".into(),
         );
-        let cloned = config.clone();
+        let mut cloned = config.clone();
         let debug = format!("{cloned:?}");
         let display = cloned.to_string();
         for secret in [
@@ -429,6 +544,38 @@ mod secret_lifetime_tests {
         ] {
             assert!(!debug.contains(secret));
             assert!(!display.contains(secret));
+        }
+
+        config.zeroize();
+        cloned.zeroize();
+        assert!(config.urls.is_empty());
+        assert!(config.username.is_empty());
+        assert!(config.credential.is_empty());
+        assert!(cloned.urls.is_empty());
+        assert!(cloned.username.is_empty());
+        assert!(cloned.credential.is_empty());
+    }
+
+    #[test]
+    fn peer_preflight_rejects_credential_bearing_turn_url_components() {
+        for malicious in [
+            "turn:user:password@relay.example.test:3478?transport=udp",
+            "turn:relay.example.test:3478/private-secret",
+            "turn:relay.example.test:3478?api_key=query-secret",
+            "turn:relay.example.test:3478?transport=udp#fragment-secret",
+        ] {
+            let config = PeerConnectionConfig {
+                ice_servers: vec![IceServerConfig::new(
+                    vec![malicious.into()],
+                    "ephemeral-user".into(),
+                    "ephemeral-credential".into(),
+                )],
+                ..PeerConnectionConfig::default()
+            };
+            assert!(
+                config.preflight().is_err(),
+                "preflight accepted credential-bearing TURN URL: {malicious}"
+            );
         }
     }
 }
