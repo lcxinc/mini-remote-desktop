@@ -1,22 +1,24 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     future::Future,
     panic::{catch_unwind, AssertUnwindSafe},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         mpsc, Arc, Condvar, Mutex, OnceLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::{
+    sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore},
+    task::JoinSet,
+};
 
 const CLEANUP_WORKERS: usize = 2;
 const CLEANUP_QUEUE_CAPACITY: usize = 32;
 const CLEANUP_ADMISSION_TIMEOUT: Duration = Duration::from_secs(2);
 const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(2);
-const FORCE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const FAILURE_HISTORY_CAPACITY: usize = 128;
 
 pub(crate) type CleanupPhase<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
@@ -24,6 +26,14 @@ pub(crate) type CleanupPhase<'a> = Pin<Box<dyn Future<Output = Result<(), String
 pub(crate) trait CleanupPayload: Send + 'static {
     fn normal_cleanup(&mut self) -> CleanupPhase<'_>;
     fn force_cleanup(&mut self) -> CleanupPhase<'_>;
+
+    fn force_retry_safe(&self) -> bool {
+        true
+    }
+
+    fn preserve_on_error(&self) -> bool {
+        false
+    }
 }
 
 type Completion = Box<dyn FnOnce(CleanupJobOutcome) + Send + 'static>;
@@ -51,6 +61,7 @@ pub struct CleanupSupervisorSnapshot {
     pub force_only_worker_count: usize,
     pub queue_capacity: usize,
     pub queue_depth: usize,
+    pub ownership_registry_depth: usize,
     pub admission_capacity: usize,
     pub available_admission_slots: usize,
     pub accepting_new_peers: bool,
@@ -60,6 +71,7 @@ pub struct CleanupSupervisorSnapshot {
     pub normal_jobs: u64,
     pub forced_jobs: u64,
     pub force_failed_jobs: u64,
+    pub quarantined_jobs: u64,
     pub failed_jobs: u64,
     pub timed_out_jobs: u64,
     pub panicked_jobs: u64,
@@ -72,17 +84,19 @@ pub struct CleanupSupervisorSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CleanupForceTrigger {
     Failure,
-    TimedOut,
     Panicked,
-    ExecutorUnavailable,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum CleanupJobOutcome {
     Completed,
+    Failed,
     Forced {
         trigger: CleanupForceTrigger,
         force_failed: bool,
+    },
+    Quarantined {
+        trigger: CleanupForceTrigger,
     },
 }
 
@@ -90,17 +104,14 @@ impl CleanupJobOutcome {
     pub(crate) fn error_message(&self) -> Option<String> {
         match self {
             Self::Completed => None,
+            Self::Failed => Some("cleanup job failed; physical teardown completed".into()),
             Self::Forced {
                 trigger,
                 force_failed,
             } => {
                 let trigger = match trigger {
                     CleanupForceTrigger::Failure => "cleanup job failed",
-                    CleanupForceTrigger::TimedOut => "cleanup job timed out",
                     CleanupForceTrigger::Panicked => "cleanup job panicked",
-                    CleanupForceTrigger::ExecutorUnavailable => {
-                        "cleanup executor became unavailable"
-                    }
                 };
                 let force = if *force_failed {
                     "forced teardown failed"
@@ -109,7 +120,18 @@ impl CleanupJobOutcome {
                 };
                 Some(format!("{trigger}; {force}"))
             }
+            Self::Quarantined { trigger } => {
+                let reason = match trigger {
+                    CleanupForceTrigger::Failure => "physical teardown failed",
+                    CleanupForceTrigger::Panicked => "physical teardown panicked",
+                };
+                Some(format!("{reason}; ownership quarantined"))
+            }
         }
+    }
+
+    pub(crate) fn is_quarantined(&self) -> bool {
+        matches!(self, Self::Quarantined { .. })
     }
 }
 
@@ -124,22 +146,24 @@ pub(crate) struct RejectedCleanup<P> {
     pub reason: String,
 }
 
-struct CleanupJob {
-    meta: CleanupJobMeta,
-    timeout: Duration,
-    payload: Option<Box<dyn CleanupPayload>>,
-    permit: Option<CleanupPermit>,
-    completion: Option<Completion>,
+struct CleanupOwnership {
+    payload: Box<dyn CleanupPayload>,
+    _permit: CleanupPermit,
 }
 
-impl CleanupJob {
-    fn finish(&mut self, outcome: CleanupJobOutcome) {
-        self.payload.take();
-        self.permit.take();
-        if let Some(completion) = self.completion.take() {
-            completion(outcome);
-        }
-    }
+const JOB_QUEUED: u8 = 0;
+const JOB_RUNNING: u8 = 1;
+const JOB_FINISHED: u8 = 2;
+const JOB_QUARANTINED: u8 = 3;
+
+struct CleanupJob {
+    id: u64,
+    meta: CleanupJobMeta,
+    deadline: Instant,
+    stage: AtomicU8,
+    deadline_reported: AtomicBool,
+    ownership: AsyncMutex<Option<CleanupOwnership>>,
+    completion: Mutex<Option<Completion>>,
 }
 
 #[derive(Default)]
@@ -152,6 +176,7 @@ struct CleanupMetrics {
     normal_jobs: AtomicU64,
     forced_jobs: AtomicU64,
     force_failed_jobs: AtomicU64,
+    quarantined_jobs: AtomicU64,
     failed_jobs: AtomicU64,
     timed_out_jobs: AtomicU64,
     panicked_jobs: AtomicU64,
@@ -161,13 +186,16 @@ struct CleanupMetrics {
 }
 
 pub(crate) struct CleanupSupervisor {
-    queue: Mutex<VecDeque<CleanupJob>>,
-    has_work: Condvar,
+    queue: Mutex<VecDeque<Arc<CleanupJob>>>,
+    registry: Mutex<HashMap<u64, Arc<CleanupJob>>>,
+    has_work: Notify,
     startup: Condvar,
+    startup_lock: Mutex<()>,
     queue_capacity: usize,
     admission: Arc<Semaphore>,
     accepting: AtomicBool,
     stopping: AtomicBool,
+    next_job_id: AtomicU64,
     worker_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
     metrics: CleanupMetrics,
     #[cfg(test)]
@@ -178,12 +206,15 @@ impl CleanupSupervisor {
     fn new(queue_capacity: usize) -> Arc<Self> {
         Arc::new(Self {
             queue: Mutex::new(VecDeque::with_capacity(queue_capacity)),
-            has_work: Condvar::new(),
+            registry: Mutex::new(HashMap::with_capacity(queue_capacity)),
+            has_work: Notify::new(),
             startup: Condvar::new(),
+            startup_lock: Mutex::new(()),
             queue_capacity,
             admission: Arc::new(Semaphore::new(queue_capacity)),
             accepting: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
+            next_job_id: AtomicU64::new(1),
             worker_handles: Mutex::new(Vec::new()),
             metrics: CleanupMetrics::default(),
             #[cfg(test)]
@@ -257,7 +288,7 @@ impl CleanupSupervisor {
         if ready == 0 {
             self.stopping.store(true, Ordering::Release);
             self.startup.notify_all();
-            self.has_work.notify_all();
+            self.has_work.notify_waiters();
             return Err("cleanup executor unavailable: every runtime failed to initialize".into());
         }
         self.accepting.store(true, Ordering::Release);
@@ -266,14 +297,14 @@ impl CleanupSupervisor {
     }
 
     fn wait_for_startup(&self) {
-        let mut queue = self
-            .queue
+        let mut startup = self
+            .startup_lock
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         while !self.accepting.load(Ordering::Acquire) && !self.stopping.load(Ordering::Acquire) {
-            queue = self
+            startup = self
                 .startup
-                .wait(queue)
+                .wait(startup)
                 .unwrap_or_else(|poison| poison.into_inner());
         }
     }
@@ -316,65 +347,311 @@ impl CleanupSupervisor {
         })
     }
 
-    fn run_worker(&self, runtime: tokio::runtime::Runtime) {
-        let mut force_only = false;
+    fn run_worker(self: &Arc<Self>, runtime: tokio::runtime::Runtime) {
         loop {
-            let mut job = {
-                let mut queue = self
-                    .queue
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner());
-                while queue.is_empty() {
-                    if self.stopping.load(Ordering::Acquire) {
-                        if force_only {
-                            self.metrics
-                                .force_only_workers
-                                .fetch_sub(1, Ordering::AcqRel);
-                        } else {
-                            self.metrics.normal_workers.fetch_sub(1, Ordering::AcqRel);
-                        }
-                        return;
-                    }
-                    queue = self
-                        .has_work
-                        .wait(queue)
-                        .unwrap_or_else(|poison| poison.into_inner());
-                }
-                queue.pop_front().expect("non-empty cleanup queue")
-            };
-            self.metrics.active_jobs.fetch_add(1, Ordering::AcqRel);
-            let outcome = if force_only {
-                execute_force_only(&runtime, &mut job, CleanupForceTrigger::ExecutorUnavailable)
-            } else {
-                execute_job(&runtime, &mut job)
-            };
-            self.metrics.active_jobs.fetch_sub(1, Ordering::AcqRel);
-            let meta = job.meta;
-            let completion = catch_unwind(AssertUnwindSafe(|| job.finish(outcome.clone())));
-            self.record_completion(
-                &meta,
-                if completion.is_err() {
-                    &CleanupJobOutcome::Forced {
-                        trigger: CleanupForceTrigger::Panicked,
-                        force_failed: false,
-                    }
-                } else {
-                    &outcome
-                },
-            );
-            if !force_only && self.should_exit_worker_for_test() {
-                let previous = self.metrics.normal_workers.fetch_sub(1, Ordering::AcqRel);
-                if previous == 1 {
+            let worker = Arc::clone(self);
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                runtime.block_on(async move { worker.worker_loop().await })
+            }));
+            match result {
+                Ok(WorkerExit::Stop | WorkerExit::Injected) => return,
+                Err(_) => {
                     self.accepting.store(false, Ordering::Release);
-                    self.metrics
-                        .force_only_workers
-                        .fetch_add(1, Ordering::AcqRel);
-                    force_only = true;
-                } else {
-                    return;
+                    self.record_executor_failure();
+                    continue;
                 }
             }
         }
+    }
+
+    async fn worker_loop(self: Arc<Self>) -> WorkerExit {
+        let mut tasks = JoinSet::new();
+        loop {
+            // Register before inspecting the queue/stop flags. `notify_waiters` does not
+            // retain a permit, so registering afterwards could lose shutdown between
+            // the state check and `select!` and strand the worker thread in `join()`.
+            let notified = self.has_work.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            while let Some(job) = self.pop_queued_job() {
+                if job
+                    .stage
+                    .compare_exchange(JOB_QUEUED, JOB_RUNNING, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                self.metrics.active_jobs.fetch_add(1, Ordering::AcqRel);
+                let deadline_supervisor = Arc::clone(&self);
+                let deadline_job = Arc::clone(&job);
+                tokio::spawn(async move {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline_job.deadline))
+                        .await;
+                    deadline_supervisor.record_deadline_if_running(&deadline_job);
+                });
+                let task_supervisor = Arc::clone(&self);
+                tasks.spawn(async move {
+                    run_supervised_job(task_supervisor, job).await;
+                });
+            }
+
+            if self.stopping.load(Ordering::Acquire) && tasks.is_empty() && self.queue_is_empty() {
+                self.metrics.normal_workers.fetch_sub(1, Ordering::AcqRel);
+                return WorkerExit::Stop;
+            }
+
+            tokio::select! {
+                _ = &mut notified => {}
+                joined = tasks.join_next(), if !tasks.is_empty() => {
+                    let _ = joined;
+                    if tasks.is_empty() && self.should_exit_worker_for_test() {
+                        let exited = self
+                            .metrics
+                            .normal_workers
+                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |workers| {
+                                if workers > 1 {
+                                    Some(workers - 1)
+                                } else {
+                                    None
+                                }
+                            })
+                            .is_ok();
+                        if exited {
+                            return WorkerExit::Injected;
+                        }
+                        self.accepting.store(false, Ordering::Release);
+                    }
+                }
+            }
+        }
+    }
+
+    fn pop_queued_job(&self) -> Option<Arc<CleanupJob>> {
+        self.queue
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .pop_front()
+    }
+
+    fn queue_is_empty(&self) -> bool {
+        self.queue
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_empty()
+    }
+
+    fn record_deadline_if_running(&self, job: &CleanupJob) {
+        if !matches!(job.stage.load(Ordering::Acquire), JOB_QUEUED | JOB_RUNNING)
+            || job.deadline_reported.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        self.metrics.timed_out_jobs.fetch_add(1, Ordering::AcqRel);
+        self.metrics.failed_jobs.fetch_add(1, Ordering::AcqRel);
+        self.push_failure(
+            &job.meta,
+            "physical cleanup still in progress after deadline",
+        );
+    }
+
+    fn finish_job(&self, job: &Arc<CleanupJob>, outcome: CleanupJobOutcome) {
+        if job
+            .stage
+            .compare_exchange(
+                JOB_RUNNING,
+                JOB_FINISHED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        self.metrics.active_jobs.fetch_sub(1, Ordering::AcqRel);
+        self.registry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&job.id);
+        let ownership = job
+            .ownership
+            .try_lock()
+            .expect("completed cleanup task released ownership lock")
+            .take();
+        drop(ownership);
+        self.record_completion(&job.meta, &outcome);
+        if let Some(completion) = job
+            .completion
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+        {
+            let _ = catch_unwind(AssertUnwindSafe(|| completion(outcome)));
+        }
+    }
+
+    fn quarantine_job(&self, job: &Arc<CleanupJob>, trigger: CleanupForceTrigger) {
+        if job
+            .stage
+            .compare_exchange(
+                JOB_RUNNING,
+                JOB_QUARANTINED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        self.metrics.active_jobs.fetch_sub(1, Ordering::AcqRel);
+        self.metrics.quarantined_jobs.fetch_add(1, Ordering::AcqRel);
+        self.metrics.failed_jobs.fetch_add(1, Ordering::AcqRel);
+        if trigger == CleanupForceTrigger::Panicked {
+            self.metrics.panicked_jobs.fetch_add(1, Ordering::AcqRel);
+        }
+        self.push_failure(
+            &job.meta,
+            match trigger {
+                CleanupForceTrigger::Failure => "physical cleanup failed; ownership quarantined",
+                CleanupForceTrigger::Panicked => "physical cleanup panicked; ownership quarantined",
+            },
+        );
+        let outcome = CleanupJobOutcome::Quarantined { trigger };
+        if let Some(completion) = job
+            .completion
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+        {
+            let _ = catch_unwind(AssertUnwindSafe(|| completion(outcome)));
+        }
+    }
+
+    fn record_completion(&self, meta: &CleanupJobMeta, outcome: &CleanupJobOutcome) {
+        self.metrics.completed_jobs.fetch_add(1, Ordering::AcqRel);
+        match outcome {
+            CleanupJobOutcome::Completed => {
+                self.metrics.normal_jobs.fetch_add(1, Ordering::AcqRel);
+            }
+            CleanupJobOutcome::Failed => {
+                self.metrics.failed_jobs.fetch_add(1, Ordering::AcqRel);
+                self.push_failure(meta, "physical cleanup reported a terminal failure");
+            }
+            CleanupJobOutcome::Forced {
+                trigger,
+                force_failed,
+            } => {
+                self.metrics.forced_jobs.fetch_add(1, Ordering::AcqRel);
+                self.metrics.failed_jobs.fetch_add(1, Ordering::AcqRel);
+                if *force_failed {
+                    self.metrics
+                        .force_failed_jobs
+                        .fetch_add(1, Ordering::AcqRel);
+                }
+                self.push_failure(
+                    meta,
+                    match trigger {
+                        CleanupForceTrigger::Failure if *force_failed => {
+                            "normal and forced cleanup failed"
+                        }
+                        CleanupForceTrigger::Failure => {
+                            "normal cleanup failed; forced teardown completed"
+                        }
+                        CleanupForceTrigger::Panicked => {
+                            "normal cleanup panicked; forced teardown completed"
+                        }
+                    },
+                );
+            }
+            CleanupJobOutcome::Quarantined { .. } => {}
+        }
+    }
+
+    fn record_executor_failure(&self) {
+        self.metrics
+            .executor_unavailable_jobs
+            .fetch_add(1, Ordering::AcqRel);
+        self.metrics.failed_jobs.fetch_add(1, Ordering::AcqRel);
+        self.push_failure(
+            &CleanupJobMeta {
+                kind: "executor-runtime",
+                generation: None,
+                route_id: None,
+            },
+            "cleanup executor event loop restarted after panic",
+        );
+    }
+
+    fn push_failure(&self, meta: &CleanupJobMeta, reason: &'static str) {
+        let mut failures = self
+            .metrics
+            .recent_failures
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if failures.len() == FAILURE_HISTORY_CAPACITY {
+            failures.pop_front();
+        }
+        failures.push_back(CleanupFailureSummary {
+            job_kind: meta.kind.into(),
+            generation: meta.generation,
+            route_id_summary: meta
+                .route_id
+                .map(|route| format!("route-{:08x}", route as u32)),
+            reason: reason.into(),
+        });
+    }
+
+    pub(crate) fn snapshot(&self) -> CleanupSupervisorSnapshot {
+        let queue_depth = self
+            .queue
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len();
+        let ownership_registry_depth = self
+            .registry
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len();
+        let recent_failures = self
+            .metrics
+            .recent_failures
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        CleanupSupervisorSnapshot {
+            worker_count: self.metrics.normal_workers.load(Ordering::Acquire),
+            force_only_worker_count: self.metrics.force_only_workers.load(Ordering::Acquire),
+            queue_capacity: self.queue_capacity,
+            queue_depth,
+            ownership_registry_depth,
+            admission_capacity: self.queue_capacity,
+            available_admission_slots: self.admission.available_permits(),
+            accepting_new_peers: self.accepting.load(Ordering::Acquire),
+            active_jobs: self.metrics.active_jobs.load(Ordering::Acquire),
+            submitted_jobs: self.metrics.submitted_jobs.load(Ordering::Acquire),
+            completed_jobs: self.metrics.completed_jobs.load(Ordering::Acquire),
+            normal_jobs: self.metrics.normal_jobs.load(Ordering::Acquire),
+            forced_jobs: self.metrics.forced_jobs.load(Ordering::Acquire),
+            force_failed_jobs: self.metrics.force_failed_jobs.load(Ordering::Acquire),
+            quarantined_jobs: self.metrics.quarantined_jobs.load(Ordering::Acquire),
+            failed_jobs: self.metrics.failed_jobs.load(Ordering::Acquire),
+            timed_out_jobs: self.metrics.timed_out_jobs.load(Ordering::Acquire),
+            panicked_jobs: self.metrics.panicked_jobs.load(Ordering::Acquire),
+            executor_unavailable_jobs: self
+                .metrics
+                .executor_unavailable_jobs
+                .load(Ordering::Acquire),
+            saturated_jobs: self.metrics.saturated_jobs.load(Ordering::Acquire),
+            last_failure: recent_failures.last().cloned(),
+            recent_failures,
+        }
+    }
+
+    #[cfg(test)]
+    fn inject_worker_exit_after_jobs(&self, jobs: usize) {
+        self.worker_exit_after_jobs.store(jobs, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -395,123 +672,47 @@ impl CleanupSupervisor {
         false
     }
 
-    fn record_completion(&self, meta: &CleanupJobMeta, outcome: &CleanupJobOutcome) {
-        self.metrics.completed_jobs.fetch_add(1, Ordering::AcqRel);
-        let failure = match outcome {
-            CleanupJobOutcome::Completed => {
-                self.metrics.normal_jobs.fetch_add(1, Ordering::AcqRel);
-                return;
-            }
-            CleanupJobOutcome::Forced {
-                trigger,
-                force_failed,
-            } => {
-                self.metrics.forced_jobs.fetch_add(1, Ordering::AcqRel);
-                if *force_failed {
-                    self.metrics
-                        .force_failed_jobs
-                        .fetch_add(1, Ordering::AcqRel);
-                }
-                match trigger {
-                    CleanupForceTrigger::Failure => "normal cleanup failed; force phase ran",
-                    CleanupForceTrigger::TimedOut => {
-                        self.metrics.timed_out_jobs.fetch_add(1, Ordering::AcqRel);
-                        "normal cleanup timed out; force phase ran"
-                    }
-                    CleanupForceTrigger::Panicked => {
-                        self.metrics.panicked_jobs.fetch_add(1, Ordering::AcqRel);
-                        "normal cleanup panicked; force phase ran"
-                    }
-                    CleanupForceTrigger::ExecutorUnavailable => {
-                        self.metrics
-                            .executor_unavailable_jobs
-                            .fetch_add(1, Ordering::AcqRel);
-                        "normal executor unavailable; force phase ran"
-                    }
-                }
-            }
-        };
-        self.metrics.failed_jobs.fetch_add(1, Ordering::AcqRel);
-        let mut failures = self
-            .metrics
-            .recent_failures
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if failures.len() == FAILURE_HISTORY_CAPACITY {
-            failures.pop_front();
-        }
-        failures.push_back(CleanupFailureSummary {
-            job_kind: meta.kind.into(),
-            generation: meta.generation,
-            route_id_summary: meta
-                .route_id
-                .map(|route| format!("route-{:08x}", route as u32)),
-            reason: if matches!(
-                outcome,
-                CleanupJobOutcome::Forced {
-                    force_failed: true,
-                    ..
-                }
-            ) {
-                format!("{failure}; force phase failed")
-            } else {
-                failure.into()
-            },
-        });
-    }
-
-    pub(crate) fn snapshot(&self) -> CleanupSupervisorSnapshot {
-        let queue_depth = self
-            .queue
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .len();
-        let recent_failures = self
-            .metrics
-            .recent_failures
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        CleanupSupervisorSnapshot {
-            worker_count: self.metrics.normal_workers.load(Ordering::Acquire),
-            force_only_worker_count: self.metrics.force_only_workers.load(Ordering::Acquire),
-            queue_capacity: self.queue_capacity,
-            queue_depth,
-            admission_capacity: self.queue_capacity,
-            available_admission_slots: self.admission.available_permits(),
-            accepting_new_peers: self.accepting.load(Ordering::Acquire),
-            active_jobs: self.metrics.active_jobs.load(Ordering::Acquire),
-            submitted_jobs: self.metrics.submitted_jobs.load(Ordering::Acquire),
-            completed_jobs: self.metrics.completed_jobs.load(Ordering::Acquire),
-            normal_jobs: self.metrics.normal_jobs.load(Ordering::Acquire),
-            forced_jobs: self.metrics.forced_jobs.load(Ordering::Acquire),
-            force_failed_jobs: self.metrics.force_failed_jobs.load(Ordering::Acquire),
-            failed_jobs: self.metrics.failed_jobs.load(Ordering::Acquire),
-            timed_out_jobs: self.metrics.timed_out_jobs.load(Ordering::Acquire),
-            panicked_jobs: self.metrics.panicked_jobs.load(Ordering::Acquire),
-            executor_unavailable_jobs: self
-                .metrics
-                .executor_unavailable_jobs
-                .load(Ordering::Acquire),
-            saturated_jobs: self.metrics.saturated_jobs.load(Ordering::Acquire),
-            last_failure: recent_failures.last().cloned(),
-            recent_failures,
-        }
-    }
-
     #[cfg(test)]
-    fn inject_worker_exit_after_jobs(&self, jobs: usize) {
-        self.worker_exit_after_jobs.store(jobs, Ordering::Release);
+    pub(crate) fn release_quarantined_for_test(&self) {
+        let quarantined = {
+            let mut registry = self
+                .registry
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let ids = registry
+                .iter()
+                .filter_map(|(id, job)| {
+                    (job.stage.load(Ordering::Acquire) == JOB_QUARANTINED).then_some(*id)
+                })
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| registry.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        for job in quarantined {
+            let ownership = job
+                .ownership
+                .try_lock()
+                .expect("quarantined task released ownership lock")
+                .take();
+            drop(ownership);
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn shutdown_for_test(&self) {
+        assert_eq!(
+            self.registry
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .len(),
+            0,
+            "test cleanup supervisor cannot stop with owned or quarantined jobs"
+        );
         self.stopping.store(true, Ordering::Release);
         self.accepting.store(false, Ordering::Release);
         self.startup.notify_all();
-        self.has_work.notify_all();
+        self.has_work.notify_waiters();
         let handles = std::mem::take(
             &mut *self
                 .worker_handles
@@ -524,85 +725,80 @@ impl CleanupSupervisor {
     }
 }
 
-enum PhaseResult {
-    Completed,
-    Failed,
-    TimedOut,
-    Panicked,
+enum WorkerExit {
+    Stop,
+    Injected,
 }
 
-fn run_normal_phase(
-    runtime: &tokio::runtime::Runtime,
-    timeout: Duration,
-    payload: &mut dyn CleanupPayload,
-) -> PhaseResult {
-    catch_unwind(AssertUnwindSafe(|| {
-        runtime.block_on(async {
-            match tokio::time::timeout(timeout, payload.normal_cleanup()).await {
-                Ok(Ok(())) => PhaseResult::Completed,
-                Ok(Err(_)) => PhaseResult::Failed,
-                Err(_) => PhaseResult::TimedOut,
-            }
-        })
-    }))
-    .unwrap_or(PhaseResult::Panicked)
+struct JobRunGuard {
+    supervisor: Arc<CleanupSupervisor>,
+    job: Arc<CleanupJob>,
+    armed: bool,
 }
 
-fn run_force_phase(
-    runtime: &tokio::runtime::Runtime,
-    payload: &mut dyn CleanupPayload,
-) -> PhaseResult {
-    catch_unwind(AssertUnwindSafe(|| {
-        runtime.block_on(async {
-            match tokio::time::timeout(FORCE_CLEANUP_TIMEOUT, payload.force_cleanup()).await {
-                Ok(Ok(())) => PhaseResult::Completed,
-                Ok(Err(_)) => PhaseResult::Failed,
-                Err(_) => PhaseResult::TimedOut,
-            }
-        })
-    }))
-    .unwrap_or(PhaseResult::Panicked)
-}
-
-fn execute_job(runtime: &tokio::runtime::Runtime, job: &mut CleanupJob) -> CleanupJobOutcome {
-    let Some(payload) = job.payload.as_mut() else {
-        return CleanupJobOutcome::Forced {
-            trigger: CleanupForceTrigger::Failure,
-            force_failed: true,
-        };
-    };
-    let trigger = match run_normal_phase(runtime, job.timeout, payload.as_mut()) {
-        PhaseResult::Completed => return CleanupJobOutcome::Completed,
-        PhaseResult::Failed => CleanupForceTrigger::Failure,
-        PhaseResult::TimedOut => CleanupForceTrigger::TimedOut,
-        PhaseResult::Panicked => CleanupForceTrigger::Panicked,
-    };
-    execute_force(runtime, payload.as_mut(), trigger)
-}
-
-fn execute_force_only(
-    runtime: &tokio::runtime::Runtime,
-    job: &mut CleanupJob,
-    trigger: CleanupForceTrigger,
-) -> CleanupJobOutcome {
-    let Some(payload) = job.payload.as_mut() else {
-        return CleanupJobOutcome::Forced {
-            trigger,
-            force_failed: true,
-        };
-    };
-    execute_force(runtime, payload.as_mut(), trigger)
-}
-
-fn execute_force(
-    runtime: &tokio::runtime::Runtime,
-    payload: &mut dyn CleanupPayload,
-    trigger: CleanupForceTrigger,
-) -> CleanupJobOutcome {
-    CleanupJobOutcome::Forced {
-        trigger,
-        force_failed: !matches!(run_force_phase(runtime, payload), PhaseResult::Completed),
+impl JobRunGuard {
+    fn new(supervisor: Arc<CleanupSupervisor>, job: Arc<CleanupJob>) -> Self {
+        Self {
+            supervisor,
+            job,
+            armed: true,
+        }
     }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for JobRunGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.supervisor
+                .quarantine_job(&self.job, CleanupForceTrigger::Panicked);
+        }
+    }
+}
+
+async fn run_supervised_job(supervisor: Arc<CleanupSupervisor>, job: Arc<CleanupJob>) {
+    let mut run_guard = JobRunGuard::new(Arc::clone(&supervisor), Arc::clone(&job));
+    let decision = {
+        let mut ownership = job.ownership.lock().await;
+        let ownership = ownership
+            .as_mut()
+            .expect("running cleanup job retains physical ownership");
+        match ownership.payload.normal_cleanup().await {
+            Ok(()) => RunDecision::Finish(CleanupJobOutcome::Completed),
+            Err(_) if ownership.payload.force_retry_safe() => {
+                match ownership.payload.force_cleanup().await {
+                    Ok(()) => RunDecision::Finish(CleanupJobOutcome::Forced {
+                        trigger: CleanupForceTrigger::Failure,
+                        force_failed: false,
+                    }),
+                    Err(_) if ownership.payload.preserve_on_error() => {
+                        RunDecision::Quarantine(CleanupForceTrigger::Failure)
+                    }
+                    Err(_) => RunDecision::Finish(CleanupJobOutcome::Forced {
+                        trigger: CleanupForceTrigger::Failure,
+                        force_failed: true,
+                    }),
+                }
+            }
+            Err(_) if ownership.payload.preserve_on_error() => {
+                RunDecision::Quarantine(CleanupForceTrigger::Failure)
+            }
+            Err(_) => RunDecision::Finish(CleanupJobOutcome::Failed),
+        }
+    };
+    run_guard.disarm();
+    match decision {
+        RunDecision::Finish(outcome) => supervisor.finish_job(&job, outcome),
+        RunDecision::Quarantine(trigger) => supervisor.quarantine_job(&job, trigger),
+    }
+}
+
+enum RunDecision {
+    Finish(CleanupJobOutcome),
+    Quarantine(CleanupForceTrigger),
 }
 
 fn default_runtime_factory() -> RuntimeFactory {
@@ -649,13 +845,7 @@ where
     C: FnOnce(CleanupJobOutcome) + Send + 'static,
 {
     let supervisor = Arc::clone(&permit.supervisor);
-    if supervisor.metrics.normal_workers.load(Ordering::Acquire) == 0
-        && supervisor
-            .metrics
-            .force_only_workers
-            .load(Ordering::Acquire)
-            == 0
-    {
+    if supervisor.metrics.normal_workers.load(Ordering::Acquire) == 0 {
         return Err(RejectedCleanup {
             permit,
             payload,
@@ -678,20 +868,34 @@ where
             reason: "reserved cleanup invariant violated".into(),
         });
     }
+    let id = supervisor.next_job_id.fetch_add(1, Ordering::Relaxed);
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    let job = Arc::new(CleanupJob {
+        id,
+        meta,
+        deadline,
+        stage: AtomicU8::new(JOB_QUEUED),
+        deadline_reported: AtomicBool::new(false),
+        ownership: AsyncMutex::new(Some(CleanupOwnership {
+            payload: Box::new(payload),
+            _permit: permit,
+        })),
+        completion: Mutex::new(Some(Box::new(completion))),
+    });
+    supervisor
+        .registry
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(id, Arc::clone(&job));
+    queue.push_back(job);
     supervisor
         .metrics
         .submitted_jobs
         .fetch_add(1, Ordering::AcqRel);
-    queue.push_back(CleanupJob {
-        meta,
-        timeout,
-        payload: Some(Box::new(payload)),
-        permit: Some(permit),
-        completion: Some(Box::new(completion)),
-    });
-    // The queue owns the physical payload before logical state becomes Closing. Workers cannot
-    // observe it until notification below, so accepted is the atomic publication boundary.
     accepted();
+    drop(queue);
     supervisor.has_work.notify_one();
     Ok(())
 }
@@ -704,6 +908,7 @@ pub fn cleanup_supervisor_snapshot() -> CleanupSupervisorSnapshot {
             force_only_worker_count: 0,
             queue_capacity: CLEANUP_QUEUE_CAPACITY,
             queue_depth: 0,
+            ownership_registry_depth: 0,
             admission_capacity: CLEANUP_QUEUE_CAPACITY,
             available_admission_slots: 0,
             accepting_new_peers: false,
@@ -713,6 +918,7 @@ pub fn cleanup_supervisor_snapshot() -> CleanupSupervisorSnapshot {
             normal_jobs: 0,
             forced_jobs: 0,
             force_failed_jobs: 0,
+            quarantined_jobs: 0,
             failed_jobs: 1,
             timed_out_jobs: 0,
             panicked_jobs: 0,
@@ -736,7 +942,6 @@ fn executor_start_failure() -> CleanupFailureSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
 
     const TEST_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -819,24 +1024,33 @@ mod tests {
     }
 
     #[test]
-    fn timed_out_and_panicked_jobs_force_cleanup_before_completion() {
+    fn deadline_never_cancels_running_ownership_and_panic_quarantines_it() {
         let supervisor = CleanupSupervisor::start_with(2, 4).expect("supervisor");
+        let gate = Arc::new(Semaphore::new(0));
         let (timeout_rx, timeout_forced, timeout_dropped) = submit_test(
             &supervisor,
-            NormalBehavior::Wait(Arc::new(Semaphore::new(0))),
+            NormalBehavior::Wait(Arc::clone(&gate)),
             Duration::from_millis(20),
             "timeout-test",
         );
         assert!(matches!(
-            timeout_rx.recv_timeout(TEST_COMPLETION_TIMEOUT).unwrap(),
-            CleanupJobOutcome::Forced {
-                trigger: CleanupForceTrigger::TimedOut,
-                force_failed: false
-            }
+            timeout_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
         ));
-        assert!(timeout_forced.load(Ordering::Acquire));
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.timed_out_jobs, 1);
+        assert_eq!(snapshot.ownership_registry_depth, 1);
+        assert_eq!(snapshot.available_admission_slots, 3);
+        assert!(!timeout_forced.load(Ordering::Acquire));
+        assert!(!timeout_dropped.load(Ordering::Acquire));
+        gate.add_permits(1);
+        assert!(matches!(
+            timeout_rx.recv_timeout(TEST_COMPLETION_TIMEOUT).unwrap(),
+            CleanupJobOutcome::Completed
+        ));
         assert!(timeout_dropped.load(Ordering::Acquire));
-        let (panic_rx, panic_forced, _) = submit_test(
+
+        let (panic_rx, _, panic_dropped) = submit_test(
             &supervisor,
             NormalBehavior::Panic,
             Duration::from_secs(1),
@@ -844,12 +1058,28 @@ mod tests {
         );
         assert!(matches!(
             panic_rx.recv_timeout(TEST_COMPLETION_TIMEOUT).unwrap(),
-            CleanupJobOutcome::Forced {
-                trigger: CleanupForceTrigger::Panicked,
-                force_failed: false
+            CleanupJobOutcome::Quarantined {
+                trigger: CleanupForceTrigger::Panicked
             }
         ));
-        assert!(panic_forced.load(Ordering::Acquire));
+        assert!(!panic_dropped.load(Ordering::Acquire));
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.quarantined_jobs, 1);
+        assert_eq!(snapshot.ownership_registry_depth, 1);
+        let (after_panic_rx, _, _) = submit_test(
+            &supervisor,
+            NormalBehavior::Complete,
+            Duration::from_secs(1),
+            "after-panic",
+        );
+        assert!(matches!(
+            after_panic_rx
+                .recv_timeout(TEST_COMPLETION_TIMEOUT)
+                .unwrap(),
+            CleanupJobOutcome::Completed
+        ));
+        supervisor.release_quarantined_for_test();
+        assert!(panic_dropped.load(Ordering::Acquire));
         supervisor.shutdown_for_test();
     }
 
@@ -910,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    fn last_worker_failure_force_drains_admitted_queue_and_rejects_new_peers() {
+    fn last_worker_failure_drains_admitted_jobs_without_aborting_them() {
         let supervisor = CleanupSupervisor::start_with(1, 3).expect("supervisor");
         supervisor.inject_worker_exit_after_jobs(1);
         let gate = Arc::new(Semaphore::new(0));
@@ -920,38 +1150,35 @@ mod tests {
             Duration::from_secs(1),
             "normal-before-worker-exit",
         );
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while supervisor.snapshot().active_jobs == 0 && std::time::Instant::now() < deadline {
-            std::thread::yield_now();
-        }
         let (second_rx, second_forced, _) = submit_test(
             &supervisor,
             NormalBehavior::Complete,
             Duration::from_secs(1),
-            "force-after-worker-exit",
+            "after-worker-exit",
         );
         let (third_rx, third_forced, _) = submit_test(
             &supervisor,
             NormalBehavior::Complete,
             Duration::from_secs(1),
-            "force-after-worker-exit",
+            "after-worker-exit",
         );
+        for receiver in [second_rx, third_rx] {
+            assert!(matches!(
+                receiver.recv_timeout(TEST_COMPLETION_TIMEOUT).unwrap(),
+                CleanupJobOutcome::Completed
+            ));
+        }
         gate.add_permits(1);
         assert!(matches!(
             first_rx.recv_timeout(TEST_COMPLETION_TIMEOUT).unwrap(),
             CleanupJobOutcome::Completed
         ));
-        for receiver in [second_rx, third_rx] {
-            assert!(matches!(
-                receiver.recv_timeout(TEST_COMPLETION_TIMEOUT).unwrap(),
-                CleanupJobOutcome::Forced {
-                    trigger: CleanupForceTrigger::ExecutorUnavailable,
-                    force_failed: false
-                }
-            ));
+        assert!(!second_forced.load(Ordering::Acquire));
+        assert!(!third_forced.load(Ordering::Acquire));
+        let deadline = Instant::now() + TEST_COMPLETION_TIMEOUT;
+        while supervisor.snapshot().accepting_new_peers && Instant::now() < deadline {
+            std::thread::yield_now();
         }
-        assert!(second_forced.load(Ordering::Acquire));
-        assert!(third_forced.load(Ordering::Acquire));
         assert!(supervisor.try_reserve().is_err());
         assert_eq!(supervisor.snapshot().queue_depth, 0);
         supervisor.shutdown_for_test();
@@ -967,12 +1194,6 @@ mod tests {
             "redaction-test",
         );
         let _ = outcome_rx.recv_timeout(TEST_COMPLETION_TIMEOUT).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while supervisor.snapshot().recent_failures.is_empty()
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::yield_now();
-        }
         let failure = supervisor.snapshot().last_failure.unwrap();
         assert_eq!(failure.route_id_summary.as_deref(), Some("route-9abcdef0"));
         assert!(!failure.reason.contains("secret raw failure"));
