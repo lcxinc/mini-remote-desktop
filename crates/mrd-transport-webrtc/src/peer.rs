@@ -4028,6 +4028,62 @@ mod tests {
         supervisor.shutdown_for_test();
     }
 
+    #[tokio::test]
+    async fn capacity_one_releases_each_permit_only_after_the_same_close_future_finishes() {
+        const ROUNDS: usize = 16;
+        let supervisor = CleanupSupervisor::start_for_test(1, 1).expect("cleanup supervisor");
+
+        for round in 0..ROUNDS {
+            let entered = Arc::new(AtomicBool::new(false));
+            let gate = Arc::new(Semaphore::new(0));
+            let close_calls = Arc::new(AtomicUsize::new(0));
+            let peer = WebRtcPeerConnection::new_with_blocking_close_interceptor_for_test(
+                PeerConnectionConfig::default(),
+                Arc::clone(&supervisor),
+                BlockingCloseInterceptorHook {
+                    entered: Arc::clone(&entered),
+                    gate: Arc::clone(&gate),
+                    calls: Arc::clone(&close_calls),
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("round {round} peer admission failed: {error}"));
+            let physical = peer.physical_snapshot().expect("physical owners");
+            peer.set_physical_cleanup_timeout_for_test(Duration::from_millis(10));
+
+            let error = tokio::time::timeout(Duration::from_secs(1), peer.close())
+                .await
+                .unwrap_or_else(|error| panic!("round {round} caller was unbounded: {error}"))
+                .expect_err("blocked physical close remains in progress");
+            assert!(error.to_string().contains("in progress"));
+            assert!(entered.load(Ordering::Acquire));
+            assert_eq!(close_calls.load(Ordering::Acquire), 1);
+            assert_eq!(supervisor.snapshot().available_admission_slots, 0);
+            assert_eq!(physical.pc.connection_state(), RTCPeerConnectionState::New);
+
+            gate.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !peer.physical_shutdown_finished_for_test() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|error| panic!("round {round} physical close stalled: {error}"));
+            assert_eq!(
+                physical.pc.connection_state(),
+                RTCPeerConnectionState::Closed
+            );
+            assert_eq!(physical.active_tasks.load(Ordering::Acquire), 0);
+            assert_eq!(close_calls.load(Ordering::Acquire), 1);
+            assert_eq!(supervisor.snapshot().available_admission_slots, 1);
+            peer.close().await.expect("completed close is idempotent");
+            assert_eq!(close_calls.load(Ordering::Acquire), 1);
+        }
+
+        assert_eq!(supervisor.snapshot().completed_jobs, ROUNDS as u64);
+        supervisor.shutdown_for_test();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_close_waits_through_the_take_to_acceptance_window() {
         let supervisor = CleanupSupervisor::start_for_test(1, 1).expect("cleanup supervisor");

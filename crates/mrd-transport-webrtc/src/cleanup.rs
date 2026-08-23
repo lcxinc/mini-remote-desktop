@@ -66,7 +66,6 @@ pub struct CleanupSupervisorSnapshot {
     pub available_admission_slots: usize,
     pub accepting_new_peers: bool,
     pub active_jobs: usize,
-    pub active_deadline_reporters: usize,
     pub submitted_jobs: u64,
     pub completed_jobs: u64,
     pub normal_jobs: u64,
@@ -162,8 +161,6 @@ struct CleanupJob {
     meta: CleanupJobMeta,
     deadline: Instant,
     stage: AtomicU8,
-    deadline_reported: AtomicBool,
-    terminal: Notify,
     ownership: AsyncMutex<Option<CleanupOwnership>>,
     completion: Mutex<Option<Completion>>,
 }
@@ -173,7 +170,6 @@ struct CleanupMetrics {
     normal_workers: AtomicUsize,
     force_only_workers: AtomicUsize,
     active_jobs: AtomicUsize,
-    active_deadline_reporters: AtomicUsize,
     submitted_jobs: AtomicU64,
     completed_jobs: AtomicU64,
     normal_jobs: AtomicU64,
@@ -394,19 +390,6 @@ impl CleanupSupervisor {
                     continue;
                 }
                 self.metrics.active_jobs.fetch_add(1, Ordering::AcqRel);
-                let deadline_supervisor = Arc::clone(&self);
-                let deadline_job = Arc::clone(&job);
-                self.metrics
-                    .active_deadline_reporters
-                    .fetch_add(1, Ordering::AcqRel);
-                let reporter_guard = DeadlineReporterGuard {
-                    supervisor: Arc::clone(&deadline_supervisor),
-                };
-                tokio::spawn(run_deadline_reporter(
-                    deadline_supervisor,
-                    deadline_job,
-                    reporter_guard,
-                ));
                 let task_supervisor = Arc::clone(&self);
                 tasks.spawn(async move {
                     run_supervised_job(task_supervisor, job).await;
@@ -459,9 +442,7 @@ impl CleanupSupervisor {
     }
 
     fn record_deadline_if_running(&self, job: &CleanupJob) {
-        if !matches!(job.stage.load(Ordering::Acquire), JOB_QUEUED | JOB_RUNNING)
-            || job.deadline_reported.swap(true, Ordering::AcqRel)
-        {
+        if !matches!(job.stage.load(Ordering::Acquire), JOB_QUEUED | JOB_RUNNING) {
             return;
         }
         self.metrics.timed_out_jobs.fetch_add(1, Ordering::AcqRel);
@@ -485,7 +466,6 @@ impl CleanupSupervisor {
         {
             return;
         }
-        job.terminal.notify_waiters();
         self.metrics.active_jobs.fetch_sub(1, Ordering::AcqRel);
         self.registry
             .lock()
@@ -521,7 +501,6 @@ impl CleanupSupervisor {
         {
             return;
         }
-        job.terminal.notify_waiters();
         self.metrics.active_jobs.fetch_sub(1, Ordering::AcqRel);
         self.metrics.quarantined_jobs.fetch_add(1, Ordering::AcqRel);
         self.metrics.failed_jobs.fetch_add(1, Ordering::AcqRel);
@@ -649,10 +628,6 @@ impl CleanupSupervisor {
             available_admission_slots: self.admission.available_permits(),
             accepting_new_peers: self.accepting.load(Ordering::Acquire),
             active_jobs: self.metrics.active_jobs.load(Ordering::Acquire),
-            active_deadline_reporters: self
-                .metrics
-                .active_deadline_reporters
-                .load(Ordering::Acquire),
             submitted_jobs: self.metrics.submitted_jobs.load(Ordering::Acquire),
             completed_jobs: self.metrics.completed_jobs.load(Ordering::Acquire),
             normal_jobs: self.metrics.normal_jobs.load(Ordering::Acquire),
@@ -759,41 +734,6 @@ enum WorkerExit {
     Injected,
 }
 
-struct DeadlineReporterGuard {
-    supervisor: Arc<CleanupSupervisor>,
-}
-
-impl Drop for DeadlineReporterGuard {
-    fn drop(&mut self) {
-        self.supervisor
-            .metrics
-            .active_deadline_reporters
-            .fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-async fn run_deadline_reporter(
-    supervisor: Arc<CleanupSupervisor>,
-    job: Arc<CleanupJob>,
-    _guard: DeadlineReporterGuard,
-) {
-    let terminal = job.terminal.notified();
-    tokio::pin!(terminal);
-    terminal.as_mut().enable();
-    if matches!(
-        job.stage.load(Ordering::Acquire),
-        JOB_FINISHED | JOB_QUARANTINED
-    ) {
-        return;
-    }
-    tokio::select! {
-        _ = &mut terminal => {}
-        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(job.deadline)) => {
-            supervisor.record_deadline_if_running(&job);
-        }
-    }
-}
-
 struct JobRunGuard {
     supervisor: Arc<CleanupSupervisor>,
     job: Arc<CleanupJob>,
@@ -825,7 +765,7 @@ impl Drop for JobRunGuard {
 
 async fn run_supervised_job(supervisor: Arc<CleanupSupervisor>, job: Arc<CleanupJob>) {
     let mut run_guard = JobRunGuard::new(Arc::clone(&supervisor), Arc::clone(&job));
-    let decision = {
+    let cleanup = async {
         let mut ownership = job.ownership.lock().await;
         let ownership = ownership
             .as_mut()
@@ -851,6 +791,17 @@ async fn run_supervised_job(supervisor: Arc<CleanupSupervisor>, job: Arc<Cleanup
                 RunDecision::Quarantine(CleanupForceTrigger::Failure)
             }
             Err(_) => RunDecision::Finish(CleanupJobOutcome::Failed),
+        }
+    };
+    tokio::pin!(cleanup);
+    let deadline = tokio::time::sleep_until(tokio::time::Instant::from_std(job.deadline));
+    tokio::pin!(deadline);
+    let decision = tokio::select! {
+        biased;
+        decision = &mut cleanup => decision,
+        _ = &mut deadline => {
+            supervisor.record_deadline_if_running(&job);
+            cleanup.await
         }
     };
     run_guard.disarm();
@@ -941,8 +892,6 @@ where
         meta,
         deadline,
         stage: AtomicU8::new(JOB_QUEUED),
-        deadline_reported: AtomicBool::new(false),
-        terminal: Notify::new(),
         ownership: AsyncMutex::new(Some(CleanupOwnership {
             payload: Box::new(payload),
             _permit: permit,
@@ -978,7 +927,6 @@ pub fn cleanup_supervisor_snapshot() -> CleanupSupervisorSnapshot {
             available_admission_slots: 0,
             accepting_new_peers: false,
             active_jobs: 0,
-            active_deadline_reporters: 0,
             submitted_jobs: 0,
             completed_jobs: 0,
             normal_jobs: 0,
@@ -1251,51 +1199,43 @@ mod tests {
     }
 
     #[test]
-    fn completed_short_jobs_cancel_deadline_reporters_without_accumulation() {
-        const CAPACITY: usize = 4;
+    fn capacity_one_cleanup_uses_no_independent_deadline_reporter_task() {
+        const CAPACITY: usize = 1;
         let supervisor = CleanupSupervisor::start_with(1, CAPACITY).expect("supervisor");
-        let mut maximum_reporters = 0;
-        for _ in 0..4 {
-            let receivers = (0..CAPACITY)
-                .map(|_| {
-                    let (receiver, _, _) = submit_test(
-                        &supervisor,
-                        NormalBehavior::Complete,
-                        Duration::from_secs(10),
-                        "short-job",
-                    );
-                    receiver
-                })
-                .collect::<Vec<_>>();
-            for receiver in receivers {
-                let outcome = receiver
-                    .recv_timeout(TEST_COMPLETION_TIMEOUT)
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "short cleanup completion stalled: {error:?}; snapshot={:?}",
-                            supervisor.snapshot()
-                        )
-                    });
-                assert!(matches!(outcome, CleanupJobOutcome::Completed));
-            }
-            maximum_reporters =
-                maximum_reporters.max(supervisor.snapshot().active_deadline_reporters);
-        }
-        let deadline = Instant::now() + Duration::from_millis(250);
-        while supervisor.snapshot().active_deadline_reporters != 0 && Instant::now() < deadline {
+        let gate = Arc::new(Semaphore::new(0));
+        let (blocked, _, _) = submit_test(
+            &supervisor,
+            NormalBehavior::Wait(Arc::clone(&gate)),
+            Duration::from_secs(10),
+            "blocked-short-job",
+        );
+        let deadline = Instant::now() + TEST_COMPLETION_TIMEOUT;
+        while supervisor.snapshot().active_jobs == 0 && Instant::now() < deadline {
             std::thread::yield_now();
         }
-        let active_after_completion = supervisor.snapshot().active_deadline_reporters;
-        supervisor.shutdown_for_test();
+        assert_eq!(supervisor.snapshot().active_jobs, 1);
+        assert_eq!(supervisor.snapshot().available_admission_slots, 0);
+        gate.add_permits(1);
+        assert!(matches!(
+            blocked.recv_timeout(TEST_COMPLETION_TIMEOUT).unwrap(),
+            CleanupJobOutcome::Completed
+        ));
 
-        assert!(
-            maximum_reporters <= CAPACITY,
-            "deadline reporters must remain bounded by lifetime cleanup slots"
-        );
-        assert_eq!(
-            active_after_completion, 0,
-            "terminal jobs must cancel their deadline reporters immediately"
-        );
+        for _ in 0..32 {
+            let (receiver, _, _) = submit_test(
+                &supervisor,
+                NormalBehavior::Complete,
+                Duration::from_secs(10),
+                "short-job",
+            );
+            assert!(matches!(
+                receiver.recv_timeout(TEST_COMPLETION_TIMEOUT).unwrap(),
+                CleanupJobOutcome::Completed
+            ));
+            assert_eq!(supervisor.snapshot().active_jobs, 0);
+            assert_eq!(supervisor.snapshot().available_admission_slots, CAPACITY);
+        }
+        supervisor.shutdown_for_test();
     }
 
     #[test]
