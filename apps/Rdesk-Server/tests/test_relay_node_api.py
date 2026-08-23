@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from app.core.config import settings
+from app.core.response_security import SensitiveResponseCacheMiddleware
 from app.core.security import get_current_user_optional
 from app.db.session import Base, get_db
 from app.models.user import User
@@ -294,6 +295,7 @@ def api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, ob
         return admin
 
     app = FastAPI()
+    app.add_middleware(SensitiveResponseCacheMiddleware)
     app.add_middleware(
         RelayNodeBoundaryMiddleware, trusted_proxy=settings.trusted_mtls_proxy
     )
@@ -970,6 +972,8 @@ def test_expired_node_certificate_is_rejected(
         f"/api/v1/relays/{NODE_ID}/heartbeat", content=body, headers=headers
     )
     assert response.status_code == 401
+    assert response.headers["cache-control"] == "no-store, private"
+    assert response.headers["pragma"] == "no-cache"
     assert _error_code(response) == "relay_certificate_invalid"
 
 

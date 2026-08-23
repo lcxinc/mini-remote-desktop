@@ -41,7 +41,7 @@ async def migrate(
     *,
     schema: str | None = None,
 ) -> None:
-    """Apply and verify relay schema through v6 in the caller's transaction."""
+    """Apply and verify relay schema through v7 in the caller's transaction."""
     if isinstance(bind, AsyncEngine):
         async with bind.begin() as connection:
             await _migrate_connection(connection, schema=schema)
@@ -81,6 +81,66 @@ async def _migrate_connection(
     registrations = _table(schema, "relay_node_registrations")
     audit_events = _table(schema, "relay_audit_events")
     versions = _table(schema, "relay_schema_migrations")
+
+    existing_versions = await connection.run_sync(
+        lambda sync_connection: _existing_migration_versions(
+            sync_connection, schema
+        )
+    )
+    if existing_versions is not None:
+        expected_prefix = _RELAY_SCHEMA_VERSIONS[: len(existing_versions)]
+        if existing_versions != expected_prefix:
+            raise RelaySchemaMismatchError(
+                "relay migration ledger versions must form a contiguous prefix"
+            )
+        if existing_versions == _RELAY_SCHEMA_VERSIONS:
+            # The normal startup path is deliberately read-only after taking the
+            # schema advisory lock. Exact verification still detects drift.
+            await connection.run_sync(
+                lambda sync_connection: _assert_schema_conforms(
+                    sync_connection, schema
+                )
+            )
+            await connection.run_sync(
+                lambda sync_connection: _assert_migration_ledger(
+                    sync_connection, schema, require_exact_versions=True
+                )
+            )
+            return
+        if existing_versions == _RELAY_SCHEMA_VERSIONS[:-1]:
+            # v7 is the directory-generation reservation lifecycle. Do not
+            # replay any earlier table creation, backfill, or constraint DDL.
+            await connection.run_sync(
+                lambda sync_connection: _preflight_existing_schema(
+                    sync_connection, schema
+                )
+            )
+            await connection.execute(
+                text(
+                    f"ALTER TABLE {reservations} ADD COLUMN superseded_at "
+                    "TIMESTAMPTZ"
+                )
+            )
+            await connection.execute(
+                text(
+                    f"ALTER TABLE {reservations} ADD COLUMN "
+                    "directory_generation VARCHAR(64) NOT NULL DEFAULT 'legacy'"
+                )
+            )
+            await connection.run_sync(
+                lambda sync_connection: _assert_schema_conforms(
+                    sync_connection, schema
+                )
+            )
+            await connection.execute(
+                text(f"INSERT INTO {versions} (version) VALUES (7)")
+            )
+            await connection.run_sync(
+                lambda sync_connection: _assert_migration_ledger(
+                    sync_connection, schema, require_exact_versions=True
+                )
+            )
+            return
 
     if schema is not None:
         await connection.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
@@ -390,6 +450,23 @@ async def _migrate_connection(
         lambda sync_connection: _assert_migration_ledger(
             sync_connection, schema, require_exact_versions=True
         )
+    )
+
+
+def _existing_migration_versions(
+    sync_connection: object, schema: str | None
+) -> tuple[int, ...] | None:
+    inspector = inspect(sync_connection)
+    if not inspector.has_table("relay_schema_migrations", schema=schema):
+        return None
+    _assert_migration_ledger(
+        sync_connection, schema, require_exact_versions=False
+    )
+    table = _table(schema, "relay_schema_migrations")
+    return tuple(
+        sync_connection.execute(
+            text(f"SELECT version FROM {table} ORDER BY version")
+        ).scalars()
     )
 
 

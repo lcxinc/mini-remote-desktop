@@ -786,6 +786,238 @@ async def test_capacity_reservation_does_not_lock_unrelated_nodes() -> None:
 
 
 @pytest.mark.anyio
+async def test_directory_admission_uses_canonical_node_lock_order() -> None:
+    """Opposite scores plus existing primaries must not form A->B / B->A."""
+
+    assert DATABASE_URL is not None
+    schema = "relay_cross_lock_" + re.sub(r"[^a-z0-9]", "", uuid4().hex)
+    admin_engine = create_async_engine(asyncpg_url(DATABASE_URL))
+    async with admin_engine.begin() as connection:
+        await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+    engine = create_async_engine(
+        asyncpg_url(DATABASE_URL),
+        connect_args={"server_settings": {"search_path": schema}},
+    )
+    cipher = AesGcmRelaySecretCipher(bytes.fromhex("76" * 32))
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with engine.begin() as connection:
+            await migrate_relay_control(connection)
+            await connection.run_sync(Base.metadata.create_all)
+            await migrate_relay_access(connection)
+        async with sessions() as setup:
+            for index, (node_id, region) in enumerate(
+                (("cross-a", "ap-east"), ("cross-b", "eu-west")), start=1
+            ):
+                enrollment = RelayEnrollment(
+                    id=f"cross-enrollment-{index}",
+                    token_digest=f"{index + 10:064x}",
+                    expires_at=NOW + timedelta(hours=1),
+                    used_at=NOW,
+                    enrolled_node_id=node_id,
+                    created_at=NOW,
+                )
+                encrypted_secret = cipher.encrypt(
+                    hashlib.sha256(f"cross-secret-{node_id}".encode()).digest(),
+                    associated_data=node_id.encode(),
+                )
+                node = RelayNode(
+                    node_id=node_id,
+                    region=region,
+                    failure_domain=f"rack-{index}",
+                    physical_host_id=f"host-{index}",
+                    state="available",
+                    endpoints=[f"turn:{node_id}.example.test:3478?transport=udp"],
+                    certificate_fingerprint="sha256:" + f"{index + 10:064x}",
+                    encrypted_turn_secret=encrypted_secret,
+                    max_allocations=4,
+                    active_allocations=0,
+                    max_egress_bps=1_000_000,
+                    current_egress_bps=0,
+                    measured_rtt_ms=10,
+                    recent_failure_bps=0,
+                    heartbeat_sequence=3,
+                    healthy_heartbeat_streak=3,
+                    lease_expires_at=NOW + timedelta(minutes=1),
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+                registration = RelayNodeRegistration(
+                    node_id=node_id,
+                    enrollment_id=enrollment.id,
+                    region=region,
+                    failure_domain=node.failure_domain,
+                    physical_host_id=node.physical_host_id,
+                    topology_approved_at=NOW,
+                    endpoints=node.endpoints,
+                    max_allocations=node.max_allocations,
+                    max_egress_bps=node.max_egress_bps,
+                    csr_pem=b"fixture",
+                    signing_public_key=bytes([index + 10]) * 32,
+                    encrypted_turn_secret=encrypted_secret,
+                    status="approved",
+                    certificate_pem=b"fixture",
+                    certificate_expires_at=NOW + timedelta(hours=1),
+                    created_at=NOW,
+                    approved_at=NOW,
+                )
+                setup.add_all([enrollment, node, registration])
+            for suffix, primary in (("a", "cross-a"), ("b", "cross-b")):
+                requester = User(
+                    id=f"cross-user-{suffix}",
+                    username=f"cross-user-{suffix}",
+                    email=f"cross-{suffix}@example.test",
+                    password_hash="unused",
+                    role="user",
+                    tenant_id="tenant-cross",
+                )
+                owner = User(
+                    id=f"cross-owner-{suffix}",
+                    username=f"cross-owner-{suffix}",
+                    email=f"cross-owner-{suffix}@example.test",
+                    password_hash="unused",
+                    role="user",
+                    tenant_id="tenant-cross",
+                )
+                setup.add_all([requester, owner])
+                await setup.flush()
+                device = Device(
+                    id=f"cross-device-{suffix}",
+                    name="target",
+                    device_id=f"cross-device-public-{suffix}",
+                    os="linux",
+                    is_bound=True,
+                    bound_user_id=owner.id,
+                    tenant_id="tenant-cross",
+                )
+                setup.add(device)
+                await setup.flush()
+                preferred = (
+                    ["ap-east", "eu-west"]
+                    if suffix == "a"
+                    else ["eu-west", "ap-east"]
+                )
+                setup.add_all(
+                    [
+                        SessionRequest(
+                            id=f"cross-session-{suffix}",
+                            requester_user_id=requester.id,
+                            target_device_id=device.id,
+                            signaling_room=f"cross-room-{suffix}",
+                            tenant_id="tenant-cross",
+                            status="approved",
+                            grant_expires_at=NOW + timedelta(minutes=5),
+                            policy_revision=17,
+                            policy_expires_at=NOW + timedelta(minutes=4),
+                            intended_peer_id=device.id,
+                            relay_allowed_regions=["ap-east", "eu-west"],
+                            relay_preferred_regions=preferred,
+                            relay_accepted_transports=["udp"],
+                        ),
+                        RelayReservation(
+                            id=f"cross-reservation-{suffix}",
+                            session_id=f"cross-session-{suffix}",
+                            user_id=requester.id,
+                            node_id=primary,
+                            expires_at=NOW + timedelta(seconds=30),
+                            superseded_at=None,
+                            directory_generation=f"seed-{suffix}",
+                            created_at=NOW,
+                        ),
+                    ]
+                )
+            await setup.commit()
+
+        arrival_lock = asyncio.Lock()
+        both_first_stages = asyncio.Event()
+        arrivals = 0
+
+        async def rendezvous() -> None:
+            nonlocal arrivals
+            async with arrival_lock:
+                arrivals += 1
+                if arrivals == 2:
+                    both_first_stages.set()
+            await asyncio.wait_for(both_first_stages.wait(), timeout=5)
+
+        async def issue(suffix: str):
+            preferred = (
+                ("ap-east", "eu-west")
+                if suffix == "a"
+                else ("eu-west", "ap-east")
+            )
+            async with sessions() as db:
+                repository = RelayRepository(
+                    db,
+                    enrollment_token_pepper=bytes.fromhex("77" * 32),
+                    secret_cipher=cipher,
+                    max_reservations_per_session=2,
+                )
+                original_reserve = repository.reserve_capacity
+
+                async def synchronized_reserve(**kwargs):
+                    result = await original_reserve(**kwargs)
+                    # The vulnerable directory used two result_limit=1 calls. Hold
+                    # both first-node locks until each request starts its backup.
+                    if kwargs.get("result_limit") == 1:
+                        await rendezvous()
+                    return result
+
+                repository.reserve_capacity = synchronized_reserve  # type: ignore[method-assign]
+                service = RelayAccessService(
+                    session=db,
+                    repository=repository,
+                    signer=Ed25519RelayDirectorySigner(
+                        key_id="cross-lock-key",
+                        private_key_seed=bytes.fromhex("78" * 32),
+                    ),
+                    credential_issuer=NodeTurnCredentialService(
+                        cipher=cipher, now=lambda: int(NOW.timestamp())
+                    ),
+                    current_policy=SessionGrantPolicy(
+                        revision=17,
+                        grant_ttl_seconds=600,
+                        policy_ttl_seconds=600,
+                        allowed_regions=("ap-east", "eu-west"),
+                        preferred_regions=preferred,
+                        accepted_transports=("udp",),
+                    ),
+                    directory_ttl_seconds=30,
+                    now=lambda: NOW,
+                )
+                return await service.issue_access(
+                    current_user_id=f"cross-user-{suffix}",
+                    session_id=f"cross-session-{suffix}",
+                    policy_revision=17,
+                    intended_peer_id=f"cross-device-{suffix}",
+                )
+
+        results = await asyncio.wait_for(
+            asyncio.gather(issue("a"), issue("b"), return_exceptions=True),
+            timeout=10,
+        )
+        assert all(not isinstance(result, Exception) for result in results), results
+        assert all(
+            {candidate.node_id for candidate in result.directory.payload.candidates}
+            == {"cross-a", "cross-b"}
+            for result in results
+        )
+        assert {
+            next(
+                candidate.node_id
+                for candidate in result.directory.payload.candidates
+                if candidate.selection_reason == "preferred-region"
+            )
+            for result in results
+        } == {"cross-a", "cross-b"}
+    finally:
+        await engine.dispose()
+        async with admin_engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        await admin_engine.dispose()
+
+
+@pytest.mark.anyio
 async def test_concurrent_directory_issuance_never_oversubscribes_real_postgres():
     assert DATABASE_URL is not None
     schema = "relay_access_test_" + re.sub(r"[^a-z0-9]", "", uuid4().hex)

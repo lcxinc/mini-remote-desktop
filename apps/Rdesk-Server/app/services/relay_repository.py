@@ -518,6 +518,7 @@ class RelayRepository:
         expires_at: datetime | None = None,
         directory_generation: str | None = None,
         require_registration: bool = False,
+        require_distinct_topology: bool = False,
         result_limit: int | None = None,
     ) -> list[RelayReservation]:
         """Reserve up to primary plus one backup, preserving candidate order.
@@ -588,6 +589,7 @@ class RelayRepository:
                 expires_at=reservation_expires_at,
                 directory_generation=directory_generation,
                 require_registration=require_registration,
+                require_distinct_topology=require_distinct_topology,
                 result_limit=result_limit,
             )
 
@@ -603,6 +605,7 @@ class RelayRepository:
                 expires_at=reservation_expires_at,
                 directory_generation=directory_generation,
                 require_registration=require_registration,
+                require_distinct_topology=require_distinct_topology,
                 result_limit=result_limit,
             )
 
@@ -616,6 +619,7 @@ class RelayRepository:
         expires_at: datetime,
         directory_generation: str | None,
         require_registration: bool,
+        require_distinct_topology: bool,
         result_limit: int,
     ) -> list[RelayReservation]:
         if directory_generation is not None:
@@ -653,38 +657,67 @@ class RelayRepository:
                 "SESSION_OWNER_MISMATCH", "reservation belongs to another user"
             )
 
-        result: list[RelayReservation] = []
-        for node_id in ordered_node_ids:
-            if len(result) >= result_limit:
-                break
-            if require_registration:
-                locked = await self._session.execute(
-                    select(RelayNode, RelayNodeRegistration)
-                    .join(
-                        RelayNodeRegistration,
-                        RelayNodeRegistration.node_id == RelayNode.node_id,
+        # Admission owns only this bounded candidate set, but owns it in one
+        # canonical order. Scoring order is deliberately applied *after* every
+        # candidate row is locked. Otherwise opposite regional preferences can
+        # form A->B / B->A while selecting a primary and backup.
+        canonical_node_ids = sorted(
+            ordered_node_ids, key=lambda value: value.encode("utf-8")
+        )
+        locked_nodes = list(
+            await self._session.scalars(
+                select(RelayNode)
+                .where(RelayNode.node_id.in_(canonical_node_ids))
+                .order_by(RelayNode.node_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        node_by_id = {node.node_id: node for node in locked_nodes}
+        registration_by_id: dict[str, RelayNodeRegistration] = {}
+        if require_registration:
+            locked_registrations = list(
+                await self._session.scalars(
+                    select(RelayNodeRegistration)
+                    .where(
+                        RelayNodeRegistration.node_id.in_(canonical_node_ids)
                     )
-                    .where(RelayNode.node_id == node_id)
+                    .order_by(RelayNodeRegistration.node_id)
                     .with_for_update()
                     .execution_options(populate_existing=True)
                 )
-                row = locked.first()
-                if row is None:
+            )
+            registration_by_id = {
+                registration.node_id: registration
+                for registration in locked_registrations
+            }
+
+        result: list[RelayReservation] = []
+        selected_topology: tuple[str, str] | None = None
+        for node_id in ordered_node_ids:
+            if len(result) >= result_limit:
+                break
+            node = node_by_id.get(node_id)
+            if node is None:
+                continue
+            if require_registration:
+                registration = registration_by_id.get(node_id)
+                if registration is None:
                     continue
-                node, registration = row
                 eligible = _node_and_registration_accept_pending_reservation(
                     node, registration, now=now
                 )
             else:
-                node = await self._session.scalar(
-                    select(RelayNode)
-                    .where(RelayNode.node_id == node_id)
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
-                )
-                if node is None:
-                    continue
                 eligible = _node_accepts_pending_reservation(node, now=now)
+            if (
+                require_distinct_topology
+                and selected_topology is not None
+                and (
+                    node.failure_domain == selected_topology[0]
+                    or node.physical_host_id == selected_topology[1]
+                )
+            ):
+                continue
             await self._session.execute(
                 delete(RelayReservation).where(
                     RelayReservation.node_id == node_id,
@@ -705,6 +738,11 @@ class RelayRepository:
                     same_session.superseded_at = None
                     same_session.directory_generation = directory_generation
                 result.append(same_session)
+                if selected_topology is None:
+                    selected_topology = (
+                        node.failure_domain,
+                        node.physical_host_id,
+                    )
                 continue
             current_count = sum(
                 reservation.superseded_at is None for reservation in active_rows
@@ -750,6 +788,11 @@ class RelayRepository:
             active_rows.append(reservation)
             existing[node_id] = reservation
             result.append(reservation)
+            if selected_topology is None:
+                selected_topology = (
+                    node.failure_domain,
+                    node.physical_host_id,
+                )
         return result
 
     async def _locked_node(self, node_id: str) -> RelayNode:

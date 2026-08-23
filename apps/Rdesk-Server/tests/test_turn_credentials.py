@@ -13,6 +13,7 @@ from app.api.v1.turn import (
     router,
 )
 from app.core.security import get_current_user
+from app.core.response_security import SensitiveResponseCacheMiddleware
 from app.services.turn_credentials import (
     NodeTurnCredentialService,
     TurnCredentialExpired,
@@ -38,6 +39,7 @@ def service() -> TurnCredentialService:
 
 def app(*, authenticated: bool, legacy_enabled: bool = False) -> FastAPI:
     test_app = FastAPI()
+    test_app.add_middleware(SensitiveResponseCacheMiddleware)
     test_app.include_router(router, prefix="/api/v1")
     test_app.dependency_overrides[get_turn_credential_service] = service
     if legacy_enabled:
@@ -47,6 +49,19 @@ def app(*, authenticated: bool, legacy_enabled: bool = False) -> FastAPI:
             id="user-42"
         )
     return test_app
+
+
+def test_sensitive_cache_middleware_does_not_disable_ordinary_api_caching():
+    test_app = app(authenticated=False)
+
+    @test_app.get("/healthz")
+    async def healthz():
+        return {"status": "ok"}
+
+    response = TestClient(test_app).get("/healthz")
+    assert response.status_code == 200
+    assert "cache-control" not in response.headers
+    assert "pragma" not in response.headers
 
 
 def test_legacy_caller_deadline_route_is_disabled_by_default_and_deprecated():
@@ -59,6 +74,8 @@ def test_legacy_caller_deadline_route_is_disabled_by_default_and_deprecated():
         },
     )
     assert response.status_code == 404
+    assert response.headers["cache-control"] == "no-store, private"
+    assert response.headers["pragma"] == "no-cache"
     operation = test_app.openapi()["paths"]["/api/v1/turn/credentials"]["post"]
     assert operation["deprecated"] is True
 
@@ -73,6 +90,8 @@ def test_explicit_development_flag_preserves_bounded_legacy_credentials():
         },
     )
     assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store, private"
+    assert response.headers["pragma"] == "no-cache"
     payload = response.json()
     assert payload["expires_at_unix_seconds"] == NOW + 300
     assert payload["username"] == f"{NOW + 300}:user-42:session-7"

@@ -7,6 +7,7 @@ import uvicorn
 from app.api.v1.router import api_router
 from app.api.v1.relays import install_relay_openapi
 from app.core.config import settings
+from app.core.response_security import SensitiveResponseCacheMiddleware
 from app.db.init_db import seed_initial_data
 from app.db.migrate_add_relay_control import migrate as migrate_relay_control
 from app.db.migrate_add_relay_access import migrate as migrate_relay_access
@@ -52,6 +53,9 @@ app.add_middleware(
 app.add_middleware(
     RelayNodeBoundaryMiddleware, trusted_proxy=settings.trusted_mtls_proxy
 )
+# The cache policy wraps the final response so exception handlers, validation
+# routes, and relay-boundary rejections cannot accidentally become cacheable.
+app.add_middleware(SensitiveResponseCacheMiddleware)
 
 app.include_router(api_router)
 install_relay_openapi(app)

@@ -293,7 +293,7 @@ class RelayAccessService:
                     _deny_access()
                 directory_id = new_directory_id()
                 # This snapshot is intentionally unlocked. Admission locks and
-                # revalidates only each candidate it actually attempts.
+                # revalidates only this bounded candidate set, never the table.
                 reservation_ttl = int(
                     (server_deadline - now).total_seconds()
                 )
@@ -309,7 +309,7 @@ class RelayAccessService:
                         )
                     ).all()
                 )
-                primary_reservations = await self._repository.reserve_capacity(
+                reservations = await self._repository.reserve_capacity(
                     session_id=session_id,
                     # Capacity belongs to the server-verified grant, not whichever
                     # of its two participants happens to request credentials first.
@@ -320,37 +320,13 @@ class RelayAccessService:
                     expires_at=server_deadline,
                     directory_generation=directory_id,
                     require_registration=True,
-                    result_limit=1,
+                    require_distinct_topology=True,
+                    result_limit=1 + policy.max_backups,
                 )
-                if not primary_reservations:
+                if not reservations:
                     raise RelayAccessError(
                         "relay_capacity_unavailable", 503, "relay capacity unavailable"
                     )
-                primary = primary_reservations[0]
-                selected_primary = next(
-                    item for item in ordered_candidates if item.node_id == primary.node_id
-                )
-                backup_candidates = [
-                    item
-                    for item in ordered_candidates
-                    if item.node_id != primary.node_id
-                    and item.failure_domain != selected_primary.failure_domain
-                    and item.physical_host_id != selected_primary.physical_host_id
-                ]
-                backup_reservations: list[RelayReservation] = []
-                if policy.max_backups > 0 and backup_candidates:
-                    backup_reservations = await self._repository.reserve_capacity(
-                        session_id=session_id,
-                        user_id=grant.requester_user_id,
-                        ordered_node_ids=[item.node_id for item in backup_candidates],
-                        now=now,
-                        ttl_seconds=reservation_ttl,
-                        expires_at=server_deadline,
-                        directory_generation=directory_id,
-                        require_registration=True,
-                        result_limit=1,
-                    )
-                reservations = primary_reservations + backup_reservations
                 existing_reservations = [
                     item
                     for item in reservations

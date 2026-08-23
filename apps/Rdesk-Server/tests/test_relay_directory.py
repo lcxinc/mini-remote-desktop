@@ -20,6 +20,7 @@ from app.api.v1.relays import (
 )
 from app.api.v1.sessions import router as sessions_router
 from app.core.security import get_current_user
+from app.core.response_security import SensitiveResponseCacheMiddleware
 from app.core.config import settings
 from app.services.relay_directory import (
     RelayAccessError,
@@ -1187,6 +1188,7 @@ def test_access_api_requires_auth_and_returns_only_signed_directory_and_credenti
     engine, session, service = relay_service_fixture()
     try:
         anonymous_app = FastAPI()
+        anonymous_app.add_middleware(SensitiveResponseCacheMiddleware)
         anonymous_app.include_router(router, prefix="/api/v1")
         anonymous_app.dependency_overrides[get_relay_access_service] = lambda: service
         anonymous = TestClient(anonymous_app).post(
@@ -1198,8 +1200,11 @@ def test_access_api_requires_auth_and_returns_only_signed_directory_and_credenti
             },
         )
         assert anonymous.status_code in {401, 403}
+        assert anonymous.headers["cache-control"] == "no-store, private"
+        assert anonymous.headers["pragma"] == "no-cache"
 
         authenticated_app = FastAPI()
+        authenticated_app.add_middleware(SensitiveResponseCacheMiddleware)
         authenticated_app.include_router(router, prefix="/api/v1")
         authenticated_app.dependency_overrides[get_relay_access_service] = lambda: service
         authenticated_app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
@@ -1209,6 +1214,8 @@ def test_access_api_requires_auth_and_returns_only_signed_directory_and_credenti
             "/api/v1/relays/access", json={}
         )
         assert invalid.status_code == 400
+        assert invalid.headers["cache-control"] == "no-store, private"
+        assert invalid.headers["pragma"] == "no-cache"
         assert invalid.json()["detail"]["code"] == "relay_access_invalid"
         response = TestClient(authenticated_app).post(
             "/api/v1/relays/access",

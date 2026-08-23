@@ -12,7 +12,7 @@ from uuid import uuid4
 
 import pytest
 from pydantic import SecretStr
-from sqlalchemy import func, inspect, select, text
+from sqlalchemy import event, func, inspect, select, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
@@ -862,6 +862,97 @@ async def test_migration_schema_matches_orm_and_required_indexes() -> None:
 
 
 @pytest.mark.anyio
+async def test_current_migration_ledger_runs_read_only_schema_verification() -> None:
+    async with isolated_postgres_engine() as engine:
+        statements: list[str] = []
+
+        def capture_sql(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: bool,
+        ) -> None:
+            statements.append(" ".join(statement.upper().split()))
+
+        event.listen(engine.sync_engine, "before_cursor_execute", capture_sql)
+        try:
+            await migrate(engine)
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", capture_sql)
+
+        mutating = tuple(
+            statement
+            for statement in statements
+            if statement.startswith(
+                ("ALTER ", "CREATE ", "DELETE ", "DO ", "DROP ", "INSERT ", "UPDATE ")
+            )
+        )
+        assert mutating == ()
+
+
+@pytest.mark.anyio
+async def test_migration_with_only_v7_missing_executes_only_v7_step() -> None:
+    async with isolated_postgres_engine() as engine:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("DELETE FROM relay_schema_migrations WHERE version = 7")
+            )
+            await connection.execute(
+                text(
+                    "ALTER TABLE relay_reservations "
+                    "DROP COLUMN superseded_at, DROP COLUMN directory_generation"
+                )
+            )
+
+        statements: list[str] = []
+
+        def capture_sql(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: bool,
+        ) -> None:
+            statements.append(" ".join(statement.upper().split()))
+
+        event.listen(engine.sync_engine, "before_cursor_execute", capture_sql)
+        try:
+            await migrate(engine)
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", capture_sql)
+
+        mutating = [
+            statement
+            for statement in statements
+            if statement.startswith(
+                ("ALTER ", "CREATE ", "DELETE ", "DO ", "DROP ", "INSERT ", "UPDATE ")
+            )
+        ]
+        assert len(mutating) == 3, mutating
+        assert all(
+            "RELAY_RESERVATIONS" in statement
+            or "INSERT INTO RELAY_SCHEMA_MIGRATIONS" in statement
+            for statement in mutating
+        )
+        assert not any(statement.startswith(("CREATE ", "DO ", "UPDATE ")) for statement in mutating)
+        async with engine.connect() as connection:
+            versions = list(
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT version FROM relay_schema_migrations "
+                            "ORDER BY version"
+                        )
+                    )
+                ).scalars()
+            )
+        assert versions == list(range(1, 8))
+
+
+@pytest.mark.anyio
 async def test_migration_accepts_existing_connection_and_fails_closed_on_partial_table() -> None:
     assert DATABASE_URL is not None
     malformed_tables = (
@@ -1081,6 +1172,7 @@ async def test_migration_rejects_cross_schema_deferrable_reservation_fk() -> Non
         "ALTER TABLE relay_schema_migrations ALTER COLUMN version TYPE BIGINT",
         "ALTER TABLE relay_schema_migrations ALTER COLUMN applied_at DROP DEFAULT",
         "ALTER TABLE relay_schema_migrations DROP CONSTRAINT relay_schema_migrations_pkey",
+        "DELETE FROM relay_schema_migrations WHERE version = 6",
         "INSERT INTO relay_schema_migrations (version) VALUES (999)",
     ],
 )
@@ -1171,7 +1263,7 @@ async def test_v4_behaviorally_upgrades_v2_schema_and_serializes_concurrent_upgr
             await connection.execute(
                 text(
                     f'DELETE FROM "{schema}".relay_schema_migrations '
-                    "WHERE version IN (3, 4)"
+                    "WHERE version >= 3"
                 )
             )
 
@@ -1334,7 +1426,7 @@ async def test_v4_backfills_only_complete_v3_inflight_renewals_without_extending
                     )
                 )
             await connection.execute(
-                text("DELETE FROM relay_schema_migrations WHERE version = 4")
+                text("DELETE FROM relay_schema_migrations WHERE version >= 4")
             )
 
         await migrate(engine)
