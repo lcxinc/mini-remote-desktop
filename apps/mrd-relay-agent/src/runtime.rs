@@ -1,6 +1,5 @@
 use std::{
     fs::{self, OpenOptions},
-    future::Future,
     io::Write,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU8, Ordering},
@@ -34,24 +33,14 @@ const HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 const MAX_RESTART_ATTEMPTS: u8 = 3;
 const MAX_BACKEND_BACKOFF_MS: u64 = 30_000;
 
-/// Run the backend/identity heartbeat worker and the local coturn supervisor as
-/// independent portable tasks. Neither worker's await points hold the other's
-/// state or prevent it from being polled.
-pub async fn run_agent<H, S>(heartbeat_worker: H, supervisor_worker: S) -> Result<(), RuntimeError>
-where
-    H: Future<Output = Result<(), RuntimeError>>,
-    S: Future<Output = Result<(), RuntimeError>>,
-{
-    tokio::try_join!(heartbeat_worker, supervisor_worker)?;
-    Ok(())
-}
-
+#[allow(clippy::too_many_arguments)]
 fn generate_pending_rotation(
     identity_epoch: u64,
     directive_sequence: u64,
     secret_version: u64,
     not_before_unix_seconds: i64,
     old_credential_deadline_unix_seconds: i64,
+    rotation_challenge: String,
     observed_wall_unix_seconds: i64,
     observed_monotonic_ms: u64,
 ) -> Result<PendingSecretRotation, RuntimeError> {
@@ -72,6 +61,7 @@ fn generate_pending_rotation(
         turn_rest_secret: PersistentSecret::new(URL_SAFE_NO_PAD.encode(secret.as_ref())),
         not_before_unix_seconds,
         old_credential_deadline_unix_seconds,
+        rotation_challenge,
         observed_wall_unix_seconds,
         observed_monotonic_ms,
         phase: SecretRotationPhase::Intent,
@@ -90,6 +80,23 @@ fn safe_window_elapsed(pending: &PendingSecretRotation, clock: &dyn ClockPort) -
     clock.monotonic_ms() >= deadline_monotonic_ms
 }
 
+fn pending_secret_digest(pending: &PendingSecretRotation) -> Result<[u8; 32], RuntimeError> {
+    use ring::digest::{digest, SHA256};
+
+    let decoded = Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(pending.turn_rest_secret.expose())
+            .map_err(|_| RuntimeError::StateInvalid)?,
+    );
+    if decoded.len() != 32 {
+        return Err(RuntimeError::StateInvalid);
+    }
+    let value = digest(&SHA256, &decoded);
+    let mut output = [0u8; 32];
+    output.copy_from_slice(value.as_ref());
+    Ok(output)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HostPressureSnapshot {
     pub packet_loss_bps: u16,
@@ -99,19 +106,17 @@ pub struct HostPressureSnapshot {
     pub recent_failure_bps: u16,
 }
 
-pub struct HeartbeatSampler<M: MetricsPort, P: LocalAllocationProbePort> {
+pub struct HeartbeatSampler<M: MetricsPort> {
     metrics: Arc<M>,
-    probe: Arc<P>,
     boot_id: String,
     endpoints: Vec<String>,
     max_allocations: u32,
     max_egress_bps: u64,
 }
 
-impl<M: MetricsPort, P: LocalAllocationProbePort> HeartbeatSampler<M, P> {
+impl<M: MetricsPort> HeartbeatSampler<M> {
     pub fn new(
         metrics: Arc<M>,
-        probe: Arc<P>,
         endpoints: Vec<String>,
         max_allocations: u32,
         max_egress_bps: u64,
@@ -122,7 +127,6 @@ impl<M: MetricsPort, P: LocalAllocationProbePort> HeartbeatSampler<M, P> {
             .map_err(|_| RuntimeError::StateInvalid)?;
         let sampler = Self {
             metrics,
-            probe,
             boot_id: URL_SAFE_NO_PAD.encode(boot_id),
             endpoints,
             max_allocations,
@@ -143,6 +147,7 @@ impl<M: MetricsPort, P: LocalAllocationProbePort> HeartbeatSampler<M, P> {
         identity_epoch: u64,
         process_health: ProcessHealth,
         listener_health: ProcessHealth,
+        probe_health: RelayHealth,
         pressure: HostPressureSnapshot,
         applied_secret_version: u64,
     ) -> Result<HeartbeatPayload, RuntimeError> {
@@ -151,11 +156,6 @@ impl<M: MetricsPort, P: LocalAllocationProbePort> HeartbeatSampler<M, P> {
             .collect()
             .await
             .map_err(|_| RuntimeError::StateInvalid)?;
-        let probe_health = match self.probe.probe().await {
-            Ok(AllocationProbeEvidence::Live(_)) => RelayHealth::Healthy,
-            Ok(AllocationProbeEvidence::NonEvidence) => RelayHealth::NonEvidence,
-            Err(_) => RelayHealth::Failed,
-        };
         let mut nonce = [0u8; 32];
         SystemRandom::new()
             .fill(&mut nonce)
@@ -209,24 +209,69 @@ pub struct IdentityLifecycle {
 }
 
 #[derive(Clone, Default)]
-pub struct SharedProcessHealth(Arc<AtomicU8>);
+pub struct SharedRelayHealth {
+    process: Arc<AtomicU8>,
+    listener: Arc<AtomicU8>,
+    probe: Arc<AtomicU8>,
+}
 
-impl SharedProcessHealth {
-    pub fn get(&self) -> ProcessHealth {
-        match self.0.load(Ordering::Acquire) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelayHealthSnapshot {
+    pub process: ProcessHealth,
+    pub listener: ProcessHealth,
+    pub probe: RelayHealth,
+}
+
+impl SharedRelayHealth {
+    fn decode_process(encoded: u8) -> ProcessHealth {
+        match encoded {
             2 => ProcessHealth::Healthy,
             1 => ProcessHealth::Degraded,
             _ => ProcessHealth::Failed,
         }
     }
 
-    pub fn set(&self, health: ProcessHealth) {
-        let encoded = match health {
+    fn encode_process(health: ProcessHealth) -> u8 {
+        match health {
             ProcessHealth::Healthy => 2,
             ProcessHealth::Degraded => 1,
             ProcessHealth::Failed => 0,
-        };
-        self.0.store(encoded, Ordering::Release);
+        }
+    }
+
+    fn encode_probe(health: RelayHealth) -> u8 {
+        match health {
+            RelayHealth::Healthy => 3,
+            RelayHealth::Degraded => 2,
+            RelayHealth::Failed => 1,
+            RelayHealth::NonEvidence => 0,
+        }
+    }
+
+    fn decode_probe(encoded: u8) -> RelayHealth {
+        match encoded {
+            3 => RelayHealth::Healthy,
+            2 => RelayHealth::Degraded,
+            1 => RelayHealth::Failed,
+            _ => RelayHealth::NonEvidence,
+        }
+    }
+
+    pub fn snapshot(&self) -> RelayHealthSnapshot {
+        RelayHealthSnapshot {
+            process: Self::decode_process(self.process.load(Ordering::Acquire)),
+            listener: Self::decode_process(self.listener.load(Ordering::Acquire)),
+            probe: Self::decode_probe(self.probe.load(Ordering::Acquire)),
+        }
+    }
+
+    pub fn set(&self, snapshot: RelayHealthSnapshot) {
+        self.process
+            .store(Self::encode_process(snapshot.process), Ordering::Release);
+        self.listener
+            .store(Self::encode_process(snapshot.listener), Ordering::Release);
+        self.probe
+            .store(Self::encode_probe(snapshot.probe), Ordering::Release);
     }
 }
 
@@ -297,7 +342,7 @@ impl IdentityLifecycle {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn backend_worker_once<F, C, K, S, J, M, P>(
+pub async fn backend_worker_once<F, C, K, S, J, M>(
     lifecycle: &mut IdentityLifecycle,
     identity: &mut CertificateState<F>,
     enrollment_backend: &dyn RelayBackendPort,
@@ -305,9 +350,10 @@ pub async fn backend_worker_once<F, C, K, S, J, M, P>(
     factory: &dyn RelayBackendClientFactoryPort,
     enrollment: Option<EnrollmentRequest>,
     runtime: &mut AgentRuntime<SwappableRelayBackend, C, K, S, J>,
-    sampler: &HeartbeatSampler<M, P>,
+    sampler: &HeartbeatSampler<M>,
     process_health: ProcessHealth,
     listener_health: ProcessHealth,
+    probe_health: RelayHealth,
     pressure: HostPressureSnapshot,
 ) -> Result<IdentityMaintenance, RuntimeError>
 where
@@ -317,7 +363,6 @@ where
     S: SleeperPort,
     J: JitterPort,
     M: MetricsPort,
-    P: LocalAllocationProbePort,
 {
     let maintenance = lifecycle
         .maintain_once(
@@ -336,7 +381,14 @@ where
         runtime.activate_identity_epoch(identity_epoch)?;
     }
     runtime
-        .heartbeat_cycle(identity, sampler, process_health, listener_health, pressure)
+        .heartbeat_cycle(
+            identity,
+            sampler,
+            process_health,
+            listener_health,
+            probe_health,
+            pressure,
+        )
         .await?;
     // Directives are not merely reported to a caller: the production worker
     // drives the crash-recoverable secret transaction on every heartbeat.
@@ -346,7 +398,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn run_backend_worker<F, C, K, S, J, M, P>(
+pub async fn run_backend_worker<F, C, K, S, J, M>(
     lifecycle: &mut IdentityLifecycle,
     identity: &mut CertificateState<F>,
     enrollment_backend: &dyn RelayBackendPort,
@@ -354,8 +406,8 @@ pub async fn run_backend_worker<F, C, K, S, J, M, P>(
     factory: &dyn RelayBackendClientFactoryPort,
     enrollment: Option<EnrollmentRequest>,
     runtime: &mut AgentRuntime<SwappableRelayBackend, C, K, S, J>,
-    sampler: &HeartbeatSampler<M, P>,
-    supervisor_health: &SharedProcessHealth,
+    sampler: &HeartbeatSampler<M>,
+    supervisor_health: &SharedRelayHealth,
     pressure: HostPressureSnapshot,
 ) -> Result<(), RuntimeError>
 where
@@ -365,10 +417,10 @@ where
     S: SleeperPort,
     J: JitterPort,
     M: MetricsPort,
-    P: LocalAllocationProbePort,
 {
     let mut backend_attempt = 0u32;
     loop {
+        let health = supervisor_health.snapshot();
         match backend_worker_once(
             lifecycle,
             identity,
@@ -378,8 +430,9 @@ where
             enrollment.clone(),
             runtime,
             sampler,
-            supervisor_health.get(),
-            supervisor_health.get(),
+            health.process,
+            health.listener,
+            health.probe,
             pressure,
         )
         .await
@@ -399,22 +452,257 @@ where
     }
 }
 
-pub async fn run_coturn_supervisor<B, C, K, S, J>(
-    runtime: &mut AgentRuntime<B, C, K, S, J>,
-    shared_health: &SharedProcessHealth,
-) -> Result<(), RuntimeError>
+pub struct CoturnSupervisor<C, S, P>
 where
-    B: RelayBackendPort,
+    C: CoturnRuntimePort,
+    S: SleeperPort,
+    P: LocalAllocationProbePort,
+{
+    coturn: Arc<C>,
+    sleeper: Arc<S>,
+    probe: Arc<P>,
+    shared_health: SharedRelayHealth,
+    restart_attempts: u8,
+}
+
+impl<C, S, P> CoturnSupervisor<C, S, P>
+where
+    C: CoturnRuntimePort,
+    S: SleeperPort,
+    P: LocalAllocationProbePort,
+{
+    pub fn new(
+        coturn: Arc<C>,
+        sleeper: Arc<S>,
+        probe: Arc<P>,
+        shared_health: SharedRelayHealth,
+    ) -> Self {
+        Self {
+            coturn,
+            sleeper,
+            probe,
+            shared_health,
+            restart_attempts: 0,
+        }
+    }
+
+    pub fn restart_attempts(&self) -> u8 {
+        self.restart_attempts
+    }
+
+    pub async fn supervise_once(&mut self) -> Result<(), RuntimeError> {
+        let process_health = self
+            .coturn
+            .snapshot()
+            .await
+            .map(|snapshot| snapshot.health)
+            .unwrap_or(ProcessHealth::Failed);
+        let probe_health = if process_health == ProcessHealth::Failed {
+            RelayHealth::Failed
+        } else {
+            match self.probe.probe().await {
+                Ok(AllocationProbeEvidence::Live(_)) => RelayHealth::Healthy,
+                Ok(AllocationProbeEvidence::NonEvidence) => RelayHealth::NonEvidence,
+                Err(_) => RelayHealth::Failed,
+            }
+        };
+        let verified_healthy =
+            process_health == ProcessHealth::Healthy && probe_health == RelayHealth::Healthy;
+        self.shared_health.set(RelayHealthSnapshot {
+            process: process_health,
+            listener: process_health,
+            probe: probe_health,
+        });
+        if verified_healthy {
+            self.restart_attempts = 0;
+        } else if self.restart_attempts < MAX_RESTART_ATTEMPTS {
+            let delay_seconds = 1u64 << self.restart_attempts;
+            self.sleeper
+                .sleep(Duration::from_secs(delay_seconds.min(4)))
+                .await;
+            self.restart_attempts = self.restart_attempts.saturating_add(1);
+            let _ = self.coturn.restart().await;
+        }
+        Ok(())
+    }
+
+    pub async fn run(&mut self) -> Result<(), RuntimeError> {
+        loop {
+            self.supervise_once().await?;
+            self.sleeper.sleep(Duration::from_secs(1)).await;
+            // An injected sleeper is allowed to complete immediately. Yielding
+            // keeps an unhealthy local process from starving the backend task
+            // in deterministic tests or embedders with a virtual clock.
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+pub struct PortableRelayAgent<F, C, K, S, J, M, P>
+where
+    F: IdentityFsPort,
     C: CoturnRuntimePort,
     K: ClockPort,
     S: SleeperPort,
     J: JitterPort,
+    M: MetricsPort,
+    P: LocalAllocationProbePort,
 {
-    loop {
-        runtime.supervise_coturn_once().await?;
-        shared_health.set(runtime.process_health());
-        runtime.sleeper.sleep(Duration::from_secs(1)).await;
+    lifecycle: IdentityLifecycle,
+    identity: CertificateState<F>,
+    enrollment_backend: Arc<dyn RelayBackendPort>,
+    slot: Arc<SwappableRelayBackend>,
+    factory: Arc<dyn RelayBackendClientFactoryPort>,
+    enrollment: Option<EnrollmentRequest>,
+    runtime: AgentRuntime<SwappableRelayBackend, C, K, S, J>,
+    sampler: HeartbeatSampler<M>,
+    shared_health: SharedRelayHealth,
+    supervisor: CoturnSupervisor<C, S, P>,
+    pressure: HostPressureSnapshot,
+}
+
+pub struct PortableRelayAgentDeps<F, C, K, S, J, M, P>
+where
+    F: IdentityFsPort,
+    C: CoturnRuntimePort,
+    K: ClockPort,
+    S: SleeperPort,
+    J: JitterPort,
+    M: MetricsPort,
+    P: LocalAllocationProbePort,
+{
+    pub identity: CertificateState<F>,
+    pub enrollment_backend: Arc<dyn RelayBackendPort>,
+    pub initial_backend: Arc<dyn RelayBackendPort>,
+    pub factory: Arc<dyn RelayBackendClientFactoryPort>,
+    pub coturn: Arc<C>,
+    pub clock: Arc<K>,
+    pub sleeper: Arc<S>,
+    pub jitter: Arc<J>,
+    pub state_store: Arc<dyn RuntimeStateStorePort>,
+    pub metrics: Arc<M>,
+    pub probe: Arc<P>,
+}
+
+pub struct PortableRelayAgentConfig {
+    pub enrollment: Option<EnrollmentRequest>,
+    pub endpoints: Vec<String>,
+    pub max_allocations: u32,
+    pub max_egress_bps: u64,
+    pub pressure: HostPressureSnapshot,
+    pub renewal_window: Duration,
+}
+
+impl<F, C, K, S, J, M, P> PortableRelayAgent<F, C, K, S, J, M, P>
+where
+    F: IdentityFsPort,
+    C: CoturnRuntimePort,
+    K: ClockPort,
+    S: SleeperPort,
+    J: JitterPort,
+    M: MetricsPort,
+    P: LocalAllocationProbePort,
+{
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        identity: CertificateState<F>,
+        enrollment_backend: Arc<dyn RelayBackendPort>,
+        initial_backend: Arc<dyn RelayBackendPort>,
+        factory: Arc<dyn RelayBackendClientFactoryPort>,
+        enrollment: Option<EnrollmentRequest>,
+        coturn: Arc<C>,
+        clock: Arc<K>,
+        sleeper: Arc<S>,
+        jitter: Arc<J>,
+        state_store: Arc<dyn RuntimeStateStorePort>,
+        metrics: Arc<M>,
+        probe: Arc<P>,
+        endpoints: Vec<String>,
+        max_allocations: u32,
+        max_egress_bps: u64,
+        pressure: HostPressureSnapshot,
+        renewal_window: Duration,
+    ) -> Result<Self, RuntimeError> {
+        let shared_health = SharedRelayHealth::default();
+        let slot = Arc::new(SwappableRelayBackend::new(initial_backend));
+        let runtime = AgentRuntime::new_with_state_store(
+            slot.clone(),
+            coturn.clone(),
+            clock,
+            sleeper.clone(),
+            jitter,
+            state_store,
+        )?;
+        let sampler = HeartbeatSampler::new(metrics, endpoints, max_allocations, max_egress_bps)?;
+        let supervisor = CoturnSupervisor::new(coturn, sleeper, probe, shared_health.clone());
+        Ok(Self {
+            lifecycle: IdentityLifecycle::new(renewal_window)?,
+            identity,
+            enrollment_backend,
+            slot,
+            factory,
+            enrollment,
+            runtime,
+            sampler,
+            shared_health,
+            supervisor,
+            pressure,
+        })
     }
+
+    pub async fn run(&mut self) -> Result<(), RuntimeError> {
+        tokio::try_join!(
+            run_backend_worker(
+                &mut self.lifecycle,
+                &mut self.identity,
+                self.enrollment_backend.as_ref(),
+                self.slot.as_ref(),
+                self.factory.as_ref(),
+                self.enrollment.clone(),
+                &mut self.runtime,
+                &self.sampler,
+                &self.shared_health,
+                self.pressure,
+            ),
+            self.supervisor.run(),
+        )?;
+        Ok(())
+    }
+}
+
+pub async fn run_agent<F, C, K, S, J, M, P>(
+    dependencies: PortableRelayAgentDeps<F, C, K, S, J, M, P>,
+    config: PortableRelayAgentConfig,
+) -> Result<(), RuntimeError>
+where
+    F: IdentityFsPort,
+    C: CoturnRuntimePort,
+    K: ClockPort,
+    S: SleeperPort,
+    J: JitterPort,
+    M: MetricsPort,
+    P: LocalAllocationProbePort,
+{
+    let mut agent = PortableRelayAgent::new(
+        dependencies.identity,
+        dependencies.enrollment_backend,
+        dependencies.initial_backend,
+        dependencies.factory,
+        config.enrollment,
+        dependencies.coturn,
+        dependencies.clock,
+        dependencies.sleeper,
+        dependencies.jitter,
+        dependencies.state_store,
+        dependencies.metrics,
+        dependencies.probe,
+        config.endpoints,
+        config.max_allocations,
+        config.max_egress_bps,
+        config.pressure,
+        config.renewal_window,
+    )?;
+    agent.run().await
 }
 
 fn generate_rotation_identifier() -> Result<String, RuntimeError> {
@@ -502,6 +790,7 @@ pub struct PendingSecretRotation {
     pub turn_rest_secret: PersistentSecret,
     pub not_before_unix_seconds: i64,
     pub old_credential_deadline_unix_seconds: i64,
+    pub rotation_challenge: String,
     pub observed_wall_unix_seconds: i64,
     pub observed_monotonic_ms: u64,
     pub phase: SecretRotationPhase,
@@ -522,6 +811,7 @@ impl std::fmt::Debug for PendingSecretRotation {
                 "old_credential_deadline_unix_seconds",
                 &self.old_credential_deadline_unix_seconds,
             )
+            .field("rotation_challenge", &self.rotation_challenge)
             .field("phase", &self.phase)
             .field("probe_evidence_sha256", &self.probe_evidence_sha256)
             .finish()
@@ -801,8 +1091,6 @@ where
     sleeper: Arc<S>,
     jitter: Arc<J>,
     next_heartbeat_at_ms: u64,
-    restart_attempts: u8,
-    process_health: ProcessHealth,
     identity_epoch: u64,
     last_directive_sequence: u64,
     secret_version: u64,
@@ -855,6 +1143,13 @@ where
             if pending.identity_epoch != state.identity_epoch
                 || pending.secret_version <= state.secret_version
                 || pending.old_credential_deadline_unix_seconds < pending.not_before_unix_seconds
+                || URL_SAFE_NO_PAD
+                    .decode(&pending.rotation_challenge)
+                    .ok()
+                    .filter(|decoded| decoded.len() == 32)
+                    .is_none_or(|decoded| {
+                        URL_SAFE_NO_PAD.encode(decoded) != pending.rotation_challenge
+                    })
             {
                 return Err(RuntimeError::StateInvalid);
             }
@@ -871,8 +1166,6 @@ where
             sleeper,
             jitter,
             next_heartbeat_at_ms: now,
-            restart_attempts: 0,
-            process_health: ProcessHealth::Failed,
             identity_epoch: state.identity_epoch,
             last_directive_sequence: state.last_directive_sequence,
             secret_version: state.secret_version,
@@ -917,29 +1210,6 @@ where
         Duration::from_millis(bounded.saturating_add(jitter))
     }
 
-    pub async fn supervise_coturn_once(&mut self) -> Result<(), RuntimeError> {
-        let health = match self.coturn.snapshot().await {
-            Ok(snapshot) => snapshot.health,
-            Err(_) => ProcessHealth::Failed,
-        };
-        self.process_health = health;
-        match health {
-            ProcessHealth::Healthy | ProcessHealth::Degraded => {
-                self.restart_attempts = 0;
-            }
-            ProcessHealth::Failed if self.restart_attempts < MAX_RESTART_ATTEMPTS => {
-                let delay_seconds = 1u64 << self.restart_attempts;
-                self.sleeper
-                    .sleep(Duration::from_secs(delay_seconds.min(4)))
-                    .await;
-                self.restart_attempts += 1;
-                let _ = self.coturn.restart().await;
-            }
-            ProcessHealth::Failed => {}
-        }
-        Ok(())
-    }
-
     pub async fn heartbeat_once(&mut self, heartbeat: SignedHeartbeat) -> Result<(), RuntimeError> {
         self.note_heartbeat_attempt();
         let directive = self
@@ -950,18 +1220,18 @@ where
         self.apply_directive(directive).await
     }
 
-    pub async fn heartbeat_cycle<F, M, P>(
+    pub async fn heartbeat_cycle<F, M>(
         &mut self,
         identity: &mut CertificateState<F>,
-        sampler: &HeartbeatSampler<M, P>,
+        sampler: &HeartbeatSampler<M>,
         process_health: ProcessHealth,
         listener_health: ProcessHealth,
+        probe_health: RelayHealth,
         pressure: HostPressureSnapshot,
     ) -> Result<(), RuntimeError>
     where
         F: IdentityFsPort,
         M: MetricsPort,
-        P: LocalAllocationProbePort,
     {
         self.wait_until_next_heartbeat().await;
         let payload = sampler
@@ -969,6 +1239,7 @@ where
                 identity.identity_epoch(),
                 process_health,
                 listener_health,
+                probe_health,
                 pressure,
                 self.secret_version,
             )
@@ -1015,6 +1286,9 @@ where
             ) else {
                 return Err(RuntimeError::SecretUpdateUnsafe);
             };
+            let Some(rotation_challenge) = directive.desired.rotation_challenge.clone() else {
+                return Err(RuntimeError::SecretUpdateUnsafe);
+            };
             if deadline < not_before {
                 return Err(RuntimeError::SecretUpdateUnsafe);
             }
@@ -1025,6 +1299,9 @@ where
                 {
                     return Err(RuntimeError::SecretVersionReplay)
                 }
+                Some(pending) if pending.rotation_challenge != rotation_challenge => {
+                    return Err(RuntimeError::SecretVersionReplay)
+                }
                 Some(_) => {}
                 None => {
                     next_pending_rotation = Some(generate_pending_rotation(
@@ -1033,6 +1310,7 @@ where
                         directive.desired.secret_version,
                         not_before,
                         deadline,
+                        rotation_challenge,
                         self.clock.unix_seconds(),
                         self.clock.monotonic_ms(),
                     )?);
@@ -1159,28 +1437,21 @@ where
         let proof = pending
             .probe_evidence_sha256
             .ok_or(RuntimeError::StateInvalid)?;
+        let pending_secret_digest = pending_secret_digest(&pending)?;
         let request = identity.prepare_secret_commit(
             self.clock.unix_seconds(),
             pending.rotation_id.clone(),
             pending.secret_version,
+            pending.rotation_challenge.clone(),
+            pending_secret_digest,
             proof,
+            pending.turn_rest_secret.expose(),
         )?;
         self.backend
             .commit_secret(request)
             .await
             .map_err(RuntimeError::Backend)?;
-        let digest = {
-            use ring::digest::{digest, SHA256};
-            let decoded = Zeroizing::new(
-                URL_SAFE_NO_PAD
-                    .decode(pending.turn_rest_secret.expose())
-                    .map_err(|_| RuntimeError::StateInvalid)?,
-            );
-            let value = digest(&SHA256, &decoded);
-            let mut digest = [0u8; 32];
-            digest.copy_from_slice(value.as_ref());
-            digest
-        };
+        let digest = pending_secret_digest;
         let committed = RuntimeStateSnapshot {
             identity_epoch: self.identity_epoch,
             last_directive_sequence: self.last_directive_sequence,
@@ -1211,14 +1482,6 @@ where
         self.state_store.atomic_store(&state)?;
         self.pending_rotation = Some(pending);
         Ok(())
-    }
-
-    pub fn process_health(&self) -> ProcessHealth {
-        self.process_health
-    }
-
-    pub fn restart_attempts(&self) -> u8 {
-        self.restart_attempts
     }
 
     pub fn is_draining(&self) -> bool {

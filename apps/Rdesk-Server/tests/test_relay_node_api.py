@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import threading
 import time
@@ -71,6 +72,8 @@ def test_shared_heartbeat_fixture_is_exact_and_accepts_available_state() -> None
 
 
 def test_shared_secret_rotation_fixture_is_exact_for_upload_and_commit() -> None:
+    from app.services.relay_registry import rotation_proof_message
+
     fixture_path = (
         Path(__file__).parents[3]
         / "tests"
@@ -101,6 +104,24 @@ def test_shared_secret_rotation_fixture_is_exact_for_upload_and_commit() -> None
     assert commit_payload.rotation_id == "rotation-0001"
     assert commit_payload.secret_version == 2
     assert commit_payload.probe_evidence_sha256 == "ab" * 32
+    assert commit_payload.rotation_challenge == fixture["rotation_challenge"]
+    assert commit_payload.proof_mac == fixture["proof_mac"]
+    proof_message = rotation_proof_message(
+        node_id=fixture["node_id"],
+        identity_epoch=commit_payload.identity_epoch,
+        rotation_id=commit_payload.rotation_id,
+        secret_version=commit_payload.secret_version,
+        rotation_challenge=commit_payload.rotation_challenge,
+        pending_secret_digest=bytes.fromhex(fixture["pending_secret_digest_sha256"]),
+        probe_evidence_sha256=bytes.fromhex(commit_payload.probe_evidence_sha256),
+    )
+    assert proof_message.hex() == fixture["proof_message_hex"]
+    expected_proof = hmac.new(
+        upload_payload.turn_rest_secret.get_secret_value().encode("ascii"),
+        proof_message,
+        hashlib.sha256,
+    ).hexdigest()
+    assert hmac.compare_digest(expected_proof, commit_payload.proof_mac)
     assert _canonical_request(
         commit["method"],
         commit["path"],
@@ -141,6 +162,7 @@ def test_new_enrollment_rejects_colon_node_id_but_legacy_outputs_remain_valid() 
             "secret_version": 1,
             "not_before": None,
             "old_credential_deadline": None,
+            "rotation_challenge": None,
         },
         lease_expires_at=datetime.now(UTC),
     )
@@ -732,6 +754,7 @@ def test_extended_heartbeat_is_epoch_bound_and_returns_strict_desired_state(
             "secret_version": 1,
             "not_before": None,
             "old_credential_deadline": None,
+            "rotation_challenge": None,
         },
         "lease_expires_at": response.json()["lease_expires_at"],
     }
@@ -742,6 +765,7 @@ def test_node_generated_secret_rotation_is_authenticated_encrypted_and_atomic(
 ) -> None:
     from app.models.relay_audit_event import RelayAuditEvent
     from app.models.relay_node import RelayNode
+    from app.services.relay_registry import rotation_proof_message
 
     client, engine = api
     key, _ = _enroll(client)
@@ -759,7 +783,15 @@ def test_node_generated_secret_rotation_is_authenticated_encrypted_and_atomic(
     assert directive["identity_epoch"] == 1
     assert directive["secret_version"] == 2
     assert directive["draining"] is True
+    challenge = directive["rotation_challenge"]
+    assert len(challenge) == 43
     assert "turn_rest_secret" not in requested.text
+    repeated_request = client.post(
+        f"/api/v1/relays/{NODE_ID}/rotate-secret",
+        json={"credential_ttl_seconds": 60},
+    )
+    assert repeated_request.status_code == 202
+    assert repeated_request.json()["rotation_challenge"] == challenge
 
     heartbeat_body, heartbeat_headers = _heartbeat_request(
         key, fingerprint, sequence=1
@@ -772,6 +804,7 @@ def test_node_generated_secret_rotation_is_authenticated_encrypted_and_atomic(
     assert heartbeat.status_code == 200, heartbeat.text
     assert heartbeat.json()["desired"]["secret_version"] == 2
     assert heartbeat.json()["desired"]["draining"] is True
+    assert heartbeat.json()["desired"]["rotation_challenge"] == challenge
 
     rotation_id = "rotation-0001"
     new_secret = base64.urlsafe_b64encode(
@@ -852,12 +885,43 @@ def test_node_generated_secret_rotation_is_authenticated_encrypted_and_atomic(
         "identity_epoch": 1,
         "rotation_id": rotation_id,
         "secret_version": 2,
+        "rotation_challenge": challenge,
         "probe_evidence_sha256": "ab" * 32,
+        "proof_mac": "ab" * 32,
     }
     commit_body, commit_headers = _heartbeat_request(
         key,
         fingerprint,
         sequence=6,
+        path=commit_path,
+        payload=commit_payload,
+        replace_payload=True,
+    )
+    rejected_replay = client.post(
+        commit_path, content=commit_body, headers=commit_headers
+    )
+    assert rejected_replay.status_code == 409
+    assert _error_code(rejected_replay) == "relay_rotation_proof_invalid"
+
+    pending_digest = hashlib.sha256(
+        base64.urlsafe_b64decode(new_secret + "=")
+    ).digest()
+    proof_message = rotation_proof_message(
+        node_id=NODE_ID,
+        identity_epoch=1,
+        rotation_id=rotation_id,
+        secret_version=2,
+        rotation_challenge=challenge,
+        pending_secret_digest=pending_digest,
+        probe_evidence_sha256=bytes.fromhex(commit_payload["probe_evidence_sha256"]),
+    )
+    commit_payload["proof_mac"] = hmac.new(
+        new_secret.encode("ascii"), proof_message, hashlib.sha256
+    ).hexdigest()
+    commit_body, commit_headers = _heartbeat_request(
+        key,
+        fingerprint,
+        sequence=7,
         path=commit_path,
         payload=commit_payload,
         replace_payload=True,
@@ -868,7 +932,7 @@ def test_node_generated_secret_rotation_is_authenticated_encrypted_and_atomic(
     retry_commit_body, retry_commit_headers = _heartbeat_request(
         key,
         fingerprint,
-        sequence=7,
+        sequence=8,
         path=commit_path,
         payload=commit_payload,
         replace_payload=True,
@@ -878,12 +942,32 @@ def test_node_generated_secret_rotation_is_authenticated_encrypted_and_atomic(
     )
     assert retried_commit.status_code == 200, retried_commit.text
     assert retried_commit.json() == committed.json()
+    cross_rotation_payload = dict(commit_payload)
+    cross_rotation_payload["rotation_challenge"] = base64.urlsafe_b64encode(
+        b"\x03" * 32
+    ).rstrip(b"=").decode("ascii")
+    cross_body, cross_headers = _heartbeat_request(
+        key,
+        fingerprint,
+        sequence=9,
+        path=commit_path,
+        payload=cross_rotation_payload,
+        replace_payload=True,
+    )
+    cross_rotation = client.post(
+        commit_path, content=cross_body, headers=cross_headers
+    )
+    assert cross_rotation.status_code == 409
     with Session(engine) as session:
         node = session.get(RelayNode, NODE_ID)
         assert node is not None
         assert node.active_secret_version == 2
         assert node.applied_secret_version == 2
         assert node.pending_encrypted_turn_secret is None
+        assert node.rotation_challenge is None
+        assert node.committed_rotation_challenge == challenge
+        assert node.committed_probe_evidence_sha256 == bytes.fromhex("ab" * 32)
+        assert node.committed_proof_mac == bytes.fromhex(commit_payload["proof_mac"])
         events = session.scalars(
             select(RelayAuditEvent).where(
                 RelayAuditEvent.action == "relay_secret_rotation_committed"

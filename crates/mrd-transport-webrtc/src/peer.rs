@@ -34,6 +34,7 @@ use webrtc::{
     },
     track::track_local::TrackLocal,
 };
+use zeroize::Zeroizing;
 
 use crate::{
     cleanup::{
@@ -42,7 +43,7 @@ use crate::{
     },
     config::{
         ice_server_secret_values, normalize_secret_values, IceServerConfig, IceTransportPolicy,
-        PeerConnectionConfig, PeerConnectionRole,
+        PeerConnectionConfig, PeerConnectionRole, SecretValues,
     },
     control::{
         channel_info, realtime_channel_init, reliable_channel_init, weak_callback_owner,
@@ -3209,14 +3210,14 @@ fn validate_turn_servers(ice_servers: &[IceServerConfig]) -> Result<(), Transpor
     Ok(())
 }
 
-fn secret_values(ice_servers: &[IceServerConfig]) -> Vec<String> {
+fn secret_values(ice_servers: &[IceServerConfig]) -> SecretValues {
     ice_server_secret_values(ice_servers)
 }
 
-fn candidate_secret_values(candidate: &IceCandidate) -> Vec<String> {
-    let mut secrets = vec![candidate.candidate.clone()];
+fn candidate_secret_values(candidate: &IceCandidate) -> SecretValues {
+    let mut secrets = Zeroizing::new(vec![Zeroizing::new(candidate.candidate.clone())]);
     if let Some(username_fragment) = &candidate.username_fragment {
-        secrets.push(username_fragment.clone());
+        secrets.push(Zeroizing::new(username_fragment.clone()));
     }
     let fields = candidate
         .candidate
@@ -3224,16 +3225,16 @@ fn candidate_secret_values(candidate: &IceCandidate) -> Vec<String> {
         .collect::<Vec<_>>();
     for pair in fields.windows(2) {
         if pair[0].eq_ignore_ascii_case("ufrag") && !pair[1].is_empty() {
-            secrets.push(pair[1].to_owned());
+            secrets.push(Zeroizing::new(pair[1].to_owned()));
         }
     }
     normalize_secret_values(secrets)
 }
 
-fn redact_transport_error(error: TransportError, secrets: &[String]) -> TransportError {
+fn redact_transport_error(error: TransportError, secrets: &SecretValues) -> TransportError {
     let mut message = error.to_string();
-    for secret in normalize_secret_values(secrets.to_vec()) {
-        message = message.replace(&secret, "[REDACTED]");
+    for secret in secrets.iter() {
+        message = message.replace(secret.as_str(), "[REDACTED]");
     }
     TransportError::Message(message)
 }
@@ -3246,10 +3247,10 @@ fn redact_sdp_error(error: TransportError, sdp: &str) -> TransportError {
                 .or_else(|| line.strip_prefix("a=ice-pwd:"))
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .map(str::to_owned)
+                .map(|value| Zeroizing::new(value.to_owned()))
         })
         .collect::<Vec<_>>();
-    redact_transport_error(error, &secrets)
+    redact_transport_error(error, &Zeroizing::new(secrets))
 }
 
 fn validate_selected_pair(
@@ -3316,7 +3317,7 @@ fn peer_error(context: &'static str) -> impl FnOnce(webrtc::Error) -> TransportE
 
 fn peer_error_redacted<'a>(
     context: &'static str,
-    secrets: &'a [String],
+    secrets: &'a SecretValues,
 ) -> impl FnOnce(webrtc::Error) -> TransportError + 'a {
     move |error| redact_transport_error(peer_error(context)(error), secrets)
 }
@@ -3362,10 +3363,11 @@ mod tests {
         let error = TransportError::Message(
             "TURN setup failed for temporary-user using temporary-password".into(),
         );
-        let redacted = redact_transport_error(
-            error,
-            &["temporary-user".into(), "temporary-password".into()],
-        );
+        let secrets = normalize_secret_values(Zeroizing::new(vec![
+            Zeroizing::new("temporary-user".into()),
+            Zeroizing::new("temporary-password".into()),
+        ]));
+        let redacted = redact_transport_error(error, &secrets);
         let output = redacted.to_string();
         assert!(!output.contains("temporary-user"));
         assert!(!output.contains("temporary-password"));

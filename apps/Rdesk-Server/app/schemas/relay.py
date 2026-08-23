@@ -1,16 +1,33 @@
 from __future__ import annotations
 
+import base64
+import binascii
 from datetime import datetime
 from typing import Annotated, Literal
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
     SecretStr,
     StringConstraints,
     field_validator,
+    model_validator,
 )
+
+
+def _canonical_base64url_32(value: str) -> str:
+    try:
+        decoded = base64.urlsafe_b64decode(value + "=")
+    except (ValueError, binascii.Error):
+        raise ValueError("value must be canonical base64url") from None
+    if (
+        len(decoded) != 32
+        or base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii") != value
+    ):
+        raise ValueError("value must be canonical base64url")
+    return value
 
 
 RelayId = Annotated[
@@ -48,7 +65,9 @@ BootId = Annotated[
     str, StringConstraints(min_length=22, max_length=22, pattern=r"^[A-Za-z0-9_-]{22}$")
 ]
 RequestNonce = Annotated[
-    str, StringConstraints(min_length=43, max_length=43, pattern=r"^[A-Za-z0-9_-]{43}$")
+    str,
+    StringConstraints(min_length=43, max_length=43, pattern=r"^[A-Za-z0-9_-]{43}$"),
+    AfterValidator(_canonical_base64url_32),
 ]
 
 
@@ -166,6 +185,22 @@ class RelayDesiredState(BaseModel):
     secret_version: int = Field(strict=True, ge=1, le=2**63 - 1)
     not_before: datetime | None
     old_credential_deadline: datetime | None
+    rotation_challenge: RequestNonce | None = None
+
+    @model_validator(mode="after")
+    def validate_rotation_fields(self) -> "RelayDesiredState":
+        has_rotation_window = self.not_before is not None
+        if (
+            has_rotation_window != (self.old_credential_deadline is not None)
+            or has_rotation_window != (self.rotation_challenge is not None)
+            or (
+                self.not_before is not None
+                and self.old_credential_deadline is not None
+                and self.old_credential_deadline < self.not_before
+            )
+        ):
+            raise ValueError("desired rotation fields must be present together")
+        return self
 
 
 class RelayHeartbeatResponse(BaseModel):
@@ -194,6 +229,7 @@ class RelaySecretRotationDirective(BaseModel):
     draining: Literal[True]
     not_before: datetime
     old_credential_deadline: datetime
+    rotation_challenge: RequestNonce
 
 
 class RelaySecretUploadRequest(BaseModel):
@@ -225,9 +261,11 @@ class RelaySecretCommitRequest(BaseModel):
     identity_epoch: int = Field(strict=True, ge=1, le=2**63 - 1)
     rotation_id: RotationId
     secret_version: int = Field(strict=True, ge=2, le=2**63 - 1)
+    rotation_challenge: RequestNonce
     probe_evidence_sha256: str = Field(
         min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
     )
+    proof_mac: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
 
 
 class RelaySecretCommitResponse(BaseModel):

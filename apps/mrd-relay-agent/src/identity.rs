@@ -7,7 +7,7 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType, PKCS_ED25519};
-use ring::{rand::SystemRandom, signature, signature::KeyPair as _};
+use ring::{hmac, rand::SystemRandom, signature, signature::KeyPair as _};
 use rustls_pki_types::PrivatePkcs8KeyDer;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -23,11 +23,11 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     backend::{
-        serialize_renewal_body, serialize_secret_commit_body, serialize_secret_upload_body,
-        sign_relay_request, BackendError, EnrollmentRequest, EnrollmentStatus, HeartbeatPayload,
-        NodeCertificate, PickupRequest, RelayBackendClientFactoryPort, RelayBackendPort,
-        RenewalRequest, RequestAuthentication, SecretCommitRequest, SecretUploadRequest,
-        SignedHeartbeat, SwappableRelayBackend,
+        rotation_proof_message, serialize_renewal_body, serialize_secret_commit_body,
+        serialize_secret_upload_body, sign_relay_request, BackendError, EnrollmentRequest,
+        EnrollmentStatus, HeartbeatPayload, NodeCertificate, PickupRequest,
+        RelayBackendClientFactoryPort, RelayBackendPort, RenewalRequest, RequestAuthentication,
+        SecretCommitRequest, SecretUploadRequest, SignedHeartbeat, SwappableRelayBackend,
     },
     runtime::{ClockPort, RuntimeError},
 };
@@ -593,21 +593,45 @@ impl<F: IdentityFsPort> CertificateState<F> {
         Ok(request)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_secret_commit(
         &mut self,
         timestamp: i64,
         rotation_id: String,
         secret_version: u64,
+        rotation_challenge: String,
+        pending_secret_digest: [u8; 32],
         proof_sha256: [u8; 32],
+        canonical_secret: &str,
     ) -> Result<SecretCommitRequest, RuntimeError> {
         let node_id = self.identity.stored.node_id.clone();
         let identity_epoch = self.identity.stored.identity_epoch;
+        let proof_message = rotation_proof_message(
+            &node_id,
+            identity_epoch,
+            &rotation_id,
+            secret_version,
+            &rotation_challenge,
+            &pending_secret_digest,
+            &proof_sha256,
+        )
+        .map_err(RuntimeError::Backend)?;
+        let proof_mac = hmac::sign(
+            &hmac::Key::new(hmac::HMAC_SHA256, canonical_secret.as_bytes()),
+            &proof_message,
+        );
         let mut request = SecretCommitRequest {
             node_id: node_id.clone(),
             identity_epoch,
             rotation_id,
             secret_version,
+            rotation_challenge,
             probe_evidence_sha256: proof_sha256
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            proof_mac: proof_mac
+                .as_ref()
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect(),

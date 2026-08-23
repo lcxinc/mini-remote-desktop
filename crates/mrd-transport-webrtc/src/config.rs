@@ -1,6 +1,7 @@
 use std::fmt;
 
 use mrd_pipeline_core::VideoCodec;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{H264Profile, TransportError, DEFAULT_MAX_H264_ACCESS_UNIT_BYTES};
 
@@ -18,11 +19,32 @@ pub enum IceTransportPolicy {
     Relay,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct IceServerConfig {
     pub urls: Vec<String>,
     pub username: String,
     pub credential: String,
+}
+
+impl Clone for IceServerConfig {
+    fn clone(&self) -> Self {
+        Self {
+            urls: self.urls.clone(),
+            username: self.username.clone(),
+            credential: self.credential.clone(),
+        }
+    }
+}
+
+impl Drop for IceServerConfig {
+    fn drop(&mut self) {
+        for url in &mut self.urls {
+            url.zeroize();
+        }
+        self.urls.clear();
+        self.username.zeroize();
+        self.credential.zeroize();
+    }
 }
 
 impl IceServerConfig {
@@ -152,11 +174,13 @@ pub(crate) fn redact_ice_server_url(url: &str) -> String {
     output
 }
 
-pub(crate) fn ice_server_secret_values(ice_servers: &[IceServerConfig]) -> Vec<String> {
-    let mut secrets = Vec::new();
+pub(crate) type SecretValues = Zeroizing<Vec<Zeroizing<String>>>;
+
+pub(crate) fn ice_server_secret_values(ice_servers: &[IceServerConfig]) -> SecretValues {
+    let mut secrets = Zeroizing::new(Vec::new());
     for server in ice_servers {
-        secrets.push(server.username.clone());
-        secrets.push(server.credential.clone());
+        secrets.push(Zeroizing::new(server.username.clone()));
+        secrets.push(Zeroizing::new(server.credential.clone()));
         for url in &server.urls {
             collect_url_secrets(url, &mut secrets);
         }
@@ -164,24 +188,22 @@ pub(crate) fn ice_server_secret_values(ice_servers: &[IceServerConfig]) -> Vec<S
     normalize_secret_values(secrets)
 }
 
-pub(crate) fn normalize_secret_values(mut secrets: Vec<String>) -> Vec<String> {
+pub(crate) fn normalize_secret_values(mut secrets: SecretValues) -> SecretValues {
     secrets.retain(|secret| !secret.is_empty());
-    secrets
-        .sort_unstable_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
-    secrets.dedup();
+    secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
     secrets
 }
 
-fn collect_url_secrets(url: &str, secrets: &mut Vec<String>) {
+fn collect_url_secrets(url: &str, secrets: &mut SecretValues) {
     let Some((_, remainder)) = url.trim().split_once(':') else {
-        secrets.push(url.to_owned());
+        secrets.push(Zeroizing::new(url.to_owned()));
         return;
     };
     let (without_fragment, fragment) = remainder
         .split_once('#')
         .map_or((remainder, None), |(base, value)| (base, Some(value)));
     if let Some(fragment) = fragment {
-        secrets.push(fragment.to_owned());
+        secrets.push(Zeroizing::new(fragment.to_owned()));
     }
     let (endpoint_and_path, query) = without_fragment
         .split_once('?')
@@ -195,9 +217,9 @@ fn collect_url_secrets(url: &str, secrets: &mut Vec<String>) {
                     && matches!(value.to_ascii_lowercase().as_str(), "udp" | "tcp")
             });
             if !is_public_transport {
-                secrets.push(parameter.to_owned());
+                secrets.push(Zeroizing::new(parameter.to_owned()));
                 if let Some((_, value)) = parameter.split_once('=') {
-                    secrets.push(value.to_owned());
+                    secrets.push(Zeroizing::new(value.to_owned()));
                 }
             }
         }
@@ -206,12 +228,19 @@ fn collect_url_secrets(url: &str, secrets: &mut Vec<String>) {
     let endpoint = path_offset.map_or(endpoint_and_path, |offset| &endpoint_and_path[..offset]);
     if let Some(offset) = path_offset {
         let path = &endpoint_and_path[offset + 1..];
-        secrets.push(path.to_owned());
-        secrets.extend(path.split('/').map(str::to_owned));
+        secrets.push(Zeroizing::new(path.to_owned()));
+        secrets.extend(
+            path.split('/')
+                .map(|value| Zeroizing::new(value.to_owned())),
+        );
     }
     if let Some((userinfo, _)) = endpoint.rsplit_once('@') {
-        secrets.push(userinfo.to_owned());
-        secrets.extend(userinfo.split(':').map(str::to_owned));
+        secrets.push(Zeroizing::new(userinfo.to_owned()));
+        secrets.extend(
+            userinfo
+                .split(':')
+                .map(|value| Zeroizing::new(value.to_owned())),
+        );
     }
 }
 
@@ -373,5 +402,33 @@ impl PeerConnectionConfig {
             ));
         }
         Ok(codec)
+    }
+}
+
+#[cfg(test)]
+mod secret_lifetime_tests {
+    use super::IceServerConfig;
+
+    #[test]
+    fn ice_server_config_and_clones_have_zeroizing_drop_owners() {
+        assert!(std::mem::needs_drop::<IceServerConfig>());
+        let config = IceServerConfig::new(
+            vec!["turn:url-user-9x:url-pass-8y@relay.invalid?credential=url-secret-7z".into()],
+            "sensitive-user".into(),
+            "sensitive-credential".into(),
+        );
+        let cloned = config.clone();
+        let debug = format!("{cloned:?}");
+        let display = cloned.to_string();
+        for secret in [
+            "url-user-9x",
+            "url-pass-8y",
+            "url-secret-7z",
+            "sensitive-user",
+            "sensitive-credential",
+        ] {
+            assert!(!debug.contains(secret));
+            assert!(!display.contains(secret));
+        }
     }
 }

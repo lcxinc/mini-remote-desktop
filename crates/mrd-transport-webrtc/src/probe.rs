@@ -3,7 +3,7 @@ use std::{future::Future, sync::OnceLock, time::Duration};
 use mrd_pipeline_core::{EncodedAccessUnit, VideoCodec};
 
 use crate::{
-    config::{ice_server_secret_values, normalize_secret_values},
+    config::{ice_server_secret_values, SecretValues},
     CandidateKind, ControlLane, IceServerConfig, IceTransportPolicy, PeerConnectionConfig,
     PeerConnectionRole, SelectedCandidatePairStats, TransportError, WebRtcPeerConnection,
 };
@@ -241,14 +241,14 @@ async fn run_live_probe(
     TurnRelayProbeEvidence::from_observation(selected_pair, control_round_trip, media_round_trip)
 }
 
-fn secret_values(servers: &[IceServerConfig]) -> Vec<String> {
+fn secret_values(servers: &[IceServerConfig]) -> SecretValues {
     ice_server_secret_values(servers)
 }
 
-fn redact(error: TransportError, secrets: &[String]) -> TransportError {
+fn redact(error: TransportError, secrets: &SecretValues) -> TransportError {
     let mut message = error.to_string();
-    for secret in normalize_secret_values(secrets.to_vec()) {
-        message = message.replace(&secret, "[REDACTED]");
+    for secret in secrets.iter() {
+        message = message.replace(secret.as_str(), "[REDACTED]");
     }
     TransportError::Message(message)
 }

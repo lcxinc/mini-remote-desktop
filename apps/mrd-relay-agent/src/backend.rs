@@ -172,7 +172,9 @@ pub struct SecretCommitRequest {
     pub identity_epoch: u64,
     pub rotation_id: String,
     pub secret_version: u64,
+    pub rotation_challenge: String,
     pub probe_evidence_sha256: String,
+    pub proof_mac: String,
     pub authentication: RequestAuthentication,
 }
 
@@ -285,6 +287,7 @@ pub struct DesiredNodeState {
     pub secret_version: u64,
     pub not_before_unix_seconds: Option<i64>,
     pub old_credential_deadline_unix_seconds: Option<i64>,
+    pub rotation_challenge: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -311,6 +314,7 @@ impl NodeDirective {
                 secret_version: version,
                 not_before_unix_seconds: None,
                 old_credential_deadline_unix_seconds: None,
+                rotation_challenge: None,
             },
             secret_update: Some(SecretUpdate { version, secret }),
         }
@@ -330,6 +334,7 @@ impl NodeDirective {
                 secret_version: 1,
                 not_before_unix_seconds: None,
                 old_credential_deadline_unix_seconds: None,
+                rotation_challenge: None,
             },
             secret_update: None,
         }
@@ -556,14 +561,22 @@ pub(crate) fn serialize_secret_commit_body(
         identity_epoch: u64,
         rotation_id: &'a str,
         secret_version: u64,
+        rotation_challenge: &'a str,
         probe_evidence_sha256: &'a str,
+        proof_mac: &'a str,
     }
     if request.identity_epoch == 0
         || request.secret_version < 2
         || !is_urlsafe_identifier(&request.rotation_id)
+        || !is_canonical_base64url(&request.rotation_challenge, 32)
         || request.probe_evidence_sha256.len() != 64
         || !request
             .probe_evidence_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || request.proof_mac.len() != 64
+        || !request
+            .proof_mac
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
@@ -573,9 +586,53 @@ pub(crate) fn serialize_secret_commit_body(
         identity_epoch: request.identity_epoch,
         rotation_id: &request.rotation_id,
         secret_version: request.secret_version,
+        rotation_challenge: &request.rotation_challenge,
         probe_evidence_sha256: &request.probe_evidence_sha256,
+        proof_mac: &request.proof_mac,
     })
     .map_err(|_| BackendError::ProtocolInvalid)
+}
+
+const ROTATION_PROOF_CONTEXT: &[u8] = b"MRD_RELAY_ROTATION_PROOF_V1\0";
+
+pub fn rotation_proof_message(
+    node_id: &str,
+    identity_epoch: u64,
+    rotation_id: &str,
+    secret_version: u64,
+    rotation_challenge: &str,
+    pending_secret_digest: &[u8; 32],
+    probe_evidence_sha256: &[u8; 32],
+) -> Result<Vec<u8>, BackendError> {
+    if identity_epoch == 0
+        || secret_version < 2
+        || !is_urlsafe_identifier(node_id)
+        || !is_urlsafe_identifier(rotation_id)
+        || !is_canonical_base64url(rotation_challenge, 32)
+    {
+        return Err(BackendError::ProtocolInvalid);
+    }
+    let identity_epoch = identity_epoch.to_string();
+    let secret_version = secret_version.to_string();
+    let fields: [&[u8]; 7] = [
+        node_id.as_bytes(),
+        identity_epoch.as_bytes(),
+        rotation_id.as_bytes(),
+        secret_version.as_bytes(),
+        rotation_challenge.as_bytes(),
+        pending_secret_digest,
+        probe_evidence_sha256,
+    ];
+    let mut output = Vec::with_capacity(
+        ROTATION_PROOF_CONTEXT.len() + fields.iter().map(|field| 4 + field.len()).sum::<usize>(),
+    );
+    output.extend_from_slice(ROTATION_PROOF_CONTEXT);
+    for field in fields {
+        let length = u32::try_from(field.len()).map_err(|_| BackendError::ProtocolInvalid)?;
+        output.extend_from_slice(&length.to_be_bytes());
+        output.extend_from_slice(field);
+    }
+    Ok(output)
 }
 
 pub struct ReqwestRelayBackend {
@@ -734,6 +791,7 @@ struct DesiredStateResponse {
     secret_version: u64,
     not_before: Option<String>,
     old_credential_deadline: Option<String>,
+    rotation_challenge: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -820,6 +878,12 @@ pub fn decode_heartbeat_response(
         )
         || body.desired.secret_version == 0
         || (body.desired.not_before.is_some() != body.desired.old_credential_deadline.is_some())
+        || (body.desired.rotation_challenge.is_some() != body.desired.not_before.is_some())
+        || body
+            .desired
+            .rotation_challenge
+            .as_deref()
+            .is_some_and(|value| !is_canonical_base64url(value, 32))
         || parse_rfc3339_unix_seconds(&body.lease_expires_at)? <= 0
     {
         return Err(BackendError::ProtocolInvalid);
@@ -859,6 +923,7 @@ pub fn decode_heartbeat_response(
             secret_version: body.desired.secret_version,
             not_before_unix_seconds,
             old_credential_deadline_unix_seconds,
+            rotation_challenge: body.desired.rotation_challenge,
         },
         secret_update: None,
     })
@@ -875,7 +940,7 @@ fn is_urlsafe_identifier(value: &str) -> bool {
     (8..=128).contains(&value.len())
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 async fn read_bounded_response(
@@ -938,6 +1003,7 @@ impl RelayBackendPort for ReqwestRelayBackend {
         if response.status() != StatusCode::ACCEPTED {
             return Err(BackendError::Rejected);
         }
+        require_private_no_store(&response)?;
         let body = read_bounded_response(response).await?;
         decode_enrollment_response(&body, &expected_node_id)
     }
@@ -964,6 +1030,7 @@ impl RelayBackendPort for ReqwestRelayBackend {
         if !response.status().is_success() {
             return Err(BackendError::Rejected);
         }
+        require_private_no_store(&response)?;
         let body = read_bounded_response(response).await?;
         decode_pickup_response(&body, &expected_enrollment_id, &expected_node_id)
     }
@@ -991,6 +1058,7 @@ impl RelayBackendPort for ReqwestRelayBackend {
         if !response.status().is_success() {
             return Err(BackendError::Rejected);
         }
+        require_private_no_store(&response)?;
         let body = read_bounded_response(response).await?;
         let body: RenewalResponse = decode_json(&body)?;
         if body.node_id != expected_node_id
@@ -1060,9 +1128,10 @@ impl RelayBackendPort for ReqwestRelayBackend {
             .send()
             .await
             .map_err(|_| BackendError::Unavailable)?;
-        if response.status() != StatusCode::ACCEPTED || !response_has_no_store(&response) {
+        if response.status() != StatusCode::ACCEPTED {
             return Err(BackendError::Rejected);
         }
+        require_private_no_store(&response)?;
         let body = read_bounded_response(response).await?;
         let body: SecretUploadResponse = decode_json(&body)?;
         if body.node_id != request.node_id
@@ -1093,9 +1162,10 @@ impl RelayBackendPort for ReqwestRelayBackend {
             .send()
             .await
             .map_err(|_| BackendError::Unavailable)?;
-        if !response.status().is_success() || !response_has_no_store(&response) {
+        if !response.status().is_success() {
             return Err(BackendError::Rejected);
         }
+        require_private_no_store(&response)?;
         let body = read_bounded_response(response).await?;
         let body: SecretCommitResponse = decode_json(&body)?;
         if body.node_id != request.node_id
@@ -1110,16 +1180,33 @@ impl RelayBackendPort for ReqwestRelayBackend {
     }
 }
 
-fn response_has_no_store(response: &reqwest::Response) -> bool {
-    response
-        .headers()
-        .get(reqwest::header::CACHE_CONTROL)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(',')
-                .any(|directive| directive.trim().eq_ignore_ascii_case("no-store"))
-        })
+fn require_private_no_store(response: &reqwest::Response) -> Result<(), BackendError> {
+    if headers_are_private_no_store(response.headers()) {
+        Ok(())
+    } else {
+        Err(BackendError::ProtocolInvalid)
+    }
+}
+
+fn headers_are_private_no_store(headers: &reqwest::header::HeaderMap) -> bool {
+    let cache_control = headers
+        .get_all(reqwest::header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','));
+    let mut no_store = false;
+    let mut private = false;
+    for directive in cache_control {
+        no_store |= directive.trim().eq_ignore_ascii_case("no-store");
+        private |= directive.trim().eq_ignore_ascii_case("private");
+    }
+    let pragma_no_cache = headers
+        .get_all(reqwest::header::PRAGMA)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|directive| directive.trim().eq_ignore_ascii_case("no-cache"));
+    no_store && private && pragma_no_cache
 }
 
 fn certificate_from_wire(
@@ -1145,4 +1232,31 @@ fn parse_rfc3339_unix_seconds(value: &str) -> Result<i64, BackendError> {
     time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
         .map(|value| value.unix_timestamp())
         .map_err(|_| BackendError::ProtocolInvalid)
+}
+
+#[cfg(test)]
+mod response_security_tests {
+    use super::headers_are_private_no_store;
+    use reqwest::header::{HeaderMap, HeaderValue, CACHE_CONTROL, PRAGMA};
+
+    #[test]
+    fn sensitive_responses_require_private_no_store_and_pragma_no_cache() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+        headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
+        assert!(headers_are_private_no_store(&headers));
+
+        for missing in [CACHE_CONTROL, PRAGMA] {
+            let mut stripped = headers.clone();
+            stripped.remove(missing);
+            assert!(!headers_are_private_no_store(&stripped));
+        }
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        assert!(!headers_are_private_no_store(&headers));
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("private"));
+        assert!(!headers_are_private_no_store(&headers));
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+        headers.insert(PRAGMA, HeaderValue::from_static("cache"));
+        assert!(!headers_are_private_no_store(&headers));
+    }
 }

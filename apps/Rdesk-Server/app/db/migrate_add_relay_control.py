@@ -71,6 +71,25 @@ def _v8_constraints_sql(nodes: str) -> str:
             "pending_rotation_id IS NOT NULL AND "
             "pending_secret_uploaded_at IS NOT NULL)",
         ),
+        (
+            "ck_relay_nodes_rotation_challenge",
+            "(desired_secret_version = active_secret_version AND "
+            "rotation_challenge IS NULL) OR "
+            "(desired_secret_version > active_secret_version AND "
+            "rotation_challenge IS NOT NULL AND length(rotation_challenge) = 43)",
+        ),
+        (
+            "ck_relay_nodes_rotation_committed_proof",
+            "(committed_rotation_id IS NULL AND committed_identity_epoch IS NULL AND "
+            "committed_rotation_challenge IS NULL AND "
+            "committed_probe_evidence_sha256 IS NULL AND committed_proof_mac IS NULL) OR "
+            "(committed_rotation_id IS NOT NULL AND committed_identity_epoch >= 1 AND "
+            "committed_rotation_challenge IS NOT NULL AND "
+            "length(committed_rotation_challenge) = 43 AND "
+            "committed_probe_evidence_sha256 IS NOT NULL AND "
+            "length(committed_probe_evidence_sha256) = 32 AND "
+            "committed_proof_mac IS NOT NULL AND length(committed_proof_mac) = 32)",
+        ),
     )
     statements = "\n".join(
         "BEGIN "
@@ -185,7 +204,12 @@ async def _migrate_connection(
                         ADD COLUMN pending_secret_digest BYTEA,
                         ADD COLUMN pending_rotation_id VARCHAR(128),
                         ADD COLUMN pending_secret_uploaded_at TIMESTAMPTZ,
-                        ADD COLUMN committed_rotation_id VARCHAR(128)
+                        ADD COLUMN rotation_challenge VARCHAR(43),
+                        ADD COLUMN committed_rotation_id VARCHAR(128),
+                        ADD COLUMN committed_identity_epoch BIGINT,
+                        ADD COLUMN committed_rotation_challenge VARCHAR(43),
+                        ADD COLUMN committed_probe_evidence_sha256 BYTEA,
+                        ADD COLUMN committed_proof_mac BYTEA
                     """
                 )
             )
@@ -247,7 +271,12 @@ async def _migrate_connection(
             pending_secret_digest BYTEA,
             pending_rotation_id VARCHAR(128),
             pending_secret_uploaded_at TIMESTAMPTZ,
+            rotation_challenge VARCHAR(43),
             committed_rotation_id VARCHAR(128),
+            committed_identity_epoch BIGINT,
+            committed_rotation_challenge VARCHAR(43),
+            committed_probe_evidence_sha256 BYTEA,
+            committed_proof_mac BYTEA,
             heartbeat_sequence BIGINT NOT NULL DEFAULT 0,
             healthy_heartbeat_streak INTEGER NOT NULL DEFAULT 0,
             measured_rtt_ms BIGINT,
@@ -297,6 +326,28 @@ async def _migrate_connection(
                  length(pending_secret_digest) = 32 AND
                  pending_rotation_id IS NOT NULL AND
                  pending_secret_uploaded_at IS NOT NULL)
+            ),
+            CONSTRAINT ck_relay_nodes_rotation_challenge CHECK (
+                (desired_secret_version = active_secret_version AND
+                 rotation_challenge IS NULL) OR
+                (desired_secret_version > active_secret_version AND
+                 rotation_challenge IS NOT NULL AND
+                 length(rotation_challenge) = 43)
+            ),
+            CONSTRAINT ck_relay_nodes_rotation_committed_proof CHECK (
+                (committed_rotation_id IS NULL AND
+                 committed_identity_epoch IS NULL AND
+                 committed_rotation_challenge IS NULL AND
+                 committed_probe_evidence_sha256 IS NULL AND
+                 committed_proof_mac IS NULL) OR
+                (committed_rotation_id IS NOT NULL AND
+                 committed_identity_epoch >= 1 AND
+                 committed_rotation_challenge IS NOT NULL AND
+                 length(committed_rotation_challenge) = 43 AND
+                 committed_probe_evidence_sha256 IS NOT NULL AND
+                 length(committed_probe_evidence_sha256) = 32 AND
+                 committed_proof_mac IS NOT NULL AND
+                 length(committed_proof_mac) = 32)
             ),
             CONSTRAINT ck_relay_nodes_heartbeat_sequence CHECK (heartbeat_sequence >= 0),
             CONSTRAINT ck_relay_nodes_healthy_heartbeat_streak CHECK (
@@ -470,7 +521,12 @@ async def _migrate_connection(
         f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS pending_secret_digest BYTEA",
         f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS pending_rotation_id VARCHAR(128)",
         f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS pending_secret_uploaded_at TIMESTAMPTZ",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS rotation_challenge VARCHAR(43)",
         f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS committed_rotation_id VARCHAR(128)",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS committed_identity_epoch BIGINT",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS committed_rotation_challenge VARCHAR(43)",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS committed_probe_evidence_sha256 BYTEA",
+        f"ALTER TABLE {nodes} ADD COLUMN IF NOT EXISTS committed_proof_mac BYTEA",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS receipt_digest VARCHAR(64)",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS request_digest VARCHAR(64)",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS receipt_expires_at TIMESTAMPTZ",
@@ -741,7 +797,12 @@ def _preflight_existing_schema(sync_connection: object, schema: str | None) -> N
                 "pending_secret_digest",
                 "pending_rotation_id",
                 "pending_secret_uploaded_at",
+                "rotation_challenge",
                 "committed_rotation_id",
+                "committed_identity_epoch",
+                "committed_rotation_challenge",
+                "committed_probe_evidence_sha256",
+                "committed_proof_mac",
             },
         }.get(table_name, set())
         allowed = (
@@ -1065,7 +1126,12 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             "pending_secret_digest": (LargeBinary, None, True),
             "pending_rotation_id": (String, 128, True),
             "pending_secret_uploaded_at": (DateTime, None, True),
+            "rotation_challenge": (String, 43, True),
             "committed_rotation_id": (String, 128, True),
+            "committed_identity_epoch": (BigInteger, None, True),
+            "committed_rotation_challenge": (String, 43, True),
+            "committed_probe_evidence_sha256": (LargeBinary, None, True),
+            "committed_proof_mac": (LargeBinary, None, True),
             "heartbeat_sequence": (BigInteger, None, False),
             "healthy_heartbeat_streak": (Integer, None, False),
             "measured_rtt_ms": (BigInteger, None, True),
@@ -1253,6 +1319,23 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
                 "length(pending_secret_digest) = 32 AND "
                 "pending_rotation_id IS NOT NULL AND "
                 "pending_secret_uploaded_at IS NOT NULL"
+            ),
+            "ck_relay_nodes_rotation_challenge": (
+                "desired_secret_version = active_secret_version AND "
+                "rotation_challenge IS NULL OR "
+                "desired_secret_version > active_secret_version AND "
+                "rotation_challenge IS NOT NULL AND length(rotation_challenge) = 43"
+            ),
+            "ck_relay_nodes_rotation_committed_proof": (
+                "committed_rotation_id IS NULL AND committed_identity_epoch IS NULL AND "
+                "committed_rotation_challenge IS NULL AND "
+                "committed_probe_evidence_sha256 IS NULL AND committed_proof_mac IS NULL OR "
+                "committed_rotation_id IS NOT NULL AND committed_identity_epoch >= 1 AND "
+                "committed_rotation_challenge IS NOT NULL AND "
+                "length(committed_rotation_challenge) = 43 AND "
+                "committed_probe_evidence_sha256 IS NOT NULL AND "
+                "length(committed_probe_evidence_sha256) = 32 AND "
+                "committed_proof_mac IS NOT NULL AND length(committed_proof_mac) = 32"
             ),
             "ck_relay_nodes_heartbeat_sequence": "heartbeat_sequence >= 0",
             "ck_relay_nodes_healthy_heartbeat_streak": (

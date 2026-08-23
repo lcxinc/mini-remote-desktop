@@ -565,6 +565,7 @@ async def record_relay_heartbeat(
             "secret_version": node.desired_secret_version,
             "not_before": node.secret_not_before,
             "old_credential_deadline": node.old_credential_deadline,
+            "rotation_challenge": node.rotation_challenge,
         },
         lease_expires_at=node.lease_expires_at,
     )
@@ -655,6 +656,7 @@ async def rotate_relay_secret(
         draining=True,
         not_before=node.secret_not_before,
         old_credential_deadline=node.old_credential_deadline,
+        rotation_challenge=node.rotation_challenge,
     )
 
 
@@ -712,7 +714,9 @@ async def commit_relay_secret(
             identity_epoch=payload.identity_epoch,
             rotation_id=payload.rotation_id,
             secret_version=payload.secret_version,
+            rotation_challenge=payload.rotation_challenge,
             probe_evidence_sha256=payload.probe_evidence_sha256,
+            proof_mac=payload.proof_mac,
             now=_now(),
         )
         await _commit(db)

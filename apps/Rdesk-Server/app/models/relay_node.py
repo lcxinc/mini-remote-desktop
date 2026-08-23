@@ -72,6 +72,25 @@ class RelayNode(Base):
             name="ck_relay_nodes_rotation_pending",
         ),
         CheckConstraint(
+            "(desired_secret_version = active_secret_version AND "
+            "rotation_challenge IS NULL) OR "
+            "(desired_secret_version > active_secret_version AND "
+            "rotation_challenge IS NOT NULL AND length(rotation_challenge) = 43)",
+            name="ck_relay_nodes_rotation_challenge",
+        ),
+        CheckConstraint(
+            "(committed_rotation_id IS NULL AND committed_identity_epoch IS NULL AND "
+            "committed_rotation_challenge IS NULL AND "
+            "committed_probe_evidence_sha256 IS NULL AND committed_proof_mac IS NULL) OR "
+            "(committed_rotation_id IS NOT NULL AND committed_identity_epoch >= 1 AND "
+            "committed_rotation_challenge IS NOT NULL AND "
+            "length(committed_rotation_challenge) = 43 AND "
+            "committed_probe_evidence_sha256 IS NOT NULL AND "
+            "length(committed_probe_evidence_sha256) = 32 AND "
+            "committed_proof_mac IS NOT NULL AND length(committed_proof_mac) = 32)",
+            name="ck_relay_nodes_rotation_committed_proof",
+        ),
+        CheckConstraint(
             "heartbeat_sequence >= 0", name="ck_relay_nodes_heartbeat_sequence"
         ),
         CheckConstraint(
@@ -179,7 +198,16 @@ class RelayNode(Base):
     pending_secret_uploaded_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    rotation_challenge: Mapped[str | None] = mapped_column(String(43), nullable=True)
     committed_rotation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    committed_identity_epoch: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    committed_rotation_challenge: Mapped[str | None] = mapped_column(
+        String(43), nullable=True
+    )
+    committed_probe_evidence_sha256: Mapped[bytes | None] = mapped_column(
+        LargeBinary, nullable=True
+    )
+    committed_proof_mac: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     heartbeat_sequence: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=0, server_default=text("0")
     )

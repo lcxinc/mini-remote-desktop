@@ -31,6 +31,7 @@ from app.services.relay_node_auth import (
 from app.services.relay_repository import (
     RelayRepositoryError,
     RelaySecretCipher,
+    RelaySecretCipherError,
     _validate_endpoints,
     _turn_secret_has_minimum_quality,
 )
@@ -40,11 +41,57 @@ _ENROLLMENT_CONTEXT = b"MRD_RELAY_ENROLLMENT_V1\x00"
 _RECEIPT_CONTEXT = b"MRD_RELAY_RECEIPT_V1\x00"
 _RECEIPT_DERIVE_CONTEXT = b"MRD_RELAY_RECEIPT_DERIVE_V1\x00"
 _ENROLLMENT_REQUEST_CONTEXT = b"MRD_RELAY_ENROLLMENT_REQUEST_V1\x00"
+_ROTATION_PROOF_CONTEXT = b"MRD_RELAY_ROTATION_PROOF_V1\x00"
 _TOPOLOGY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _NODE_IDENTITY_LOCK_CONTEXT = b"MRD_RELAY_NODE_IDENTITY_LOCK_V1\x00"
 _LOCAL_NODE_LOCKS = tuple(threading.Lock() for _ in range(256))
 _LOCAL_NODE_LOCKS_INFO = "relay_registry_local_node_locks"
 _LOCAL_NODE_LOCK_LISTENER_INFO = "relay_registry_local_node_lock_listener"
+
+
+def rotation_proof_message(
+    *,
+    node_id: str,
+    identity_epoch: int,
+    rotation_id: str,
+    secret_version: int,
+    rotation_challenge: str,
+    pending_secret_digest: bytes,
+    probe_evidence_sha256: bytes,
+) -> bytes:
+    if (
+        _TOPOLOGY_ID.fullmatch(node_id) is None
+        or not 1 <= identity_epoch <= 2**63 - 1
+        or _TOPOLOGY_ID.fullmatch(rotation_id) is None
+        or not 2 <= secret_version <= 2**63 - 1
+        or len(rotation_challenge) != 43
+        or re.fullmatch(r"[A-Za-z0-9_-]{43}", rotation_challenge) is None
+        or len(pending_secret_digest) != 32
+        or len(probe_evidence_sha256) != 32
+    ):
+        raise ValueError("relay rotation proof fields are invalid")
+    try:
+        decoded_challenge = base64.urlsafe_b64decode(rotation_challenge + "=")
+    except (ValueError, binascii.Error):
+        raise ValueError("relay rotation proof fields are invalid") from None
+    if (
+        len(decoded_challenge) != 32
+        or base64.urlsafe_b64encode(decoded_challenge).rstrip(b"=").decode("ascii")
+        != rotation_challenge
+    ):
+        raise ValueError("relay rotation proof fields are invalid")
+    fields = (
+        node_id.encode("ascii"),
+        str(identity_epoch).encode("ascii"),
+        rotation_id.encode("ascii"),
+        str(secret_version).encode("ascii"),
+        rotation_challenge.encode("ascii"),
+        pending_secret_digest,
+        probe_evidence_sha256,
+    )
+    return _ROTATION_PROOF_CONTEXT + b"".join(
+        len(field).to_bytes(4, "big") + field for field in fields
+    )
 
 
 class RelayRegistryError(Exception):
@@ -664,6 +711,12 @@ class RelayRegistry:
         node.pending_secret_digest = None
         node.pending_rotation_id = None
         node.pending_secret_uploaded_at = None
+        node.rotation_challenge = None
+        node.committed_rotation_id = None
+        node.committed_identity_epoch = None
+        node.committed_rotation_challenge = None
+        node.committed_probe_evidence_sha256 = None
+        node.committed_proof_mac = None
         node.healthy_heartbeat_streak = 0
         node.state = "unavailable"
         node.lease_expires_at = None
@@ -868,6 +921,12 @@ class RelayRegistry:
             node.pending_secret_digest = None
             node.pending_rotation_id = None
             node.pending_secret_uploaded_at = None
+            node.rotation_challenge = secrets.token_urlsafe(32)
+            node.committed_rotation_id = None
+            node.committed_identity_epoch = None
+            node.committed_rotation_challenge = None
+            node.committed_probe_evidence_sha256 = None
+            node.committed_proof_mac = None
             node.state = "draining"
             node.lease_expires_at = now
             node.healthy_heartbeat_streak = 0
@@ -913,6 +972,7 @@ class RelayRegistry:
                 or node.state != "draining"
                 or secret_version != node.desired_secret_version
                 or secret_version <= node.active_secret_version
+                or node.rotation_challenge is None
             ):
                 self._error("relay_secret_rotation_invalid", 409, "relay secret rotation invalid")
             if node.pending_secret_version is not None:
@@ -953,13 +1013,22 @@ class RelayRegistry:
         identity_epoch: int,
         rotation_id: str,
         secret_version: int,
+        rotation_challenge: str,
         probe_evidence_sha256: str,
+        proof_mac: str,
         now: datetime,
     ) -> RelayNode:
         if identity.is_previous:
             self._error("relay_identity_epoch_invalid", 409, "relay identity epoch invalid")
         if re.fullmatch(r"[0-9a-f]{64}", probe_evidence_sha256) is None:
             self._error("relay_probe_invalid", 400, "relay allocation probe invalid")
+        if re.fullmatch(r"[0-9a-f]{64}", proof_mac) is None:
+            self._error("relay_rotation_proof_invalid", 400, "relay rotation proof invalid")
+        try:
+            evidence = bytes.fromhex(probe_evidence_sha256)
+            supplied_proof = bytes.fromhex(proof_mac)
+        except ValueError:
+            self._error("relay_rotation_proof_invalid", 400, "relay rotation proof invalid")
         async with self._node_identity_lock(identity.node_id):
             node = await self._session.get(RelayNode, identity.node_id)
             if node is None or node.certificate_fingerprint != identity.certificate_fingerprint:
@@ -977,6 +1046,12 @@ class RelayRegistry:
                 node.active_secret_version == secret_version
                 and node.applied_secret_version == secret_version
                 and node.committed_rotation_id == rotation_id
+                and node.committed_identity_epoch == identity_epoch
+                and node.committed_rotation_challenge == rotation_challenge
+                and node.committed_probe_evidence_sha256 is not None
+                and hmac.compare_digest(node.committed_probe_evidence_sha256, evidence)
+                and node.committed_proof_mac is not None
+                and hmac.compare_digest(node.committed_proof_mac, supplied_proof)
                 and node.pending_secret_version is None
                 and node.pending_encrypted_turn_secret is None
             ):
@@ -998,9 +1073,76 @@ class RelayRegistry:
                 or node.pending_secret_version != secret_version
                 or node.pending_rotation_id != rotation_id
                 or node.pending_encrypted_turn_secret is None
+                or node.pending_secret_digest is None
                 or secret_version != node.desired_secret_version
+                or node.rotation_challenge != rotation_challenge
             ):
                 self._error("relay_secret_rotation_unsafe", 409, "relay secret rotation unsafe")
+            cipher = self._turn_secret_cipher
+            if cipher is None:
+                self._error("relay_access_unavailable", 503, "relay access unavailable")
+            try:
+                canonical_secret = cipher.decrypt_mutable(
+                    bytes(node.pending_encrypted_turn_secret),
+                    associated_data=identity.node_id.encode("utf-8"),
+                )
+            except RelaySecretCipherError:
+                self._error("relay_rotation_proof_invalid", 409, "relay rotation proof invalid")
+            try:
+                padded_secret = bytearray(canonical_secret)
+                padded_secret.extend(b"=")
+                try:
+                    decoded_secret = bytearray(base64.urlsafe_b64decode(padded_secret))
+                except (ValueError, binascii.Error):
+                    self._error(
+                        "relay_rotation_proof_invalid", 409, "relay rotation proof invalid"
+                    )
+                finally:
+                    for index in range(len(padded_secret)):
+                        padded_secret[index] = 0
+                try:
+                    pending_digest = hashlib.sha256(decoded_secret).digest()
+                    canonical_encoding = base64.urlsafe_b64encode(decoded_secret).rstrip(b"=")
+                    if (
+                        len(decoded_secret) != 32
+                        or not hmac.compare_digest(canonical_encoding, canonical_secret)
+                    ):
+                        self._error(
+                            "relay_rotation_proof_invalid",
+                            409,
+                            "relay rotation proof invalid",
+                        )
+                finally:
+                    for index in range(len(decoded_secret)):
+                        decoded_secret[index] = 0
+                if not hmac.compare_digest(pending_digest, node.pending_secret_digest):
+                    self._error(
+                        "relay_rotation_proof_invalid", 409, "relay rotation proof invalid"
+                    )
+                try:
+                    proof_message = rotation_proof_message(
+                        node_id=identity.node_id,
+                        identity_epoch=identity_epoch,
+                        rotation_id=rotation_id,
+                        secret_version=secret_version,
+                        rotation_challenge=rotation_challenge,
+                        pending_secret_digest=pending_digest,
+                        probe_evidence_sha256=evidence,
+                    )
+                except ValueError:
+                    self._error(
+                        "relay_rotation_proof_invalid", 409, "relay rotation proof invalid"
+                    )
+                expected_proof = hmac.new(
+                    canonical_secret, proof_message, hashlib.sha256
+                ).digest()
+                if not hmac.compare_digest(expected_proof, supplied_proof):
+                    self._error(
+                        "relay_rotation_proof_invalid", 409, "relay rotation proof invalid"
+                    )
+            finally:
+                for index in range(len(canonical_secret)):
+                    canonical_secret[index] = 0
             node.encrypted_turn_secret = bytes(node.pending_encrypted_turn_secret)
             node.active_secret_version = secret_version
             node.applied_secret_version = secret_version
@@ -1010,6 +1152,11 @@ class RelayRegistry:
             node.pending_rotation_id = None
             node.pending_secret_uploaded_at = None
             node.committed_rotation_id = rotation_id
+            node.committed_identity_epoch = identity_epoch
+            node.committed_rotation_challenge = rotation_challenge
+            node.committed_probe_evidence_sha256 = evidence
+            node.committed_proof_mac = supplied_proof
+            node.rotation_challenge = None
             node.desired_draining = False
             node.secret_not_before = None
             node.old_credential_deadline = None

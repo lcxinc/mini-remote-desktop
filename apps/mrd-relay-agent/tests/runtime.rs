@@ -10,11 +10,11 @@ use async_trait::async_trait;
 use mrd_relay_agent::{
     backend::{
         canonical_relay_request, decode_enrollment_response, decode_heartbeat_response,
-        decode_pickup_response, BackendError, DesiredNodeState, EnrollmentRequest,
-        EnrollmentStatus, HeartbeatPayload, NodeCertificate, NodeDirective, PickupRequest,
-        RelayBackendClientFactoryPort, RelayBackendPort, RelayHealth, RelayNodeState,
-        RenewalRequest, ReqwestRelayBackend, SecretCommitRequest, SecretUploadRequest,
-        SignedHeartbeat, SwappableRelayBackend,
+        decode_pickup_response, rotation_proof_message, BackendError, DesiredNodeState,
+        EnrollmentRequest, EnrollmentStatus, HeartbeatPayload, NodeCertificate, NodeDirective,
+        PickupRequest, RelayBackendClientFactoryPort, RelayBackendPort, RelayHealth,
+        RelayNodeState, RenewalRequest, ReqwestRelayBackend, SecretCommitRequest,
+        SecretUploadRequest, SignedHeartbeat, SwappableRelayBackend,
     },
     config::{AgentConfig, ConfigError},
     identity::{load_or_create_identity, CertificateState, IdentityFsPort, StoredIdentity},
@@ -27,9 +27,10 @@ use mrd_relay_agent::{
         ProcessError, ProcessHealth, SecretBytes, WebRtcLocalAllocationProbe,
     },
     runtime::{
-        backend_worker_once, run_agent, AgentRuntime, ClockPort, HeartbeatSampler,
-        HostPressureSnapshot, IdentityLifecycle, IdentityMaintenance, JitterPort, RandomJitter,
-        RuntimeError, RuntimeStateSnapshot, RuntimeStateStorePort, SecretRotationPhase,
+        backend_worker_once, run_agent, AgentRuntime, ClockPort, CoturnSupervisor,
+        HeartbeatSampler, HostPressureSnapshot, IdentityLifecycle, IdentityMaintenance, JitterPort,
+        PortableRelayAgentConfig, PortableRelayAgentDeps, RandomJitter, RuntimeError,
+        RuntimeStateSnapshot, RuntimeStateStorePort, SecretRotationPhase, SharedRelayHealth,
         SleeperPort, StdRuntimeStateStore, SystemClock,
     },
 };
@@ -281,6 +282,18 @@ struct FakeBackendFactory {
     replacement: Arc<FakeBackend>,
 }
 
+struct StaticBackendFactory(Arc<dyn RelayBackendPort>);
+
+impl RelayBackendClientFactoryPort for StaticBackendFactory {
+    fn build_mtls(
+        &self,
+        _certificate: &NodeCertificate,
+        _private_pkcs8: &[u8],
+    ) -> Result<Arc<dyn RelayBackendPort>, BackendError> {
+        Ok(self.0.clone())
+    }
+}
+
 impl FakeBackendFactory {
     fn new(failures: u32, replacement: Arc<FakeBackend>) -> Self {
         Self {
@@ -437,6 +450,21 @@ impl SleeperPort for FakeSleeper {
     }
 }
 
+struct AdvancingSleeper {
+    clock: Arc<FakeClock>,
+    sleeps: Mutex<Vec<Duration>>,
+}
+
+#[async_trait]
+impl SleeperPort for AdvancingSleeper {
+    async fn sleep(&self, duration: Duration) {
+        self.sleeps.lock().unwrap().push(duration);
+        let delta = u64::try_from(duration.as_millis()).unwrap();
+        let mut monotonic = self.clock.monotonic_ms.lock().unwrap();
+        *monotonic = monotonic.saturating_add(delta);
+    }
+}
+
 struct FixedJitter(u64);
 
 impl JitterPort for FixedJitter {
@@ -499,6 +527,7 @@ fn enrollment_request() -> EnrollmentRequest {
 }
 
 const CERT_NOW_UNIX_SECONDS: i64 = 1_800_000_000;
+const ROTATION_CHALLENGE: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI";
 
 #[derive(Clone, Copy)]
 enum LeafProfile {
@@ -1333,7 +1362,6 @@ async fn heartbeat_sampler_uses_process_boot_identity_unique_nonce_metrics_and_p
             current_egress_bps: 22_000,
             errors_total: 3,
         })),
-        Arc::new(NonEvidenceProbe),
         vec!["turn:relay.example:3478?transport=udp".into()],
         100,
         1_000_000,
@@ -1351,6 +1379,7 @@ async fn heartbeat_sampler_uses_process_boot_identity_unique_nonce_metrics_and_p
             7,
             ProcessHealth::Failed,
             ProcessHealth::Degraded,
+            RelayHealth::NonEvidence,
             pressure,
             4,
         )
@@ -1361,6 +1390,7 @@ async fn heartbeat_sampler_uses_process_boot_identity_unique_nonce_metrics_and_p
             7,
             ProcessHealth::Failed,
             ProcessHealth::Degraded,
+            RelayHealth::NonEvidence,
             pressure,
             4,
         )
@@ -1379,7 +1409,6 @@ async fn heartbeat_sampler_uses_process_boot_identity_unique_nonce_metrics_and_p
 
     let new_process = HeartbeatSampler::new(
         Arc::new(FakeMetrics(CoturnMetrics::default())),
-        Arc::new(NonEvidenceProbe),
         vec!["turn:relay.example:3478?transport=udp".into()],
         100,
         1_000_000,
@@ -1390,6 +1419,7 @@ async fn heartbeat_sampler_uses_process_boot_identity_unique_nonce_metrics_and_p
             7,
             ProcessHealth::Healthy,
             ProcessHealth::Healthy,
+            RelayHealth::NonEvidence,
             HostPressureSnapshot::default(),
             4,
         )
@@ -1437,7 +1467,6 @@ async fn heartbeat_cycle_connects_identity_metrics_probe_and_backend_directive()
             current_egress_bps: 4_000,
             errors_total: 5,
         })),
-        Arc::new(NonEvidenceProbe),
         vec!["turn:relay.example:3478?transport=udp".into()],
         100,
         1_000_000,
@@ -1449,6 +1478,7 @@ async fn heartbeat_cycle_connects_identity_metrics_probe_and_backend_directive()
             &sampler,
             ProcessHealth::Failed,
             ProcessHealth::Healthy,
+            RelayHealth::NonEvidence,
             HostPressureSnapshot::default(),
         )
         .await
@@ -1509,7 +1539,6 @@ async fn backend_worker_automatically_enrolls_picks_up_installs_and_renews_ident
     .unwrap();
     let sampler = HeartbeatSampler::new(
         Arc::new(FakeMetrics(CoturnMetrics::default())),
-        Arc::new(NonEvidenceProbe),
         vec!["turn:relay.example:3478?transport=udp".into()],
         100,
         1_000_000,
@@ -1527,6 +1556,7 @@ async fn backend_worker_automatically_enrolls_picks_up_installs_and_renews_ident
         &sampler,
         ProcessHealth::Healthy,
         ProcessHealth::Healthy,
+        RelayHealth::Healthy,
         HostPressureSnapshot::default(),
     )
     .await
@@ -1563,6 +1593,7 @@ async fn backend_worker_automatically_enrolls_picks_up_installs_and_renews_ident
         &sampler,
         ProcessHealth::Healthy,
         ProcessHealth::Healthy,
+        RelayHealth::Healthy,
         HostPressureSnapshot::default(),
     )
     .await
@@ -1598,6 +1629,7 @@ async fn backend_worker_automatically_advances_persisted_secret_transaction() {
                 secret_version: 2,
                 not_before_unix_seconds: Some(CERT_NOW_UNIX_SECONDS + 10),
                 old_credential_deadline_unix_seconds: Some(CERT_NOW_UNIX_SECONDS + 60),
+                rotation_challenge: Some(ROTATION_CHALLENGE.into()),
             },
             secret_update: None,
         }));
@@ -1624,7 +1656,6 @@ async fn backend_worker_automatically_advances_persisted_secret_transaction() {
     .unwrap();
     let sampler = HeartbeatSampler::new(
         Arc::new(FakeMetrics(CoturnMetrics::default())),
-        Arc::new(NonEvidenceProbe),
         vec!["turn:relay.example:3478?transport=udp".into()],
         100,
         1_000_000,
@@ -1643,6 +1674,7 @@ async fn backend_worker_automatically_advances_persisted_secret_transaction() {
         &sampler,
         ProcessHealth::Healthy,
         ProcessHealth::Healthy,
+        RelayHealth::Healthy,
         HostPressureSnapshot::default(),
     )
     .await
@@ -1663,7 +1695,88 @@ async fn backend_worker_automatically_advances_persisted_secret_transaction() {
 }
 
 #[tokio::test]
-async fn heartbeat_once_uses_backend_directive_without_stalling_local_supervisor() {
+async fn successful_backend_cycles_follow_exact_monotonic_five_second_deadlines() {
+    let (_fs, backend, mut identity, csr) = pending_certificate_state().await;
+    backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(backend.issuer.issue(&csr, LeafProfile::Client))));
+    identity.pickup(backend.as_ref()).await.unwrap();
+    for sequence in 1..=3 {
+        backend
+            .heartbeat_results
+            .lock()
+            .unwrap()
+            .push_back(Ok(NodeDirective::state(sequence, false)));
+    }
+    let slot = Arc::new(SwappableRelayBackend::new(backend.clone()));
+    let factory = FakeBackendFactory::new(0, backend.clone());
+    let clock = Arc::new(FakeClock::default());
+    *clock.monotonic_ms.lock().unwrap() = 10_000;
+    *clock.unix_seconds.lock().unwrap() = CERT_NOW_UNIX_SECONDS;
+    let sleeper = Arc::new(AdvancingSleeper {
+        clock: clock.clone(),
+        sleeps: Mutex::default(),
+    });
+    let store = Arc::new(FakeRuntimeStateStore::default());
+    *store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([1; 32]),
+        ..RuntimeStateSnapshot::default()
+    };
+    let mut runtime = AgentRuntime::new_with_state_store(
+        slot.clone(),
+        Arc::new(FakeCoturn::default()),
+        clock.clone(),
+        sleeper.clone(),
+        Arc::new(FixedJitter(0)),
+        store,
+    )
+    .unwrap();
+    let sampler = HeartbeatSampler::new(
+        Arc::new(FakeMetrics(CoturnMetrics::default())),
+        vec!["turn:relay.example:3478?transport=udp".into()],
+        100,
+        1_000_000,
+    )
+    .unwrap();
+    let mut lifecycle = IdentityLifecycle::new(Duration::from_secs(24 * 60 * 60)).unwrap();
+    for cycle in 0..3 {
+        if cycle == 1 {
+            *clock.unix_seconds.lock().unwrap() = CERT_NOW_UNIX_SECONDS - 10_000;
+        }
+        backend_worker_once(
+            &mut lifecycle,
+            &mut identity,
+            backend.as_ref(),
+            slot.as_ref(),
+            &factory,
+            None,
+            &mut runtime,
+            &sampler,
+            ProcessHealth::Healthy,
+            ProcessHealth::Healthy,
+            RelayHealth::Healthy,
+            HostPressureSnapshot::default(),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        *sleeper.sleeps.lock().unwrap(),
+        vec![
+            Duration::ZERO,
+            Duration::from_secs(5),
+            Duration::from_secs(5)
+        ]
+    );
+    assert_eq!(*clock.monotonic_ms.lock().unwrap(), 20_000);
+}
+
+#[tokio::test]
+async fn heartbeat_once_applies_backend_directive() {
     let backend = Arc::new(FakeBackend::default());
     backend
         .heartbeat_results
@@ -1671,20 +1784,13 @@ async fn heartbeat_once_uses_backend_directive_without_stalling_local_supervisor
         .unwrap()
         .push_back(Ok(NodeDirective::state(1, true)));
     let coturn = Arc::new(FakeCoturn::default());
-    let sleeper = Arc::new(FakeSleeper::default());
-    coturn
-        .snapshots
-        .lock()
-        .unwrap()
-        .push_back(Ok(CoturnSnapshot::healthy(4, 40)));
     let mut runtime = AgentRuntime::new_volatile(
         backend.clone(),
         coturn.clone(),
         Arc::new(FakeClock::default()),
-        sleeper.clone(),
+        Arc::new(FakeSleeper::default()),
         Arc::new(FixedJitter(0)),
     );
-    runtime.supervise_coturn_once().await.unwrap();
     runtime
         .heartbeat_once(SignedHeartbeat {
             node_id: "relay-hkg-1".into(),
@@ -1697,12 +1803,20 @@ async fn heartbeat_once_uses_backend_directive_without_stalling_local_supervisor
         .await
         .unwrap();
     assert_eq!(backend.heartbeats.lock().unwrap().len(), 1);
-    assert_eq!(runtime.process_health(), ProcessHealth::Healthy);
     assert!(runtime.is_draining());
 }
 
 #[tokio::test]
 async fn run_agent_keeps_supervisor_live_while_backend_heartbeat_never_returns() {
+    let (_fs, enrollment_backend, mut identity, csr) = pending_certificate_state().await;
+    enrollment_backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(
+            enrollment_backend.issuer.issue(&csr, LeafProfile::Client),
+        )));
+    identity.pickup(enrollment_backend.as_ref()).await.unwrap();
     let backend_entered = Arc::new(tokio::sync::Semaphore::new(0));
     let supervised = Arc::new(tokio::sync::Semaphore::new(0));
     let backend = Arc::new(PendingHeartbeatBackend {
@@ -1711,24 +1825,37 @@ async fn run_agent_keeps_supervisor_live_while_backend_heartbeat_never_returns()
     let coturn = Arc::new(NotifyingCoturn {
         supervised: supervised.clone(),
     });
-    let mut heartbeat_runtime = AgentRuntime::new_volatile(
-        backend,
-        Arc::new(FakeCoturn::default()),
-        Arc::new(FakeClock::default()),
-        Arc::new(FakeSleeper::default()),
-        Arc::new(FixedJitter(0)),
-    );
-    let mut supervisor_runtime = AgentRuntime::new_volatile(
-        Arc::new(FakeBackend::default()),
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = CERT_NOW_UNIX_SECONDS;
+    let state_store = Arc::new(FakeRuntimeStateStore::default());
+    *state_store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([1; 32]),
+        ..RuntimeStateSnapshot::default()
+    };
+    let dependencies = PortableRelayAgentDeps {
+        identity,
+        enrollment_backend,
+        initial_backend: backend.clone(),
+        factory: Arc::new(StaticBackendFactory(backend)),
         coturn,
-        Arc::new(FakeClock::default()),
-        Arc::new(FakeSleeper::default()),
-        Arc::new(FixedJitter(0)),
-    );
-    let task = tokio::spawn(run_agent(
-        async move { heartbeat_runtime.heartbeat_once(dummy_heartbeat(1)).await },
-        async move { supervisor_runtime.supervise_coturn_once().await },
-    ));
+        clock,
+        sleeper: Arc::new(FakeSleeper::default()),
+        jitter: Arc::new(FixedJitter(0)),
+        state_store,
+        metrics: Arc::new(FakeMetrics(CoturnMetrics::default())),
+        probe: Arc::new(NonEvidenceProbe),
+    };
+    let config = PortableRelayAgentConfig {
+        enrollment: None,
+        endpoints: vec!["turn:relay.example:3478?transport=udp".into()],
+        max_allocations: 100,
+        max_egress_bps: 1_000_000,
+        pressure: HostPressureSnapshot::default(),
+        renewal_window: Duration::from_secs(24 * 60 * 60),
+    };
+    let task = tokio::spawn(run_agent(dependencies, config));
     tokio::time::timeout(Duration::from_secs(1), backend_entered.acquire())
         .await
         .unwrap()
@@ -1929,15 +2056,15 @@ async fn coturn_restart_is_attempted_exactly_three_times_then_stays_failed() {
                 current_egress_bps: 0,
             }));
     }
-    let mut runtime = AgentRuntime::new_volatile(
-        Arc::new(FakeBackend::default()),
+    let shared = SharedRelayHealth::default();
+    let mut supervisor = CoturnSupervisor::new(
         coturn.clone(),
-        Arc::new(FakeClock::default()),
         sleeper.clone(),
-        Arc::new(FixedJitter(0)),
+        Arc::new(NonEvidenceProbe),
+        shared.clone(),
     );
     for _ in 0..5 {
-        runtime.supervise_coturn_once().await.unwrap();
+        supervisor.supervise_once().await.unwrap();
     }
     assert_eq!(*coturn.restarts.lock().unwrap(), 3);
     assert_eq!(
@@ -1948,15 +2075,37 @@ async fn coturn_restart_is_attempted_exactly_three_times_then_stays_failed() {
             Duration::from_secs(4),
         ]
     );
-    assert_eq!(runtime.process_health(), ProcessHealth::Failed);
+    assert_eq!(supervisor.restart_attempts(), 3);
+    assert_eq!(shared.snapshot().process, ProcessHealth::Failed);
+}
 
-    coturn
-        .snapshots
-        .lock()
-        .unwrap()
-        .push_back(Ok(CoturnSnapshot::healthy(0, 0)));
-    runtime.supervise_coturn_once().await.unwrap();
-    assert_eq!(runtime.restart_attempts(), 0);
+#[tokio::test]
+async fn production_supervisor_does_not_reset_restart_budget_on_healthy_process_non_evidence() {
+    let coturn = Arc::new(FakeCoturn::default());
+    let sleeper = Arc::new(FakeSleeper::default());
+    let shared = SharedRelayHealth::default();
+    let mut supervisor = CoturnSupervisor::new(
+        coturn.clone(),
+        sleeper.clone(),
+        Arc::new(NonEvidenceProbe),
+        shared.clone(),
+    );
+    for _ in 0..5 {
+        supervisor.supervise_once().await.unwrap();
+    }
+    assert_eq!(supervisor.restart_attempts(), 3);
+    assert_eq!(*coturn.restarts.lock().unwrap(), 3);
+    assert_eq!(
+        *sleeper.sleeps.lock().unwrap(),
+        vec![
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(4),
+        ]
+    );
+    let health = shared.snapshot();
+    assert_eq!(health.process, ProcessHealth::Healthy);
+    assert_eq!(health.probe, RelayHealth::NonEvidence);
 }
 
 #[tokio::test]
@@ -1974,18 +2123,19 @@ async fn snapshot_and_restart_errors_still_stop_after_exactly_three_attempts() {
             .unwrap()
             .push_back(Err(ProcessError::Unavailable));
     }
-    let mut runtime = AgentRuntime::new_volatile(
-        Arc::new(FakeBackend::default()),
+    let shared = SharedRelayHealth::default();
+    let mut supervisor = CoturnSupervisor::new(
         coturn.clone(),
-        Arc::new(FakeClock::default()),
         Arc::new(FakeSleeper::default()),
-        Arc::new(FixedJitter(0)),
+        Arc::new(NonEvidenceProbe),
+        shared.clone(),
     );
     for _ in 0..5 {
-        runtime.supervise_coturn_once().await.unwrap();
+        supervisor.supervise_once().await.unwrap();
     }
     assert_eq!(*coturn.restarts.lock().unwrap(), 3);
-    assert_eq!(runtime.process_health(), ProcessHealth::Failed);
+    assert_eq!(supervisor.restart_attempts(), 3);
+    assert_eq!(shared.snapshot().process, ProcessHealth::Failed);
 }
 
 #[tokio::test]
@@ -1996,7 +2146,7 @@ async fn backend_backoff_is_bounded_and_does_not_stop_local_supervision() {
         .lock()
         .unwrap()
         .push_back(Ok(CoturnSnapshot::healthy(2, 30)));
-    let mut runtime = AgentRuntime::new_volatile(
+    let runtime = AgentRuntime::new_volatile(
         Arc::new(FakeBackend::default()),
         coturn.clone(),
         Arc::new(FakeClock::default()),
@@ -2004,10 +2154,20 @@ async fn backend_backoff_is_bounded_and_does_not_stop_local_supervision() {
         Arc::new(FixedJitter(17)),
     );
     for attempt in 0..20 {
-        assert!(runtime.backend_retry_delay(attempt) <= Duration::from_secs(30));
+        let delay = runtime.backend_retry_delay(attempt);
+        assert!(!delay.is_zero());
+        assert!(delay <= Duration::from_secs(30));
     }
-    runtime.supervise_coturn_once().await.unwrap();
-    assert_eq!(runtime.process_health(), ProcessHealth::Healthy);
+    let shared = SharedRelayHealth::default();
+    let mut supervisor = CoturnSupervisor::new(
+        coturn,
+        Arc::new(FakeSleeper::default()),
+        Arc::new(NonEvidenceProbe),
+        shared.clone(),
+    );
+    supervisor.supervise_once().await.unwrap();
+    assert_eq!(shared.snapshot().process, ProcessHealth::Healthy);
+    assert_eq!(shared.snapshot().probe, RelayHealth::NonEvidence);
 }
 
 #[tokio::test]
@@ -2118,6 +2278,7 @@ async fn generated_secret_rotation_persists_intent_uses_monotonic_window_and_req
                 secret_version: 2,
                 not_before_unix_seconds: Some(1_010),
                 old_credential_deadline_unix_seconds: Some(1_060),
+                rotation_challenge: Some(ROTATION_CHALLENGE.into()),
             },
             secret_update: None,
         })
@@ -2269,6 +2430,7 @@ async fn pending_generated_secret_is_reused_after_upload_failure_and_restart() {
                 secret_version: 2,
                 not_before_unix_seconds: Some(2_010),
                 old_credential_deadline_unix_seconds: Some(2_060),
+                rotation_challenge: Some(ROTATION_CHALLENGE.into()),
             },
             secret_update: None,
         })
@@ -2357,8 +2519,42 @@ async fn secret_upload_and_commit_requests_match_signed_python_wire() {
         .unwrap();
 
     let commit = identity
-        .prepare_secret_commit(2_501, "rotation-0001".into(), 2, [0xab; 32])
+        .prepare_secret_commit(
+            2_501,
+            "rotation-0001".into(),
+            2,
+            ROTATION_CHALLENGE.into(),
+            [
+                0x72, 0xcd, 0x6e, 0x84, 0x22, 0xc4, 0x07, 0xfb, 0x6d, 0x09, 0x86, 0x90, 0xf1, 0x13,
+                0x0b, 0x7d, 0xed, 0x7e, 0xc2, 0xf7, 0xf5, 0xe1, 0xd3, 0x0b, 0xd9, 0xd5, 0x21, 0xf0,
+                0x15, 0x36, 0x37, 0x93,
+            ],
+            [0xab; 32],
+            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+        )
         .unwrap();
+    let proof_message = rotation_proof_message(
+        fixture["node_id"].as_str().unwrap(),
+        1,
+        "rotation-0001",
+        2,
+        ROTATION_CHALLENGE,
+        &[
+            0x72, 0xcd, 0x6e, 0x84, 0x22, 0xc4, 0x07, 0xfb, 0x6d, 0x09, 0x86, 0x90, 0xf1, 0x13,
+            0x0b, 0x7d, 0xed, 0x7e, 0xc2, 0xf7, 0xf5, 0xe1, 0xd3, 0x0b, 0xd9, 0xd5, 0x21, 0xf0,
+            0x15, 0x36, 0x37, 0x93,
+        ],
+        &[0xab; 32],
+    )
+    .unwrap();
+    assert_eq!(
+        proof_message
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        fixture["proof_message_hex"]
+    );
+    assert_eq!(commit.proof_mac, fixture["proof_mac"]);
     assert_eq!(
         commit.authentication.sequence,
         upload.authentication.sequence + 1

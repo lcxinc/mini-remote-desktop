@@ -931,7 +931,11 @@ async def test_migration_with_only_v8_missing_executes_only_v8_step() -> None:
                     "DROP COLUMN pending_encrypted_turn_secret, "
                     "DROP COLUMN pending_secret_digest, DROP COLUMN pending_rotation_id, "
                     "DROP COLUMN pending_secret_uploaded_at, "
-                    "DROP COLUMN committed_rotation_id"
+                    "DROP COLUMN rotation_challenge, DROP COLUMN committed_rotation_id, "
+                    "DROP COLUMN committed_identity_epoch, "
+                    "DROP COLUMN committed_rotation_challenge, "
+                    "DROP COLUMN committed_probe_evidence_sha256, "
+                    "DROP COLUMN committed_proof_mac"
                 )
             )
 
@@ -1009,7 +1013,11 @@ async def test_v7_to_v8_failure_rolls_back_columns_constraints_and_ledger(
                     "DROP COLUMN pending_encrypted_turn_secret, "
                     "DROP COLUMN pending_secret_digest, DROP COLUMN pending_rotation_id, "
                     "DROP COLUMN pending_secret_uploaded_at, "
-                    "DROP COLUMN committed_rotation_id"
+                    "DROP COLUMN rotation_challenge, DROP COLUMN committed_rotation_id, "
+                    "DROP COLUMN committed_identity_epoch, "
+                    "DROP COLUMN committed_rotation_challenge, "
+                    "DROP COLUMN committed_probe_evidence_sha256, "
+                    "DROP COLUMN committed_proof_mac"
                 )
             )
 
@@ -1035,7 +1043,14 @@ async def test_v7_to_v8_failure_rolls_back_columns_constraints_and_ledger(
                     column["name"]
                     for column in inspect(sync_connection).get_columns("relay_nodes")
                 }
-                return "identity_epoch" in columns
+                return any(
+                    column in columns
+                    for column in (
+                        "identity_epoch",
+                        "rotation_challenge",
+                        "committed_proof_mac",
+                    )
+                )
 
             column_exists = await connection.run_sync(has_v8_column)
         assert version == 7

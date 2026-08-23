@@ -13,6 +13,7 @@ sha2 = "0.10"
 thiserror.workspace = true
 tokio.workspace = true
 webrtc = "0.12"
+zeroize.workspace = true
 
 [dev-dependencies]
 mrd-encode-nvenc = { path = "../mrd-encode-nvenc" }
