@@ -8,11 +8,16 @@ from app.core.security import (
     password_needs_rehash,
     verify_password,
 )
+from app.core.response_security import no_store_sensitive_response
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.auth import LoginRequest, LoginResponse, RegisterRequest
 
-router = APIRouter(prefix="/auth", tags=["auth"])
+router = APIRouter(
+    prefix="/auth",
+    tags=["auth"],
+    dependencies=[Depends(no_store_sensitive_response)],
+)
 
 
 @router.post("/register", response_model=LoginResponse)

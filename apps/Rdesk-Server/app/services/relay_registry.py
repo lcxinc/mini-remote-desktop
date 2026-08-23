@@ -32,6 +32,7 @@ from app.services.relay_repository import (
     RelayRepositoryError,
     RelaySecretCipher,
     _validate_endpoints,
+    _turn_secret_has_minimum_quality,
 )
 
 
@@ -957,7 +958,11 @@ class RelayRegistry:
             self._error("relay_enrollment_invalid", 400, "relay enrollment invalid")
         try:
             canonical = base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii")
-            if len(decoded) != 32 or not hmac.compare_digest(canonical, encoded):
+            if (
+                len(decoded) != 32
+                or not hmac.compare_digest(canonical, encoded)
+                or not _turn_secret_has_minimum_quality(decoded)
+            ):
                 self._error(
                     "relay_enrollment_invalid", 400, "relay enrollment invalid"
                 )

@@ -19,7 +19,10 @@ class Settings(BaseSettings):
     jwt_expire_minutes: int = 60
     jwt_max_lifetime_minutes: int = 60 * 24
     jwt_future_iat_skew_seconds: int = 60
+    device_jwt_audience: str = ""
+    device_jwt_expire_minutes: int = 60
     device_enrollment_token_pepper: SecretStr = SecretStr("")
+    device_serial_pepper: SecretStr = SecretStr("")
     device_enrollment_ttl_seconds: int = 300
     password_pbkdf2_iterations: int = 600_000
     bootstrap_admin_enabled: bool = False
@@ -41,6 +44,8 @@ class Settings(BaseSettings):
     relay_directory_signing_private_key: SecretStr = SecretStr("")
     relay_turn_secret_encryption_key: SecretStr = SecretStr("")
     relay_turn_secret_encryption_key_id: str = "active"
+    relay_turn_secret_encryption_read_keys: SecretStr = SecretStr("{}")
+    relay_turn_secret_encryption_legacy_key_id: str = ""
     session_grant_ttl_seconds: int = 600
     relay_policy_ttl_seconds: int = 600
     relay_policy_revision: int = 1

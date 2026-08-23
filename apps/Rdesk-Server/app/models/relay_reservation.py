@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import DateTime, ForeignKey, Index, String, UniqueConstraint
+from sqlalchemy import DateTime, ForeignKey, Index, String, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.session import Base
@@ -39,5 +39,11 @@ class RelayReservation(Base):
     )
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
+    )
+    superseded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    directory_generation: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="legacy", server_default=text("'legacy'")
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

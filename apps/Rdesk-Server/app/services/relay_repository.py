@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import hmac
 import ipaddress
@@ -13,12 +15,13 @@ from typing import Callable, Protocol
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidTag
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.relay_enrollment import RelayEnrollment
 from app.models.relay_node import RelayNode
+from app.models.relay_node_registration import RelayNodeRegistration
 from app.models.relay_reservation import RelayReservation
 
 
@@ -73,6 +76,8 @@ class RelaySecretCipher(Protocol):
     def decrypt_mutable(
         self, ciphertext: bytes, *, associated_data: bytes
     ) -> bytearray: ...
+
+    def needs_reencrypt(self, ciphertext: bytes) -> bool: ...
 
 
 class AesGcmRelaySecretCipher:
@@ -186,6 +191,34 @@ class AesGcmRelaySecretCipher:
             return bytearray(plaintext)
         finally:
             del plaintext
+
+    def needs_reencrypt(self, ciphertext: bytes) -> bool:
+        if not ciphertext:
+            raise RelaySecretCipherError(
+                "INVALID_ENVELOPE", "relay secret envelope is invalid"
+            )
+        if ciphertext[:1] == _LEGACY_CIPHERTEXT_VERSION:
+            return True
+        if ciphertext[:1] != _CIPHERTEXT_VERSION or len(ciphertext) < 3:
+            raise RelaySecretCipherError(
+                "INVALID_ENVELOPE", "relay secret envelope is invalid"
+            )
+        key_id_length = ciphertext[1]
+        if key_id_length == 0 or len(ciphertext) < 2 + key_id_length + 28:
+            raise RelaySecretCipherError(
+                "INVALID_ENVELOPE", "relay secret envelope is invalid"
+            )
+        try:
+            envelope_key_id = ciphertext[2 : 2 + key_id_length].decode("ascii")
+        except UnicodeDecodeError:
+            raise RelaySecretCipherError(
+                "INVALID_ENVELOPE", "relay secret envelope is invalid"
+            ) from None
+        if envelope_key_id not in self._keys:
+            raise RelaySecretCipherError(
+                "UNKNOWN_KEY_ID", "relay secret key id is unavailable"
+            )
+        return envelope_key_id != self._active_key_id
 
 
 class RelayRepository:
@@ -482,6 +515,9 @@ class RelayRepository:
         ordered_node_ids: list[str],
         now: datetime,
         ttl_seconds: int = 30,
+        expires_at: datetime | None = None,
+        directory_generation: str | None = None,
+        require_registration: bool = False,
         result_limit: int | None = None,
     ) -> list[RelayReservation]:
         """Reserve up to primary plus one backup, preserving candidate order.
@@ -495,10 +531,16 @@ class RelayRepository:
             raise RelayRepositoryError("INVALID_SESSION_ID", "invalid session id")
         if not _valid_general_id(user_id):
             raise RelayRepositoryError("INVALID_USER_ID", "invalid user id")
-        if not _integer_in_range(
-            ttl_seconds,
-            minimum=1,
-            maximum=_MAX_RESERVATION_TTL_SECONDS,
+        if expires_at is not None:
+            _require_utc(expires_at)
+            exact_ttl = (expires_at - now).total_seconds()
+            if not 0 < exact_ttl <= _MAX_RESERVATION_TTL_SECONDS:
+                raise RelayRepositoryError(
+                    "INVALID_RESERVATION_TTL",
+                    f"TTL must be between 1 and {_MAX_RESERVATION_TTL_SECONDS} seconds",
+                )
+        elif not _integer_in_range(
+            ttl_seconds, minimum=1, maximum=_MAX_RESERVATION_TTL_SECONDS
         ):
             raise RelayRepositoryError(
                 "INVALID_RESERVATION_TTL",
@@ -518,13 +560,17 @@ class RelayRepository:
             )
         if any(not _valid_general_id(node_id) for node_id in ordered_node_ids):
             raise RelayRepositoryError("INVALID_NODE_ID", "invalid candidate node id")
+        if directory_generation is not None and not _valid_general_id(
+            directory_generation
+        ):
+            raise RelayRepositoryError(
+                "INVALID_DIRECTORY_GENERATION", "invalid directory generation"
+            )
         ordered_unique = list(dict.fromkeys(ordered_node_ids))
         if not ordered_unique:
             return []
-        reservation_expires_at = _checked_add_seconds(
-            now,
-            seconds=ttl_seconds,
-            code="INVALID_RESERVATION_TTL",
+        reservation_expires_at = expires_at or _checked_add_seconds(
+            now, seconds=ttl_seconds, code="INVALID_RESERVATION_TTL"
         )
 
         if _session_dialect_name(self._session) == "postgresql":
@@ -540,6 +586,8 @@ class RelayRepository:
                 ordered_node_ids=ordered_unique,
                 now=now,
                 expires_at=reservation_expires_at,
+                directory_generation=directory_generation,
+                require_registration=require_registration,
                 result_limit=result_limit,
             )
 
@@ -553,6 +601,8 @@ class RelayRepository:
                 ordered_node_ids=ordered_unique,
                 now=now,
                 expires_at=reservation_expires_at,
+                directory_generation=directory_generation,
+                require_registration=require_registration,
                 result_limit=result_limit,
             )
 
@@ -564,38 +614,40 @@ class RelayRepository:
         ordered_node_ids: list[str],
         now: datetime,
         expires_at: datetime,
+        directory_generation: str | None,
+        require_registration: bool,
         result_limit: int,
     ) -> list[RelayReservation]:
-
-        locked_nodes = await self._session.scalars(
-            select(RelayNode)
-            .where(RelayNode.node_id.in_(ordered_node_ids))
-            .order_by(RelayNode.node_id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
-        nodes_by_id = {node.node_id: node for node in locked_nodes}
-
-        await self._session.execute(
-            delete(RelayReservation).where(
-                RelayReservation.node_id.in_(ordered_node_ids),
-                RelayReservation.expires_at <= now,
+        if directory_generation is not None:
+            # A new generation atomically retires the previous directory's current
+            # slots. The rows remain live and continue to consume node capacity until
+            # their credential expiry. Any later failure rolls this update back.
+            await self._session.execute(
+                update(RelayReservation)
+                .where(
+                    RelayReservation.session_id == session_id,
+                    RelayReservation.expires_at > now,
+                    RelayReservation.superseded_at.is_(None),
+                    RelayReservation.directory_generation != directory_generation,
+                )
+                .values(superseded_at=now)
+                .execution_options(synchronize_session=False)
             )
-        )
-        await self._session.flush()
+            await self._session.flush()
 
-        current = await self._session.scalars(
-            select(RelayReservation).where(
+        active_rows = list(await self._session.scalars(
+            select(RelayReservation)
+            .where(
                 RelayReservation.session_id == session_id,
                 RelayReservation.expires_at > now,
             )
-        )
-        current_reservations = list(current)
+            .execution_options(populate_existing=True)
+        ))
         existing = {
-            reservation.node_id: reservation for reservation in current_reservations
+            reservation.node_id: reservation for reservation in active_rows
         }
         if any(
-            reservation.user_id != user_id for reservation in current_reservations
+            reservation.user_id != user_id for reservation in active_rows
         ):
             raise RelayRepositoryError(
                 "SESSION_OWNER_MISMATCH", "reservation belongs to another user"
@@ -605,20 +657,59 @@ class RelayRepository:
         for node_id in ordered_node_ids:
             if len(result) >= result_limit:
                 break
-            node = nodes_by_id.get(node_id)
-            if node is None:
-                continue
-            if not _node_accepts_pending_reservation(node, now=now):
-                invalid_existing = existing.pop(node_id, None)
-                if invalid_existing is not None:
-                    await self._session.delete(invalid_existing)
-                    current_reservations.remove(invalid_existing)
+            if require_registration:
+                locked = await self._session.execute(
+                    select(RelayNode, RelayNodeRegistration)
+                    .join(
+                        RelayNodeRegistration,
+                        RelayNodeRegistration.node_id == RelayNode.node_id,
+                    )
+                    .where(RelayNode.node_id == node_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+                row = locked.first()
+                if row is None:
+                    continue
+                node, registration = row
+                eligible = _node_and_registration_accept_pending_reservation(
+                    node, registration, now=now
+                )
+            else:
+                node = await self._session.scalar(
+                    select(RelayNode)
+                    .where(RelayNode.node_id == node_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+                if node is None:
+                    continue
+                eligible = _node_accepts_pending_reservation(node, now=now)
+            await self._session.execute(
+                delete(RelayReservation).where(
+                    RelayReservation.node_id == node_id,
+                    RelayReservation.expires_at <= now,
+                ).execution_options(synchronize_session=False)
+            )
+            await self._session.flush()
+            same_session = existing.get(node_id)
+            if not eligible:
+                if same_session is not None and directory_generation is None:
+                    await self._session.delete(same_session)
+                    existing.pop(node_id, None)
+                    active_rows.remove(same_session)
                     await self._session.flush()
                 continue
-            if node_id in existing:
-                result.append(existing[node_id])
+            if same_session is not None:
+                if directory_generation is not None:
+                    same_session.superseded_at = None
+                    same_session.directory_generation = directory_generation
+                result.append(same_session)
                 continue
-            if len(current_reservations) >= self._max_reservations:
+            current_count = sum(
+                reservation.superseded_at is None for reservation in active_rows
+            )
+            if current_count >= self._max_reservations:
                 continue
             used = await self._session.scalar(
                 select(func.count())
@@ -650,11 +741,14 @@ class RelayRepository:
                 user_id=user_id,
                 node_id=node_id,
                 expires_at=expires_at,
+                superseded_at=None,
+                directory_generation=directory_generation or "legacy",
                 created_at=now,
             )
             self._session.add(reservation)
             await self._session.flush()
-            current_reservations.append(reservation)
+            active_rows.append(reservation)
+            existing[node_id] = reservation
             result.append(reservation)
         return result
 
@@ -776,17 +870,43 @@ def _valid_general_id(value: object) -> bool:
 
 
 def _validated_turn_secret(value: object) -> bytes:
-    if not isinstance(value, str) or len(value) > 512:
+    """Accept only the node-agent's canonical 32-byte base64url secret."""
+
+    if (
+        not isinstance(value, str)
+        or len(value) != 43
+        or not value.isascii()
+        or re.fullmatch(r"[A-Za-z0-9_-]{43}", value) is None
+    ):
         raise RelayRepositoryError("INVALID_TURN_SECRET", "TURN secret required")
     try:
-        encoded = value.encode("utf-8")
-    except UnicodeEncodeError:
+        decoded = base64.urlsafe_b64decode(value + "=")
+    except (ValueError, binascii.Error):
         raise RelayRepositoryError(
             "INVALID_TURN_SECRET", "TURN secret required"
         ) from None
-    if not 16 <= len(encoded) <= 512:
+    canonical = base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii")
+    if (
+        len(decoded) != 32
+        or not hmac.compare_digest(canonical, value)
+        or not _turn_secret_has_minimum_quality(decoded)
+    ):
         raise RelayRepositoryError("INVALID_TURN_SECRET", "TURN secret required")
-    return encoded
+    return decoded
+
+
+def _turn_secret_has_minimum_quality(secret: bytes | bytearray) -> bool:
+    # This is not an entropy estimator. It rejects deterministic deployment
+    # placeholders and repeated-byte material while generation remains CSPRNG-only.
+    lowered = bytes(secret).lower()
+    return (
+        len(secret) == 32
+        and len(set(secret)) >= 8
+        and not any(
+            marker in lowered
+            for marker in (b"placeholder", b"changeme", b"change-me")
+        )
+    )
 
 
 def _integer_in_range(value: object, *, minimum: int, maximum: int) -> bool:
@@ -809,6 +929,26 @@ def _node_accepts_pending_reservation(node: RelayNode, *, now: datetime) -> bool
         node.state in {"available", "degraded"}
         and node.lease_expires_at is not None
         and _as_utc(node.lease_expires_at) > now
+    )
+
+
+def _node_and_registration_accept_pending_reservation(
+    node: RelayNode,
+    registration: RelayNodeRegistration,
+    *,
+    now: datetime,
+) -> bool:
+    return (
+        _node_accepts_pending_reservation(node, now=now)
+        and node.revoked_at is None
+        and registration.status == "approved"
+        and registration.certificate_expires_at is not None
+        and _as_utc(registration.certificate_expires_at) > now
+        and registration.topology_approved_at is not None
+        and registration.physical_host_id is not None
+        and registration.physical_host_id == node.physical_host_id
+        and registration.failure_domain == node.failure_domain
+        and registration.encrypted_turn_secret is not None
     )
 
 

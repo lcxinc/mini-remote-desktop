@@ -11,6 +11,7 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
+from jose import jwt
 from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session
@@ -18,17 +19,22 @@ from sqlalchemy.pool import StaticPool
 
 from app.api.v1.devices import bind_device_owner, router
 from app.core.config import settings
-from app.core.security import create_access_token
+from app.core.security import create_access_token, create_device_access_token
 from app.db.session import Base, get_db
 from app.models.device import Device
 from app.models.device_enrollment import DeviceEnrollment
 from app.models.relay_audit_event import RelayAuditEvent
 from app.models.user import User
-from app.services.device_enrollment import DeviceEnrollmentService
+from app.services.device_enrollment import (
+    DeviceEnrollmentError,
+    DeviceEnrollmentService,
+    device_serial_digest,
+)
 from test_relay_node_api import AsyncSessionShim
 
 
 JWT_SECRET = "vY7!qP2@kL9#sX4$mR8%tN6&wC3*eH5-zB1+uD0="
+SERIAL_PEPPER = bytes.fromhex("67" * 32)
 DATABASE_URL = os.getenv("MRD_TEST_DATABASE_URL")
 
 
@@ -36,10 +42,15 @@ def _configure_jwt(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(settings.__dict__, "jwt_secret", SecretStr(JWT_SECRET))
     monkeypatch.setitem(settings.__dict__, "jwt_issuer", "https://auth.rdesk.test")
     monkeypatch.setitem(settings.__dict__, "jwt_audience", "rdesk-api")
+    monkeypatch.setitem(settings.__dict__, "device_jwt_audience", "rdesk-device")
+    monkeypatch.setitem(settings.__dict__, "device_jwt_expire_minutes", 30)
     monkeypatch.setitem(settings.__dict__, "jwt_expire_minutes", 30)
     monkeypatch.setitem(settings.__dict__, "jwt_max_lifetime_minutes", 60)
     monkeypatch.setitem(
         settings.__dict__, "device_enrollment_token_pepper", SecretStr("66" * 32)
+    )
+    monkeypatch.setitem(
+        settings.__dict__, "device_serial_pepper", SecretStr("67" * 32)
     )
     monkeypatch.setitem(settings.__dict__, "device_enrollment_ttl_seconds", 300)
 
@@ -61,7 +72,10 @@ def _device(*, owner: User | None = None) -> Device:
         name="workstation-a",
         device_id="100000000001",
         os="Linux",
-        motherboard_serial="serial-a",
+        motherboard_serial=None,
+        motherboard_serial_digest=device_serial_digest(
+            "serial-a", SERIAL_PEPPER
+        ),
         hostname="host-a",
         tenant_id=owner.tenant_id if owner else "default",
         is_bound=owner is not None,
@@ -114,7 +128,7 @@ def device_api(monkeypatch: pytest.MonkeyPatch):
             user_token=create_access_token(owner.id, owner.username, owner.role),
             other_token=create_access_token(other.id, other.username, other.role),
             admin_token=create_access_token(admin.id, admin.username, admin.role),
-            device_token=create_access_token(device.device_id, device.name, "device"),
+            device_token=create_device_access_token(device),
         )
     finally:
         client.close()
@@ -135,6 +149,8 @@ def _issue_device_enrollment(device_api: SimpleNamespace) -> str:
         headers={"Authorization": f"Bearer {device_api.admin_token}"},
     )
     assert response.status_code == 200, response.text
+    assert response.headers["cache-control"] == "no-store, private"
+    assert response.headers["pragma"] == "no-cache"
     token = response.json()["token"]
     assert re.fullmatch(r"[A-Za-z0-9_-]{43}", token)
     assert token not in repr(response)
@@ -231,7 +247,7 @@ def test_auto_bind_never_forces_another_owner_or_cross_tenant_migration(
 def test_existing_registration_requires_current_device_proof_or_admin(
     device_api: SimpleNamespace,
 ) -> None:
-    payload = _register_payload(device_api.device.motherboard_serial)
+    payload = _register_payload("serial-a")
     anonymous = device_api.client.post("/api/v1/devices/register", json=payload)
     anonymous_unknown = device_api.client.post(
         "/api/v1/devices/register", json=_register_payload("unknown-serial")
@@ -328,6 +344,8 @@ def test_first_registration_requires_one_time_device_enrollment(
     assert anonymous.status_code == 401
     assert malformed.status_code == 401
     assert created.status_code == 200, created.text
+    assert created.headers["cache-control"] == "no-store, private"
+    assert created.headers["pragma"] == "no-cache"
     body = created.json()
     assert body["access_token"]
 
@@ -403,7 +421,7 @@ def test_enrollment_token_cannot_refresh_an_existing_device(
     response = device_api.client.post(
         "/api/v1/devices/register",
         json={
-            **_register_payload(device_api.device.motherboard_serial),
+            **_register_payload("serial-a"),
             "hostname": "attacker-host",
         },
         headers=_enrollment_headers(token),
@@ -443,7 +461,7 @@ def test_device_registration_check_rejects_non_admin_before_serial_query(
     class SerialQuerySpy(AsyncSessionShim):
         async def scalar(self, *args: object, **kwargs: object) -> object:
             statement = str(args[0]) if args else ""
-            if "devices.motherboard_serial" in statement:
+            if "devices.motherboard_serial_digest" in statement:
                 serial_queries.append(statement)
             return await super().scalar(*args, **kwargs)
 
@@ -460,11 +478,15 @@ def test_device_registration_check_rejects_non_admin_before_serial_query(
         },
     )
     for headers in headers_by_caller:
-        known = device_api.client.get(
-            "/api/v1/devices/check/serial-a", headers=headers
+        known = device_api.client.post(
+            "/api/v1/devices/inventory/check",
+            json={"motherboard_serial": "serial-a"},
+            headers=headers,
         )
-        unknown = device_api.client.get(
-            "/api/v1/devices/check/serial-unknown", headers=headers
+        unknown = device_api.client.post(
+            "/api/v1/devices/inventory/check",
+            json={"motherboard_serial": "serial-unknown"},
+            headers=headers,
         )
         assert known.status_code == unknown.status_code == 403
         assert known.json() == unknown.json()
@@ -477,11 +499,15 @@ def test_device_registration_check_is_admin_inventory_only(
 ) -> None:
     headers = {"Authorization": f"Bearer {device_api.admin_token}"}
 
-    known = device_api.client.get(
-        "/api/v1/devices/check/serial-a", headers=headers
+    known = device_api.client.post(
+        "/api/v1/devices/inventory/check",
+        json={"motherboard_serial": "serial-a"},
+        headers=headers,
     )
-    unknown = device_api.client.get(
-        "/api/v1/devices/check/serial-unknown", headers=headers
+    unknown = device_api.client.post(
+        "/api/v1/devices/inventory/check",
+        json={"motherboard_serial": "serial-unknown"},
+        headers=headers,
     )
 
     assert known.status_code == unknown.status_code == 200
@@ -493,10 +519,231 @@ def test_device_registration_check_is_admin_inventory_only(
     }
     assert unknown.json() == {"registered": False}
     operation = device_api.app.openapi()["paths"][
-        "/api/v1/devices/check/{motherboard_serial}"
-    ]["get"]
-    assert operation["deprecated"] is True
+        "/api/v1/devices/inventory/check"
+    ]["post"]
     assert operation["security"] == [{"HTTPBearer": []}]
+
+
+def test_device_reads_are_tenant_and_owner_scoped(
+    device_api: SimpleNamespace,
+) -> None:
+    same_tenant_other = _user("owner-c", device_api.owner.tenant_id)
+    owned = device_api.device
+    owned.is_bound = True
+    owned.bound_user_id = device_api.owner.id
+    owned.tenant_id = device_api.owner.tenant_id
+    same_tenant_foreign = Device(
+        id="device-row-c",
+        name="same-tenant-foreign",
+        device_id="100000000003",
+        os="Linux",
+        motherboard_serial_digest=device_serial_digest(
+            "serial-c", SERIAL_PEPPER
+        ),
+        tenant_id=device_api.owner.tenant_id,
+        is_bound=True,
+        bound_user_id=same_tenant_other.id,
+    )
+    cross_tenant = Device(
+        id="device-row-b",
+        name="cross-tenant",
+        device_id="100000000002",
+        os="Linux",
+        motherboard_serial_digest=device_serial_digest(
+            "serial-b", SERIAL_PEPPER
+        ),
+        tenant_id=device_api.other.tenant_id,
+        is_bound=True,
+        bound_user_id=device_api.other.id,
+    )
+    device_api.session.add_all(
+        [same_tenant_other, same_tenant_foreign, cross_tenant]
+    )
+    device_api.session.commit()
+    owner_headers = {"Authorization": f"Bearer {device_api.user_token}"}
+    admin_headers = {"Authorization": f"Bearer {device_api.admin_token}"}
+
+    anonymous = device_api.client.get("/api/v1/devices")
+    owner_list = device_api.client.get("/api/v1/devices", headers=owner_headers)
+    admin_list = device_api.client.get("/api/v1/devices", headers=admin_headers)
+
+    assert anonymous.status_code in {401, 403}
+    assert [item["device_id"] for item in owner_list.json()] == [owned.device_id]
+    assert {item["device_id"] for item in admin_list.json()} >= {
+        owned.device_id,
+        same_tenant_foreign.device_id,
+        cross_tenant.device_id,
+    }
+    assert device_api.client.get(
+        f"/api/v1/devices/{same_tenant_foreign.id}", headers=owner_headers
+    ).status_code == 404
+    assert device_api.client.get(
+        f"/api/v1/devices/{cross_tenant.id}", headers=owner_headers
+    ).status_code == 404
+    assert device_api.client.get(
+        f"/api/v1/devices/{owned.id}", headers=owner_headers
+    ).status_code == 200
+    assert device_api.client.get(
+        f"/api/v1/devices/{cross_tenant.id}", headers=admin_headers
+    ).status_code == 200
+
+    anonymous_status = device_api.client.get(
+        f"/api/v1/devices/{owned.device_id}/binding-status"
+    )
+    foreign_status = device_api.client.get(
+        f"/api/v1/devices/{owned.device_id}/binding-status",
+        headers={"Authorization": f"Bearer {device_api.other_token}"},
+    )
+    owner_status = device_api.client.get(
+        f"/api/v1/devices/{owned.device_id}/binding-status",
+        headers=owner_headers,
+    )
+    assert anonymous_status.status_code in {401, 403}
+    assert foreign_status.status_code == 404
+    assert owned.bound_user_id not in foreign_status.text
+    assert owner_status.status_code == 200
+    assert owner_status.json()["bound_user_id"] == device_api.owner.id
+
+
+def test_device_rename_requires_owner_and_matching_device_or_admin(
+    device_api: SimpleNamespace,
+) -> None:
+    device_api.device.is_bound = True
+    device_api.device.bound_user_id = device_api.owner.id
+    device_api.device.tenant_id = device_api.owner.tenant_id
+    device_api.session.commit()
+    path = f"/api/v1/devices/{device_api.device.device_id}/rename"
+    owner_only = device_api.client.patch(
+        path,
+        json={"name": "owner-only"},
+        headers={"Authorization": f"Bearer {device_api.user_token}"},
+    )
+    wrong_device = device_api.client.patch(
+        path,
+        json={"name": "wrong-device"},
+        headers=_dual_headers(
+            device_api.user_token,
+            create_access_token("different-device", "other", "device"),
+        ),
+    )
+    valid = device_api.client.patch(
+        path,
+        json={"name": "owner-renamed"},
+        headers=_dual_headers(device_api.user_token, device_api.device_token),
+    )
+    admin = device_api.client.patch(
+        path,
+        json={"name": "admin-renamed"},
+        headers={"Authorization": f"Bearer {device_api.admin_token}"},
+    )
+
+    assert owner_only.status_code in {401, 403}
+    assert wrong_device.status_code in {401, 403}
+    assert valid.status_code == 200
+    assert admin.status_code == 200
+    device_api.session.refresh(device_api.device)
+    assert device_api.device.name == "admin-renamed"
+
+    device_api.device.is_bound = False
+    device_api.device.bound_user_id = None
+    device_api.session.commit()
+    unbound = device_api.client.patch(
+        path,
+        json={"name": "unbound-user-write"},
+        headers=_dual_headers(device_api.user_token, device_api.device_token),
+    )
+    assert unbound.status_code in {403, 404}
+
+
+def test_device_token_has_independent_context_and_rotation_revokes_old_token(
+    device_api: SimpleNamespace,
+) -> None:
+    device_api.device.is_bound = True
+    device_api.device.bound_user_id = device_api.owner.id
+    device_api.device.tenant_id = device_api.owner.tenant_id
+    device_api.session.commit()
+    rotate_path = (
+        f"/api/v1/devices/{device_api.device.device_id}/credentials/rotate"
+    )
+
+    rotated = device_api.client.post(
+        rotate_path,
+        headers=_dual_headers(device_api.user_token, device_api.device_token),
+    )
+
+    assert rotated.status_code == 200, rotated.text
+    new_token = rotated.json()["access_token"]
+    claims = jwt.get_unverified_claims(new_token)
+    assert claims["aud"] == "rdesk-device"
+    assert claims["token_type"] == "device"
+    assert claims["device_id"] == device_api.device.device_id
+    assert claims["auth_version"] == 2
+    old_rejected = device_api.client.post(
+        "/api/v1/devices/auto-bind",
+        json={"device_id": device_api.device.device_id},
+        headers=_dual_headers(device_api.user_token, device_api.device_token),
+    )
+    assert old_rejected.status_code == 401
+
+    revoked = device_api.client.post(
+        f"/api/v1/devices/{device_api.device.device_id}/credentials/revoke",
+        headers={"Authorization": f"Bearer {device_api.admin_token}"},
+    )
+    assert revoked.status_code == 200
+    new_rejected = device_api.client.post(
+        "/api/v1/devices/auto-bind",
+        json={"device_id": device_api.device.device_id},
+        headers=_dual_headers(device_api.user_token, new_token),
+    )
+    assert new_rejected.status_code == 401
+
+    admin_rotated = device_api.client.post(
+        f"/api/v1/devices/{device_api.device.device_id}/credentials/admin-rotate",
+        headers={"Authorization": f"Bearer {device_api.admin_token}"},
+    )
+    assert admin_rotated.status_code == 200
+    assert jwt.get_unverified_claims(admin_rotated.json()["access_token"])[
+        "auth_version"
+    ] == 4
+
+
+def test_serial_inventory_uses_admin_post_and_registration_stores_digest_only(
+    device_api: SimpleNamespace,
+) -> None:
+    admin_headers = {"Authorization": f"Bearer {device_api.admin_token}"}
+    old_path = device_api.client.get(
+        "/api/v1/devices/check/serial-a", headers=admin_headers
+    )
+    inventory = device_api.client.post(
+        "/api/v1/devices/inventory/check",
+        json={"motherboard_serial": "serial-a"},
+        headers=admin_headers,
+    )
+    assert old_path.status_code == 404
+    assert inventory.status_code == 200
+    assert "serial-a" not in repr(inventory.request.url)
+    assert not any(
+        "motherboard_serial" in path
+        for path in device_api.app.openapi()["paths"]
+    )
+
+    token = _issue_device_enrollment(device_api)
+    registered = device_api.client.post(
+        "/api/v1/devices/register",
+        json=_register_payload("serial-private-new"),
+        headers=_enrollment_headers(token),
+    )
+    assert registered.status_code == 200, registered.text
+    row = device_api.session.scalar(
+        select(Device).where(
+            Device.device_id == registered.json()["device_id"]
+        )
+    )
+    assert row is not None
+    assert row.motherboard_serial is None
+    assert re.fullmatch(
+        r"[0-9a-f]{64}", getattr(row, "motherboard_serial_digest", "")
+    )
 
 
 def _asyncpg_url(url: str) -> str:
@@ -531,7 +778,10 @@ async def test_concurrent_first_bind_has_exactly_one_owner() -> None:
                         name="race-device",
                         device_id="200000000002",
                         os="Linux",
-                        motherboard_serial="race-serial",
+                        motherboard_serial=None,
+                        motherboard_serial_digest=device_serial_digest(
+                            "race-serial", SERIAL_PEPPER
+                        ),
                         tenant_id="default",
                         is_bound=False,
                     ),
@@ -605,6 +855,7 @@ async def test_concurrent_device_enrollment_consumption_is_one_logical_result() 
             issued = await DeviceEnrollmentService(
                 setup,
                 token_pepper=bytes.fromhex("66" * 32),
+                serial_pepper=SERIAL_PEPPER,
                 ttl_seconds=300,
                 now=lambda: now,
                 token_source=lambda _: raw_token,
@@ -620,6 +871,7 @@ async def test_concurrent_device_enrollment_consumption_is_one_logical_result() 
                     result = await DeviceEnrollmentService(
                         session,
                         token_pepper=bytes.fromhex("66" * 32),
+                        serial_pepper=SERIAL_PEPPER,
                         ttl_seconds=300,
                         now=lambda: now,
                     ).register(
@@ -655,6 +907,81 @@ async def test_concurrent_device_enrollment_consumption_is_one_logical_result() 
                 "device_enrollment_consumed",
                 "device_enrollment_issued",
             ]
+    finally:
+        await engine.dispose()
+        async with admin_engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        await admin_engine.dispose()
+
+
+@pytest.mark.skipif(not DATABASE_URL, reason="MRD_TEST_DATABASE_URL is not configured")
+@pytest.mark.anyio
+async def test_different_enrollment_tokens_for_one_serial_conflict_stably() -> None:
+    assert DATABASE_URL is not None
+    schema = "device_serial_race_" + re.sub(r"[^a-z0-9]", "", uuid4().hex)
+    admin_engine = create_async_engine(_asyncpg_url(DATABASE_URL))
+    async with admin_engine.begin() as connection:
+        await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+    engine = create_async_engine(
+        _asyncpg_url(DATABASE_URL),
+        connect_args={"server_settings": {"search_path": schema}},
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime(2026, 8, 23, 18, 30, tzinfo=UTC)
+    token_pepper = bytes.fromhex("66" * 32)
+    tokens = ("A" * 43, "B" * 43)
+    registration = _register_payload("same-physical-serial")
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with sessions.begin() as setup:
+            setup.add(_user("serial-race-admin", "tenant-admin", role="admin"))
+        issued_tokens: list[str] = []
+        for raw_token in tokens:
+            async with sessions.begin() as setup:
+                issued = await DeviceEnrollmentService(
+                    setup,
+                    token_pepper=token_pepper,
+                    serial_pepper=SERIAL_PEPPER,
+                    ttl_seconds=300,
+                    now=lambda: now,
+                    token_source=lambda _, value=raw_token: value,
+                ).issue(admin_user_id="serial-race-admin")
+                issued_tokens.append(issued.token.get_secret_value())
+
+        start = asyncio.Event()
+
+        async def consume(raw_token: str) -> str:
+            async with sessions() as session:
+                await start.wait()
+                try:
+                    async with session.begin():
+                        await DeviceEnrollmentService(
+                            session,
+                            token_pepper=token_pepper,
+                            serial_pepper=SERIAL_PEPPER,
+                            ttl_seconds=300,
+                            now=lambda: now,
+                        ).register(
+                            token=SecretStr(raw_token),
+                            registration=registration,
+                        )
+                    return "ok"
+                except DeviceEnrollmentError as error:
+                    await session.rollback()
+                    return error.code
+
+        first = asyncio.create_task(consume(issued_tokens[0]))
+        second = asyncio.create_task(consume(issued_tokens[1]))
+        start.set()
+        results = await asyncio.wait_for(
+            asyncio.gather(first, second), timeout=10
+        )
+        assert sorted(results) == ["device_enrollment_conflict", "ok"]
+        async with sessions() as verification:
+            assert await verification.scalar(
+                select(func.count()).select_from(Device)
+            ) == 1
     finally:
         await engine.dispose()
         async with admin_engine.begin() as connection:

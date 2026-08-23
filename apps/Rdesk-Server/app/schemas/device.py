@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from typing import Optional
 
 
@@ -27,7 +27,9 @@ class DeviceRegisterRequest(BaseModel):
     """设备注册请求"""
     model_config = ConfigDict(extra="forbid")
 
-    motherboard_serial: str = Field(..., min_length=1, max_length=128, description="主板序列号")
+    motherboard_serial: str = Field(
+        ..., min_length=1, max_length=128, description="主板序列号", repr=False
+    )
     hostname: str = Field(..., min_length=1, max_length=128, description="主机名")
     os_version: str = Field(..., min_length=1, max_length=256, description="操作系统版本")
     device_name: Optional[str] = Field(None, min_length=1, max_length=128, description="设备显示名称")
@@ -47,6 +49,31 @@ class DeviceEnrollmentTokenOut(BaseModel):
     enrollment_id: str
     token: str = Field(repr=False)
     expires_at: datetime
+
+
+class DeviceInventoryCheckRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    motherboard_serial: SecretStr = Field(repr=False)
+
+
+class DeviceInventoryCheckResponse(BaseModel):
+    registered: bool
+    device_id: str | None = None
+    device_name: str | None = None
+    is_bound: bool | None = None
+
+
+class DeviceCredentialResponse(BaseModel):
+    device_id: str
+    auth_version: int
+    access_token: str = Field(repr=False)
+
+
+class DeviceCredentialRevocationResponse(BaseModel):
+    device_id: str
+    auth_version: int
+    revoked: bool
 
 
 class DeviceBindRequest(BaseModel):

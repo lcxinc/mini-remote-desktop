@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import base64
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -32,7 +33,13 @@ def fingerprint(label: str) -> str:
 
 
 CERTIFICATE = fingerprint("default-certificate")
-TURN_SECRET = "node-unique-turn-rest-secret"
+def turn_secret(label: str) -> str:
+    return base64.urlsafe_b64encode(hashlib.sha256(label.encode()).digest()).rstrip(
+        b"="
+    ).decode("ascii")
+
+
+TURN_SECRET = turn_secret("node-unique-turn-rest-secret")
 # Deterministic URL-safe values in this module are test fixtures only. Production
 # enrollment tokens are minted through the repository's injected CSPRNG source.
 ENDPOINTS = [
@@ -149,7 +156,7 @@ async def enroll(
         endpoints=ENDPOINTS,
         max_allocations=max_allocations,
         max_egress_bps=1_000_000,
-        turn_secret=TURN_SECRET + node_id,
+        turn_secret=turn_secret("node:" + node_id),
         now=NOW,
     )
     if ready:
@@ -202,7 +209,7 @@ async def test_enrollment_tokens_are_hashed_one_use_and_never_repr_raw(
             endpoints=ENDPOINTS,
             max_allocations=10,
             max_egress_bps=1_000_000,
-            turn_secret="another-node-secret",
+            turn_secret=turn_secret("another-node-secret"),
             now=NOW,
         )
     assert error.value.code == "ENROLLMENT_TOKEN_USED"
@@ -248,7 +255,7 @@ async def test_issue_enrollment_token_requests_256_bits_and_returns_raw_once(
         endpoints=ENDPOINTS,
         max_allocations=1,
         max_egress_bps=1,
-        turn_secret="issued-node-secret",
+        turn_secret=turn_secret("issued-node-secret"),
         now=NOW,
     )
     with pytest.raises(RelayRepositoryError) as reused:
@@ -261,7 +268,7 @@ async def test_issue_enrollment_token_requests_256_bits_and_returns_raw_once(
             endpoints=ENDPOINTS,
             max_allocations=1,
             max_egress_bps=1,
-            turn_secret="issued-node-secret-again",
+            turn_secret=turn_secret("issued-node-secret-again"),
             now=NOW,
         )
     assert reused.value.code == "ENROLLMENT_TOKEN_USED"
@@ -278,8 +285,8 @@ async def test_turn_secret_is_encrypted_at_rest_and_not_in_repr_or_errors(
     ciphertext = bytes(node.encrypted_turn_secret)
     assert TURN_SECRET.encode() not in ciphertext
     assert TURN_SECRET not in repr(node)
-    assert cipher.decrypt(ciphertext, associated_data=node.node_id.encode()).decode() == (
-        TURN_SECRET + node.node_id
+    assert cipher.decrypt(ciphertext, associated_data=node.node_id.encode()) == (
+        base64.urlsafe_b64decode(turn_secret("node:" + node.node_id) + "=")
     )
 
     with pytest.raises(RelayRepositoryError) as error:
@@ -292,7 +299,7 @@ async def test_turn_secret_is_encrypted_at_rest_and_not_in_repr_or_errors(
             endpoints=ENDPOINTS,
             max_allocations=1,
             max_egress_bps=1,
-            turn_secret="must-not-leak",
+            turn_secret=turn_secret("must-not-leak"),
             now=NOW,
         )
     assert "must-not-leak" not in repr(error.value)
@@ -436,7 +443,7 @@ async def test_revocation_cannot_be_undone_by_heartbeat_or_reenrollment(
             endpoints=ENDPOINTS,
             max_allocations=10,
             max_egress_bps=1_000_000,
-            turn_secret="replacement-secret",
+            turn_secret=turn_secret("replacement-secret"),
             now=NOW,
         )
     assert reenroll.value.code == "NODE_REVOKED"
@@ -478,7 +485,7 @@ async def test_invalid_endpoints_are_rejected_before_persistence(
             endpoints=endpoints,
             max_allocations=1,
             max_egress_bps=1,
-            turn_secret="not-stored",
+            turn_secret=turn_secret("not-stored"),
             now=NOW,
         )
     assert error.value.code == "INVALID_ENDPOINTS"
@@ -507,7 +514,7 @@ async def test_endpoints_are_canonicalized_before_duplicate_detection(
         ],
         max_allocations=1,
         max_egress_bps=1,
-        turn_secret="canonical-turn-secret",
+        turn_secret=turn_secret("canonical-turn-secret"),
         now=NOW,
     )
     assert node.endpoints == [
@@ -534,7 +541,7 @@ async def test_endpoints_are_canonicalized_before_duplicate_detection(
             ],
             max_allocations=1,
             max_egress_bps=1,
-            turn_secret="canonical-duplicate-secret",
+            turn_secret=turn_secret("canonical-duplicate-secret"),
             now=NOW,
         )
     assert duplicate.value.code == "INVALID_ENDPOINTS"
@@ -559,7 +566,7 @@ async def test_turns_udp_is_rejected(
             endpoints=["turns:relay.example.test:5349?transport=udp"],
             max_allocations=1,
             max_egress_bps=1,
-            turn_secret="turns-udp-secret",
+            turn_secret=turn_secret("turns-udp-secret"),
             now=NOW,
         )
     assert error.value.code == "INVALID_ENDPOINTS"
@@ -600,7 +607,7 @@ async def test_certificate_fingerprint_is_bounded_and_structurally_valid(
             endpoints=ENDPOINTS,
             max_allocations=1,
             max_egress_bps=1,
-            turn_secret="not-persisted",
+            turn_secret=turn_secret("not-persisted"),
             now=NOW,
         )
     assert error.value.code == "INVALID_CERTIFICATE"
@@ -1022,7 +1029,7 @@ async def test_structured_constraint_name_ignores_deceptive_error_detail(
             endpoints=ENDPOINTS,
             max_allocations=1,
             max_egress_bps=1,
-            turn_secret="structured-secret",
+            turn_secret=turn_secret("structured-secret"),
             now=NOW,
         )
     assert error.value.code == "CERTIFICATE_ALREADY_BOUND"
@@ -1076,7 +1083,7 @@ async def test_enrollment_integrity_conflicts_are_stable_and_rollback(
             endpoints=ENDPOINTS,
             max_allocations=1,
             max_egress_bps=1,
-            turn_secret="sensitive-turn-secret",
+            turn_secret=turn_secret("sensitive-turn-secret"),
             now=NOW,
         )
     assert conflict.value.code == expected_code

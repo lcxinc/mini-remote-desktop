@@ -1,3 +1,6 @@
+import base64
+import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -11,6 +14,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.api.v1.relays import (
     RelayAccessResponse,
+    _relay_turn_secret_cipher,
     get_relay_access_service,
     router,
 )
@@ -469,6 +473,49 @@ def test_access_factory_fails_closed_without_explicit_signing_and_encryption_key
     assert "private" not in str(error.value.detail).lower()
 
 
+def test_relay_cipher_factory_loads_bounded_previous_read_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_key = bytes.fromhex("31" * 32)
+    new_key = bytes.fromhex("32" * 32)
+    encode = lambda value: base64.b64encode(value).decode("ascii")
+    monkeypatch.setattr(
+        settings, "relay_turn_secret_encryption_key", SecretStr(encode(new_key))
+    )
+    monkeypatch.setattr(settings, "relay_turn_secret_encryption_key_id", "new")
+    monkeypatch.setattr(
+        settings,
+        "relay_turn_secret_encryption_read_keys",
+        SecretStr(json.dumps({"old": encode(old_key)})),
+    )
+    monkeypatch.setattr(
+        settings, "relay_turn_secret_encryption_legacy_key_id", "old"
+    )
+    old = AesGcmRelaySecretCipher(old_key, key_id="old")
+    envelope = old.encrypt(b"x" * 32, associated_data=b"relay-a")
+    rotated = _relay_turn_secret_cipher()
+    assert rotated.needs_reencrypt(envelope)
+    assert rotated.decrypt(envelope, associated_data=b"relay-a") == b"x" * 32
+
+    monkeypatch.setattr(
+        settings,
+        "relay_turn_secret_encryption_read_keys",
+        SecretStr(json.dumps({str(index): encode(old_key) for index in range(5)})),
+    )
+    with pytest.raises(ValueError):
+        _relay_turn_secret_cipher()
+
+    monkeypatch.setattr(
+        settings,
+        "relay_turn_secret_encryption_read_keys",
+        SecretStr(
+            '{"old":"' + encode(old_key) + '","old":"' + encode(new_key) + '"}'
+        ),
+    )
+    with pytest.raises(ValueError):
+        _relay_turn_secret_cipher()
+
+
 class AsyncSessionShim:
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -565,7 +612,8 @@ def relay_service_fixture():
             endpoints=[f"turn:{node_id}.example.test:3478?transport=udp"],
             certificate_fingerprint="sha256:" + f"{index + 1:064x}",
             encrypted_turn_secret=cipher.encrypt(
-                f"{node_id}-unique-turn-secret".encode(), associated_data=node_id.encode()
+                hashlib.sha256(f"{node_id}-unique-turn-secret".encode()).digest(),
+                associated_data=node_id.encode(),
             ),
             max_allocations=2, active_allocations=0,
             max_egress_bps=1_000_000, current_egress_bps=0,
@@ -622,6 +670,54 @@ async def test_both_bound_participants_reuse_capacity_without_double_reserving()
             item.node_id for item in owner.directory.payload.candidates
         ]
         assert session.scalar(select(func.count()).select_from(RelayReservation)) == 2
+    finally:
+        session.close()
+        engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_access_progressively_reencrypts_old_node_secret_envelopes():
+    engine, session, service = relay_service_fixture()
+    old_key = bytes.fromhex("31" * 32)
+    old_cipher = AesGcmRelaySecretCipher(old_key, key_id="old")
+    rotated = AesGcmRelaySecretCipher(
+        bytes.fromhex("32" * 32),
+        key_id="current",
+        read_keys={"old": old_key},
+    )
+    expected: dict[str, bytes] = {}
+    try:
+        for relay in session.scalars(select(RelayNode)):
+            secret = hashlib.sha256(
+                f"rotating-{relay.node_id}".encode()
+            ).digest()
+            expected[relay.node_id] = secret
+            envelope = old_cipher.encrypt(
+                secret, associated_data=relay.node_id.encode()
+            )
+            relay.encrypted_turn_secret = envelope
+            registration = session.get(RelayNodeRegistration, relay.node_id)
+            assert registration is not None
+            registration.encrypted_turn_secret = envelope
+        session.commit()
+        service._credential_issuer._cipher = rotated
+
+        await service.issue_access(
+            current_user_id="user-42",
+            session_id="session-7",
+            policy_revision=17,
+            intended_peer_id="device-7",
+        )
+
+        for relay in session.scalars(select(RelayNode)):
+            registration = session.get(RelayNodeRegistration, relay.node_id)
+            assert registration is not None
+            assert relay.encrypted_turn_secret == registration.encrypted_turn_secret
+            assert not rotated.needs_reencrypt(relay.encrypted_turn_secret)
+            assert rotated.decrypt(
+                relay.encrypted_turn_secret,
+                associated_data=relay.node_id.encode(),
+            ) == expected[relay.node_id]
     finally:
         session.close()
         engine.dispose()
@@ -861,6 +957,115 @@ async def test_retry_never_shortens_a_reservation_behind_an_issued_credential():
 
 
 @pytest.mark.anyio
+async def test_directory_deadline_is_one_exact_unix_second_everywhere():
+    engine, session, service = relay_service_fixture()
+    try:
+        precise_now = NOW + timedelta(microseconds=987_654)
+        service._now = lambda: precise_now
+        service._credential_issuer._now = lambda: int(precise_now.timestamp())
+        # A node/certificate can be the earliest bound and may carry
+        # sub-second precision. It must be floored before touching storage too.
+        for relay in session.scalars(select(RelayNode)):
+            relay.lease_expires_at = precise_now + timedelta(
+                seconds=10, microseconds=654_321
+            )
+        session.commit()
+        result = await service.issue_access(
+            current_user_id="user-42",
+            session_id="session-7",
+            policy_revision=17,
+            intended_peer_id="device-7",
+        )
+        deadline_ms = result.directory.payload.expires_at_ms
+        assert deadline_ms % 1000 == 0
+        assert {
+            item.reservation.expires_at_ms
+            for item in result.directory.payload.candidates
+        } == {deadline_ms}
+        assert {
+            item.expires_at_unix_seconds for item in result.credentials
+        } == {deadline_ms // 1000}
+        assert {
+            int(item.username.split(":", 1)[0]) for item in result.credentials
+        } == {deadline_ms // 1000}
+        assert {
+            int(_aware(value).timestamp())
+            for value in session.scalars(select(RelayReservation.expires_at))
+        } == {deadline_ms // 1000}
+    finally:
+        session.close()
+        engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_draining_backup_is_superseded_and_replaced_without_freeing_capacity():
+    engine, session, service = relay_service_fixture()
+    try:
+        first = await service.issue_access(
+            current_user_id="user-42", session_id="session-7",
+            policy_revision=17, intended_peer_id="device-7",
+        )
+        assert len(first.credentials) == 2
+
+        cipher = service._credential_issuer._cipher
+        enrollment = RelayEnrollment(
+            id="enrollment-c", token_digest="c" * 64,
+            expires_at=NOW + timedelta(hours=1), used_at=NOW,
+            enrolled_node_id="relay-c", created_at=NOW,
+        )
+        relay_c = RelayNode(
+            node_id="relay-c", region="eu-west", failure_domain="rack-c",
+            physical_host_id="host-relay-c", state="available",
+            endpoints=["turn:relay-c.example.test:3478?transport=udp"],
+            certificate_fingerprint="sha256:" + "c" * 64,
+            encrypted_turn_secret=cipher.encrypt(
+                hashlib.sha256(b"relay-c-unique-turn-secret").digest(),
+                associated_data=b"relay-c",
+            ),
+            max_allocations=2, active_allocations=0,
+            max_egress_bps=1_000_000, current_egress_bps=0,
+            heartbeat_sequence=3, healthy_heartbeat_streak=3,
+            lease_expires_at=NOW + timedelta(seconds=15),
+            created_at=NOW, updated_at=NOW,
+        )
+        registration_c = RelayNodeRegistration(
+            node_id="relay-c", enrollment_id="enrollment-c", region="eu-west",
+            failure_domain="rack-c", physical_host_id="host-relay-c",
+            topology_approved_at=NOW, endpoints=relay_c.endpoints,
+            max_allocations=2, max_egress_bps=1_000_000,
+            csr_pem=b"fixture", signing_public_key=b"3" * 32,
+            encrypted_turn_secret=relay_c.encrypted_turn_secret,
+            status="approved", certificate_pem=b"fixture",
+            certificate_expires_at=NOW + timedelta(hours=1),
+            created_at=NOW, approved_at=NOW,
+        )
+        session.add_all([enrollment, relay_c, registration_c])
+        session.get(RelayNode, "relay-b").state = "draining"
+        session.commit()
+
+        replaced = await service.issue_access(
+            current_user_id="user-42", session_id="session-7",
+            policy_revision=17, intended_peer_id="device-7",
+        )
+        assert {item.node_id for item in replaced.credentials} == {"relay-a", "relay-c"}
+        reservations = {
+            item.node_id: item
+            for item in session.scalars(select(RelayReservation))
+        }
+        assert reservations["relay-b"].superseded_at is not None
+        assert _aware(reservations["relay-b"].expires_at) > NOW
+        assert reservations["relay-a"].superseded_at is None
+        assert reservations["relay-c"].superseded_at is None
+        assert len({
+            reservations[node_id].directory_generation
+            for node_id in ("relay-a", "relay-c")
+        }) == 1
+    finally:
+        session.close()
+        engine.dispose()
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("case", ["missing", "wrong-user"])
 async def test_database_authorization_failure_never_leaves_a_reservation(case: str):
     engine, session, service = relay_service_fixture()
@@ -1014,6 +1219,8 @@ def test_access_api_requires_auth_and_returns_only_signed_directory_and_credenti
             },
         )
         assert response.status_code == 200, response.text
+        assert response.headers["cache-control"] == "no-store, private"
+        assert response.headers["pragma"] == "no-cache"
         body = response.json()
         assert set(body) == {"directory", "credentials"}
         candidates = body["directory"]["payload"]["candidates"]

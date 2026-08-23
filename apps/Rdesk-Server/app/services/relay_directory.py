@@ -28,6 +28,7 @@ from app.services.relay_signing import (
 from app.services.session_grants import (
     SessionGrantError,
     SessionGrantPolicy,
+    session_grant_identity_lock,
     validate_session_grant_policy,
 )
 from app.services.turn_credentials import NodeTurnCredential, NodeTurnCredentialService
@@ -159,20 +160,36 @@ class RelayAccessService:
         policy_revision: int,
         intended_peer_id: str,
     ) -> RelayAccessResult:
+        async with session_grant_identity_lock(
+            self._session, "session:" + session_id
+        ):
+            return await self._issue_access_locked(
+                current_user_id=current_user_id,
+                session_id=session_id,
+                policy_revision=policy_revision,
+                intended_peer_id=intended_peer_id,
+            )
+
+    async def _issue_access_locked(
+        self,
+        *,
+        current_user_id: str,
+        session_id: str,
+        policy_revision: int,
+        intended_peer_id: str,
+    ) -> RelayAccessResult:
         now = _utc(self._now())
         try:
             async with _issuance_transaction(self._session):
-                grant = await self._session.scalar(
+                grant_preview = await self._session.scalar(
                     select(SessionRequest)
                     .where(SessionRequest.id == session_id)
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
                 )
-                if grant is None:
+                if grant_preview is None:
                     _deny_access()
                 target_device = await self._session.scalar(
                     select(Device)
-                    .where(Device.id == grant.target_device_id)
+                    .where(Device.id == grant_preview.target_device_id)
                     .with_for_update()
                     .execution_options(populate_existing=True)
                 )
@@ -185,7 +202,7 @@ class RelayAccessService:
                     .where(
                         User.id.in_(
                             {
-                                grant.requester_user_id,
+                                grant_preview.requester_user_id,
                                 target_device.bound_user_id,
                                 current_user_id,
                             }
@@ -196,6 +213,14 @@ class RelayAccessService:
                     .execution_options(populate_existing=True)
                 )
                 participants = {user.id: user for user in participant_rows}
+                grant = await self._session.scalar(
+                    select(SessionRequest)
+                    .where(SessionRequest.id == session_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+                if grant is None or grant.target_device_id != target_device.id:
+                    _deny_access()
                 authorize_relay_grant(
                     grant=grant,
                     target_device=target_device,
@@ -216,8 +241,6 @@ class RelayAccessService:
                         RelayNodeRegistration.node_id == RelayNode.node_id,
                     )
                     .order_by(RelayNode.node_id)
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
                 )
                 records = list(rows.all())
                 views = [_view(node, registration) for node, registration in records]
@@ -258,23 +281,31 @@ class RelayAccessService:
                     raise RelayAccessError(
                         "relay_capacity_unavailable", 503, "relay capacity unavailable"
                     )
-                server_deadline = min(
-                    now + timedelta(seconds=self._directory_ttl_seconds),
-                    _utc(grant.grant_expires_at),
-                    _utc(grant.policy_expires_at),
+                server_deadline_seconds = min(
+                    int((now + timedelta(seconds=self._directory_ttl_seconds)).timestamp()),
+                    _unix_seconds(grant.grant_expires_at),
+                    _unix_seconds(grant.policy_expires_at),
                 )
-                reservation_ttl = int((server_deadline - now).total_seconds())
-                if reservation_ttl <= 0:
+                server_deadline = datetime.fromtimestamp(
+                    server_deadline_seconds, tz=UTC
+                )
+                if server_deadline <= now:
+                    _deny_access()
+                directory_id = new_directory_id()
+                # This snapshot is intentionally unlocked. Admission locks and
+                # revalidates only each candidate it actually attempts.
+                reservation_ttl = int(
+                    (server_deadline - now).total_seconds()
+                )
+                if reservation_ttl < 0:
                     _deny_access()
                 preexisting_reservation_ids = set(
                     (
                         await self._session.scalars(
-                            select(RelayReservation.id)
-                            .where(
+                            select(RelayReservation.id).where(
                                 RelayReservation.session_id == session_id,
                                 RelayReservation.expires_at > now,
                             )
-                            .with_for_update()
                         )
                     ).all()
                 )
@@ -286,6 +317,9 @@ class RelayAccessService:
                     ordered_node_ids=[item.node_id for item in ordered_candidates],
                     now=now,
                     ttl_seconds=reservation_ttl,
+                    expires_at=server_deadline,
+                    directory_generation=directory_id,
+                    require_registration=True,
                     result_limit=1,
                 )
                 if not primary_reservations:
@@ -311,6 +345,9 @@ class RelayAccessService:
                         ordered_node_ids=[item.node_id for item in backup_candidates],
                         now=now,
                         ttl_seconds=reservation_ttl,
+                        expires_at=server_deadline,
+                        directory_generation=directory_id,
+                        require_registration=True,
                         result_limit=1,
                     )
                 reservations = primary_reservations + backup_reservations
@@ -378,7 +415,7 @@ class RelayAccessService:
                 payload = RelayDirectoryPayloadOut(
                     format_version=1,
                     policy_revision=grant.policy_revision,
-                    directory_id=new_directory_id(),
+                    directory_id=directory_id,
                     issued_at_ms=_unix_ms(now),
                     expires_at_ms=_unix_ms(reservation_expiry),
                     session_id=grant.id,
@@ -429,6 +466,16 @@ class RelayAccessService:
                         raise RelayAccessError(
                             "relay_credential_unavailable", 503, "relay access unavailable"
                         ) from None
+                    if issued_credential.reencrypted_secret is not None:
+                        # The repository locked/revalidated both rows during
+                        # admission; rotate their envelope in this same issuance
+                        # transaction without ever materializing a string secret.
+                        node.encrypted_turn_secret = (
+                            issued_credential.reencrypted_secret
+                        )
+                        registration.encrypted_turn_secret = (
+                            issued_credential.reencrypted_secret
+                        )
                     credentials.append(issued_credential)
                 for candidate in signed_candidates:
                     self._session.add(
@@ -493,10 +540,16 @@ async def _cohere_reservations(
     """Make a v1-coherent set without invalidating already-issued credentials."""
 
     if not existing_reservations:
-        deadline = min(
+        raw_deadline = min(
             server_deadline,
             *(_utc(item.expires_at) for item in reservations),
             *(_node_deadline(item.node_id, by_id) for item in reservations),
+        )
+        # PostgreSQL and certificate sources preserve microseconds while TURN
+        # REST usernames carry whole Unix seconds. Floor the *final* minimum so
+        # the row, signed directory and credential all expire at one instant.
+        deadline = datetime.fromtimestamp(
+            int(raw_deadline.timestamp()), tz=UTC
         )
         for reservation in reservations:
             if _utc(reservation.expires_at) > deadline:

@@ -92,6 +92,12 @@ class RecordingCipher:
     ) -> bytearray:
         return bytearray(self.decrypt(ciphertext, associated_data=associated_data))
 
+    def encrypt(self, plaintext: bytes, *, associated_data: bytes) -> bytes:
+        return b"active:" + associated_data + b":" + plaintext
+
+    def needs_reencrypt(self, ciphertext: bytes) -> bool:
+        return False
+
 
 class MutableRecordingCipher:
     def __init__(self) -> None:
@@ -102,8 +108,14 @@ class MutableRecordingCipher:
     ) -> bytearray:
         assert ciphertext == b"ciphertext-a"
         assert associated_data == b"relay-a"
-        self.buffer = bytearray(b"relay-a-unique-secret")
+        self.buffer = bytearray(hashlib.sha256(b"relay-a-unique-secret").digest())
         return self.buffer
+
+    def encrypt(self, plaintext: bytes, *, associated_data: bytes) -> bytes:
+        return b"active-envelope"
+
+    def needs_reencrypt(self, ciphertext: bytes) -> bool:
+        return False
 
 
 def test_node_credential_uses_and_clears_the_cipher_mutable_buffer() -> None:
@@ -140,7 +152,8 @@ def test_node_credential_uses_and_clears_the_cipher_mutable_buffer() -> None:
 def test_node_credential_ttl_is_exact_minimum_of_all_server_deadlines(
     deadlines: tuple[int, int, int, int], expected: int
 ):
-    cipher = RecordingCipher({"relay-a": b"relay-a-unique-secret"})
+    relay_a_secret = hashlib.sha256(b"relay-a-unique-secret").digest()
+    cipher = RecordingCipher({"relay-a": relay_a_secret})
     issuer = NodeTurnCredentialService(
         cipher=cipher, ttl_seconds=600, now=lambda: NOW
     )
@@ -159,7 +172,7 @@ def test_node_credential_ttl_is_exact_minimum_of_all_server_deadlines(
     assert credential.expires_at_unix_seconds == expected
     assert credential.username == f"{expected}:user-42:session-7:relay-a"
     expected_hmac = base64.b64encode(
-        hmac.new(b"relay-a-unique-secret", credential.username.encode(), hashlib.sha1).digest()
+        hmac.new(relay_a_secret, credential.username.encode(), hashlib.sha1).digest()
     ).decode()
     assert hmac.compare_digest(credential.credential, expected_hmac)
     assert cipher.decrypt_calls == [(b"ciphertext-a", b"relay-a")]
@@ -168,9 +181,11 @@ def test_node_credential_ttl_is_exact_minimum_of_all_server_deadlines(
 
 
 def test_node_credentials_are_secret_isolated_and_expire_at_exact_now():
+    relay_a_secret = hashlib.sha256(b"relay-a-unique-secret").digest()
+    relay_b_secret = hashlib.sha256(b"relay-b-unique-secret").digest()
     cipher = RecordingCipher({
-        "relay-a": b"relay-a-unique-secret",
-        "relay-b": b"relay-b-unique-secret",
+        "relay-a": relay_a_secret,
+        "relay-b": relay_b_secret,
     })
     issuer = NodeTurnCredentialService(cipher=cipher, ttl_seconds=600, now=lambda: NOW)
     common = dict(
@@ -193,13 +208,13 @@ def test_node_credentials_are_secret_isolated_and_expire_at_exact_now():
         encrypted_secret=b"ciphertext-b",
     )
     assert not NodeTurnCredentialService.verify_with_secret(
-        a.username, a.credential, b"relay-b-unique-secret", now=NOW
+        a.username, a.credential, relay_b_secret, now=NOW
     )
     assert NodeTurnCredentialService.verify_with_secret(
-        b.username, b.credential, b"relay-b-unique-secret", now=NOW
+        b.username, b.credential, relay_b_secret, now=NOW
     )
     assert not NodeTurnCredentialService.verify_with_secret(
-        b.username, b.credential, b"relay-b-unique-secret", now=NOW + 300
+        b.username, b.credential, relay_b_secret, now=NOW + 300
     )
     with pytest.raises(TurnCredentialExpired):
         issuer.issue(
@@ -208,6 +223,30 @@ def test_node_credentials_are_secret_isolated_and_expire_at_exact_now():
             urls=["turn:relay-a.example.test:3478?transport=udp"],
             encrypted_secret=b"ciphertext-a",
         )
+
+
+def test_node_credential_returns_active_envelope_for_old_read_key() -> None:
+    class RotatingCipher(RecordingCipher):
+        def needs_reencrypt(self, ciphertext: bytes) -> bool:
+            return ciphertext == b"old-envelope"
+
+    secret = hashlib.sha256(b"rotation-secret").digest()
+    cipher = RotatingCipher({"relay-a": secret})
+    issued = NodeTurnCredentialService(
+        cipher=cipher, ttl_seconds=60, now=lambda: NOW
+    ).issue(
+        user_id="user-42",
+        session_id="session-7",
+        node_id="relay-a",
+        urls=["turn:relay-a.example.test:3478?transport=udp"],
+        encrypted_secret=b"old-envelope",
+        grant_deadline_unix_seconds=NOW + 30,
+        directory_deadline_unix_seconds=NOW + 30,
+        policy_deadline_unix_seconds=NOW + 30,
+        node_deadline_unix_seconds=NOW + 30,
+    )
+    assert issued.reencrypted_secret == b"active:relay-a:" + secret
+    assert secret.hex() not in repr(issued)
 
 
 def test_legacy_service_rejects_invalid_scope_and_caps_ttl():

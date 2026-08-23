@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import threading
@@ -112,14 +113,34 @@ def test_same_enrollment_token_with_different_turn_secret_conflicts(
     first = client.post("/api/v1/relays/enroll", headers=TLS_HEADERS, json=payload)
     assert first.status_code == 202, first.text
     changed = dict(payload)
-    changed["turn_rest_secret"] = base64.urlsafe_b64encode(b"x" * 32).rstrip(
-        b"="
-    ).decode("ascii")
+    changed["turn_rest_secret"] = base64.urlsafe_b64encode(
+        hashlib.sha256(b"different-valid-turn-secret").digest()
+    ).rstrip(b"=").decode("ascii")
     conflict = client.post(
         "/api/v1/relays/enroll", headers=TLS_HEADERS, json=changed
     )
     assert conflict.status_code == 409
     assert _error_code(conflict) == "relay_enrollment_already_used"
+
+
+def test_relay_enrollment_rejects_repeated_placeholder_turn_secret(
+    api: tuple[TestClient, object],
+) -> None:
+    client, _ = api
+    token = _issue_token(client)
+    csr_pem, _ = _csr(NODE_ID)
+    response = client.post(
+        "/api/v1/relays/enroll",
+        headers=TLS_HEADERS,
+        json={
+            **_enrollment_payload(token, csr_pem),
+            "turn_rest_secret": base64.urlsafe_b64encode(b"x" * 32)
+            .rstrip(b"=")
+            .decode("ascii"),
+        },
+    )
+    assert response.status_code == 400
+    assert _error_code(response) == "relay_enrollment_invalid"
 
 
 def test_admin_approval_requires_explicit_trusted_topology(
@@ -594,6 +615,8 @@ def test_renewal_lost_response_retry_rotates_once_and_old_cert_is_renew_only(
         f"/api/v1/relays/{NODE_ID}/renew", content=body, headers=headers
     )
     assert first.status_code == retry.status_code == 200
+    assert first.headers["cache-control"] == "no-store, private"
+    assert first.headers["pragma"] == "no-cache"
     assert first.json() == retry.json()
     new_fingerprint = first.json()["fingerprint"]
     assert new_fingerprint != old_fingerprint

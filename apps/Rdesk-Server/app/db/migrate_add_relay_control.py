@@ -17,7 +17,7 @@ _CHECK_CAST = re.compile(
     flags=re.IGNORECASE,
 )
 _MIGRATION_LOCK_CONTEXT = b"MRD_RELAY_SCHEMA_MIGRATION_V1\x00"
-_RELAY_SCHEMA_VERSIONS = (1, 2, 3, 4, 5, 6)
+_RELAY_SCHEMA_VERSIONS = (1, 2, 3, 4, 5, 6, 7)
 
 
 class RelaySchemaMismatchError(RuntimeError):
@@ -156,6 +156,8 @@ async def _migrate_connection(
             user_id VARCHAR(128) NOT NULL,
             node_id VARCHAR(128) NOT NULL REFERENCES {nodes}(node_id) ON DELETE CASCADE,
             expires_at TIMESTAMPTZ NOT NULL,
+            superseded_at TIMESTAMPTZ,
+            directory_generation VARCHAR(64) NOT NULL DEFAULT 'legacy',
             created_at TIMESTAMPTZ NOT NULL,
             CONSTRAINT uq_relay_reservations_session_node UNIQUE (session_id, node_id)
         )
@@ -280,6 +282,9 @@ async def _migrate_connection(
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS physical_host_id VARCHAR(128)",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS topology_approved_at TIMESTAMPTZ",
         f"ALTER TABLE {registrations} ADD COLUMN IF NOT EXISTS encrypted_turn_secret BYTEA",
+        f"ALTER TABLE {reservations} ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ",
+        f"ALTER TABLE {reservations} ADD COLUMN IF NOT EXISTS "
+        "directory_generation VARCHAR(64) NOT NULL DEFAULT 'legacy'",
     ):
         await connection.execute(text(statement))
     # v3 used previous_auth_expires_at for both old-certificate retry and
@@ -447,7 +452,20 @@ def _preflight_existing_schema(sync_connection: object, schema: str | None) -> N
                 "physical_host_id", "topology_approved_at", "encrypted_turn_secret",
             },
         }.get(table_name, set())
-        allowed = expected | v3_additions | v4_additions | v5_additions | v6_additions
+        v7_additions = {
+            "relay_reservations": {
+                "superseded_at",
+                "directory_generation",
+            },
+        }.get(table_name, set())
+        allowed = (
+            expected
+            | v3_additions
+            | v4_additions
+            | v5_additions
+            | v6_additions
+            | v7_additions
+        )
         if not expected.issubset(actual) or not actual.issubset(allowed):
             raise RelaySchemaMismatchError(
                 f"relay schema mismatch for {table_name}: column set differs"
@@ -559,7 +577,13 @@ def _assert_migration_ledger(
         table_name=table_name,
         expected_types={"relay_schema_migrations_pkey": "p"},
     )
-    _assert_empty_semantic_objects(inspector, table_name, schema)
+    _assert_empty_semantic_objects(
+        sync_connection,
+        inspector,
+        table_name,
+        schema,
+        current_schema=effective_schema,
+    )
     table = _table(schema, table_name)
     actual_versions = set(
         sync_connection.execute(text(f"SELECT version FROM {table}")).scalars()
@@ -638,17 +662,36 @@ def _foreign_key_signature(
 
 
 def _assert_empty_semantic_objects(
-    inspector: object, table_name: str, schema: str | None
+    connection: object,
+    inspector: object,
+    table_name: str,
+    schema: str | None,
+    *,
+    current_schema: str,
 ) -> None:
     if (
         inspector.get_check_constraints(table_name, schema=schema)
         or inspector.get_unique_constraints(table_name, schema=schema)
         or inspector.get_foreign_keys(table_name, schema=schema)
-        or _standalone_indexes(inspector, table_name, schema)
     ):
         raise RelaySchemaMismatchError(
             f"relay schema mismatch for {table_name}: semantic objects differ"
         )
+    for name, index in _standalone_indexes(inspector, table_name, schema).items():
+        columns = index.get("column_names")
+        if (
+            not isinstance(columns, list)
+            or not columns
+            or any(not isinstance(column, str) for column in columns)
+            or not _index_matches(index, tuple(columns))
+            or _index_access_method(
+                connection, schema=current_schema, index_name=name
+            )
+            != "btree"
+        ):
+            raise RelaySchemaMismatchError(
+                f"relay schema mismatch for {table_name}: semantic objects differ"
+            )
 
 
 def _constraint_states(
@@ -737,6 +780,8 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             "user_id": (String, 128, False),
             "node_id": (String, 128, False),
             "expires_at": (DateTime, None, False),
+            "superseded_at": (DateTime, None, True),
+            "directory_generation": (String, 64, False),
             "created_at": (DateTime, None, False),
         },
         "relay_node_registrations": {
@@ -814,6 +859,8 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             )
         elif table_name == "relay_node_registrations":
             expected_defaults["status"] = "'pending'"
+        elif table_name == "relay_reservations":
+            expected_defaults["directory_generation"] = "'legacy'"
         for name, expected_default in expected_defaults.items():
             actual_default = columns[name]["default"]
             if (
@@ -1014,7 +1061,7 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
     }
     for table_name, required in expected_indexes.items():
         actual = _standalone_indexes(inspector, table_name, schema)
-        if set(actual) != set(required) or any(
+        missing_or_changed = set(required) - set(actual) or any(
             not _index_matches(actual[name], columns)
             or _index_access_method(
                 sync_connection,
@@ -1023,7 +1070,22 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             )
             != "btree"
             for name, columns in required.items()
-        ):
+        )
+        operational_extras_are_safe = all(
+            isinstance(index.get("column_names"), list)
+            and bool(index["column_names"])
+            and all(isinstance(column, str) for column in index["column_names"])
+            and _index_matches(index, tuple(index["column_names"]))
+            and _index_access_method(
+                sync_connection,
+                schema=expected_referred_schema,
+                index_name=name,
+            )
+            == "btree"
+            for name, index in actual.items()
+            if name not in required
+        )
+        if missing_or_changed or not operational_extras_are_safe:
             raise RelaySchemaMismatchError(
                 f"relay schema mismatch for {table_name}: indexes differ"
             )

@@ -134,6 +134,48 @@ def create_access_token(user_id: str, username: str, role: str) -> str:
     return jwt.encode(payload, secret, algorithm="HS256")
 
 
+def create_device_access_token(device: Device) -> str:
+    configured = _configured_device_jwt()
+    if configured is None:
+        raise _relay_http_exception(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "authentication_unavailable",
+            "authentication service is not configured",
+        )
+    secret, issuer, audience, max_lifetime_seconds = configured
+    configured_minutes = settings.device_jwt_expire_minutes
+    lifetime_seconds = (
+        configured_minutes * 60
+        if isinstance(configured_minutes, int)
+        and not isinstance(configured_minutes, bool)
+        else 0
+    )
+    if (
+        not 0 < lifetime_seconds <= max_lifetime_seconds
+        or not isinstance(device.auth_version, int)
+        or isinstance(device.auth_version, bool)
+        or device.auth_version < 1
+    ):
+        raise _relay_http_exception(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "authentication_unavailable",
+            "authentication service is not configured",
+        )
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": device.id,
+        "device_id": device.device_id,
+        "auth_version": device.auth_version,
+        "token_type": "device",
+        "role": "device",
+        "iss": issuer,
+        "aud": audience,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(minutes=configured_minutes)).timestamp()),
+    }
+    return jwt.encode(payload, secret, algorithm="HS256")
+
+
 security = HTTPBearer()
 trusted_mtls_proxy_scheme = APIKeyHeader(
     name="X-Rdesk-Client-TLS",
@@ -277,19 +319,32 @@ async def _device_from_request(
     if matched is None:
         raise _device_credentials_exception()
     try:
-        configured = _configured_jwt()
+        configured = _configured_device_jwt()
         if configured is None:
             raise _device_credentials_exception()
         payload = _decode_access_token(matched.group(1), configured)
-        if payload.get("role") != "device":
+        if payload.get("role") != "device" or payload.get("token_type") != "device":
             raise _device_credentials_exception()
-        device_id = payload.get("sub")
-        if not isinstance(device_id, str):
+        device_row_id = payload.get("sub")
+        device_id = payload.get("device_id")
+        auth_version = payload.get("auth_version")
+        if (
+            not isinstance(device_row_id, str)
+            or not isinstance(device_id, str)
+            or not isinstance(auth_version, int)
+            or isinstance(auth_version, bool)
+            or auth_version < 1
+        ):
             raise _device_credentials_exception()
     except jwt.JWTError:
         raise _device_credentials_exception() from None
-    device = await db.scalar(select(Device).where(Device.device_id == device_id))
-    if device is None:
+    device = await db.scalar(select(Device).where(Device.id == device_row_id))
+    if (
+        device is None
+        or device.device_id != device_id
+        or device.auth_version != auth_version
+        or device.auth_revoked_at is not None
+    ):
         raise _device_credentials_exception()
     return device
 
@@ -530,6 +585,26 @@ def _configured_jwt() -> tuple[str, str, str, int] | None:
         or not isinstance(future_skew, int)
         or isinstance(future_skew, bool)
         or not 0 <= future_skew <= 300
+    ):
+        return None
+    return secret, issuer, audience, maximum_minutes * 60
+
+
+def _configured_device_jwt() -> tuple[str, str, str, int] | None:
+    secret = _configured_jwt_secret()
+    issuer = settings.jwt_issuer.strip()
+    audience = settings.device_jwt_audience.strip()
+    maximum_minutes = settings.jwt_max_lifetime_minutes
+    if (
+        secret is None
+        or not issuer
+        or len(issuer) > 512
+        or not audience
+        or len(audience) > 256
+        or audience == settings.jwt_audience.strip()
+        or not isinstance(maximum_minutes, int)
+        or isinstance(maximum_minutes, bool)
+        or not 1 <= maximum_minutes <= 60 * 24
     ):
         return None
     return secret, issuer, audience, maximum_minutes * 60

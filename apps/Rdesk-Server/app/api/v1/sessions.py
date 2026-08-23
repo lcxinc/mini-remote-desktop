@@ -10,6 +10,8 @@ from app.schemas.session import (
     SessionApprovalOut,
     SessionRequestIn,
     SessionRequestOut,
+    SessionTransitionIn,
+    SessionTransitionOut,
 )
 from app.services.session_grants import (
     SessionGrantError,
@@ -90,4 +92,70 @@ async def approve_session(
         policy_revision=grant.policy_revision,
         policy_expires_at=grant.policy_expires_at,
         intended_peer_id=grant.intended_peer_id,
+    )
+
+
+async def _transition(
+    *,
+    session_id: str,
+    action: str,
+    current_user: User,
+    db: AsyncSession,
+) -> SessionTransitionOut:
+    try:
+        grant = await _service(db).transition(
+            session_id=session_id,
+            current_user_id=current_user.id,
+            current_user_role=current_user.role,
+            action=action,
+        )
+        await _commit(db)
+    except SessionGrantError as error:
+        await db.rollback()
+        _raise(error)
+    return SessionTransitionOut(request_id=grant.id, status=grant.status)
+
+
+@router.post("/{session_id}/reject", response_model=SessionTransitionOut)
+async def reject_session(
+    session_id: str,
+    _: SessionTransitionIn,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> SessionTransitionOut:
+    return await _transition(
+        session_id=session_id,
+        action="reject",
+        current_user=current_user,
+        db=db,
+    )
+
+
+@router.post("/{session_id}/close", response_model=SessionTransitionOut)
+async def close_session(
+    session_id: str,
+    _: SessionTransitionIn,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> SessionTransitionOut:
+    return await _transition(
+        session_id=session_id,
+        action="close",
+        current_user=current_user,
+        db=db,
+    )
+
+
+@router.post("/{session_id}/revoke", response_model=SessionTransitionOut)
+async def revoke_session(
+    session_id: str,
+    _: SessionTransitionIn,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> SessionTransitionOut:
+    return await _transition(
+        session_id=session_id,
+        action="revoke",
+        current_user=current_user,
+        db=db,
     )

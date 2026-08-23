@@ -317,6 +317,8 @@ def _issue_token(client: TestClient) -> str:
         "/api/v1/relays/enrollment-tokens", json={"ttl_seconds": 300}
     )
     assert response.status_code == 201, response.text
+    assert response.headers["cache-control"] == "no-store, private"
+    assert response.headers["pragma"] == "no-cache"
     token = response.json()["token"]
     assert len(token) >= 40
     return token
@@ -350,6 +352,8 @@ def _enroll(
         },
     )
     assert response.status_code == 202, response.text
+    assert response.headers["cache-control"] == "no-store, private"
+    assert response.headers["pragma"] == "no-cache"
     assert response.json()["node_id"] == node_id
     assert response.json()["status"] == "pending"
     assert len(response.json()["enrollment_id"]) == 36
@@ -374,6 +378,8 @@ def _approve(client: TestClient, node_id: str = NODE_ID) -> tuple[str, str]:
         headers={**TLS_HEADERS, "X-Relay-Enrollment-Receipt": receipt},
     )
     assert pickup.status_code == 200, pickup.text
+    assert pickup.headers["cache-control"] == "no-store, private"
+    assert pickup.headers["pragma"] == "no-cache"
     certificate_pem = pickup.json()["certificate_pem"]
     certificate = x509.load_pem_x509_certificate(certificate_pem.encode())
     fingerprint = "sha256:" + hashlib.sha256(

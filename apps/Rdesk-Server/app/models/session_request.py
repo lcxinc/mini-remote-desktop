@@ -25,7 +25,8 @@ class SessionRequest(Base):
             name="ck_session_requests_tenant_id",
         ),
         CheckConstraint(
-            "status IN ('requested', 'approved', 'rejected', 'expired')",
+            "status IN ('requested', 'approved', 'rejected', 'expired', "
+            "'closed', 'revoked')",
             name="ck_session_requests_status",
         ),
         CheckConstraint(

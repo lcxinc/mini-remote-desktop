@@ -31,3 +31,12 @@ class SessionApprovalOut(BaseModel):
     policy_revision: int
     policy_expires_at: datetime
     intended_peer_id: str
+
+
+class SessionTransitionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class SessionTransitionOut(BaseModel):
+    request_id: str
+    status: str

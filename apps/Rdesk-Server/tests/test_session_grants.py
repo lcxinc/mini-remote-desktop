@@ -15,6 +15,8 @@ from app.core.config import settings
 from app.core.security import get_current_user
 from app.db.session import Base, get_db
 from app.models.device import Device
+from app.models.relay_audit_event import RelayAuditEvent
+from app.models.relay_reservation import RelayReservation
 from app.models.session_request import SessionRequest
 from app.models.user import User
 from test_relay_node_api import AsyncSessionShim
@@ -210,6 +212,90 @@ def test_approval_request_forbids_caller_deadline_revision_and_policy(
         )
         assert response.status_code == 422
         assert session.get(SessionRequest, request_id).status == "requested"
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_session_lifecycle_is_audited_irreversible_and_closes_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_policy(monkeypatch)
+    engine, session, current, client = _fixture()
+    try:
+        requested = client.post(
+            "/api/v1/sessions/request",
+            json={"target_device_id": "device-target"},
+        )
+        request_id = requested.json()["request_id"]
+        assert [event.action for event in session.scalars(
+            select(RelayAuditEvent).order_by(RelayAuditEvent.created_at)
+        )] == ["session_requested"]
+
+        current.user = session.get(User, "owner")
+        assert client.post(
+            f"/api/v1/sessions/{request_id}/approve", json={}
+        ).status_code == 200
+        grant = session.get(SessionRequest, request_id)
+        session.add(
+            RelayReservation(
+                session_id=request_id,
+                user_id="requester",
+                node_id="relay-terminal",
+                expires_at=grant.grant_expires_at,
+                created_at=datetime.now(UTC),
+                directory_generation="directory-before-close",
+            )
+        )
+        session.commit()
+
+        current.user = session.get(User, "requester")
+        closed = client.post(f"/api/v1/sessions/{request_id}/close", json={})
+        assert closed.status_code == 200, closed.text
+        assert closed.json()["status"] == "closed"
+        assert session.get(SessionRequest, request_id).status == "closed"
+        reservation = session.scalar(select(RelayReservation))
+        assert reservation.superseded_at is not None
+        assert client.post(
+            f"/api/v1/sessions/{request_id}/close", json={}
+        ).status_code == 409
+        assert [event.action for event in session.scalars(
+            select(RelayAuditEvent).order_by(RelayAuditEvent.created_at)
+        )] == ["session_requested", "session_approved", "session_closed"]
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_session_reject_and_revoke_enforce_owner_or_admin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_policy(monkeypatch)
+    engine, session, current, client = _fixture()
+    try:
+        first = client.post(
+            "/api/v1/sessions/request",
+            json={"target_device_id": "device-target"},
+        ).json()["request_id"]
+        assert client.post(f"/api/v1/sessions/{first}/reject", json={}).status_code == 403
+        current.user = session.get(User, "owner")
+        assert client.post(f"/api/v1/sessions/{first}/reject", json={}).json()[
+            "status"
+        ] == "rejected"
+
+        current.user = session.get(User, "requester")
+        second = client.post(
+            "/api/v1/sessions/request",
+            json={"target_device_id": "device-target"},
+        ).json()["request_id"]
+        current.user = session.get(User, "owner")
+        client.post(f"/api/v1/sessions/{second}/approve", json={})
+        current.user = session.get(User, "attacker")
+        assert client.post(f"/api/v1/sessions/{second}/revoke", json={}).status_code == 403
+        current.user = session.get(User, "owner")
+        assert client.post(f"/api/v1/sessions/{second}/revoke", json={}).json()[
+            "status"
+        ] == "revoked"
     finally:
         session.close()
         engine.dispose()

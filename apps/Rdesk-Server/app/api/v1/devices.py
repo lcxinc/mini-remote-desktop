@@ -8,8 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
+from app.core.response_security import no_store_sensitive_response
 from app.core.security import (
-    create_access_token,
+    create_device_access_token,
     get_device_enrollment_token_optional,
     get_current_device,
     get_current_device_optional,
@@ -26,6 +27,10 @@ from app.schemas.device import (
     DeviceBindRequest,
     DeviceBindingStatus,
     DeviceEnrollmentTokenOut,
+    DeviceCredentialResponse,
+    DeviceCredentialRevocationResponse,
+    DeviceInventoryCheckRequest,
+    DeviceInventoryCheckResponse,
     DeviceOut,
     DeviceRegisterRequest,
     DeviceRegisterResponse,
@@ -36,9 +41,14 @@ from app.schemas.device import (
 from app.services.device_enrollment import (
     DeviceEnrollmentError,
     DeviceEnrollmentService,
+    device_serial_digest,
 )
 
-router = APIRouter(prefix="/devices", tags=["devices"])
+router = APIRouter(
+    prefix="/devices",
+    tags=["devices"],
+    dependencies=[Depends(no_store_sensitive_response)],
+)
 _TENANT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _DUAL_SECURITY = ({"HTTPBearer": [], "DeviceBearer": []},)
 
@@ -119,11 +129,7 @@ async def register_device(
         except DeviceEnrollmentError as error:
             await db.rollback()
             _raise_device_enrollment(error)
-        access_token = create_access_token(
-            registered.device.device_id,
-            registered.device.name,
-            "device",
-        )
+        access_token = create_device_access_token(registered.device)
         return DeviceRegisterResponse(
             device_id=registered.device.device_id,
             device_name=registered.device.name,
@@ -137,9 +143,10 @@ async def register_device(
     if not is_admin and current_device is None:
         _deny_device_registration(401)
     if is_admin:
+        serial_digest = _device_serial_digest(payload.motherboard_serial)
         existing = await db.scalar(
             select(Device)
-            .where(Device.motherboard_serial == payload.motherboard_serial)
+            .where(Device.motherboard_serial_digest == serial_digest)
             .with_for_update()
             .execution_options(populate_existing=True)
         )
@@ -153,7 +160,8 @@ async def register_device(
         )
         if (
             existing is None
-            or existing.motherboard_serial != payload.motherboard_serial
+            or existing.motherboard_serial_digest
+            != _device_serial_digest(payload.motherboard_serial)
         ):
             _deny_device_registration(403)
 
@@ -180,9 +188,7 @@ async def register_device(
         await db.refresh(existing)
 
         # 生成访问令牌
-        access_token = create_access_token(
-            existing.device_id, existing.name, "device"
-        )
+        access_token = create_device_access_token(existing)
 
         return DeviceRegisterResponse(
             device_id=existing.device_id,
@@ -199,32 +205,37 @@ async def register_device(
         )
 
 
-@router.get(
-    "/check/{motherboard_serial}",
-    deprecated=True,
+@router.post(
+    "/inventory/check",
+    response_model=DeviceInventoryCheckResponse,
+    response_model_exclude_none=True,
     summary="Check device registration (admin inventory only)",
 )
 async def check_device_registration(
-    motherboard_serial: str,
+    payload: DeviceInventoryCheckRequest,
     _admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
-) -> dict:
+) -> DeviceInventoryCheckResponse:
     """
     检查设备是否已注册。设备接入应直接使用管理员签发的 enrollment token。
     """
     device = await db.scalar(
-        select(Device).where(Device.motherboard_serial == motherboard_serial)
+        select(Device).where(
+            Device.motherboard_serial_digest
+            == _device_serial_digest(
+                payload.motherboard_serial.get_secret_value()
+            )
+        )
     )
 
     if device:
-        return {
-            "registered": True,
-            "device_id": device.device_id,
-            "device_name": device.name,
-            "is_bound": device.is_bound,
-        }
-    else:
-        return {"registered": False}
+        return DeviceInventoryCheckResponse(
+            registered=True,
+            device_id=device.device_id,
+            device_name=device.name,
+            is_bound=device.is_bound,
+        )
+    return DeviceInventoryCheckResponse(registered=False)
 
 
 @router.post("/bind", openapi_extra={"security": _DUAL_SECURITY})
@@ -259,9 +270,16 @@ async def bind_device(
 async def list_devices(
     q: str | None = Query(default=None),
     status: str | None = Query(default=None),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[DeviceOut]:
     stmt: Select[tuple[Device]] = select(Device).options(selectinload(Device.status))
+    if current_user.role != "admin":
+        stmt = stmt.where(
+            Device.tenant_id == current_user.tenant_id,
+            Device.is_bound.is_(True),
+            Device.bound_user_id == current_user.id,
+        )
     if q:
         stmt = stmt.where(Device.name.ilike(f"%{q}%"))
     rows = (await db.scalars(stmt)).all()
@@ -272,12 +290,22 @@ async def list_devices(
 
 
 @router.get("/{device_id}", response_model=DeviceOut)
-async def get_device(device_id: str, db: AsyncSession = Depends(get_db)) -> DeviceOut:
+async def get_device(
+    device_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> DeviceOut:
     stmt = (
         select(Device)
         .where(Device.id == device_id)
         .options(selectinload(Device.status))
     )
+    if current_user.role != "admin":
+        stmt = stmt.where(
+            Device.tenant_id == current_user.tenant_id,
+            Device.is_bound.is_(True),
+            Device.bound_user_id == current_user.id,
+        )
     device = await db.scalar(stmt)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
@@ -438,17 +466,13 @@ async def _commit(db: AsyncSession) -> None:
 
 
 def _device_enrollment_service(db: AsyncSession) -> DeviceEnrollmentService:
-    configured = settings.device_enrollment_token_pepper
-    raw_pepper = (
-        configured.get_secret_value()
-        if isinstance(configured, SecretStr)
-        else configured
-    )
     try:
-        pepper = bytes.fromhex(raw_pepper)
         return DeviceEnrollmentService(
             db,
-            token_pepper=pepper,
+            token_pepper=_configured_hex_secret(
+                settings.device_enrollment_token_pepper
+            ),
+            serial_pepper=_configured_hex_secret(settings.device_serial_pepper),
             ttl_seconds=settings.device_enrollment_ttl_seconds,
         )
     except (AttributeError, TypeError, ValueError):
@@ -459,6 +483,29 @@ def _device_enrollment_service(db: AsyncSession) -> DeviceEnrollmentService:
                 "message": "device enrollment unavailable",
             },
         ) from None
+
+
+def _device_serial_digest(serial: str) -> str:
+    try:
+        return device_serial_digest(
+            serial, _configured_hex_secret(settings.device_serial_pepper)
+        )
+    except (AttributeError, TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "device_identity_unavailable",
+                "message": "device identity unavailable",
+            },
+        ) from None
+
+
+def _configured_hex_secret(value: str | SecretStr) -> bytes:
+    raw = value.get_secret_value() if isinstance(value, SecretStr) else value
+    decoded = bytes.fromhex(raw)
+    if len(decoded) < 32:
+        raise ValueError("secret unavailable")
+    return decoded
 
 
 def _raise_device_enrollment(error: DeviceEnrollmentError) -> None:
@@ -484,9 +531,95 @@ def _naive_utc(value: datetime) -> datetime:
     return value.astimezone(UTC).replace(tzinfo=None)
 
 
+@router.post(
+    "/{device_id}/credentials/rotate",
+    response_model=DeviceCredentialResponse,
+    openapi_extra={"security": _DUAL_SECURITY},
+)
+async def rotate_device_credentials(
+    device_id: str,
+    current_user: User = Depends(get_current_user),
+    current_device: Device = Depends(get_current_device),
+    db: AsyncSession = Depends(get_db),
+) -> DeviceCredentialResponse:
+    device = await _locked_device(db, device_id)
+    if (
+        current_device.id != device.id
+        or not device.is_bound
+        or device.bound_user_id != current_user.id
+        or device.tenant_id != current_user.tenant_id
+    ):
+        raise HTTPException(status_code=403, detail="Device credential rotation denied")
+    device.auth_version += 1
+    device.auth_revoked_at = None
+    await db.flush()
+    token = create_device_access_token(device)
+    await _commit(db)
+    return DeviceCredentialResponse(
+        device_id=device.device_id,
+        auth_version=device.auth_version,
+        access_token=token,
+    )
+
+
+@router.post(
+    "/{device_id}/credentials/admin-rotate",
+    response_model=DeviceCredentialResponse,
+)
+async def admin_rotate_device_credentials(
+    device_id: str,
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> DeviceCredentialResponse:
+    device = await _locked_device(db, device_id)
+    device.auth_version += 1
+    device.auth_revoked_at = None
+    await db.flush()
+    token = create_device_access_token(device)
+    await _commit(db)
+    return DeviceCredentialResponse(
+        device_id=device.device_id,
+        auth_version=device.auth_version,
+        access_token=token,
+    )
+
+
+@router.post(
+    "/{device_id}/credentials/revoke",
+    response_model=DeviceCredentialRevocationResponse,
+)
+async def revoke_device_credentials(
+    device_id: str,
+    _admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> DeviceCredentialRevocationResponse:
+    device = await _locked_device(db, device_id)
+    device.auth_version += 1
+    device.auth_revoked_at = datetime.now(UTC)
+    await _commit(db)
+    return DeviceCredentialRevocationResponse(
+        device_id=device.device_id,
+        auth_version=device.auth_version,
+        revoked=True,
+    )
+
+
+async def _locked_device(db: AsyncSession, device_id: str) -> Device:
+    device = await db.scalar(
+        select(Device)
+        .where(Device.device_id == device_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if device is None:
+        raise HTTPException(status_code=404, detail="Device not found")
+    return device
+
+
 @router.get("/{device_id}/binding-status", response_model=DeviceBindingStatus)
 async def get_binding_status(
     device_id: str,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> DeviceBindingStatus:
     """
@@ -494,9 +627,14 @@ async def get_binding_status(
 
     返回：是否已绑定、绑定的用户信息、绑定时间
     """
-    device = await db.scalar(
-        select(Device).where(Device.device_id == device_id)
-    )
+    statement = select(Device).where(Device.device_id == device_id)
+    if current_user.role != "admin":
+        statement = statement.where(
+            Device.tenant_id == current_user.tenant_id,
+            Device.is_bound.is_(True),
+            Device.bound_user_id == current_user.id,
+        )
+    device = await db.scalar(statement)
 
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
@@ -518,11 +656,21 @@ async def get_binding_status(
     )
 
 
-@router.patch("/{device_id}/rename", response_model=DeviceRenameResponse)
+@router.patch(
+    "/{device_id}/rename",
+    response_model=DeviceRenameResponse,
+    openapi_extra={
+        "security": (
+            {"HTTPBearer": []},
+            {"HTTPBearer": [], "DeviceBearer": []},
+        )
+    },
+)
 async def rename_device(
     device_id: str,
     payload: DeviceRenameRequest,
-    current_user = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
+    current_device: Device | None = Depends(get_current_device_optional),
     db: AsyncSession = Depends(get_db),
 ) -> DeviceRenameResponse:
     """
@@ -531,21 +679,29 @@ async def rename_device(
     需要用户登录认证。用户只能重命名自己绑定的设备。
     """
     device = await db.scalar(
-        select(Device).where(Device.device_id == device_id)
+        select(Device)
+        .where(Device.device_id == device_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
 
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
 
-    # 检查设备是否绑定到当前用户
-    if device.is_bound and device.bound_user_id != current_user.id:
+    if current_user.role != "admin" and (
+        current_device is None
+        or current_device.id != device.id
+        or not device.is_bound
+        or device.bound_user_id != current_user.id
+        or device.tenant_id != current_user.tenant_id
+    ):
         raise HTTPException(
-            status_code=403, detail="You can only rename devices bound to your account"
+            status_code=403, detail="Device rename denied"
         )
 
     # 更新设备名称
     device.name = payload.name
-    await db.commit()
+    await _commit(db)
 
     return DeviceRenameResponse(
         success=True,

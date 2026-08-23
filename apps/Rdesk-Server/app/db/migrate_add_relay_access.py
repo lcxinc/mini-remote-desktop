@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import re
 
 from sqlalchemy import BigInteger, Boolean, DateTime, Integer, LargeBinary, String, inspect, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+from pydantic import SecretStr
 
 from app.db.migrate_add_relay_control import (
     RelaySchemaMismatchError,
     assert_relay_schema_conforms,
 )
 from app.db.session import engine as default_engine
+from app.services.device_enrollment import device_serial_digest
 
 
 _IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
@@ -21,7 +24,7 @@ _CHECK_CAST = re.compile(
     flags=re.IGNORECASE,
 )
 _LOCK_CONTEXT = b"MRD_RELAY_ACCESS_SCHEMA_MIGRATION_V1\x00"
-_VERSIONS = (1, 2, 3)
+_VERSIONS = (1, 2, 3, 4, 5)
 
 
 class RelayAccessMigrationError(RuntimeError):
@@ -36,20 +39,34 @@ def _table(schema: str | None, name: str) -> str:
     return f'"{schema}".{name}'
 
 
+def _qualified_index(schema: str | None, name: str) -> str:
+    if schema is None:
+        return name
+    if _IDENTIFIER.fullmatch(schema) is None or _IDENTIFIER.fullmatch(name) is None:
+        raise ValueError("invalid database identifier")
+    return f'"{schema}".{name}'
+
+
 async def migrate(
     bind: AsyncEngine | AsyncConnection = default_engine,
     *,
     schema: str | None = None,
+    serial_pepper: bytes | str | SecretStr | None = None,
 ) -> None:
     if isinstance(bind, AsyncEngine):
         async with bind.begin() as connection:
-            await _migrate_connection(connection, schema=schema)
+            await _migrate_connection(
+                connection, schema=schema, serial_pepper=serial_pepper
+            )
         return
-    await _migrate_connection(bind, schema=schema)
+    await _migrate_connection(bind, schema=schema, serial_pepper=serial_pepper)
 
 
 async def _migrate_connection(
-    connection: AsyncConnection, *, schema: str | None
+    connection: AsyncConnection,
+    *,
+    schema: str | None,
+    serial_pepper: bytes | str | SecretStr | None,
 ) -> None:
     if connection.dialect.name != "postgresql":
         raise RelayAccessMigrationError("relay access migration requires PostgreSQL")
@@ -65,18 +82,54 @@ async def _migrate_connection(
     devices = _table(schema, "devices")
     sessions = _table(schema, "session_requests")
     device_enrollments = _table(schema, "device_enrollments")
+    reservations = _table(schema, "relay_reservations")
     versions = _table(schema, "relay_access_schema_migrations")
-    await connection.execute(
-        text(
-            f"CREATE TABLE IF NOT EXISTS {versions} ("
-            "version INTEGER PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+    ledger_exists = await connection.run_sync(
+        lambda sync: inspect(sync).has_table(
+            "relay_access_schema_migrations", schema=schema
         )
     )
+    if not ledger_exists:
+        await connection.execute(
+            text(
+                f"CREATE TABLE {versions} ("
+                "version INTEGER PRIMARY KEY, "
+                "applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+            )
+        )
     await connection.run_sync(
         lambda sync: _verify_migration_ledger(
             sync, schema, require_exact_versions=False
         )
     )
+    applied_versions = set(
+        (
+            await connection.execute(
+                text(f"SELECT version FROM {versions}")
+            )
+        ).scalars()
+    )
+    if applied_versions == set(_VERSIONS):
+        # Steady-state startup is read-only after the advisory lock. This is a
+        # schema verification path, never a repeated table-wide backfill.
+        await connection.run_sync(lambda sync: _verify(sync, schema))
+        return
+    supported_upgrade_states = (
+        set(),
+        {1, 2, 3},
+        {1, 2, 3, 4},
+    )
+    if applied_versions not in supported_upgrade_states:
+        # Versions 1-3 shipped as one atomic legacy migration. A partial legacy
+        # set cannot be produced by that transaction and is therefore drift, not
+        # a resumable state. This also makes every future/unknown version fail
+        # before any application table is changed.
+        raise RelayAccessMigrationError(
+            "relay access migration ledger versions differ"
+        )
+    apply_legacy_access = not applied_versions
+    apply_device_identity = 4 not in applied_versions
+    apply_directory_lifecycle = 5 not in applied_versions
     required_tables = (
         "users", "devices", "session_requests", "relay_nodes",
         "relay_node_registrations", "relay_audit_events",
@@ -90,9 +143,10 @@ async def _migrate_connection(
     if not all(present.values()):
         raise RelayAccessMigrationError("relay access dependency table is unavailable")
 
-    await connection.execute(
-        text(
-            f"""
+    if apply_legacy_access:
+        await connection.execute(
+            text(
+                f"""
             CREATE TABLE IF NOT EXISTS {device_enrollments} (
                 id VARCHAR(36) PRIMARY KEY,
                 token_digest VARCHAR(64) NOT NULL,
@@ -123,17 +177,17 @@ async def _migrate_connection(
                      registered_device_id IS NOT NULL)
                 )
             )
-            """
+                """
+            )
         )
-    )
-    await connection.execute(
-        text(
-            f"CREATE INDEX IF NOT EXISTS ix_device_enrollments_expiry "
-            f"ON {device_enrollments} (expires_at)"
+        await connection.execute(
+            text(
+                f"CREATE INDEX IF NOT EXISTS ix_device_enrollments_expiry "
+                f"ON {device_enrollments} (expires_at)"
+            )
         )
-    )
 
-    for statement in (
+    legacy_statements = (
         f"ALTER TABLE {users} ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(64)",
         f"ALTER TABLE {devices} ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(64)",
         f"ALTER TABLE {sessions} ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(64)",
@@ -144,64 +198,126 @@ async def _migrate_connection(
         f"ALTER TABLE {sessions} ADD COLUMN IF NOT EXISTS relay_allowed_regions JSONB",
         f"ALTER TABLE {sessions} ADD COLUMN IF NOT EXISTS relay_preferred_regions JSONB",
         f"ALTER TABLE {sessions} ADD COLUMN IF NOT EXISTS relay_accepted_transports JSONB",
+    )
+    device_identity_statements = (
+        f"ALTER TABLE {devices} ADD COLUMN IF NOT EXISTS "
+        "motherboard_serial_digest VARCHAR(64)",
+        f"ALTER TABLE {devices} ADD COLUMN IF NOT EXISTS auth_version INTEGER",
+        f"ALTER TABLE {devices} ADD COLUMN IF NOT EXISTS "
+        "auth_revoked_at TIMESTAMPTZ",
+    )
+    directory_lifecycle_statements = (
+        f"ALTER TABLE {reservations} ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ",
+        f"ALTER TABLE {reservations} ADD COLUMN IF NOT EXISTS "
+        "directory_generation VARCHAR(64)",
+    )
+    for statement in (
+        (legacy_statements if apply_legacy_access else ())
+        + (device_identity_statements if apply_device_identity else ())
+        + (directory_lifecycle_statements if apply_directory_lifecycle else ())
     ):
         await connection.execute(text(statement))
 
     # Reject wrong historical types before any backfill can coerce or partially
     # rewrite a malformed deployment.
     await connection.run_sync(lambda sync: _verify_column_types(sync, schema))
+    legacy_session_status = await connection.run_sync(
+        lambda sync: _session_status_constraint_is_legacy(sync, schema)
+    )
 
-    await connection.execute(text(f"UPDATE {users} SET tenant_id = 'default' WHERE tenant_id IS NULL"))
-    await connection.execute(
-        text(
-            f"UPDATE {devices} d SET bound_user_id = NULL, is_bound = FALSE "
-            f"WHERE d.bound_user_id IS NOT NULL AND NOT EXISTS ("
-            f"SELECT 1 FROM {users} u WHERE u.id = d.bound_user_id)"
-        )
-    )
-    # Historical rows with contradictory binding fields cannot establish a
-    # trustworthy owner. Normalize them to unbound instead of elevating a
-    # stale/caller-controlled owner reference into an active ownership grant.
-    await connection.execute(
-        text(
-            f"UPDATE {devices} SET bound_user_id = NULL, is_bound = FALSE "
-            "WHERE is_bound = FALSE AND bound_user_id IS NOT NULL"
-        )
-    )
-    await connection.execute(
-        text(
-            f"UPDATE {devices} SET is_bound = FALSE "
-            "WHERE is_bound = TRUE AND bound_user_id IS NULL"
-        )
-    )
-    await connection.execute(
-        text(
-            f"UPDATE {devices} d SET tenant_id = u.tenant_id FROM {users} u "
-            "WHERE d.bound_user_id = u.id AND d.tenant_id IS NULL"
-        )
-    )
-    await connection.execute(text(f"UPDATE {devices} SET tenant_id = 'default' WHERE tenant_id IS NULL"))
-    await connection.execute(
-        text(
-            f"UPDATE {sessions} s SET tenant_id = u.tenant_id FROM {users} u "
-            "WHERE s.requester_user_id = u.id AND s.tenant_id IS NULL"
-        )
-    )
-    await connection.execute(text(f"UPDATE {sessions} SET tenant_id = 'default' WHERE tenant_id IS NULL"))
-    await connection.execute(text(f"UPDATE {sessions} SET status = 'requested' WHERE status IS NULL"))
-    for table_name in (users, devices, sessions):
-        await connection.execute(
+    contradictory_owners = int(
+        await connection.scalar(
             text(
-                f"ALTER TABLE {table_name} ALTER COLUMN tenant_id SET DEFAULT 'default', "
-                "ALTER COLUMN tenant_id SET NOT NULL"
+                f"SELECT count(*) FROM {devices} d WHERE "
+                "(d.is_bound = FALSE AND d.bound_user_id IS NOT NULL) OR "
+                "(d.is_bound = TRUE AND d.bound_user_id IS NULL) OR "
+                "(d.bound_user_id IS NOT NULL AND NOT EXISTS ("
+                f"SELECT 1 FROM {users} u WHERE u.id = d.bound_user_id))"
             )
         )
-    await connection.execute(
-        text(
-            f"ALTER TABLE {sessions} ALTER COLUMN status SET DEFAULT 'requested', "
-            "ALTER COLUMN status SET NOT NULL"
-        )
+        or 0
     )
+    if contradictory_owners:
+        raise RelayAccessMigrationError(
+            "relay access ownership remediation required for "
+            f"{contradictory_owners} device row(s); run the offline ownership "
+            "remediation before startup"
+        )
+    if apply_legacy_access:
+        await connection.execute(
+            text(f"UPDATE {users} SET tenant_id = 'default' WHERE tenant_id IS NULL")
+        )
+        await connection.execute(
+            text(
+                f"UPDATE {devices} d SET tenant_id = u.tenant_id FROM {users} u "
+                "WHERE d.bound_user_id = u.id AND d.tenant_id IS NULL"
+            )
+        )
+        await connection.execute(
+            text(f"UPDATE {devices} SET tenant_id = 'default' WHERE tenant_id IS NULL")
+        )
+        await connection.execute(
+            text(
+                f"UPDATE {sessions} s SET tenant_id = u.tenant_id FROM {users} u "
+                "WHERE s.requester_user_id = u.id AND s.tenant_id IS NULL"
+            )
+        )
+        await connection.execute(
+            text(f"UPDATE {sessions} SET tenant_id = 'default' WHERE tenant_id IS NULL")
+        )
+        await connection.execute(
+            text(f"UPDATE {sessions} SET status = 'requested' WHERE status IS NULL")
+        )
+        for table_name in (users, devices, sessions):
+            await connection.execute(
+                text(
+                    f"ALTER TABLE {table_name} "
+                    "ALTER COLUMN tenant_id SET DEFAULT 'default', "
+                    "ALTER COLUMN tenant_id SET NOT NULL"
+                )
+            )
+        await connection.execute(
+            text(
+                f"ALTER TABLE {sessions} "
+                "ALTER COLUMN status SET DEFAULT 'requested', "
+                "ALTER COLUMN status SET NOT NULL"
+            )
+        )
+    if apply_device_identity:
+        await _backfill_device_serial_digests(
+            connection,
+            devices=devices,
+            serial_pepper=_configured_serial_pepper(serial_pepper),
+        )
+        await connection.execute(
+            text(f"UPDATE {devices} SET auth_version = 1 WHERE auth_version IS NULL")
+        )
+        await connection.execute(
+            text(
+                f"ALTER TABLE {devices} ALTER COLUMN auth_version SET DEFAULT 1, "
+                "ALTER COLUMN auth_version SET NOT NULL"
+            )
+        )
+        await connection.execute(
+            text(
+                f"DROP INDEX IF EXISTS "
+                f"{_qualified_index(schema, 'ix_devices_motherboard_serial')}"
+            )
+        )
+    if apply_directory_lifecycle:
+        await connection.execute(
+            text(
+                f"UPDATE {reservations} SET directory_generation = 'legacy' "
+                "WHERE directory_generation IS NULL"
+            )
+        )
+        await connection.execute(
+            text(
+                f"ALTER TABLE {reservations} "
+                "ALTER COLUMN directory_generation SET DEFAULT 'legacy', "
+                "ALTER COLUMN directory_generation SET NOT NULL"
+            )
+        )
 
     checks = (
         (users, f"{effective_schema}.users", "ck_users_tenant_id", "length(tenant_id) BETWEEN 1 AND 64"),
@@ -209,42 +325,82 @@ async def _migrate_connection(
         (devices, f"{effective_schema}.devices", "ck_devices_tenant_id", "length(tenant_id) BETWEEN 1 AND 64"),
         (devices, f"{effective_schema}.devices", "ck_devices_tenant_id_canonical", "tenant_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'"),
         (devices, f"{effective_schema}.devices", "ck_devices_bound_owner", "(is_bound = FALSE AND bound_user_id IS NULL) OR (is_bound = TRUE AND bound_user_id IS NOT NULL)"),
+        (devices, f"{effective_schema}.devices", "ck_devices_auth_version", "auth_version >= 1"),
+        (devices, f"{effective_schema}.devices", "ck_devices_serial_digest", "motherboard_serial_digest IS NULL OR length(motherboard_serial_digest) = 64"),
+        (devices, f"{effective_schema}.devices", "ck_devices_plaintext_serial_cleared", "motherboard_serial IS NULL"),
         (sessions, f"{effective_schema}.session_requests", "ck_session_requests_tenant_id", "length(tenant_id) BETWEEN 1 AND 64"),
         (sessions, f"{effective_schema}.session_requests", "ck_session_requests_tenant_id_canonical", "tenant_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'"),
-        (sessions, f"{effective_schema}.session_requests", "ck_session_requests_status", "status IN ('requested', 'approved', 'rejected', 'expired')"),
+        (sessions, f"{effective_schema}.session_requests", "ck_session_requests_status", "status IN ('requested', 'approved', 'rejected', 'expired', 'closed', 'revoked')"),
         (sessions, f"{effective_schema}.session_requests", "ck_session_requests_policy_revision", "policy_revision IS NULL OR policy_revision > 0"),
         (sessions, f"{effective_schema}.session_requests", "ck_session_requests_approved_bundle", "status <> 'approved' OR (grant_expires_at IS NOT NULL AND policy_revision IS NOT NULL AND policy_expires_at IS NOT NULL AND intended_peer_id IS NOT NULL AND relay_allowed_regions IS NOT NULL AND relay_preferred_regions IS NOT NULL AND relay_accepted_transports IS NOT NULL)"),
     )
     for table_name, regclass, name, expression in checks:
+        should_apply = (
+            (name == "ck_session_requests_status" and (
+                apply_legacy_access or apply_directory_lifecycle
+            ))
+            or (name in {
+                "ck_devices_auth_version",
+                "ck_devices_serial_digest",
+                "ck_devices_plaintext_serial_cleared",
+            } and apply_device_identity)
+            or (name not in {
+                "ck_session_requests_status",
+                "ck_devices_auth_version",
+                "ck_devices_serial_digest",
+                "ck_devices_plaintext_serial_cleared",
+            } and apply_legacy_access)
+        )
+        if not should_apply:
+            continue
+        if name == "ck_session_requests_status" and legacy_session_status:
+            await connection.execute(
+                text(f"ALTER TABLE {sessions} DROP CONSTRAINT IF EXISTS {name}")
+            )
         await _add_constraint(
             connection, table=table_name, regclass=regclass,
             name=name, expression=f"CHECK ({expression})",
         )
 
-    await _add_constraint(
-        connection,
-        table=devices,
-        regclass=f"{effective_schema}.devices",
-        name="devices_bound_user_id_fkey",
-        expression=f"FOREIGN KEY (bound_user_id) REFERENCES {users}(id) ON DELETE RESTRICT",
-    )
-    await _add_constraint(
-        connection,
-        table=sessions,
-        regclass=f"{effective_schema}.session_requests",
-        name="session_requests_intended_peer_id_fkey",
-        expression=f"FOREIGN KEY (intended_peer_id) REFERENCES {devices}(id) ON DELETE CASCADE",
-    )
-    for statement in (
+    if apply_legacy_access:
+        await _add_constraint(
+            connection,
+            table=devices,
+            regclass=f"{effective_schema}.devices",
+            name="devices_bound_user_id_fkey",
+            expression=(
+                f"FOREIGN KEY (bound_user_id) REFERENCES {users}(id) "
+                "ON DELETE RESTRICT"
+            ),
+        )
+        await _add_constraint(
+            connection,
+            table=sessions,
+            regclass=f"{effective_schema}.session_requests",
+            name="session_requests_intended_peer_id_fkey",
+            expression=(
+                f"FOREIGN KEY (intended_peer_id) REFERENCES {devices}(id) "
+                "ON DELETE CASCADE"
+            ),
+        )
+    legacy_indexes = (
         f"CREATE INDEX IF NOT EXISTS ix_users_tenant_id ON {users} (tenant_id)",
         f"CREATE INDEX IF NOT EXISTS ix_devices_tenant_id ON {devices} (tenant_id)",
         f"CREATE INDEX IF NOT EXISTS ix_devices_bound_user_id ON {devices} (bound_user_id)",
         f"CREATE INDEX IF NOT EXISTS ix_session_requests_tenant_id ON {sessions} (tenant_id)",
+    )
+    identity_indexes = (
+        f"CREATE UNIQUE INDEX IF NOT EXISTS ix_devices_motherboard_serial_digest "
+        f"ON {devices} (motherboard_serial_digest)",
+    )
+    for statement in (
+        (legacy_indexes if apply_legacy_access else ())
+        + (identity_indexes if apply_device_identity else ())
     ):
         await connection.execute(text(statement))
 
     await connection.run_sync(lambda sync: _verify(sync, schema))
-    for version in _VERSIONS:
+    for version in sorted(set(_VERSIONS) - applied_versions):
         await connection.execute(
             text(
                 f"INSERT INTO {versions} (version) VALUES (:version) "
@@ -257,6 +413,113 @@ async def _migrate_connection(
             sync, schema, require_exact_versions=True
         )
     )
+
+
+def _configured_serial_pepper(
+    value: bytes | str | SecretStr | None,
+) -> bytes | None:
+    if isinstance(value, SecretStr):
+        value = value.get_secret_value()
+    if isinstance(value, bytes):
+        return bytes(value) if len(value) >= 32 else None
+    if isinstance(value, str):
+        try:
+            decoded = bytes.fromhex(value)
+        except ValueError:
+            return None
+        return decoded if len(decoded) >= 32 else None
+    return None
+
+
+def _session_status_constraint_is_legacy(
+    connection: object, schema: str | None
+) -> bool:
+    inspector = inspect(connection)
+    checks = {
+        item["name"]: _normalize_check_expression(item["sqltext"])
+        for item in inspector.get_check_constraints(
+            "session_requests", schema=schema
+        )
+    }
+    actual = checks.get("ck_session_requests_status")
+    legacy = _normalize_check_expression(
+        "status = ANY (ARRAY['requested', 'approved', 'rejected', 'expired'])"
+    )
+    current = _normalize_check_expression(
+        "status = ANY (ARRAY['requested', 'approved', 'rejected', 'expired', "
+        "'closed', 'revoked'])"
+    )
+    if actual == legacy:
+        return True
+    if actual == current:
+        return False
+    raise RelayAccessMigrationError(
+        "relay access session status constraint differs"
+    )
+
+
+async def _backfill_device_serial_digests(
+    connection: AsyncConnection,
+    *,
+    devices: str,
+    serial_pepper: bytes | None,
+) -> None:
+    rows = list(
+        (
+            await connection.execute(
+                text(
+                    f"SELECT id, motherboard_serial, motherboard_serial_digest "
+                    f"FROM {devices} ORDER BY id FOR UPDATE"
+                )
+            )
+        ).all()
+    )
+    plaintext_rows = [row for row in rows if row.motherboard_serial is not None]
+    if plaintext_rows and serial_pepper is None:
+        raise RelayAccessMigrationError(
+            "relay access serial remediation requires the configured device "
+            "serial pepper"
+        )
+    seen: dict[str, str] = {}
+    updates: list[tuple[str, str]] = []
+    for row in rows:
+        actual_digest = row.motherboard_serial_digest
+        if actual_digest is not None:
+            if not isinstance(actual_digest, str) or re.fullmatch(
+                r"[0-9a-f]{64}", actual_digest
+            ) is None:
+                raise RelayAccessMigrationError(
+                    "relay access device serial digest differs"
+                )
+            previous = seen.setdefault(actual_digest, str(row.id))
+            if previous != str(row.id):
+                raise RelayAccessMigrationError(
+                    "relay access serial digest collision requires offline remediation"
+                )
+        if row.motherboard_serial is None:
+            continue
+        assert serial_pepper is not None
+        digest = device_serial_digest(str(row.motherboard_serial), serial_pepper)
+        if actual_digest is not None and not hmac.compare_digest(
+            actual_digest, digest
+        ):
+            raise RelayAccessMigrationError(
+                "relay access serial identity conflict requires offline remediation"
+            )
+        previous = seen.setdefault(digest, str(row.id))
+        if previous != str(row.id):
+            raise RelayAccessMigrationError(
+                "relay access serial digest collision requires offline remediation"
+            )
+        updates.append((str(row.id), digest))
+    for row_id, digest in updates:
+        await connection.execute(
+            text(
+                f"UPDATE {devices} SET motherboard_serial_digest = :digest, "
+                "motherboard_serial = NULL WHERE id = :row_id"
+            ),
+            {"digest": digest, "row_id": row_id},
+        )
 
 
 def _type_matches(value: object, expected_type: type[object], length: int | None = None) -> bool:
@@ -280,6 +543,10 @@ def _auth_specs() -> dict[str, dict[str, tuple[type[object], int | None, bool]]]
             "is_bound": (Boolean, None, False),
             "bound_user_id": (String, 36, True),
             "tenant_id": (String, 64, False),
+            "motherboard_serial": (String, 128, True),
+            "motherboard_serial_digest": (String, 64, True),
+            "auth_version": (Integer, None, False),
+            "auth_revoked_at": (DateTime, None, True),
         },
         "session_requests": {
             "id": (String, 36, False),
@@ -393,7 +660,14 @@ def _verify_migration_ledger(
         expected_types={"relay_access_schema_migrations_pkey": "p"},
         exact=True,
     )
-    _assert_no_semantic_objects(inspector, table_name, schema)
+    _verify_exact_indexes(
+        connection,
+        inspector,
+        schema=schema,
+        current_schema=effective_schema,
+        table_name=table_name,
+        expected={},
+    )
     table = _table(schema, table_name)
     actual_versions = set(
         connection.execute(text(f"SELECT version FROM {table}")).scalars()
@@ -466,7 +740,7 @@ def _verify_exact_indexes(
     expected: dict[str, tuple[tuple[str, ...], bool]],
 ) -> None:
     actual = _standalone_indexes(inspector, table_name, schema)
-    if set(actual) != set(expected):
+    if set(expected) - set(actual):
         raise RelayAccessMigrationError(
             f"relay access indexes differ for {table_name}"
         )
@@ -481,6 +755,23 @@ def _verify_exact_indexes(
         raise RelayAccessMigrationError(
             f"relay access indexes differ for {table_name}"
         )
+    for name, index in actual.items():
+        if name in expected:
+            continue
+        columns = index.get("column_names")
+        if (
+            not isinstance(columns, list)
+            or not columns
+            or any(not isinstance(column, str) for column in columns)
+            or not _index_matches(index, tuple(columns), unique=False)
+            or _index_access_method(
+                connection, schema=current_schema, index_name=name
+            )
+            != "btree"
+        ):
+            raise RelayAccessMigrationError(
+                f"relay access indexes differ for {table_name}"
+            )
 
 
 def _foreign_key_signature(
@@ -782,6 +1073,21 @@ def _verify(connection: object, schema: str | None) -> None:
     }
     if _normalize_server_default(session_columns["status"]["default"]) != "'requested'":
         raise RelayAccessMigrationError("relay session status default differs")
+    device_columns = {
+        column["name"]: column
+        for column in inspector.get_columns("devices", schema=schema)
+    }
+    if _normalize_server_default(device_columns["auth_version"]["default"]) != "1":
+        raise RelayAccessMigrationError("relay device auth version default differs")
+    if any(
+        device_columns[name]["default"] is not None
+        for name in (
+            "motherboard_serial",
+            "motherboard_serial_digest",
+            "auth_revoked_at",
+        )
+    ):
+        raise RelayAccessMigrationError("relay device identity defaults differ")
 
     required_checks = {
         "users": {
@@ -792,12 +1098,19 @@ def _verify(connection: object, schema: str | None) -> None:
             "ck_devices_tenant_id": "length(tenant_id) >= 1 AND length(tenant_id) <= 64",
             "ck_devices_tenant_id_canonical": "tenant_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'",
             "ck_devices_bound_owner": "is_bound = FALSE AND bound_user_id IS NULL OR is_bound = TRUE AND bound_user_id IS NOT NULL",
+            "ck_devices_auth_version": "auth_version >= 1",
+            "ck_devices_serial_digest": (
+                "motherboard_serial_digest IS NULL OR "
+                "length(motherboard_serial_digest) = 64"
+            ),
+            "ck_devices_plaintext_serial_cleared": "motherboard_serial IS NULL",
         },
         "session_requests": {
             "ck_session_requests_tenant_id": "length(tenant_id) >= 1 AND length(tenant_id) <= 64",
             "ck_session_requests_tenant_id_canonical": "tenant_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'",
             "ck_session_requests_status": (
-                "status = ANY (ARRAY['requested', 'approved', 'rejected', 'expired'])"
+                "status = ANY (ARRAY['requested', 'approved', 'rejected', "
+                "'expired', 'closed', 'revoked'])"
             ),
             "ck_session_requests_policy_revision": "policy_revision IS NULL OR policy_revision > 0",
             "ck_session_requests_approved_bundle": "status <> 'approved' OR grant_expires_at IS NOT NULL AND policy_revision IS NOT NULL AND policy_expires_at IS NOT NULL AND intended_peer_id IS NOT NULL AND relay_allowed_regions IS NOT NULL AND relay_preferred_regions IS NOT NULL AND relay_accepted_transports IS NOT NULL",
@@ -945,7 +1258,9 @@ def _verify(connection: object, schema: str | None) -> None:
         "devices": {
             "ix_devices_bound_user_id": (("bound_user_id",), False),
             "ix_devices_device_id": (("device_id",), True),
-            "ix_devices_motherboard_serial": (("motherboard_serial",), True),
+            "ix_devices_motherboard_serial_digest": (
+                ("motherboard_serial_digest",), True
+            ),
             "ix_devices_name": (("name",), False),
             "ix_devices_tenant_id": (("tenant_id",), False),
         },

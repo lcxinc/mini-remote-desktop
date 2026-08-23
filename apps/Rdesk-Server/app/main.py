@@ -23,7 +23,9 @@ async def lifespan(_: FastAPI):
         # legacy/dev bootstrap only. Relay tables are created and verified by the
         # explicit versioned migration above, never by metadata.create_all.
         await conn.run_sync(Base.metadata.create_all)
-        await migrate_relay_access(conn)
+        await migrate_relay_access(
+            conn, serial_pepper=settings.device_serial_pepper
+        )
     async with AsyncSessionLocal() as db:
         # Administrator creation is disabled unless every opt-in bootstrap
         # setting is explicitly supplied; no built-in credential exists.

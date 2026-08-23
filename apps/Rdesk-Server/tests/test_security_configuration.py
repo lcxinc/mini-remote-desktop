@@ -342,6 +342,8 @@ def test_successful_legacy_password_login_rehashes_before_commit(
             json={"username": user.username, "password": password},
         )
     assert response.status_code == 200, response.text
+    assert response.headers["cache-control"] == "no-store, private"
+    assert response.headers["pragma"] == "no-cache"
     assert user.password_hash.startswith("pbkdf2_sha256$v2$")
     assert session.commits == 1
 

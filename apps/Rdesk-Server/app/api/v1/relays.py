@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
+import re
 from datetime import UTC, datetime
 from typing import Annotated, Callable, Coroutine
 
@@ -22,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from app.core.config import settings
+from app.core.response_security import no_store_sensitive_response
 from app.core.security import (
     get_current_user,
     get_verified_relay_node,
@@ -102,6 +105,7 @@ router = APIRouter(
     tags=["relays"],
     route_class=RelayAPIRoute,
     responses=_RELAY_ERROR_RESPONSES,
+    dependencies=[Depends(no_store_sensitive_response)],
 )
 
 _HEARTBEAT_OPENAPI_PATH = "/api/v1/relays/{node_id}/heartbeat"
@@ -290,8 +294,44 @@ def _relay_turn_secret_cipher() -> AesGcmRelaySecretCipher:
     encryption_key = _decode_secret_b64(
         settings.relay_turn_secret_encryption_key, expected_length=32
     )
+    key_id = settings.relay_turn_secret_encryption_key_id
+    raw_read_keys = _secret_value(
+        settings.relay_turn_secret_encryption_read_keys
+    )
+    if len(raw_read_keys) > 4096:
+        raise ValueError("relay secret read keyring is invalid")
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        parsed_object: dict[str, object] = {}
+        for name, value in pairs:
+            if name in parsed_object:
+                raise ValueError("relay secret read keyring is invalid")
+            parsed_object[name] = value
+        return parsed_object
+
+    parsed = json.loads(raw_read_keys, object_pairs_hook=unique_object)
+    if not isinstance(parsed, dict) or len(parsed) > 4:
+        raise ValueError("relay secret read keyring is invalid")
+    read_keys: dict[str, bytes] = {}
+    for read_key_id, encoded_key in parsed.items():
+        if (
+            not isinstance(read_key_id, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", read_key_id)
+            is None
+            or not isinstance(encoded_key, str)
+            or read_key_id == key_id
+        ):
+            raise ValueError("relay secret read keyring is invalid")
+        read_keys[read_key_id] = _decode_secret_b64(
+            encoded_key, expected_length=32
+        )
+    legacy_key_id = settings.relay_turn_secret_encryption_legacy_key_id or None
+    if legacy_key_id is not None and legacy_key_id not in read_keys:
+        raise ValueError("relay legacy secret read key is invalid")
     return AesGcmRelaySecretCipher(
-        encryption_key, key_id=settings.relay_turn_secret_encryption_key_id
+        encryption_key,
+        key_id=key_id,
+        read_keys=read_keys,
+        legacy_key_id=legacy_key_id,
     )
 
 

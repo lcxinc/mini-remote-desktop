@@ -67,6 +67,12 @@ def fingerprint(label: str) -> str:
     return "sha256:" + hashlib.sha256(label.encode()).hexdigest()
 
 
+def canonical_turn_secret(label: str) -> str:
+    return base64.urlsafe_b64encode(
+        hashlib.sha256(label.encode()).digest()
+    ).rstrip(b"=").decode("ascii")
+
+
 @asynccontextmanager
 async def isolated_postgres_engine() -> AsyncIterator[AsyncEngine]:
     assert DATABASE_URL is not None
@@ -113,7 +119,7 @@ async def enroll_postgres_node(
         endpoints=["turn:relay.example.test:3478?transport=udp"],
         max_allocations=max_allocations,
         max_egress_bps=1_000_000,
-        turn_secret=f"turn-secret-{node_id}",
+        turn_secret=canonical_turn_secret(f"turn-secret-{node_id}"),
         now=now,
     )
     if ready:
@@ -167,7 +173,7 @@ async def test_concurrent_admission_uses_row_locks_and_never_oversubscribes() ->
                 endpoints=["turn:relay.example.test:3478?transport=udp"],
                 max_allocations=1,
                 max_egress_bps=1_000_000,
-                turn_secret="postgres-turn-secret",
+                turn_secret=canonical_turn_secret("postgres-turn-secret"),
                 now=now,
             )
             for sequence in (1, 2, 3):
@@ -497,7 +503,9 @@ async def test_concurrent_enrollment_conflicts_are_stable_and_transactions_recov
                         endpoints=["turn:relay.example.test:3478?transport=udp"],
                         max_allocations=1,
                         max_egress_bps=1,
-                        turn_secret=f"sensitive-secret-{token}",
+                        turn_secret=canonical_turn_secret(
+                            f"sensitive-secret-{token}"
+                        ),
                         now=now,
                     )
                     await session.commit()
@@ -1209,7 +1217,7 @@ async def test_v4_behaviorally_upgrades_v2_schema_and_serializes_concurrent_upgr
             assert "healthy_heartbeat_streak" in node_columns
             assert set(registration_v3_columns).issubset(registration_columns)
             assert set(registration_v4_columns).issubset(registration_columns)
-            assert versions == [1, 2, 3, 4, 5, 6]
+            assert versions == [1, 2, 3, 4, 5, 6, 7]
     finally:
         await first.dispose()
         await second.dispose()

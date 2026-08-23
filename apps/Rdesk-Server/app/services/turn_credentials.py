@@ -25,6 +25,10 @@ class RelaySecretDecryptor(Protocol):
         self, ciphertext: bytes, *, associated_data: bytes
     ) -> bytearray: ...
 
+    def encrypt(self, plaintext: bytes, *, associated_data: bytes) -> bytes: ...
+
+    def needs_reencrypt(self, ciphertext: bytes) -> bool: ...
+
 
 @dataclass(frozen=True)
 class TurnCredential:
@@ -43,6 +47,9 @@ class NodeTurnCredential:
     username: str
     credential: str = dataclass_field(repr=False)
     expires_at_unix_seconds: int
+    reencrypted_secret: bytes | None = dataclass_field(
+        default=None, repr=False, compare=False
+    )
 
 
 class TurnCredentialService:
@@ -177,13 +184,20 @@ class NodeTurnCredentialService:
                 raise TurnCredentialConfigurationError(
                     "relay credential material is unavailable"
                 )
-            if not 16 <= len(secret) <= 512:
+            if len(secret) != 32 or len(set(secret)) < 8:
                 raise TurnCredentialConfigurationError(
                     "relay credential material is unavailable"
                 )
             credential = base64.b64encode(
                 hmac.new(secret, username.encode("utf-8"), hashlib.sha1).digest()
             ).decode("ascii")
+            reencrypted_secret = (
+                self._cipher.encrypt(
+                    bytes(secret), associated_data=node_id.encode("utf-8")
+                )
+                if self._cipher.needs_reencrypt(encrypted_secret)
+                else None
+            )
         finally:
             for index in range(len(secret)):
                 secret[index] = 0
@@ -193,6 +207,7 @@ class NodeTurnCredentialService:
             username=username,
             credential=credential,
             expires_at_unix_seconds=expires_at,
+            reencrypted_secret=reencrypted_secret,
         )
 
     @staticmethod
