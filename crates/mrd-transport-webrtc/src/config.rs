@@ -37,13 +37,37 @@ impl IceServerConfig {
 
 impl fmt::Debug for IceServerConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let urls = redacted_urls(&self.urls);
         formatter
             .debug_struct("IceServerConfig")
-            .field("urls", &self.urls)
+            .field("urls", &urls)
             .field("username", &"[REDACTED]")
             .field("credential", &"[REDACTED]")
             .finish()
     }
+}
+
+impl fmt::Display for IceServerConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let urls = redacted_urls(&self.urls);
+        write!(
+            formatter,
+            "IceServerConfig {{ urls: {:?}, username: [REDACTED], credential: [REDACTED] }}",
+            urls
+        )
+    }
+}
+
+fn redacted_urls(urls: &[String]) -> Vec<String> {
+    urls.iter()
+        .map(|url| match url.rsplit_once('@') {
+            Some((prefix, host)) if prefix.contains(':') => {
+                let scheme_end = prefix.find(':').expect("prefix contains a colon");
+                format!("{}:[REDACTED]@{host}", &prefix[..scheme_end])
+            }
+            _ => url.clone(),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

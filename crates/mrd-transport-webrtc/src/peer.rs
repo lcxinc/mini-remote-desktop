@@ -2,14 +2,14 @@ use std::{
     fmt,
     future::Future,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex as StdMutex,
     },
     time::Duration,
 };
 
 use bytes::Bytes;
-use mrd_pipeline_core::EncodedAccessUnit;
+use mrd_pipeline_core::{EncodedAccessUnit, VideoCodec};
 use tokio::{
     sync::{mpsc, watch, Mutex, OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
@@ -31,7 +31,7 @@ use webrtc::{
 };
 
 use crate::{
-    config::{IceTransportPolicy, PeerConnectionConfig, PeerConnectionRole},
+    config::{IceServerConfig, IceTransportPolicy, PeerConnectionConfig, PeerConnectionRole},
     control::{
         channel_info, realtime_channel_init, reliable_channel_init, weak_callback_owner,
         ControlChannels, ControlLane, ControlState, QueuedBytes, BULK_LABEL, CTRL_REL_LABEL,
@@ -45,6 +45,9 @@ const CHANNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const DISCONNECTED_GRACE_PERIOD: Duration = Duration::from_secs(2);
 const BULK_BUFFER_HIGH_WATERMARK: usize = 64 * 1024;
 const BULK_SEND_PACING_INTERVAL: Duration = Duration::from_millis(1);
+const RESTART_VALIDATION_TIMEOUT: Duration = Duration::from_secs(10);
+const RESTART_PROBE_PREFIX: &[u8] = b"mrd-webrtc-restart-probe-v1:";
+static NEXT_RESTART_ROUTE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionDescriptionType {
@@ -52,18 +55,46 @@ pub enum SessionDescriptionType {
     Answer,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SessionDescription {
     pub kind: SessionDescriptionType,
     pub sdp: String,
+    /// Authenticated signaling generation. Initial negotiation is generation zero.
+    pub generation: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl fmt::Debug for SessionDescription {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionDescription")
+            .field("kind", &self.kind)
+            .field("sdp", &"[REDACTED]")
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct IceCandidate {
     pub candidate: String,
     pub sdp_mid: Option<String>,
     pub sdp_mline_index: Option<u16>,
     pub username_fragment: Option<String>,
+    /// Authenticated signaling generation. Initial negotiation is generation zero.
+    pub generation: u64,
+}
+
+impl fmt::Debug for IceCandidate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IceCandidate")
+            .field("candidate", &self.candidate)
+            .field("sdp_mid", &self.sdp_mid)
+            .field("sdp_mline_index", &self.sdp_mline_index)
+            .field("username_fragment", &"[REDACTED]")
+            .field("generation", &self.generation)
+            .finish()
+    }
 }
 
 impl From<RTCIceCandidateInit> for IceCandidate {
@@ -73,7 +104,78 @@ impl From<RTCIceCandidateInit> for IceCandidate {
             sdp_mid: value.sdp_mid,
             sdp_mline_index: value.sdp_mline_index,
             username_fragment: value.username_fragment,
+            generation: 0,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RestartRouteEvidence {
+    generation: u64,
+    route_id: u64,
+    selected_pair: SelectedCandidatePairStats,
+    control_round_trip: bool,
+    media_round_trip: bool,
+}
+
+impl RestartRouteEvidence {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn selected_pair(&self) -> &SelectedCandidatePairStats {
+        &self.selected_pair
+    }
+
+    pub fn control_round_trip(&self) -> bool {
+        self.control_round_trip
+    }
+
+    pub fn media_round_trip(&self) -> bool {
+        self.media_round_trip
+    }
+}
+
+enum PendingRestart {
+    Building {
+        generation: u64,
+    },
+    Ready {
+        generation: u64,
+        route_id: u64,
+        peer: Arc<WebRtcPeerConnection>,
+        validated: bool,
+    },
+}
+
+impl PendingRestart {
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Building { generation } | Self::Ready { generation, .. } => *generation,
+        }
+    }
+
+    fn ready_peer(&self) -> Option<(u64, Arc<WebRtcPeerConnection>)> {
+        match self {
+            Self::Ready { route_id, peer, .. } => Some((*route_id, Arc::clone(peer))),
+            Self::Building { .. } => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct RestartState {
+    active_generation: u64,
+    active_replacement: Option<Arc<WebRtcPeerConnection>>,
+    pending: Option<PendingRestart>,
+}
+
+impl RestartState {
+    fn active_snapshot(&self) -> (u64, Option<Arc<WebRtcPeerConnection>>) {
+        (
+            self.active_generation,
+            self.active_replacement.as_ref().map(Arc::clone),
+        )
     }
 }
 
@@ -103,6 +205,7 @@ pub struct WebRtcPeerConnection {
     active_tasks: Arc<AtomicUsize>,
     completed_video_drops: Arc<VideoDropCounter>,
     closed: Arc<AtomicBool>,
+    restart: StdMutex<RestartState>,
 }
 
 #[derive(Debug)]
@@ -155,6 +258,7 @@ impl fmt::Debug for WebRtcPeerConnection {
             .field("role", &self.config.role)
             .field("active_tasks", &self.active_task_count())
             .field("closed", &self.closed.load(Ordering::Acquire))
+            .field("generation", &self.current_generation_now())
             .finish_non_exhaustive()
     }
 }
@@ -168,6 +272,7 @@ impl Drop for WebRtcPeerConnection {
 impl WebRtcPeerConnection {
     pub async fn new(config: PeerConnectionConfig) -> Result<Self, TransportError> {
         let codec = config.preflight()?.clone();
+        let config_secrets = secret_values(&config.ice_servers);
         let mut media_engine = MediaEngine::default();
         media_engine
             .register_default_codecs()
@@ -203,9 +308,10 @@ impl WebRtcPeerConnection {
                 ..Default::default()
             })
             .await
-            .map_err(|error| {
-                TransportError::Message(format!("create peer connection failed: {error}"))
-            })?,
+            .map_err(peer_error_redacted(
+                "create peer connection",
+                &config_secrets,
+            ))?,
         );
 
         let capacity = config.event_queue_capacity;
@@ -368,10 +474,21 @@ impl WebRtcPeerConnection {
             active_tasks,
             completed_video_drops,
             closed,
+            restart: StdMutex::new(RestartState::default()),
         })
     }
 
     pub async fn create_offer(&self) -> Result<SessionDescription, TransportError> {
+        let (generation, route) = self.active_snapshot();
+        if let Some(route) = route {
+            let mut offer = route.create_offer_physical().await?;
+            offer.generation = generation;
+            return Ok(offer);
+        }
+        self.create_offer_physical().await
+    }
+
+    async fn create_offer_physical(&self) -> Result<SessionDescription, TransportError> {
         self.require_role(PeerConnectionRole::Offerer)?;
         let offer = self
             .pc
@@ -381,15 +498,32 @@ impl WebRtcPeerConnection {
         let description = SessionDescription {
             kind: SessionDescriptionType::Offer,
             sdp: offer.sdp.clone(),
+            generation: 0,
         };
+        let sdp = offer.sdp.clone();
         self.pc
             .set_local_description(offer)
             .await
-            .map_err(peer_error("set local offer"))?;
+            .map_err(|error| redact_sdp_error(peer_error("set local offer")(error), &sdp))?;
         Ok(description)
     }
 
     pub async fn accept_offer(
+        &self,
+        mut offer: SessionDescription,
+    ) -> Result<SessionDescription, TransportError> {
+        let (generation, route) = self.active_snapshot();
+        require_generation(generation, offer.generation, "offer")?;
+        if let Some(route) = route {
+            offer.generation = 0;
+            let mut answer = route.accept_offer_physical(offer).await?;
+            answer.generation = generation;
+            return Ok(answer);
+        }
+        self.accept_offer_physical(offer).await
+    }
+
+    async fn accept_offer_physical(
         &self,
         offer: SessionDescription,
     ) -> Result<SessionDescription, TransportError> {
@@ -397,11 +531,15 @@ impl WebRtcPeerConnection {
         if offer.kind != SessionDescriptionType::Offer {
             return Err(TransportError::Message("expected an SDP offer".into()));
         }
-        let offer = RTCSessionDescription::offer(offer.sdp).map_err(peer_error("parse offer"))?;
+        let remote_sdp = offer.sdp;
+        let offer = RTCSessionDescription::offer(remote_sdp.clone())
+            .map_err(|error| redact_sdp_error(peer_error("parse offer")(error), &remote_sdp))?;
         self.pc
             .set_remote_description(offer)
             .await
-            .map_err(peer_error("set remote offer"))?;
+            .map_err(|error| {
+                redact_sdp_error(peer_error("set remote offer")(error), &remote_sdp)
+            })?;
         let answer = self
             .pc
             .create_answer(None)
@@ -410,39 +548,97 @@ impl WebRtcPeerConnection {
         let description = SessionDescription {
             kind: SessionDescriptionType::Answer,
             sdp: answer.sdp.clone(),
+            generation: 0,
         };
+        let local_sdp = answer.sdp.clone();
         self.pc
             .set_local_description(answer)
             .await
-            .map_err(peer_error("set local answer"))?;
+            .map_err(|error| redact_sdp_error(peer_error("set local answer")(error), &local_sdp))?;
         Ok(description)
     }
 
-    pub async fn accept_answer(&self, answer: SessionDescription) -> Result<(), TransportError> {
+    pub async fn accept_answer(
+        &self,
+        mut answer: SessionDescription,
+    ) -> Result<(), TransportError> {
+        let (generation, route) = self.active_snapshot();
+        require_generation(generation, answer.generation, "answer")?;
+        if let Some(route) = route {
+            answer.generation = 0;
+            return route.accept_answer_physical(answer).await;
+        }
+        self.accept_answer_physical(answer).await
+    }
+
+    async fn accept_answer_physical(
+        &self,
+        answer: SessionDescription,
+    ) -> Result<(), TransportError> {
         self.require_role(PeerConnectionRole::Offerer)?;
         if answer.kind != SessionDescriptionType::Answer {
             return Err(TransportError::Message("expected an SDP answer".into()));
         }
-        let answer =
-            RTCSessionDescription::answer(answer.sdp).map_err(peer_error("parse answer"))?;
+        let remote_sdp = answer.sdp;
+        let answer = RTCSessionDescription::answer(remote_sdp.clone())
+            .map_err(|error| redact_sdp_error(peer_error("parse answer")(error), &remote_sdp))?;
         self.pc
             .set_remote_description(answer)
             .await
-            .map_err(peer_error("set remote answer"))
+            .map_err(|error| redact_sdp_error(peer_error("set remote answer")(error), &remote_sdp))
     }
 
     pub async fn next_local_candidate(&self) -> Option<IceCandidate> {
+        let (generation, route) = self.active_snapshot();
+        let mut candidate = if let Some(route) = route {
+            route.next_local_candidate_physical().await?
+        } else {
+            self.next_local_candidate_physical().await?
+        };
+        candidate.generation = generation;
+        Some(candidate)
+    }
+
+    async fn next_local_candidate_physical(&self) -> Option<IceCandidate> {
         self.local_candidates.lock().await.recv().await
     }
 
-    pub async fn add_ice_candidate(&self, candidate: IceCandidate) -> Result<(), TransportError> {
+    pub async fn add_ice_candidate(
+        &self,
+        mut candidate: IceCandidate,
+    ) -> Result<(), TransportError> {
+        let (generation, route) = self.active_snapshot();
+        require_generation(generation, candidate.generation, "ICE candidate")?;
+        if let Some(route) = route {
+            candidate.generation = 0;
+            return route.add_ice_candidate_physical(candidate).await;
+        }
+        self.add_ice_candidate_physical(candidate).await
+    }
+
+    async fn add_ice_candidate_physical(
+        &self,
+        candidate: IceCandidate,
+    ) -> Result<(), TransportError> {
+        let secrets = candidate
+            .username_fragment
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
         self.pc
             .add_ice_candidate(candidate.into())
             .await
-            .map_err(peer_error("add ICE candidate"))
+            .map_err(peer_error_redacted("add ICE candidate", &secrets))
     }
 
     pub async fn wait_connected(&self) -> Result<(), TransportError> {
+        if let Some(route) = self.active_route() {
+            return route.wait_connected_physical().await;
+        }
+        self.wait_connected_physical().await
+    }
+
+    async fn wait_connected_physical(&self) -> Result<(), TransportError> {
         let mut states = self.connection_state_rx.clone();
         loop {
             let state = *states.borrow_and_update();
@@ -465,6 +661,13 @@ impl WebRtcPeerConnection {
 
     /// Wait until the peer connection leaves the usable connected state.
     pub async fn wait_terminated(&self) -> Result<(), TransportError> {
+        if let Some(route) = self.active_route() {
+            return route.wait_terminated_physical().await;
+        }
+        self.wait_terminated_physical().await
+    }
+
+    async fn wait_terminated_physical(&self) -> Result<(), TransportError> {
         let mut states = self.connection_state_rx.clone();
         loop {
             let state = *states.borrow_and_update();
@@ -489,6 +692,16 @@ impl WebRtcPeerConnection {
         &self,
         access_unit: &EncodedAccessUnit,
     ) -> Result<usize, TransportError> {
+        if let Some(route) = self.active_route() {
+            return route.send_h264_access_unit_physical(access_unit).await;
+        }
+        self.send_h264_access_unit_physical(access_unit).await
+    }
+
+    async fn send_h264_access_unit_physical(
+        &self,
+        access_unit: &EncodedAccessUnit,
+    ) -> Result<usize, TransportError> {
         self.h264_sender
             .lock()
             .await
@@ -497,6 +710,13 @@ impl WebRtcPeerConnection {
     }
 
     pub async fn next_h264_access_unit(&self) -> Option<EncodedAccessUnit> {
+        if let Some(route) = self.active_route() {
+            return route.next_h264_access_unit_physical().await;
+        }
+        self.next_h264_access_unit_physical().await
+    }
+
+    async fn next_h264_access_unit_physical(&self) -> Option<EncodedAccessUnit> {
         self.h264_rx
             .lock()
             .await
@@ -506,10 +726,24 @@ impl WebRtcPeerConnection {
     }
 
     pub fn take_completed_video_drops(&self) -> u64 {
+        if let Some(route) = self.active_route() {
+            return route.completed_video_drops.take();
+        }
         self.completed_video_drops.take()
     }
 
     pub async fn send_control(
+        &self,
+        lane: ControlLane,
+        payload: &[u8],
+    ) -> Result<usize, TransportError> {
+        if let Some(route) = self.active_route() {
+            return route.send_control_physical(lane, payload).await;
+        }
+        self.send_control_physical(lane, payload).await
+    }
+
+    async fn send_control_physical(
         &self,
         lane: ControlLane,
         payload: &[u8],
@@ -536,6 +770,13 @@ impl WebRtcPeerConnection {
     }
 
     pub async fn next_control(&self, lane: ControlLane) -> Option<Bytes> {
+        if let Some(route) = self.active_route() {
+            return route.next_control_physical(lane).await;
+        }
+        self.next_control_physical(lane).await
+    }
+
+    async fn next_control_physical(&self, lane: ControlLane) -> Option<Bytes> {
         match lane {
             ControlLane::Reliable => self.reliable_rx.lock().await.recv().await,
             ControlLane::Realtime => self.realtime_rx.lock().await.recv().await,
@@ -545,6 +786,13 @@ impl WebRtcPeerConnection {
     }
 
     pub async fn control_channels(&self) -> ControlChannels {
+        if let Some(route) = self.active_route() {
+            return route.control_channels_physical().await;
+        }
+        self.control_channels_physical().await
+    }
+
+    async fn control_channels_physical(&self) -> ControlChannels {
         let reliable = self.control.channel(ControlLane::Reliable).await;
         let realtime = self.control.channel(ControlLane::Realtime).await;
         let bulk = self.control.channel(ControlLane::Bulk).await;
@@ -575,15 +823,290 @@ impl WebRtcPeerConnection {
     }
 
     pub async fn selected_candidate_pair_stats(&self) -> Option<SelectedCandidatePairStats> {
+        if let Some(route) = self.active_route() {
+            return route.selected_candidate_pair_stats_physical().await;
+        }
+        self.selected_candidate_pair_stats_physical().await
+    }
+
+    async fn selected_candidate_pair_stats_physical(&self) -> Option<SelectedCandidatePairStats> {
         selected_candidate_pair(self.pc.get_stats().await)
     }
 
     pub fn active_task_count(&self) -> usize {
+        if let Some(route) = self.active_route() {
+            return route.active_tasks.load(Ordering::Acquire);
+        }
         self.active_tasks.load(Ordering::Acquire)
+    }
+
+    /// Create a replacement offer with a strictly newer authenticated generation.
+    ///
+    /// webrtc-rs 0.12 cannot safely replace ICE servers in-place, so this constructs an
+    /// independent peer and leaves the active route untouched until [`Self::commit_restart`].
+    pub async fn create_restart_offer(
+        &self,
+        generation: u64,
+        ice_servers: Vec<IceServerConfig>,
+    ) -> Result<SessionDescription, TransportError> {
+        self.require_active_role(PeerConnectionRole::Offerer)?;
+        let secrets = secret_values(&ice_servers);
+        let (config, loser) = self.begin_restart(generation)?;
+        let config = restart_peer_config(config, ice_servers);
+        close_loser(loser).await;
+
+        let pending = match Self::new(config).await {
+            Ok(peer) => Arc::new(peer),
+            Err(error) => {
+                self.abort_build(generation);
+                return Err(redact_transport_error(error, &secrets));
+            }
+        };
+        let mut offer = match pending.create_offer_physical().await {
+            Ok(offer) => offer,
+            Err(error) => {
+                self.abort_build(generation);
+                let _ = pending.close_physical().await;
+                return Err(redact_transport_error(error, &secrets));
+            }
+        };
+        if !self.finish_build(generation, Arc::clone(&pending)) {
+            let _ = pending.close_physical().await;
+            return Err(stale_generation_error(generation, "restart offer"));
+        }
+        offer.generation = generation;
+        Ok(offer)
+    }
+
+    /// Accept a replacement offer on a separate answerer peer.
+    pub async fn accept_restart_offer(
+        &self,
+        generation: u64,
+        ice_servers: Vec<IceServerConfig>,
+        mut offer: SessionDescription,
+    ) -> Result<SessionDescription, TransportError> {
+        self.require_active_role(PeerConnectionRole::Answerer)?;
+        require_generation(generation, offer.generation, "restart offer")?;
+        let secrets = secret_values(&ice_servers);
+        let (config, loser) = self.begin_restart(generation)?;
+        let config = restart_peer_config(config, ice_servers);
+        close_loser(loser).await;
+
+        let pending = match Self::new(config).await {
+            Ok(peer) => Arc::new(peer),
+            Err(error) => {
+                self.abort_build(generation);
+                return Err(redact_transport_error(error, &secrets));
+            }
+        };
+        offer.generation = 0;
+        let mut answer = match pending.accept_offer_physical(offer).await {
+            Ok(answer) => answer,
+            Err(error) => {
+                self.abort_build(generation);
+                let _ = pending.close_physical().await;
+                return Err(redact_transport_error(error, &secrets));
+            }
+        };
+        if !self.finish_build(generation, Arc::clone(&pending)) {
+            let _ = pending.close_physical().await;
+            return Err(stale_generation_error(generation, "restart offer"));
+        }
+        answer.generation = generation;
+        Ok(answer)
+    }
+
+    pub async fn accept_restart_answer(
+        &self,
+        generation: u64,
+        mut answer: SessionDescription,
+    ) -> Result<(), TransportError> {
+        require_generation(generation, answer.generation, "restart answer")?;
+        let (_, peer) = self.ready_restart(generation)?;
+        answer.generation = 0;
+        peer.accept_answer_physical(answer).await
+    }
+
+    pub async fn next_restart_candidate(
+        &self,
+        generation: u64,
+    ) -> Result<IceCandidate, TransportError> {
+        let (route_id, peer) = self.ready_restart(generation)?;
+        let Some(mut candidate) = peer.next_local_candidate_physical().await else {
+            return Err(TransportError::Message(format!(
+                "restart candidate stream closed for generation {generation}"
+            )));
+        };
+        self.require_ready_route(generation, route_id)?;
+        candidate.generation = generation;
+        Ok(candidate)
+    }
+
+    pub async fn add_restart_candidate(
+        &self,
+        generation: u64,
+        mut candidate: IceCandidate,
+    ) -> Result<(), TransportError> {
+        require_generation(generation, candidate.generation, "restart ICE candidate")?;
+        let (_, peer) = self.ready_restart(generation)?;
+        candidate.generation = 0;
+        peer.add_ice_candidate_physical(candidate).await
+    }
+
+    /// Exercise real control and H.264 traffic on the pending route before publication.
+    /// Both peers must call this concurrently after exchanging candidates.
+    pub async fn validate_pending_restart(
+        &self,
+        generation: u64,
+    ) -> Result<RestartRouteEvidence, TransportError> {
+        let (route_id, peer) = self.ready_restart(generation)?;
+        tokio::time::timeout(RESTART_VALIDATION_TIMEOUT, peer.wait_connected_physical())
+            .await
+            .map_err(|_| {
+                TransportError::Message(format!(
+                    "restart route connection timed out for generation {generation}"
+                ))
+            })??;
+
+        let pair = peer
+            .selected_candidate_pair_stats_physical()
+            .await
+            .ok_or_else(|| {
+                TransportError::Message(format!(
+                    "restart route has no selected candidate pair for generation {generation}"
+                ))
+            })?;
+        validate_selected_pair(&pair, peer.config.ice_transport_policy)?;
+
+        let mut control_probe = RESTART_PROBE_PREFIX.to_vec();
+        control_probe.extend_from_slice(generation.to_string().as_bytes());
+        peer.send_control_physical(ControlLane::Reliable, &control_probe)
+            .await?;
+        let media_probe = restart_media_probe(generation);
+        peer.send_h264_access_unit_physical(&media_probe).await?;
+
+        let received_control = tokio::time::timeout(
+            RESTART_VALIDATION_TIMEOUT,
+            peer.next_control_physical(ControlLane::Reliable),
+        )
+        .await
+        .map_err(|_| {
+            TransportError::Message(format!(
+                "restart control probe timed out for generation {generation}"
+            ))
+        })?
+        .ok_or_else(|| TransportError::Message("restart control channel closed".into()))?;
+        if received_control.as_ref() != control_probe {
+            return Err(TransportError::Message(
+                "restart control probe payload mismatch".into(),
+            ));
+        }
+
+        let received_media = tokio::time::timeout(
+            RESTART_VALIDATION_TIMEOUT,
+            peer.next_h264_access_unit_physical(),
+        )
+        .await
+        .map_err(|_| {
+            TransportError::Message(format!(
+                "restart media probe timed out for generation {generation}"
+            ))
+        })?
+        .ok_or_else(|| TransportError::Message("restart media stream closed".into()))?;
+        if received_media.bytes != media_probe.bytes {
+            return Err(TransportError::Message(
+                "restart media probe payload mismatch".into(),
+            ));
+        }
+
+        self.mark_restart_validated(generation, route_id)?;
+        Ok(RestartRouteEvidence {
+            generation,
+            route_id,
+            selected_pair: pair,
+            control_round_trip: true,
+            media_round_trip: true,
+        })
+    }
+
+    /// Atomically publish a validated pending peer and then close the losing active route.
+    pub async fn commit_restart(
+        &self,
+        generation: u64,
+        evidence: RestartRouteEvidence,
+    ) -> Result<(), TransportError> {
+        let (replacement, previous) = {
+            let mut state = self.restart_state();
+            let pending = state
+                .pending
+                .take()
+                .ok_or_else(|| stale_generation_error(generation, "restart commit"))?;
+            let PendingRestart::Ready {
+                generation: pending_generation,
+                route_id,
+                peer,
+                validated,
+            } = pending
+            else {
+                state.pending = Some(pending);
+                return Err(TransportError::Message(format!(
+                    "restart generation {generation} is still being built"
+                )));
+            };
+            if pending_generation != generation
+                || evidence.generation != generation
+                || evidence.route_id != route_id
+                || !validated
+                || !evidence.control_round_trip
+                || !evidence.media_round_trip
+            {
+                state.pending = Some(PendingRestart::Ready {
+                    generation: pending_generation,
+                    route_id,
+                    peer,
+                    validated,
+                });
+                return Err(stale_generation_error(generation, "restart evidence"));
+            }
+            let previous = state.active_replacement.replace(Arc::clone(&peer));
+            state.active_generation = generation;
+            (peer, previous)
+        };
+
+        if let Some(previous) = previous {
+            previous.close_physical().await?;
+        } else {
+            self.close_physical().await?;
+        }
+        debug_assert_eq!(replacement.config.role, self.config.role);
+        Ok(())
+    }
+
+    pub async fn current_generation(&self) -> u64 {
+        self.current_generation_now()
+    }
+
+    pub async fn pending_restart_generation(&self) -> Option<u64> {
+        self.restart_state()
+            .pending
+            .as_ref()
+            .map(PendingRestart::generation)
     }
 
     /// Begin idempotent transport termination without requiring an async caller.
     pub fn terminate_now(&self) {
+        if let Ok(state) = self.restart.lock() {
+            if let Some(active) = &state.active_replacement {
+                active.terminate_physical_now();
+            }
+            if let Some(PendingRestart::Ready { peer, .. }) = &state.pending {
+                peer.terminate_physical_now();
+            }
+        }
+        self.terminate_physical_now();
+    }
+
+    fn terminate_physical_now(&self) {
         self.completed_video_drops.seal();
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
@@ -612,8 +1135,29 @@ impl WebRtcPeerConnection {
     }
 
     pub async fn close(&self) -> Result<(), TransportError> {
+        let (active, pending) = {
+            let mut state = self.restart_state();
+            let active = state.active_replacement.take();
+            let pending = match state.pending.take() {
+                Some(PendingRestart::Ready { peer, .. }) => Some(peer),
+                _ => None,
+            };
+            (active, pending)
+        };
+        if let Some(pending) = pending {
+            pending.close_physical().await?;
+        }
+        if let Some(active) = active {
+            active.close_physical().await?;
+        }
+        self.close_physical().await
+    }
+
+    async fn close_physical(&self) -> Result<(), TransportError> {
         self.completed_video_drops.seal();
-        self.closed.store(true, Ordering::Release);
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
         let mut tasks = self.tasks.lock().await;
         for task in tasks.iter() {
             task.abort();
@@ -647,6 +1191,137 @@ impl WebRtcPeerConnection {
         }
     }
 
+    fn require_active_role(&self, expected: PeerConnectionRole) -> Result<(), TransportError> {
+        if let Some(route) = self.active_route() {
+            route.require_role(expected)
+        } else {
+            self.require_role(expected)
+        }
+    }
+
+    fn current_generation_now(&self) -> u64 {
+        self.active_snapshot().0
+    }
+
+    fn active_route(&self) -> Option<Arc<WebRtcPeerConnection>> {
+        self.active_snapshot().1
+    }
+
+    fn active_snapshot(&self) -> (u64, Option<Arc<WebRtcPeerConnection>>) {
+        self.restart_state().active_snapshot()
+    }
+
+    fn restart_state(&self) -> std::sync::MutexGuard<'_, RestartState> {
+        self.restart.lock().expect("restart state lock poisoned")
+    }
+
+    fn begin_restart(
+        &self,
+        generation: u64,
+    ) -> Result<(PeerConnectionConfig, Option<Arc<WebRtcPeerConnection>>), TransportError> {
+        if generation == 0 {
+            return Err(TransportError::Message(
+                "restart generation must be greater than zero".into(),
+            ));
+        }
+        let mut state = self.restart_state();
+        let pending_generation = state.pending.as_ref().map(PendingRestart::generation);
+        if generation <= state.active_generation
+            || pending_generation.is_some_and(|pending| generation <= pending)
+        {
+            return Err(stale_generation_error(generation, "restart request"));
+        }
+        let config = state
+            .active_replacement
+            .as_ref()
+            .map(|peer| peer.config.clone())
+            .unwrap_or_else(|| self.config.clone());
+        let loser = match state.pending.take() {
+            Some(PendingRestart::Ready { peer, .. }) => Some(peer),
+            _ => None,
+        };
+        state.pending = Some(PendingRestart::Building { generation });
+        Ok((config, loser))
+    }
+
+    fn finish_build(&self, generation: u64, peer: Arc<WebRtcPeerConnection>) -> bool {
+        let mut state = self.restart_state();
+        if matches!(
+            state.pending,
+            Some(PendingRestart::Building {
+                generation: pending
+            }) if pending == generation
+        ) && generation > state.active_generation
+        {
+            state.pending = Some(PendingRestart::Ready {
+                generation,
+                route_id: NEXT_RESTART_ROUTE_ID.fetch_add(1, Ordering::Relaxed),
+                peer,
+                validated: false,
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    fn abort_build(&self, generation: u64) {
+        let mut state = self.restart_state();
+        if matches!(
+            state.pending,
+            Some(PendingRestart::Building {
+                generation: pending
+            }) if pending == generation
+        ) {
+            state.pending = None;
+        }
+    }
+
+    fn ready_restart(
+        &self,
+        generation: u64,
+    ) -> Result<(u64, Arc<WebRtcPeerConnection>), TransportError> {
+        let state = self.restart_state();
+        match state.pending.as_ref() {
+            Some(pending) if pending.generation() == generation => {
+                pending.ready_peer().ok_or_else(|| {
+                    TransportError::Message(format!(
+                        "restart generation {generation} is still being built"
+                    ))
+                })
+            }
+            _ => Err(stale_generation_error(generation, "restart signaling")),
+        }
+    }
+
+    fn require_ready_route(&self, generation: u64, route_id: u64) -> Result<(), TransportError> {
+        let state = self.restart_state();
+        match state.pending.as_ref() {
+            Some(PendingRestart::Ready {
+                generation: pending_generation,
+                route_id: pending_route_id,
+                ..
+            }) if *pending_generation == generation && *pending_route_id == route_id => Ok(()),
+            _ => Err(stale_generation_error(generation, "restart route")),
+        }
+    }
+
+    fn mark_restart_validated(&self, generation: u64, route_id: u64) -> Result<(), TransportError> {
+        let mut state = self.restart_state();
+        match state.pending.as_mut() {
+            Some(PendingRestart::Ready {
+                generation: pending_generation,
+                route_id: pending_route_id,
+                validated,
+                ..
+            }) if *pending_generation == generation && *pending_route_id == route_id => {
+                *validated = true;
+                Ok(())
+            }
+            _ => Err(stale_generation_error(generation, "restart validation")),
+        }
+    }
+
     async fn wait_for_channel(
         &self,
         lane: ControlLane,
@@ -668,10 +1343,137 @@ impl WebRtcPeerConnection {
     }
 }
 
+async fn close_loser(loser: Option<Arc<WebRtcPeerConnection>>) {
+    if let Some(loser) = loser {
+        let _ = loser.close_physical().await;
+    }
+}
+
+fn require_generation(
+    expected: u64,
+    actual: u64,
+    context: &'static str,
+) -> Result<(), TransportError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(TransportError::Message(format!(
+            "stale {context} generation {actual}; expected {expected}"
+        )))
+    }
+}
+
+fn stale_generation_error(generation: u64, context: &'static str) -> TransportError {
+    TransportError::Message(format!("stale or losing {context} generation {generation}"))
+}
+
+fn restart_peer_config(
+    mut config: PeerConnectionConfig,
+    ice_servers: Vec<IceServerConfig>,
+) -> PeerConnectionConfig {
+    if !ice_servers.is_empty() {
+        config.ice_transport_policy = IceTransportPolicy::Relay;
+    }
+    config.ice_servers = ice_servers;
+    config
+}
+
+fn secret_values(ice_servers: &[IceServerConfig]) -> Vec<String> {
+    ice_servers
+        .iter()
+        .flat_map(|server| [&server.username, &server.credential])
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .collect()
+}
+
+fn redact_transport_error(error: TransportError, secrets: &[String]) -> TransportError {
+    let mut message = error.to_string();
+    for secret in secrets {
+        message = message.replace(secret, "[REDACTED]");
+    }
+    TransportError::Message(message)
+}
+
+fn redact_sdp_error(error: TransportError, sdp: &str) -> TransportError {
+    let secrets = sdp
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("a=ice-ufrag:")
+                .or_else(|| line.strip_prefix("a=ice-pwd:"))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    redact_transport_error(error, &secrets)
+}
+
+fn validate_selected_pair(
+    pair: &SelectedCandidatePairStats,
+    policy: IceTransportPolicy,
+) -> Result<(), TransportError> {
+    if !pair.nominated
+        || pair.local_candidate_kind == crate::CandidateKind::Unknown
+        || pair.remote_candidate_kind == crate::CandidateKind::Unknown
+    {
+        return Err(TransportError::Message(
+            "restart route lacks a nominated candidate pair with known candidate kinds".into(),
+        ));
+    }
+    if policy == IceTransportPolicy::Relay
+        && (pair.local_candidate_kind != crate::CandidateKind::Relay
+            || pair.remote_candidate_kind != crate::CandidateKind::Relay)
+    {
+        return Err(TransportError::Message(
+            "relay-only restart did not select a relay/relay candidate pair".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn restart_media_probe(generation: u64) -> EncodedAccessUnit {
+    EncodedAccessUnit {
+        codec: VideoCodec::H264,
+        timestamp_us: generation.saturating_mul(1_000),
+        is_keyframe: true,
+        bytes: vec![0, 0, 0, 1, 0x65, 0x88, 0x84, 0x21],
+    }
+}
+
 fn try_reserve_video_bytes(budget: Arc<Semaphore>, bytes: usize) -> Option<OwnedSemaphorePermit> {
     u32::try_from(bytes)
         .ok()
         .and_then(|bytes| budget.try_acquire_many_owned(bytes).ok())
+}
+
+fn spawn_tracked<F>(counter: &Arc<AtomicUsize>, future: F) -> JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    counter.fetch_add(1, Ordering::AcqRel);
+    let counter = Arc::clone(counter);
+    tokio::spawn(async move {
+        struct TaskGuard(Arc<AtomicUsize>);
+        impl Drop for TaskGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _guard = TaskGuard(counter);
+        future.await;
+    })
+}
+
+fn peer_error(context: &'static str) -> impl FnOnce(webrtc::Error) -> TransportError {
+    move |error| TransportError::Message(format!("{context} failed: {error}"))
+}
+
+fn peer_error_redacted<'a>(
+    context: &'static str,
+    secrets: &'a [String],
+) -> impl FnOnce(webrtc::Error) -> TransportError + 'a {
+    move |error| redact_transport_error(peer_error(context)(error), secrets)
 }
 
 #[cfg(test)]
@@ -709,26 +1511,67 @@ mod tests {
 
         assert_eq!(drops.take(), 1);
     }
-}
 
-fn spawn_tracked<F>(counter: &Arc<AtomicUsize>, future: F) -> JoinHandle<()>
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    counter.fetch_add(1, Ordering::AcqRel);
-    let counter = Arc::clone(counter);
-    tokio::spawn(async move {
-        struct TaskGuard(Arc<AtomicUsize>);
-        impl Drop for TaskGuard {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
-        let _guard = TaskGuard(counter);
-        future.await;
-    })
-}
+    #[test]
+    fn transport_error_redaction_removes_all_credential_values() {
+        let error = TransportError::Message(
+            "TURN setup failed for temporary-user using temporary-password".into(),
+        );
+        let redacted = redact_transport_error(
+            error,
+            &["temporary-user".into(), "temporary-password".into()],
+        );
+        let output = redacted.to_string();
+        assert!(!output.contains("temporary-user"));
+        assert!(!output.contains("temporary-password"));
+        assert_eq!(output.matches("[REDACTED]").count(), 2);
+    }
 
-fn peer_error(context: &'static str) -> impl FnOnce(webrtc::Error) -> TransportError {
-    move |error| TransportError::Message(format!("{context} failed: {error}"))
+    #[test]
+    fn sdp_error_redaction_removes_ice_credentials() {
+        let sdp = "v=0\r\na=ice-ufrag:temporary-user\r\na=ice-pwd:temporary-password\r\n";
+        let error =
+            TransportError::Message("invalid temporary-user credential temporary-password".into());
+
+        let output = redact_sdp_error(error, sdp).to_string();
+
+        assert!(!output.contains("temporary-user"));
+        assert!(!output.contains("temporary-password"));
+        assert_eq!(output.matches("[REDACTED]").count(), 2);
+    }
+
+    #[test]
+    fn restart_with_turn_servers_forces_relay_only_policy() {
+        let active = PeerConnectionConfig::default();
+        let servers = vec![IceServerConfig::new(
+            vec!["turn:relay.example.test:3478".into()],
+            "user".into(),
+            "credential".into(),
+        )];
+
+        let restart = restart_peer_config(active, servers.clone());
+
+        assert_eq!(restart.ice_servers, servers);
+        assert_eq!(restart.ice_transport_policy, IceTransportPolicy::Relay);
+    }
+
+    #[tokio::test]
+    async fn active_snapshot_keeps_generation_and_peer_from_one_state_read() {
+        let peer = Arc::new(
+            WebRtcPeerConnection::new(PeerConnectionConfig::default())
+                .await
+                .expect("peer"),
+        );
+        let state = RestartState {
+            active_generation: 9,
+            active_replacement: Some(Arc::clone(&peer)),
+            pending: None,
+        };
+
+        let (generation, route) = state.active_snapshot();
+
+        assert_eq!(generation, 9);
+        assert!(Arc::ptr_eq(&route.expect("active route"), &peer));
+        peer.close().await.expect("close peer");
+    }
 }

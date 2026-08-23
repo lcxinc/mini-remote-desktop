@@ -19,6 +19,7 @@ use webrtc::{
 mod config;
 mod control;
 mod peer;
+mod probe;
 mod stats;
 
 pub use config::{
@@ -28,7 +29,11 @@ pub use config::{
 pub use control::{
     ControlChannelInfo, ControlChannels, ControlLane, BULK_LABEL, CTRL_REL_LABEL, CTRL_RT_LABEL,
 };
-pub use peer::{IceCandidate, SessionDescription, SessionDescriptionType, WebRtcPeerConnection};
+pub use peer::{
+    IceCandidate, RestartRouteEvidence, SessionDescription, SessionDescriptionType,
+    WebRtcPeerConnection,
+};
+pub use probe::{probe_turn_relay, TurnRelayProbeConfig, TurnRelayProbeEvidence};
 pub use stats::{CandidateKind, SelectedCandidatePairStats};
 
 pub const DEFAULT_MAX_H264_ACCESS_UNIT_BYTES: usize = 4 * 1024 * 1024;
