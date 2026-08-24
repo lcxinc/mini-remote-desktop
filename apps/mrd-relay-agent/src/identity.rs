@@ -32,12 +32,12 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     backend::{
-        rotation_proof_message, serialize_renewal_body, serialize_secret_commit_body,
-        serialize_secret_rotation_status_body, serialize_secret_upload_body, sign_relay_request,
-        BackendError, EnrollmentRequest, EnrollmentStatus, HeartbeatPayload, NodeCertificate,
-        PickupRequest, RelayBackendClientFactoryPort, RelayBackendPort, RenewalRequest,
-        RequestAuthentication, SecretCommitRequest, SecretRotationStatusRequest,
-        SecretUploadRequest, SignedHeartbeat, SwappableRelayBackend,
+        build_secret_upload_request, rotation_proof_message, serialize_renewal_body,
+        serialize_secret_commit_body, serialize_secret_rotation_status_body, sign_relay_request,
+        valid_enrollment_receipt, BackendError, EnrollmentRequest, EnrollmentStatus,
+        HeartbeatPayload, NodeCertificate, PickupRequest, RelayBackendClientFactoryPort,
+        RelayBackendPort, RenewalRequest, RequestAuthentication, SecretCommitRequest,
+        SecretRotationStatusRequest, SecretUploadRequest, SignedHeartbeat, SwappableRelayBackend,
     },
     runtime::{ClockPort, RuntimeError},
 };
@@ -452,10 +452,6 @@ fn valid_operation_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-fn valid_enrollment_receipt(value: &str) -> bool {
-    (20..=512).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_graphic())
-}
-
 fn validate_key_and_csr(
     private_pkcs8_b64: &str,
     public_key_b64: &str,
@@ -520,6 +516,18 @@ pub struct CertificateState<F: IdentityFsPort> {
     pending_delivery: Option<NodeCertificate>,
     trusted_ca_der: Vec<u8>,
     clock: Arc<dyn ClockPort>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum RenewalPreparation {
+    Request {
+        identity_epoch: u64,
+        request: RenewalRequest,
+    },
+    Ready {
+        identity_epoch: u64,
+        renewal_id: String,
+    },
 }
 
 impl<F: IdentityFsPort> CertificateState<F> {
@@ -638,22 +646,15 @@ impl<F: IdentityFsPort> CertificateState<F> {
     ) -> Result<SecretUploadRequest, RuntimeError> {
         let node_id = self.identity.stored.node_id.clone();
         let identity_epoch = self.identity.stored.identity_epoch;
-        let mut request = SecretUploadRequest {
-            node_id: node_id.clone(),
+        let path = format!("/api/v1/relays/{node_id}/secret-rotation/upload");
+        build_secret_upload_request(
+            node_id,
             identity_epoch,
             rotation_id,
             secret_version,
             turn_rest_secret,
-            authentication: RequestAuthentication {
-                timestamp,
-                sequence: 0,
-                signature_b64: String::new(),
-            },
-        };
-        let body = serialize_secret_upload_body(&request).map_err(RuntimeError::Backend)?;
-        let path = format!("/api/v1/relays/{node_id}/secret-rotation/upload");
-        request.authentication = self.consume_signed_request("POST", &path, timestamp, &body)?;
-        Ok(request)
+            |body| self.consume_signed_request("POST", &path, timestamp, body),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -833,26 +834,14 @@ impl<F: IdentityFsPort> CertificateState<F> {
     pub async fn enroll(
         &mut self,
         backend: &dyn RelayBackendPort,
-        mut request: EnrollmentRequest,
+        request: EnrollmentRequest,
     ) -> Result<(), RuntimeError> {
-        request.csr_pem = self.identity.csr_pem().to_owned();
-        match backend
-            .enroll(request)
+        let request = self.prepare_enrollment_request(request)?;
+        let status = backend
+            .enroll(request.clone())
             .await
-            .map_err(RuntimeError::Backend)?
-        {
-            EnrollmentStatus::Pending {
-                enrollment_id,
-                receipt,
-            } => {
-                self.identity.stored.pending_enrollment = Some(StoredEnrollment {
-                    enrollment_id,
-                    receipt: receipt.expose_secret().to_owned(),
-                });
-                self.fs.atomic_replace(&self.identity.stored)?;
-            }
-        }
-        Ok(())
+            .map_err(RuntimeError::Backend)?;
+        self.complete_enrollment_response(&request, status)
     }
 
     pub async fn pickup(&mut self, backend: &dyn RelayBackendPort) -> Result<bool, RuntimeError> {
@@ -861,20 +850,98 @@ impl<F: IdentityFsPort> CertificateState<F> {
             self.pending_delivery = None;
             return Ok(true);
         }
+        let request = self.prepare_pickup_request()?;
+        let certificate = backend
+            .pickup(request.clone())
+            .await
+            .map_err(RuntimeError::Backend)?;
+        self.complete_pickup_response(&request, certificate)
+    }
+
+    pub(crate) fn prepare_enrollment_request(
+        &self,
+        mut request: EnrollmentRequest,
+    ) -> Result<EnrollmentRequest, RuntimeError> {
+        if self.identity.stored.certificate.is_some()
+            || self.identity.stored.pending_enrollment.is_some()
+            || request.node_id != self.identity.stored.node_id
+        {
+            return Err(RuntimeError::IdentityInvalid);
+        }
+        request.csr_pem = self.identity.csr_pem().to_owned();
+        Ok(request)
+    }
+
+    pub(crate) fn complete_enrollment_response(
+        &mut self,
+        request: &EnrollmentRequest,
+        status: EnrollmentStatus,
+    ) -> Result<(), RuntimeError> {
+        if self.identity.stored.certificate.is_some()
+            || request.node_id != self.identity.stored.node_id
+            || request.csr_pem != self.identity.csr_pem()
+        {
+            return Err(RuntimeError::IdentityInvalid);
+        }
+        let EnrollmentStatus::Pending {
+            enrollment_id,
+            receipt,
+        } = status;
+        if !valid_operation_id(&enrollment_id) || !valid_enrollment_receipt(receipt.expose_secret())
+        {
+            return Err(RuntimeError::IdentityInvalid);
+        }
+        let completed = StoredEnrollment {
+            enrollment_id,
+            receipt: receipt.expose_secret().to_owned(),
+        };
+        if let Some(current) = self.identity.stored.pending_enrollment.as_ref() {
+            return if current.enrollment_id == completed.enrollment_id
+                && current.receipt == completed.receipt
+            {
+                Ok(())
+            } else {
+                Err(RuntimeError::IdentityInvalid)
+            };
+        }
+        let mut proposed = self.identity.stored.clone();
+        proposed.pending_enrollment = Some(completed);
+        self.fs.atomic_replace(&proposed)?;
+        self.identity.stored = proposed;
+        Ok(())
+    }
+
+    pub(crate) fn prepare_pickup_request(&self) -> Result<PickupRequest, RuntimeError> {
         let pending = self
             .identity
             .stored
             .pending_enrollment
-            .clone()
+            .as_ref()
             .ok_or(RuntimeError::EnrollmentMissing)?;
-        let certificate = backend
-            .pickup(PickupRequest {
-                enrollment_id: pending.enrollment_id.clone(),
-                node_id: self.identity.stored.node_id.clone(),
-                receipt: SecretString::from(pending.receipt.clone()),
-            })
-            .await
-            .map_err(RuntimeError::Backend)?;
+        Ok(PickupRequest {
+            enrollment_id: pending.enrollment_id.clone(),
+            node_id: self.identity.stored.node_id.clone(),
+            receipt: SecretString::from(pending.receipt.clone()),
+        })
+    }
+
+    pub(crate) fn complete_pickup_response(
+        &mut self,
+        request: &PickupRequest,
+        certificate: Option<NodeCertificate>,
+    ) -> Result<bool, RuntimeError> {
+        let pending = self
+            .identity
+            .stored
+            .pending_enrollment
+            .as_ref()
+            .ok_or(RuntimeError::EnrollmentMissing)?;
+        if request.node_id != self.identity.stored.node_id
+            || request.enrollment_id != pending.enrollment_id
+            || request.receipt.expose_secret() != pending.receipt
+        {
+            return Err(RuntimeError::IdentityInvalid);
+        }
         let Some(certificate) = certificate else {
             return Ok(false);
         };
@@ -917,99 +984,106 @@ impl<F: IdentityFsPort> CertificateState<F> {
         timestamp: i64,
         activation: Option<(&dyn RelayBackendClientFactoryPort, &SwappableRelayBackend)>,
     ) -> Result<(), RuntimeError> {
+        let (expected_epoch, completed_renewal_id) =
+            match self.prepare_renewal_request(renewal_id, timestamp)? {
+                RenewalPreparation::Request {
+                    identity_epoch,
+                    request,
+                } => {
+                    let certificate = backend
+                        .renew(request.clone())
+                        .await
+                        .map_err(RuntimeError::Backend)?;
+                    self.complete_renewal_response(identity_epoch, &request, certificate)?;
+                    (identity_epoch, request.renewal_id)
+                }
+                RenewalPreparation::Ready {
+                    identity_epoch,
+                    renewal_id,
+                } => (identity_epoch, renewal_id),
+            };
+        if let Some((factory, slot)) = activation {
+            self.finalize_pending_renewal_and_swap(
+                expected_epoch,
+                &completed_renewal_id,
+                factory,
+                slot,
+            )?;
+        } else {
+            self.promote_pending_renewal_for(expected_epoch, &completed_renewal_id)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_renewal_request(
+        &mut self,
+        renewal_id: &str,
+        timestamp: i64,
+    ) -> Result<RenewalPreparation, RuntimeError> {
         if !valid_operation_id(renewal_id) {
             return Err(RuntimeError::IdentityInvalid);
         }
-        if let Some(pending) = self.identity.stored.pending_renewal.clone() {
+        if self.identity.stored.certificate.is_none() {
+            return Err(RuntimeError::EnrollmentMissing);
+        }
+        if let Some(pending) = self.identity.stored.pending_renewal.as_ref() {
             if pending.renewal_id != renewal_id {
                 return Err(RuntimeError::RenewalConflict);
             }
         } else {
-            let proposed = generate_identity(&self.identity.stored.node_id)?;
-            self.identity.stored.pending_renewal = Some(StoredRenewal {
+            let candidate = generate_identity(&self.identity.stored.node_id)?;
+            let mut proposed = self.identity.stored.clone();
+            proposed.pending_renewal = Some(StoredRenewal {
                 renewal_id: renewal_id.to_owned(),
-                private_pkcs8_b64: proposed.private_pkcs8_b64.clone(),
-                public_key_b64: proposed.public_key_b64.clone(),
-                csr_pem: proposed.csr_pem.clone(),
+                private_pkcs8_b64: candidate.private_pkcs8_b64.clone(),
+                public_key_b64: candidate.public_key_b64.clone(),
+                csr_pem: candidate.csr_pem.clone(),
                 certificate: None,
             });
             // Persist the candidate key before contacting the backend. A crash
             // can then retry the same idempotency id and exact CSR.
-            self.fs.atomic_replace(&self.identity.stored)?;
+            self.fs.atomic_replace(&proposed)?;
+            self.identity.stored = proposed;
         }
-        let mut pending = self
+        let pending = self
             .identity
             .stored
             .pending_renewal
             .clone()
             .ok_or(RuntimeError::RenewalConflict)?;
+        let identity_epoch = self.identity.stored.identity_epoch;
+        if pending.certificate.is_some() {
+            return Ok(RenewalPreparation::Ready {
+                identity_epoch,
+                renewal_id: renewal_id.to_owned(),
+            });
+        }
+        let node_id = self.identity.stored.node_id.clone();
+        let path = format!("/api/v1/relays/{node_id}/renew");
+        let body =
+            serialize_renewal_body(renewal_id, &pending.csr_pem).map_err(RuntimeError::Backend)?;
+        let authentication = self.consume_signed_request("POST", &path, timestamp, &body)?;
+        Ok(RenewalPreparation::Request {
+            identity_epoch,
+            request: RenewalRequest {
+                node_id,
+                renewal_id: renewal_id.to_owned(),
+                csr_pem: pending.csr_pem.clone(),
+                authentication,
+            },
+        })
+    }
+
+    pub(crate) fn complete_renewal_response(
+        &mut self,
+        expected_epoch: u64,
+        request: &RenewalRequest,
+        certificate: NodeCertificate,
+    ) -> Result<(), RuntimeError> {
+        let pending = self.pending_renewal_for_request(expected_epoch, request)?;
         let expected_public_key = STANDARD
             .decode(&pending.public_key_b64)
             .map_err(|_| RuntimeError::IdentityInvalid)?;
-        if pending.certificate.is_none() {
-            self.identity.stored.request_sequence = self
-                .identity
-                .stored
-                .request_sequence
-                .checked_add(1)
-                .ok_or(RuntimeError::IdentityInvalid)?;
-            self.fs.atomic_replace(&self.identity.stored)?;
-            let request_sequence = self.identity.stored.request_sequence;
-            let node_id = self.identity.stored.node_id.clone();
-            let path = format!("/api/v1/relays/{node_id}/renew");
-            let body = serialize_renewal_body(renewal_id, &pending.csr_pem)
-                .map_err(RuntimeError::Backend)?;
-            let private = self.identity.private_pkcs8()?;
-            let authentication = RequestAuthentication {
-                timestamp,
-                sequence: request_sequence,
-                signature_b64: sign_relay_request(
-                    &private,
-                    "POST",
-                    &path,
-                    &node_id,
-                    timestamp,
-                    request_sequence,
-                    &body,
-                )
-                .map_err(RuntimeError::Backend)?,
-            };
-            let certificate = backend
-                .renew(RenewalRequest {
-                    node_id,
-                    renewal_id: renewal_id.to_owned(),
-                    csr_pem: pending.csr_pem.clone(),
-                    authentication,
-                })
-                .await
-                .map_err(RuntimeError::Backend)?;
-            validate_node_certificate(
-                &certificate,
-                &self.identity.stored.node_id,
-                &expected_public_key,
-                &self.trusted_ca_der,
-                self.clock.unix_seconds(),
-            )?;
-            self.identity
-                .stored
-                .pending_renewal
-                .as_mut()
-                .ok_or(RuntimeError::RenewalConflict)?
-                .certificate = Some(certificate.into());
-            self.fs.atomic_replace(&self.identity.stored)?;
-            pending = self
-                .identity
-                .stored
-                .pending_renewal
-                .clone()
-                .ok_or(RuntimeError::RenewalConflict)?;
-        }
-        let certificate = NodeCertificate::from(
-            pending
-                .certificate
-                .as_ref()
-                .ok_or(RuntimeError::RenewalConflict)?,
-        );
         validate_node_certificate(
             &certificate,
             &self.identity.stored.node_id,
@@ -1017,25 +1091,120 @@ impl<F: IdentityFsPort> CertificateState<F> {
             &self.trusted_ca_der,
             self.clock.unix_seconds(),
         )?;
-        let replacement = if let Some((factory, _)) = activation {
-            let private = Zeroizing::new(
-                STANDARD
-                    .decode(&pending.private_pkcs8_b64)
-                    .map_err(|_| RuntimeError::IdentityInvalid)?,
-            );
-            Some(
-                factory
-                    .build_mtls(&certificate, &private)
-                    .map_err(RuntimeError::Backend)?,
-            )
-        } else {
-            None
-        };
-        self.promote_pending_renewal()?;
-        if let (Some((_, slot)), Some(replacement)) = (activation, replacement) {
-            slot.swap(replacement);
+        if let Some(current) = pending.certificate.as_ref() {
+            return if NodeCertificate::from(current) == certificate {
+                Ok(())
+            } else {
+                Err(RuntimeError::RenewalConflict)
+            };
         }
+        let mut proposed = self.identity.stored.clone();
+        proposed
+            .pending_renewal
+            .as_mut()
+            .ok_or(RuntimeError::RenewalConflict)?
+            .certificate = Some(certificate.into());
+        if let Err(error) = self.fs.atomic_replace(&proposed) {
+            // Retain a validated delivery in memory across a local atomic-write
+            // failure. The active identity is unchanged, while a retry can
+            // persist/promote this exact certificate without another ambiguous
+            // network call. A process restart safely reuses the renewal id/CSR.
+            self.identity
+                .stored
+                .pending_renewal
+                .as_mut()
+                .ok_or(RuntimeError::RenewalConflict)?
+                .certificate = proposed
+                .pending_renewal
+                .as_ref()
+                .and_then(|renewal| renewal.certificate.clone());
+            return Err(error);
+        }
+        self.identity.stored = proposed;
         Ok(())
+    }
+
+    pub(crate) fn renewal_request_was_overtaken(
+        &self,
+        expected_epoch: u64,
+        request: &RenewalRequest,
+    ) -> bool {
+        self.pending_renewal_for_request(expected_epoch, request)
+            .is_ok()
+            && self.identity.stored.request_sequence > request.authentication.sequence
+    }
+
+    pub(crate) fn finalize_pending_renewal_and_swap(
+        &mut self,
+        expected_epoch: u64,
+        renewal_id: &str,
+        factory: &dyn RelayBackendClientFactoryPort,
+        slot: &SwappableRelayBackend,
+    ) -> Result<(), RuntimeError> {
+        let pending = self.pending_renewal_for(expected_epoch, renewal_id)?;
+        let certificate = NodeCertificate::from(
+            pending
+                .certificate
+                .as_ref()
+                .ok_or(RuntimeError::RenewalConflict)?,
+        );
+        let expected_public_key = STANDARD
+            .decode(&pending.public_key_b64)
+            .map_err(|_| RuntimeError::IdentityInvalid)?;
+        validate_node_certificate(
+            &certificate,
+            &self.identity.stored.node_id,
+            &expected_public_key,
+            &self.trusted_ca_der,
+            self.clock.unix_seconds(),
+        )?;
+        let private = Zeroizing::new(
+            STANDARD
+                .decode(&pending.private_pkcs8_b64)
+                .map_err(|_| RuntimeError::IdentityInvalid)?,
+        );
+        let replacement = factory
+            .build_mtls(&certificate, &private)
+            .map_err(RuntimeError::Backend)?;
+        self.promote_pending_renewal_for(expected_epoch, renewal_id)?;
+        slot.swap(replacement);
+        Ok(())
+    }
+
+    fn pending_renewal_for_request(
+        &self,
+        expected_epoch: u64,
+        request: &RenewalRequest,
+    ) -> Result<&StoredRenewal, RuntimeError> {
+        let pending = self.pending_renewal_for(expected_epoch, &request.renewal_id)?;
+        if request.node_id != self.identity.stored.node_id
+            || request.csr_pem != pending.csr_pem
+            || request.authentication.sequence == 0
+            || request.authentication.sequence > self.identity.stored.request_sequence
+        {
+            return Err(RuntimeError::RenewalConflict);
+        }
+        Ok(pending)
+    }
+
+    fn pending_renewal_for(
+        &self,
+        expected_epoch: u64,
+        renewal_id: &str,
+    ) -> Result<&StoredRenewal, RuntimeError> {
+        if self.identity.stored.identity_epoch != expected_epoch {
+            return Err(RuntimeError::RenewalConflict);
+        }
+        let pending = self
+            .identity
+            .stored
+            .pending_renewal
+            .as_ref()
+            .ok_or(RuntimeError::RenewalConflict)?;
+        if pending.renewal_id != renewal_id {
+            return Err(RuntimeError::RenewalConflict);
+        }
+        Ok(pending)
     }
 
     fn install_certificate(&mut self, certificate: NodeCertificate) -> Result<(), RuntimeError> {
@@ -1054,13 +1223,14 @@ impl<F: IdentityFsPort> CertificateState<F> {
         Ok(())
     }
 
-    fn promote_pending_renewal(&mut self) -> Result<(), RuntimeError> {
+    fn promote_pending_renewal_for(
+        &mut self,
+        expected_epoch: u64,
+        renewal_id: &str,
+    ) -> Result<(), RuntimeError> {
         let pending = self
-            .identity
-            .stored
-            .pending_renewal
-            .clone()
-            .ok_or(RuntimeError::RenewalConflict)?;
+            .pending_renewal_for(expected_epoch, renewal_id)?
+            .clone();
         let certificate = pending
             .certificate
             .clone()

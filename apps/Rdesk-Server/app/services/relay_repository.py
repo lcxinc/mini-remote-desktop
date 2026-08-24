@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import hashlib
 import hmac
 import ipaddress
@@ -18,6 +16,12 @@ from cryptography.exceptions import InvalidTag
 from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.mutable_base64url import (
+    decode_canonical_base64url,
+    encode_unpadded_base64url,
+    zeroize,
+)
 
 from app.models.relay_enrollment import RelayEnrollment
 from app.models.relay_node import RelayNode
@@ -326,6 +330,14 @@ class RelayRepository:
                 "INVALID_CERTIFICATE", "certificate fingerprint is invalid"
             )
         turn_secret_bytes = _validated_turn_secret(turn_secret)
+        try:
+            # AESGCM accepts only immutable bytes.  This is the cryptography
+            # boundary; the application-owned canonical owner is wiped here.
+            encrypted_turn_secret = self._secret_cipher.encrypt(
+                bytes(turn_secret_bytes), associated_data=node_id.encode()
+            )
+        finally:
+            zeroize(turn_secret_bytes)
 
         digest = self._token_digest(token)
         enrollment = await self._session.scalar(
@@ -370,9 +382,7 @@ class RelayRepository:
             state="unavailable",
             endpoints=validated_endpoints,
             certificate_fingerprint=certificate_fingerprint,
-            encrypted_turn_secret=self._secret_cipher.encrypt(
-                turn_secret_bytes, associated_data=node_id.encode()
-            ),
+            encrypted_turn_secret=encrypted_turn_secret,
             max_allocations=max_allocations,
             active_allocations=0,
             max_egress_bps=max_egress_bps,
@@ -912,7 +922,7 @@ def _valid_general_id(value: object) -> bool:
     )
 
 
-def _validated_turn_secret(value: object) -> bytes:
+def _validated_turn_secret(value: object) -> bytearray:
     """Validate 32-byte entropy while preserving the coturn wire string."""
 
     if (
@@ -922,57 +932,57 @@ def _validated_turn_secret(value: object) -> bytes:
         or re.fullmatch(r"[A-Za-z0-9_-]{43}", value) is None
     ):
         raise RelayRepositoryError("INVALID_TURN_SECRET", "TURN secret required")
-    padded = bytearray(value.encode("ascii"))
-    padded.extend(b"=")
-    decoded: bytearray | None = None
     canonical: bytearray | None = None
     try:
         try:
-            decoded_result = base64.urlsafe_b64decode(padded)
-            decoded = (
-                decoded_result
-                if isinstance(decoded_result, bytearray)
-                else bytearray(decoded_result)
+            decoded = decode_canonical_base64url(
+                value, expected_length=32
             )
-            canonical_result = base64.urlsafe_b64encode(decoded)
-            canonical = (
-                canonical_result
-                if isinstance(canonical_result, bytearray)
-                else bytearray(canonical_result)
-            )
-            while canonical.endswith(b"="):
-                canonical.pop()
-            padded.pop()
-        except (ValueError, binascii.Error):
+        except ValueError:
             raise RelayRepositoryError(
                 "INVALID_TURN_SECRET", "TURN secret required"
             ) from None
-        if (
-            len(decoded) != 32
-            or not hmac.compare_digest(canonical, padded)
-            or not _turn_secret_has_minimum_quality(decoded)
-        ):
+        if not _turn_secret_has_minimum_quality(decoded):
             raise RelayRepositoryError("INVALID_TURN_SECRET", "TURN secret required")
         # coturn's static-auth-secret is the configured string, not its decoded
         # entropy bytes. The representation is canonical, so preserving it is
         # unambiguous and keeps the agent/server/coturn HMAC keys identical.
-        return bytes(padded)
+        canonical = encode_unpadded_base64url(memoryview(decoded))
+        return canonical
     finally:
-        for buffer in (canonical, decoded, padded):
-            if buffer is not None:
-                for index in range(len(buffer)):
-                    buffer[index] = 0
+        if "decoded" in locals():
+            zeroize(decoded)
 
 
 def _turn_secret_has_minimum_quality(secret: bytes | bytearray) -> bool:
     # This is not an entropy estimator. It rejects deterministic deployment
     # placeholders and repeated-byte material while generation remains CSPRNG-only.
-    lowered = bytes(secret).lower()
+    def contains_case_insensitive(marker: bytes) -> bool:
+        if len(marker) > len(secret):
+            return False
+        for offset in range(len(secret) - len(marker) + 1):
+            if all(
+                (
+                    secret[offset + index] + 32
+                    if 65 <= secret[offset + index] <= 90
+                    else secret[offset + index]
+                )
+                == marker[index]
+                for index in range(len(marker))
+            ):
+                return True
+        return False
+
+    unique_count = 0
+    for index in range(len(secret)):
+        if all(secret[prior] != secret[index] for prior in range(index)):
+            unique_count += 1
+
     return (
         len(secret) == 32
-        and len(set(secret)) >= 8
+        and unique_count >= 8
         and not any(
-            marker in lowered
+            contains_case_insensitive(marker)
             for marker in (b"placeholder", b"changeme", b"change-me")
         )
     )

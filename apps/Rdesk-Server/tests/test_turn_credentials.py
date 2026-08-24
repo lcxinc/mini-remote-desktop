@@ -168,29 +168,21 @@ def test_node_credential_matches_coturn_canonical_secret_string() -> None:
 def test_coturn_wire_secret_clears_controllable_base64_codec_buffers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    real_decode = base64.urlsafe_b64decode
-    real_encode = base64.urlsafe_b64encode
+    from app.core import mutable_base64url
+
     canonical_secret = bytearray(
-        real_encode(hashlib.sha256(b"codec-buffer-secret").digest()).rstrip(b"=")
+        base64.urlsafe_b64encode(
+            hashlib.sha256(b"codec-buffer-secret").digest()
+        ).rstrip(b"=")
     )
     codec_buffers: list[bytearray] = []
 
-    def tracked_decode(value: object) -> bytearray:
-        buffer = bytearray(real_decode(value))
+    def tracked_buffer() -> bytearray:
+        buffer = bytearray()
         codec_buffers.append(buffer)
         return buffer
 
-    def tracked_encode(value: object) -> bytearray:
-        buffer = bytearray(real_encode(value))
-        codec_buffers.append(buffer)
-        return buffer
-
-    monkeypatch.setattr(
-        turn_credentials_module.base64, "urlsafe_b64decode", tracked_decode
-    )
-    monkeypatch.setattr(
-        turn_credentials_module.base64, "urlsafe_b64encode", tracked_encode
-    )
+    monkeypatch.setattr(mutable_base64url, "_new_buffer", tracked_buffer)
     wire_secret, was_legacy = turn_credentials_module._coturn_wire_secret(  # noqa: SLF001
         canonical_secret
     )
@@ -198,6 +190,29 @@ def test_coturn_wire_secret_clears_controllable_base64_codec_buffers(
     assert was_legacy is False
     assert codec_buffers
     assert all(buffer == bytearray(len(buffer)) for buffer in codec_buffers)
+
+
+def test_coturn_wire_secret_quality_failure_clears_decoded_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.core import mutable_base64url
+
+    owners: list[bytearray] = []
+
+    def tracked_buffer() -> bytearray:
+        owner = bytearray()
+        owners.append(owner)
+        return owner
+
+    monkeypatch.setattr(mutable_base64url, "_new_buffer", tracked_buffer)
+    canonical = bytearray(base64.urlsafe_b64encode(b"x" * 32).rstrip(b"="))
+    with pytest.raises(
+        turn_credentials_module.TurnCredentialConfigurationError,
+        match="credential material is unavailable",
+    ):
+        turn_credentials_module._coturn_wire_secret(canonical)  # noqa: SLF001
+    assert owners
+    assert all(not any(owner) for owner in owners)
 
 
 def test_node_credential_upgrades_legacy_raw_secret_to_wire_string() -> None:

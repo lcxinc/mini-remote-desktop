@@ -15,7 +15,12 @@ import pytest
 from pydantic import SecretStr
 from sqlalchemy import event, func, inspect, select, text
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
+    AsyncEngine,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.db.migrate_add_relay_control import migrate
 import app.db.migrate_add_relay_control as relay_migration
@@ -95,6 +100,32 @@ async def isolated_postgres_engine() -> AsyncIterator[AsyncEngine]:
         async with admin_engine.begin() as connection:
             await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
         await admin_engine.dispose()
+
+
+async def insert_legacy_draining_node(
+    connection: AsyncConnection, *, node_id: str
+) -> None:
+    await connection.execute(
+        text(
+            """
+            INSERT INTO relay_nodes (
+                node_id, region, failure_domain, state, endpoints,
+                certificate_fingerprint, encrypted_turn_secret,
+                max_allocations, max_egress_bps, desired_draining,
+                created_at, updated_at
+            ) VALUES (
+                :node_id, 'ap-east', 'rack-legacy', 'draining',
+                '[]'::jsonb, :fingerprint, decode(:secret_hex, 'hex'),
+                10, 1000000, false, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            """
+        ),
+        {
+            "node_id": node_id,
+            "fingerprint": fingerprint(node_id),
+            "secret_hex": "11" * 32,
+        },
+    )
 
 
 async def enroll_postgres_node(
@@ -635,6 +666,18 @@ async def test_renewal_serializes_old_epoch_heartbeat_and_records_previous_seque
             identity, cipher, _ = await seed_registry_rotation_node(
                 setup_session, node_id=node_id, now=now
             )
+            # This race exercises an ordinary renewal versus an old-epoch
+            # heartbeat.  Rotation-in-flight renewals are intentionally
+            # rejected by the fail-closed lifecycle invariant.
+            seeded = await setup_session.get(RelayNode, node_id)
+            assert seeded is not None
+            seeded.state = "unavailable"
+            seeded.desired_draining = False
+            seeded.desired_secret_version = seeded.active_secret_version
+            seeded.secret_not_before = None
+            seeded.old_credential_deadline = None
+            seeded.rotation_challenge = None
+            await setup_session.commit()
 
         async with sessions() as first, sessions() as second:
             first_registry = RelayRegistry(
@@ -1508,6 +1551,9 @@ async def test_current_migration_ledger_runs_read_only_schema_verification() -> 
 async def test_migration_with_only_v8_missing_executes_only_v8_step() -> None:
     async with isolated_postgres_engine() as engine:
         async with engine.begin() as connection:
+            await insert_legacy_draining_node(
+                connection, node_id="relay-v7-draining"
+            )
             await connection.execute(
                 text("DELETE FROM relay_schema_migrations WHERE version = 8")
             )
@@ -1583,7 +1629,14 @@ async def test_migration_with_only_v8_missing_executes_only_v8_step() -> None:
                     )
                 ).scalars()
             )
+            desired_draining = await connection.scalar(
+                text(
+                    "SELECT desired_draining FROM relay_nodes "
+                    "WHERE node_id = 'relay-v7-draining'"
+                )
+            )
         assert versions == list(range(1, 9))
+        assert desired_draining is True
 
 
 @pytest.mark.anyio
@@ -1592,6 +1645,9 @@ async def test_v7_to_v8_failure_rolls_back_columns_constraints_and_ledger(
 ) -> None:
     async with isolated_postgres_engine() as engine:
         async with engine.begin() as connection:
+            await insert_legacy_draining_node(
+                connection, node_id="relay-v7-rollback-draining"
+            )
             await connection.execute(
                 text("DELETE FROM relay_schema_migrations WHERE version = 8")
             )
@@ -1652,14 +1708,24 @@ async def test_v7_to_v8_failure_rolls_back_columns_constraints_and_ledger(
                 )
 
             column_exists = await connection.run_sync(has_v8_column)
+            state = await connection.scalar(
+                text(
+                    "SELECT state FROM relay_nodes "
+                    "WHERE node_id = 'relay-v7-rollback-draining'"
+                )
+            )
         assert version == 7
         assert column_exists is False
+        assert state == "draining"
 
 
 @pytest.mark.anyio
 async def test_genuine_v6_schema_upgrades_through_v8_with_all_rotation_constraints() -> None:
     async with isolated_postgres_engine() as engine:
         async with engine.begin() as connection:
+            await insert_legacy_draining_node(
+                connection, node_id="relay-v6-draining"
+            )
             await connection.execute(
                 text("DELETE FROM relay_schema_migrations WHERE version >= 7")
             )
@@ -1722,7 +1788,14 @@ async def test_genuine_v6_schema_upgrades_through_v8_with_all_rotation_constrain
                 return columns, checks
 
             columns, checks = await connection.run_sync(inspect_upgrade)
+            desired_draining = await connection.scalar(
+                text(
+                    "SELECT desired_draining FROM relay_nodes "
+                    "WHERE node_id = 'relay-v6-draining'"
+                )
+            )
         assert versions == list(range(1, 9))
+        assert desired_draining is True
         assert "previous_identity_sequence" in columns
         assert {
             "ck_relay_nodes_previous_identity_sequence",
@@ -1754,6 +1827,84 @@ async def test_genuine_v6_schema_upgrades_through_v8_with_all_rotation_constrain
             )
             for statement in statements
         )
+
+
+@pytest.mark.anyio
+async def test_v6_draining_backfill_rolls_back_with_the_generic_upgrade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with isolated_postgres_engine() as engine:
+        async with engine.begin() as connection:
+            await insert_legacy_draining_node(
+                connection, node_id="relay-v6-rollback-draining"
+            )
+            await connection.execute(
+                text("DELETE FROM relay_schema_migrations WHERE version >= 7")
+            )
+            await connection.execute(
+                text(
+                    "ALTER TABLE relay_reservations "
+                    "DROP COLUMN superseded_at, DROP COLUMN directory_generation"
+                )
+            )
+            await connection.execute(
+                text(
+                    "ALTER TABLE relay_nodes "
+                    "DROP COLUMN current_ingress_bps, DROP COLUMN identity_epoch, "
+                    "DROP COLUMN previous_identity_sequence, DROP COLUMN last_boot_id, "
+                    "DROP COLUMN last_heartbeat_nonce, DROP COLUMN process_health, "
+                    "DROP COLUMN listener_health, DROP COLUMN probe_health, "
+                    "DROP COLUMN packet_loss_bps, DROP COLUMN cpu_usage_bps, "
+                    "DROP COLUMN memory_usage_bps, DROP COLUMN active_secret_version, "
+                    "DROP COLUMN applied_secret_version, DROP COLUMN desired_secret_version, "
+                    "DROP COLUMN desired_draining, DROP COLUMN secret_not_before, "
+                    "DROP COLUMN old_credential_deadline, DROP COLUMN pending_secret_version, "
+                    "DROP COLUMN pending_encrypted_turn_secret, "
+                    "DROP COLUMN pending_secret_digest, DROP COLUMN pending_rotation_id, "
+                    "DROP COLUMN pending_secret_uploaded_at, "
+                    "DROP COLUMN rotation_challenge, DROP COLUMN committed_rotation_id, "
+                    "DROP COLUMN committed_identity_epoch, "
+                    "DROP COLUMN committed_rotation_challenge, "
+                    "DROP COLUMN committed_probe_evidence_sha256, "
+                    "DROP COLUMN committed_proof_mac"
+                )
+            )
+
+        def fail_exact_verifier(*_args: object) -> None:
+            raise relay_migration.RelaySchemaMismatchError(
+                "injected generic verifier failure"
+            )
+
+        monkeypatch.setattr(
+            relay_migration, "_assert_schema_conforms", fail_exact_verifier
+        )
+        with pytest.raises(
+            relay_migration.RelaySchemaMismatchError,
+            match="injected generic verifier failure",
+        ):
+            await migrate(engine)
+
+        async with engine.connect() as connection:
+            version = await connection.scalar(
+                text("SELECT MAX(version) FROM relay_schema_migrations")
+            )
+            state = await connection.scalar(
+                text(
+                    "SELECT state FROM relay_nodes "
+                    "WHERE node_id = 'relay-v6-rollback-draining'"
+                )
+            )
+
+            def has_desired_draining(sync_connection: object) -> bool:
+                return "desired_draining" in {
+                    column["name"]
+                    for column in inspect(sync_connection).get_columns("relay_nodes")
+                }
+
+            column_exists = await connection.run_sync(has_desired_draining)
+        assert version == 6
+        assert state == "draining"
+        assert column_exists is False
 
 
 @pytest.mark.anyio

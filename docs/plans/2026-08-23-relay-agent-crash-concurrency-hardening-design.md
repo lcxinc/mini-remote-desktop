@@ -37,8 +37,23 @@ shared-health snapshot. The supervisor marks a probe generation in progress
 before awaiting it, so an old live result cannot extend a lease. Local and
 transient backend failures become fail-closed health samples plus bounded
 retry, while protocol, identity and persisted-state corruption remain fatal.
-Identity maintenance runs independently from heartbeat cadence and coturn
-supervision.
+The production worker gives heartbeat its own absolute monotonic 5-second
+cadence. Identity maintenance synchronously prepares and persists candidate
+state plus the consumed request sequence, then places an owned backend/request
+future in the event loop; that future never borrows the certificate state or
+holds its exclusive owner across a network await. A one-second hard timeout
+drops the owned HTTP future well before the next heartbeat. Timeout and 503
+retry retain the renewal id, CSR and candidate key, but consume and persist a
+fresh sequence and signature after the intervening heartbeat. No maintenance
+request is detached with `spawn`. Identity, permission, certificate and
+persisted-state errors propagate through the agent's `try_join`, which drops
+the in-flight request and cancels coturn supervision; transient network errors
+leave both the exact heartbeat cadence and coturn supervision running.
+If a renewal committed remotely but its response was lost, the old
+certificate's rejected heartbeat is suppressed only while the same-epoch exact
+renewal retry is pending; the retry then retrieves the cached certificate with
+the same renewal id and CSR but a fresh sequence. A rejection from the renewal
+request itself remains fatal unless it is a proven overtaken HTTP 409 conflict.
 
 The active certificate identity epoch is authoritative on restart. Equal
 epochs are a no-op. An exact `N -> N+1` crash-window may clear the old sequence
@@ -71,12 +86,29 @@ and cannot consume a challenge.
 
 Canonical identifiers use their protocol-specific bounds: node IDs are 1..128
 and may contain dots; generated renewal and rotation IDs use rejection sampling
-so the first character is always alphanumeric. Boot IDs decode and re-encode
-to exactly 16 base64url bytes on both Python and Rust.
+so the first character is always alphanumeric. Boot IDs decode to exactly 16
+bytes and reject every non-canonical base64url spelling on both Python and
+Rust.
 
 Controllable plaintext JSON buffers and temporary decoded/base64 values use
-zeroizing mutable storage. Fresh private-key seeds, generated signing-key
-owners and generated PKCS#8 documents also have zeroizing drop semantics.
+zeroizing mutable storage. Relay rotation upload JSON is serialized exactly
+once into a zeroizing owner; the same exact bytes are signed and retained by a
+`Bytes::from_owner` request body until reqwest drops the request. Enrollment
+JSON follows the same owned-body rule instead of reqwest `.json()`. Copies
+inside reqwest, hyper, rustls, the kernel and a terminating TLS proxy are
+opaque upstream boundaries and are not claimed to be physically zeroized.
+
+Python canonical base64url validation writes directly from the existing
+Pydantic string or a memoryview into a mutable bytearray, rejects padding and
+non-canonical unused bits, and clears every application-owned decode/encode
+buffer in `finally`. Pydantic's input string, the immutable argument required
+by AESGCM, Starlette/FastAPI's immutable replay body, and TLS/framework copies
+are explicit third-party boundaries. The ASGI boundary still clears its final
+controllable request accumulator byte by byte after downstream completion or
+failure.
+
+Fresh private-key seeds, generated signing-key owners and generated PKCS#8
+documents also have zeroizing drop semantics.
 rcgen borrows the source DER, and its internal serialized-key copy is held by a
 `Zeroizing<KeyPair>` owner through CSR generation and every error path.
 Public TURN endpoints reject userinfo, paths, fragments, non-transport query
@@ -88,11 +120,23 @@ with the peer but are outside its accessible clearing API.
 ## Migration and lifecycle invariants
 
 The final unpublished v8 schema includes rotation challenge and committed
-proof constraints. A real historical v6 schema upgrades contiguously to the
-same v8; v7 to v8 remains exactly three mutations, steady-state migration is
-read-only, and rollback restores the previous ledger state.
+proof constraints. A historical `state='draining'` row is backfilled to
+`desired_draining=true` in the same migration transaction. A real historical
+v6 schema upgrades contiguously to the same v8; v7 to v8 remains exactly three
+mutations (the backfill stays inside its existing `DO`), steady-state migration
+is read-only, and v7 and generic-upgrade failures roll back schema, data and
+ledger together.
 
 Rotation forces desired drain until atomic commit. A failed or non-evidence
 heartbeat cannot erase the desired drain, and admin resume is rejected while a
 rotation is pending. Probe health has one shared vocabulary; non-live states do
 not renew a healthy lease or cause an unbounded restart loop.
+
+Certificate renewal reads the freshly locked row. New renewals fail closed
+before certificate issuance whenever a rotation intent, pending upload,
+challenge, or credential transition window exists. A pure administrator drain
+is preserved as desired drain and `draining` state across the new identity
+epoch; an ordinary renewal starts unavailable. An exact cached lost-response
+retry may return the already-issued certificate while advancing only the
+previous-epoch replay watermark, never current sequence, drain/rotation state,
+or audit history.

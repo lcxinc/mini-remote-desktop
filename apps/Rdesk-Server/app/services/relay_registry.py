@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import hashlib
 import hmac
 import re
@@ -18,6 +16,12 @@ from pydantic import SecretStr
 from sqlalchemy import event, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.mutable_base64url import (
+    decode_canonical_base64url,
+    encode_unpadded_base64url,
+    zeroize,
+)
 
 from app.models.relay_audit_event import RelayAuditEvent
 from app.models.relay_enrollment import RelayEnrollment
@@ -70,38 +74,15 @@ def rotation_proof_message(
         or len(probe_evidence_sha256) != 32
     ):
         raise ValueError("relay rotation proof fields are invalid")
-    padded_challenge = bytearray(rotation_challenge.encode("ascii"))
-    padded_challenge.extend(b"=")
-    decoded_challenge: bytearray | None = None
-    canonical_challenge: bytearray | None = None
     try:
-        try:
-            decoded_result = base64.urlsafe_b64decode(padded_challenge)
-            decoded_challenge = (
-                decoded_result
-                if isinstance(decoded_result, bytearray)
-                else bytearray(decoded_result)
-            )
-            canonical_result = base64.urlsafe_b64encode(decoded_challenge)
-            canonical_challenge = (
-                canonical_result
-                if isinstance(canonical_result, bytearray)
-                else bytearray(canonical_result)
-            )
-            while canonical_challenge.endswith(b"="):
-                canonical_challenge.pop()
-        except (ValueError, binascii.Error):
-            raise ValueError("relay rotation proof fields are invalid") from None
-        if (
-            len(decoded_challenge) != 32
-            or canonical_challenge.decode("ascii") != rotation_challenge
-        ):
-            raise ValueError("relay rotation proof fields are invalid")
+        decoded_challenge = decode_canonical_base64url(
+            rotation_challenge, expected_length=32
+        )
+    except ValueError:
+        raise ValueError("relay rotation proof fields are invalid") from None
     finally:
-        for buffer in (canonical_challenge, decoded_challenge, padded_challenge):
-            if buffer is not None:
-                for index in range(len(buffer)):
-                    buffer[index] = 0
+        if "decoded_challenge" in locals():
+            zeroize(decoded_challenge)
     fields = (
         node_id.encode("ascii"),
         str(identity_epoch).encode("ascii"),
@@ -657,6 +638,23 @@ class RelayRegistry:
             or self._as_utc(registration.previous_certificate_expires_at) <= now
         ):
             self._error("relay_renewal_conflict", 409, "relay renewal conflicts")
+        rotation_in_flight = (
+            node.desired_secret_version > node.active_secret_version
+            or node.pending_secret_version is not None
+            or node.pending_encrypted_turn_secret is not None
+            or node.pending_secret_digest is not None
+            or node.pending_rotation_id is not None
+            or node.pending_secret_uploaded_at is not None
+            or node.rotation_challenge is not None
+            or node.secret_not_before is not None
+            or node.old_credential_deadline is not None
+        )
+        # Only the previous certificate can prove a lost-response retry.  A
+        # current-certificate replay means the caller already received the new
+        # certificate; advancing its shared sequence here could invalidate an
+        # in-flight secret-rotation mutation.
+        if rotation_in_flight and not identity.is_previous:
+            self._error("relay_renewal_conflict", 409, "relay renewal conflicts")
         record_until = (
             self._as_utc(registration.renewal_record_expires_at)
             if registration.renewal_record_expires_at is not None
@@ -700,12 +698,18 @@ class RelayRegistry:
                     node.previous_identity_sequence = sequence
                 else:
                     node.heartbeat_sequence = sequence
-                node.updated_at = now
                 await self._session.flush()
                 return ApprovedRelay(node=node, certificate=certificate)
             if existing_renewal_id == renewal_id or identity.is_previous:
                 self._error("relay_renewal_conflict", 409, "relay renewal conflicts")
         if identity.is_previous:
+            self._error("relay_renewal_conflict", 409, "relay renewal conflicts")
+        # A new certificate epoch must never consume an in-flight TURN secret
+        # transition.  The row was selected under the node identity lock, so
+        # these values are the authoritative state for this renewal attempt.
+        # The exact previous-certificate retry above is safe: it only advances
+        # the separate previous replay watermark and leaves rotation intact.
+        if rotation_in_flight:
             self._error("relay_renewal_conflict", 409, "relay renewal conflicts")
         if not hmac.compare_digest(
             node.certificate_fingerprint, identity.certificate_fingerprint
@@ -757,10 +761,11 @@ class RelayRegistry:
         node.identity_epoch += 1
         node.previous_identity_sequence = sequence
         node.heartbeat_sequence = 0
-        # Desired-state messages are scoped to the certificate identity epoch.
-        # A grace-period identity may retry renewal, but it cannot carry a
-        # rotation intent into the new epoch.
-        node.desired_draining = False
+        # Rotation state is scoped to the certificate identity epoch and was
+        # rejected above.  Administrator drain is durable desired state, so it
+        # remains authoritative across the new epoch.
+        preserve_admin_drain = node.desired_draining
+        node.desired_draining = preserve_admin_drain
         node.desired_secret_version = node.active_secret_version
         node.secret_not_before = None
         node.old_credential_deadline = None
@@ -776,7 +781,7 @@ class RelayRegistry:
         node.committed_probe_evidence_sha256 = None
         node.committed_proof_mac = None
         node.healthy_heartbeat_streak = 0
-        node.state = "unavailable"
+        node.state = "draining" if preserve_admin_drain else "unavailable"
         node.lease_expires_at = None
         node.updated_at = now
         self._audit(
@@ -1135,48 +1140,18 @@ class RelayRegistry:
             except RelaySecretCipherError:
                 self._error("relay_rotation_proof_invalid", 409, "relay rotation proof invalid")
             try:
-                padded_secret = bytearray(canonical_secret)
-                padded_secret.extend(b"=")
-                decoded_secret: bytearray | None = None
                 try:
-                    decoded_result = base64.urlsafe_b64decode(padded_secret)
-                    decoded_secret = (
-                        decoded_result
-                        if isinstance(decoded_result, bytearray)
-                        else bytearray(decoded_result)
+                    decoded_secret = decode_canonical_base64url(
+                        memoryview(canonical_secret), expected_length=32
                     )
-                except (ValueError, binascii.Error):
+                except ValueError:
                     self._error(
                         "relay_rotation_proof_invalid", 409, "relay rotation proof invalid"
                     )
-                finally:
-                    for index in range(len(padded_secret)):
-                        padded_secret[index] = 0
-                canonical_encoding: bytearray | None = None
                 try:
                     pending_digest = hashlib.sha256(decoded_secret).digest()
-                    canonical_result = base64.urlsafe_b64encode(decoded_secret)
-                    canonical_encoding = (
-                        canonical_result
-                        if isinstance(canonical_result, bytearray)
-                        else bytearray(canonical_result)
-                    )
-                    while canonical_encoding.endswith(b"="):
-                        canonical_encoding.pop()
-                    if (
-                        len(decoded_secret) != 32
-                        or not hmac.compare_digest(canonical_encoding, canonical_secret)
-                    ):
-                        self._error(
-                            "relay_rotation_proof_invalid",
-                            409,
-                            "relay rotation proof invalid",
-                        )
                 finally:
-                    for buffer in (canonical_encoding, decoded_secret):
-                        if buffer is not None:
-                            for index in range(len(buffer)):
-                                buffer[index] = 0
+                    zeroize(decoded_secret)
                 if not hmac.compare_digest(pending_digest, node.pending_secret_digest):
                     self._error(
                         "relay_rotation_proof_invalid", 409, "relay rotation proof invalid"
@@ -1546,34 +1521,13 @@ class RelayRegistry:
             or re.fullmatch(r"[A-Za-z0-9_-]{43}", encoded) is None
         ):
             self._error("relay_enrollment_invalid", 400, "relay enrollment invalid")
-        padded = bytearray(encoded.encode("ascii"))
-        padded.extend(b"=")
-        decoded: bytearray | None = None
         canonical: bytearray | None = None
         try:
             try:
-                decoded_result = base64.urlsafe_b64decode(padded)
-                decoded = (
-                    decoded_result
-                    if isinstance(decoded_result, bytearray)
-                    else bytearray(decoded_result)
-                )
-                canonical_result = base64.urlsafe_b64encode(decoded)
-                canonical = (
-                    canonical_result
-                    if isinstance(canonical_result, bytearray)
-                    else bytearray(canonical_result)
-                )
-                while canonical.endswith(b"="):
-                    canonical.pop()
-                padded.pop()
-            except (ValueError, binascii.Error):
+                decoded = decode_canonical_base64url(encoded, expected_length=32)
+            except ValueError:
                 self._error("relay_enrollment_invalid", 400, "relay enrollment invalid")
-            if (
-                len(decoded) != 32
-                or not hmac.compare_digest(canonical, padded)
-                or not _turn_secret_has_minimum_quality(decoded)
-            ):
+            if not _turn_secret_has_minimum_quality(decoded):
                 self._error(
                     "relay_enrollment_invalid", 400, "relay enrollment invalid"
                 )
@@ -1581,20 +1535,19 @@ class RelayRegistry:
             # Preserve the canonical configured value as coturn's actual HMAC
             # key. The decoded bytes are used only for quality validation and
             # the stable enrollment request digest.
-            plaintext = bytearray(padded)
+            canonical = encode_unpadded_base64url(memoryview(decoded))
             try:
+                # AESGCM requires immutable plaintext.  That library-owned copy
+                # is beyond this boundary; ``canonical`` remains controllable.
                 encrypted = cipher.encrypt(
-                    bytes(plaintext), associated_data=node_id.encode("utf-8")
+                    bytes(canonical), associated_data=node_id.encode("utf-8")
                 )
             finally:
-                for index in range(len(plaintext)):
-                    plaintext[index] = 0
+                zeroize(canonical)
             return digest, encrypted
         finally:
-            for buffer in (canonical, decoded, padded):
-                if buffer is not None:
-                    for index in range(len(buffer)):
-                        buffer[index] = 0
+            if "decoded" in locals():
+                zeroize(decoded)
 
     def _derive_receipt(
         self, token: str, enrollment_id: str, request_digest: str
@@ -1607,7 +1560,13 @@ class RelayRegistry:
             _RECEIPT_DERIVE_CONTEXT + material,
             hashlib.sha256,
         ).digest()
-        return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+        encoded = encode_unpadded_base64url(memoryview(digest))
+        try:
+            # Pydantic/HTTP response fields are immutable strings; the mutable
+            # encoding owner is cleared immediately after crossing that API.
+            return encoded.decode("ascii")
+        finally:
+            zeroize(encoded)
 
     @classmethod
     def _enrollment_request_digest(

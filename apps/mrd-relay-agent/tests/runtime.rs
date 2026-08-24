@@ -2,7 +2,10 @@ use std::{
     collections::VecDeque,
     fmt::Write as _,
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -271,9 +274,15 @@ struct PendingHeartbeatBackend {
     entered: Arc<tokio::sync::Semaphore>,
 }
 
-struct PendingRenewBackend {
+struct TimeoutRenewBackend {
     renewal_entered: Arc<tokio::sync::Semaphore>,
     heartbeat_sent: Arc<tokio::sync::Semaphore>,
+    clock: Arc<TokioTestClock>,
+    renewals: Mutex<Vec<RenewalRequest>>,
+    heartbeats: Mutex<Vec<(u64, u64, u64)>>,
+    active_renewals: Arc<AtomicUsize>,
+    max_active_renewals: Arc<AtomicUsize>,
+    renewal_drops: Arc<AtomicUsize>,
 }
 
 struct UnavailableRenewBackend {
@@ -285,7 +294,7 @@ struct PendingApprovalBackend {
 }
 
 #[async_trait]
-impl RelayBackendPort for PendingRenewBackend {
+impl RelayBackendPort for TimeoutRenewBackend {
     async fn enroll(&self, _request: EnrollmentRequest) -> Result<EnrollmentStatus, BackendError> {
         Err(BackendError::Unavailable)
     }
@@ -297,14 +306,228 @@ impl RelayBackendPort for PendingRenewBackend {
         Err(BackendError::Unavailable)
     }
 
-    async fn renew(&self, _request: RenewalRequest) -> Result<NodeCertificate, BackendError> {
+    async fn renew(&self, request: RenewalRequest) -> Result<NodeCertificate, BackendError> {
+        self.renewals.lock().unwrap().push(request);
         self.renewal_entered.add_permits(1);
+        let active = self.active_renewals.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active_renewals.fetch_max(active, Ordering::SeqCst);
+        let _drop = InFlightRenewalGuard {
+            active: self.active_renewals.clone(),
+            drops: self.renewal_drops.clone(),
+        };
         std::future::pending().await
     }
 
     async fn heartbeat(&self, heartbeat: SignedHeartbeat) -> Result<NodeDirective, BackendError> {
+        {
+            let mut heartbeats = self.heartbeats.lock().unwrap();
+            heartbeats.push((
+                self.clock.monotonic_ms(),
+                heartbeat.identity_epoch,
+                heartbeat.sequence,
+            ));
+        }
         self.heartbeat_sent.add_permits(1);
-        Ok(NodeDirective::state(heartbeat.sequence, false))
+        Ok(directive_for_heartbeat(&heartbeat))
+    }
+}
+
+struct UnavailableCadenceBackend {
+    clock: Arc<TokioTestClock>,
+    renewals: Mutex<Vec<RenewalRequest>>,
+    heartbeats: Mutex<Vec<(u64, u64, u64)>>,
+}
+
+#[async_trait]
+impl RelayBackendPort for UnavailableCadenceBackend {
+    async fn enroll(&self, _request: EnrollmentRequest) -> Result<EnrollmentStatus, BackendError> {
+        Err(BackendError::Unavailable)
+    }
+
+    async fn pickup(
+        &self,
+        _request: PickupRequest,
+    ) -> Result<Option<NodeCertificate>, BackendError> {
+        Err(BackendError::Unavailable)
+    }
+
+    async fn renew(&self, request: RenewalRequest) -> Result<NodeCertificate, BackendError> {
+        self.renewals.lock().unwrap().push(request);
+        Err(BackendError::Unavailable)
+    }
+
+    async fn heartbeat(&self, heartbeat: SignedHeartbeat) -> Result<NodeDirective, BackendError> {
+        self.heartbeats.lock().unwrap().push((
+            self.clock.monotonic_ms(),
+            heartbeat.identity_epoch,
+            heartbeat.sequence,
+        ));
+        Ok(directive_for_heartbeat(&heartbeat))
+    }
+}
+
+struct OvertakenRenewBackend {
+    issuer: Arc<TestCertificateAuthority>,
+    enrollment_csr: Mutex<Option<String>>,
+    renewals: Mutex<Vec<RenewalRequest>>,
+    heartbeats: Mutex<Vec<(u64, u64, u64)>>,
+    clock: Arc<TokioTestClock>,
+    first_renewal_entered: Arc<tokio::sync::Semaphore>,
+    release_first_renewal: Arc<tokio::sync::Semaphore>,
+    first_renewal_error: BackendError,
+}
+
+struct LostResponseRenewBackend {
+    issuer: Arc<TestCertificateAuthority>,
+    enrollment_csr: Mutex<Option<String>>,
+    renewals: Mutex<Vec<RenewalRequest>>,
+    heartbeats: Mutex<Vec<(u64, u64, u64)>>,
+    clock: Arc<TokioTestClock>,
+    committed_certificate: Mutex<Option<NodeCertificate>>,
+}
+
+#[async_trait]
+impl RelayBackendPort for OvertakenRenewBackend {
+    async fn enroll(&self, request: EnrollmentRequest) -> Result<EnrollmentStatus, BackendError> {
+        *self.enrollment_csr.lock().unwrap() = Some(request.csr_pem);
+        Ok(EnrollmentStatus::Pending {
+            enrollment_id: "enrollment-overtaken-0001".into(),
+            receipt: secrecy::SecretString::from("overtaken-enrollment-receipt"),
+        })
+    }
+
+    async fn pickup(
+        &self,
+        _request: PickupRequest,
+    ) -> Result<Option<NodeCertificate>, BackendError> {
+        let csr = self
+            .enrollment_csr
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(BackendError::ProtocolInvalid)?;
+        Ok(Some(self.issuer.issue(&csr, LeafProfile::Client)))
+    }
+
+    async fn renew(&self, request: RenewalRequest) -> Result<NodeCertificate, BackendError> {
+        let csr = request.csr_pem.clone();
+        let attempt = {
+            let mut renewals = self.renewals.lock().unwrap();
+            renewals.push(request);
+            renewals.len()
+        };
+        if attempt == 1 {
+            self.first_renewal_entered.add_permits(1);
+            self.release_first_renewal
+                .acquire()
+                .await
+                .map_err(|_| BackendError::Unavailable)?
+                .forget();
+            return Err(self.first_renewal_error.clone());
+        }
+        Ok(self.issuer.issue(&csr, LeafProfile::Client))
+    }
+
+    async fn heartbeat(&self, heartbeat: SignedHeartbeat) -> Result<NodeDirective, BackendError> {
+        let count = {
+            let mut heartbeats = self.heartbeats.lock().unwrap();
+            heartbeats.push((
+                self.clock.monotonic_ms(),
+                heartbeat.identity_epoch,
+                heartbeat.sequence,
+            ));
+            heartbeats.len()
+        };
+        if count == 1 {
+            self.clock.jump_monotonic(Duration::from_secs(5));
+        }
+        if count == 2 {
+            self.release_first_renewal.add_permits(1);
+        }
+        Ok(directive_for_heartbeat(&heartbeat))
+    }
+}
+
+#[async_trait]
+impl RelayBackendPort for LostResponseRenewBackend {
+    async fn enroll(&self, request: EnrollmentRequest) -> Result<EnrollmentStatus, BackendError> {
+        *self.enrollment_csr.lock().unwrap() = Some(request.csr_pem);
+        Ok(EnrollmentStatus::Pending {
+            enrollment_id: "enrollment-lost-response-0001".into(),
+            receipt: secrecy::SecretString::from("lost-response-enrollment-receipt"),
+        })
+    }
+
+    async fn pickup(
+        &self,
+        _request: PickupRequest,
+    ) -> Result<Option<NodeCertificate>, BackendError> {
+        let csr = self
+            .enrollment_csr
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(BackendError::ProtocolInvalid)?;
+        Ok(Some(self.issuer.issue(&csr, LeafProfile::Client)))
+    }
+
+    async fn renew(&self, request: RenewalRequest) -> Result<NodeCertificate, BackendError> {
+        let csr = request.csr_pem.clone();
+        let attempt = {
+            let mut renewals = self.renewals.lock().unwrap();
+            renewals.push(request);
+            renewals.len()
+        };
+        if attempt == 1 {
+            *self.committed_certificate.lock().unwrap() =
+                Some(self.issuer.issue(&csr, LeafProfile::Client));
+            return Err(BackendError::Unavailable);
+        }
+        self.committed_certificate
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(BackendError::ProtocolInvalid)
+    }
+
+    async fn heartbeat(&self, heartbeat: SignedHeartbeat) -> Result<NodeDirective, BackendError> {
+        self.heartbeats.lock().unwrap().push((
+            self.clock.monotonic_ms(),
+            heartbeat.identity_epoch,
+            heartbeat.sequence,
+        ));
+        if self.committed_certificate.lock().unwrap().is_some() && heartbeat.identity_epoch == 1 {
+            return Err(BackendError::Rejected);
+        }
+        Ok(directive_for_heartbeat(&heartbeat))
+    }
+}
+
+struct InFlightRenewalGuard {
+    active: Arc<AtomicUsize>,
+    drops: Arc<AtomicUsize>,
+}
+
+impl Drop for InFlightRenewalGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn directive_for_heartbeat(heartbeat: &SignedHeartbeat) -> NodeDirective {
+    NodeDirective {
+        identity_epoch: heartbeat.identity_epoch,
+        sequence: heartbeat.sequence,
+        state: RelayNodeState::Available,
+        desired: DesiredNodeState {
+            draining: false,
+            secret_version: 1,
+            not_before_unix_seconds: None,
+            old_credential_deadline_unix_seconds: None,
+            rotation_challenge: None,
+        },
+        secret_update: None,
     }
 }
 
@@ -626,6 +849,54 @@ struct AdvancingSleeper {
     sleeps: Mutex<Vec<Duration>>,
 }
 
+struct TokioTestClock {
+    origin: tokio::time::Instant,
+    unix_base: Mutex<i64>,
+    monotonic_offset_ms: AtomicU64,
+}
+
+impl TokioTestClock {
+    fn new(unix_base: i64) -> Self {
+        Self {
+            origin: tokio::time::Instant::now(),
+            unix_base: Mutex::new(unix_base),
+            monotonic_offset_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn set_unix_seconds(&self, unix_seconds: i64) {
+        *self.unix_base.lock().unwrap() =
+            unix_seconds.saturating_sub(i64::try_from(self.origin.elapsed().as_secs()).unwrap());
+    }
+
+    fn jump_monotonic(&self, duration: Duration) {
+        self.monotonic_offset_ms.fetch_add(
+            u64::try_from(duration.as_millis()).unwrap(),
+            Ordering::SeqCst,
+        );
+    }
+}
+
+impl ClockPort for TokioTestClock {
+    fn monotonic_ms(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_millis())
+            .unwrap()
+            .saturating_add(self.monotonic_offset_ms.load(Ordering::SeqCst))
+    }
+
+    fn unix_seconds(&self) -> i64 {
+        self.unix_base
+            .lock()
+            .unwrap()
+            .saturating_add(i64::try_from(self.origin.elapsed().as_secs()).unwrap())
+    }
+}
+
+#[derive(Default)]
+struct TokioTestSleeper {
+    supervisor_cycles: AtomicUsize,
+}
+
 struct HealthChangingSleeper {
     clock: Arc<FakeClock>,
     health: SharedRelayHealth,
@@ -655,6 +926,18 @@ impl SleeperPort for AdvancingSleeper {
         let delta = u64::try_from(duration.as_millis()).unwrap();
         let mut monotonic = self.clock.monotonic_ms.lock().unwrap();
         *monotonic = monotonic.saturating_add(delta);
+    }
+}
+
+#[async_trait]
+impl SleeperPort for TokioTestSleeper {
+    async fn sleep(&self, duration: Duration) {
+        if duration == Duration::from_secs(1) {
+            self.supervisor_cycles.fetch_add(1, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+        } else {
+            tokio::time::sleep(duration).await;
+        }
     }
 }
 
@@ -1402,7 +1685,7 @@ async fn enrollment_pickup_and_renewal_switch_identity_only_after_atomic_persist
         .unwrap()
         .push_back(Ok(EnrollmentStatus::Pending {
             enrollment_id: "enrollment-1".into(),
-            receipt: secrecy::SecretString::from("one-use-receipt"),
+            receipt: secrecy::SecretString::from("one-use-enrollment-receipt"),
         }));
     backend
         .renewal_results
@@ -2430,8 +2713,8 @@ async fn production_worker_samples_health_after_the_five_second_cadence_wait() {
         run_backend_worker(
             &mut lifecycle,
             &mut identity,
-            backend.as_ref(),
-            slot.as_ref(),
+            backend.clone(),
+            slot.clone(),
             &factory,
             None,
             &mut runtime,
@@ -2512,8 +2795,8 @@ async fn production_worker_success_cycles_use_exact_absolute_five_second_deadlin
         run_backend_worker(
             &mut lifecycle,
             &mut identity,
-            backend.as_ref(),
-            slot.as_ref(),
+            backend.clone(),
+            slot.clone(),
             &factory,
             None,
             &mut runtime,
@@ -2689,7 +2972,7 @@ async fn transient_metrics_failure_does_not_cancel_the_coturn_supervisor() {
     task.abort();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn renewal_timeout_does_not_block_old_identity_heartbeats_or_supervision() {
     let (_fs, enrollment_backend, mut identity, csr) = pending_certificate_state().await;
     enrollment_backend
@@ -2707,12 +2990,21 @@ async fn renewal_timeout_does_not_block_old_identity_heartbeats_or_supervision()
     let renewal_entered = Arc::new(tokio::sync::Semaphore::new(0));
     let heartbeat_sent = Arc::new(tokio::sync::Semaphore::new(0));
     let supervised = Arc::new(tokio::sync::Semaphore::new(0));
-    let backend = Arc::new(PendingRenewBackend {
+    let active_renewals = Arc::new(AtomicUsize::new(0));
+    let max_active_renewals = Arc::new(AtomicUsize::new(0));
+    let renewal_drops = Arc::new(AtomicUsize::new(0));
+    let clock = Arc::new(TokioTestClock::new(expires_at - 86_400));
+    let backend = Arc::new(TimeoutRenewBackend {
         renewal_entered: renewal_entered.clone(),
         heartbeat_sent: heartbeat_sent.clone(),
+        clock: clock.clone(),
+        renewals: Mutex::default(),
+        heartbeats: Mutex::default(),
+        active_renewals: active_renewals.clone(),
+        max_active_renewals: max_active_renewals.clone(),
+        renewal_drops: renewal_drops.clone(),
     });
-    let clock = Arc::new(FakeClock::default());
-    *clock.unix_seconds.lock().unwrap() = expires_at - 1;
+    let sleeper = Arc::new(TokioTestSleeper::default());
     let state_store = Arc::new(FakeRuntimeStateStore::default());
     *state_store.state.lock().unwrap() = RuntimeStateSnapshot {
         identity_epoch: 1,
@@ -2730,7 +3022,7 @@ async fn renewal_timeout_does_not_block_old_identity_heartbeats_or_supervision()
             supervised: supervised.clone(),
         }),
         clock,
-        sleeper: Arc::new(FakeSleeper::default()),
+        sleeper: sleeper.clone(),
         jitter: Arc::new(FixedJitter(0)),
         state_store,
         metrics: Arc::new(FakeMetrics(CoturnMetrics::default())),
@@ -2746,23 +3038,641 @@ async fn renewal_timeout_does_not_block_old_identity_heartbeats_or_supervision()
         backend_backoff_cap: Duration::from_secs(1),
     };
     let task = tokio::spawn(run_agent(dependencies, config));
-    tokio::time::timeout(Duration::from_secs(1), renewal_entered.acquire())
+    for _ in 0..100 {
+        if heartbeat_sent.available_permits() >= 1 && renewal_entered.available_permits() >= 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(heartbeat_sent.available_permits(), 1);
+    assert_eq!(renewal_entered.available_permits(), 1);
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    for _ in 0..100 {
+        if renewal_drops.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(renewal_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.heartbeats.lock().unwrap().len(), 1);
+
+    tokio::time::advance(Duration::from_secs(4)).await;
+    for _ in 0..100 {
+        if backend.heartbeats.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(backend.heartbeats.lock().unwrap().len(), 2);
+    for _ in 0..100 {
+        if backend.renewals.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    if task.is_finished() {
+        panic!("agent stopped before starting the retry: {:?}", task.await);
+    }
+    assert_eq!(backend.renewals.lock().unwrap().len(), 2);
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    for _ in 0..100 {
+        if renewal_drops.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(renewal_drops.load(Ordering::SeqCst), 2);
+
+    tokio::time::advance(Duration::from_secs(4)).await;
+    for _ in 0..100 {
+        if backend.heartbeats.lock().unwrap().len() >= 3 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..100 {
+        if backend.renewals.lock().unwrap().len() >= 3 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(supervised.available_permits() > 0);
+    assert!(!task.is_finished());
+    assert_eq!(
+        *backend.heartbeats.lock().unwrap(),
+        vec![(0, 1, 1), (5_000, 1, 3), (10_000, 1, 5)]
+    );
+    let renewal_summary = backend
+        .renewals
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|request| {
+            (
+                request.authentication.sequence,
+                request.renewal_id.clone(),
+                request.csr_pem.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        renewal_summary
+            .iter()
+            .map(|(sequence, _, _)| *sequence)
+            .collect::<Vec<_>>(),
+        vec![2, 4, 6]
+    );
+    assert!(renewal_summary
+        .windows(2)
+        .all(|pair| pair[0].1 == pair[1].1 && pair[0].2 == pair[1].2));
+    assert_eq!(max_active_renewals.load(Ordering::SeqCst), 1);
+    assert_eq!(active_renewals.load(Ordering::SeqCst), 1);
+
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(active_renewals.load(Ordering::SeqCst), 0);
+    assert_eq!(renewal_drops.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_503_renewal_uses_fresh_sequences_without_shifting_heartbeat_deadlines() {
+    let (_fs, enrollment_backend, mut identity, csr) = pending_certificate_state().await;
+    enrollment_backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(
+            enrollment_backend.issuer.issue(&csr, LeafProfile::Client),
+        )));
+    identity.pickup(enrollment_backend.as_ref()).await.unwrap();
+    let expires_at = identity
+        .active_certificate()
+        .unwrap()
+        .expires_at_unix_seconds;
+    let clock = Arc::new(TokioTestClock::new(expires_at - 86_400));
+    let backend = Arc::new(UnavailableCadenceBackend {
+        clock: clock.clone(),
+        renewals: Mutex::default(),
+        heartbeats: Mutex::default(),
+    });
+    let sleeper = Arc::new(TokioTestSleeper::default());
+    let supervised = Arc::new(tokio::sync::Semaphore::new(0));
+    let state_store = Arc::new(FakeRuntimeStateStore::default());
+    *state_store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([1; 32]),
+        ..RuntimeStateSnapshot::default()
+    };
+    let backend_port: Arc<dyn RelayBackendPort> = backend.clone();
+    let dependencies = PortableRelayAgentDeps {
+        identity,
+        enrollment_backend,
+        initial_backend: backend_port.clone(),
+        factory: Arc::new(StaticBackendFactory(backend_port)),
+        coturn: Arc::new(NotifyingCoturn {
+            supervised: supervised.clone(),
+        }),
+        clock,
+        sleeper,
+        jitter: Arc::new(FixedJitter(0)),
+        state_store,
+        metrics: Arc::new(FakeMetrics(CoturnMetrics::default())),
+        probe: Arc::new(NonEvidenceProbe),
+    };
+    let config = PortableRelayAgentConfig {
+        enrollment: None,
+        endpoints: vec!["turn:relay.example:3478?transport=udp".into()],
+        max_allocations: 100,
+        max_egress_bps: 1_000_000,
+        pressure: HostPressureSnapshot::default(),
+        renewal_window: Duration::from_secs(86_400),
+        backend_backoff_cap: Duration::from_secs(1),
+    };
+    let task = tokio::spawn(run_agent(dependencies, config));
+
+    for expected in 1..=3 {
+        if expected > 1 {
+            tokio::time::advance(Duration::from_secs(5)).await;
+        }
+        for _ in 0..200 {
+            if backend.heartbeats.lock().unwrap().len() >= expected
+                && backend.renewals.lock().unwrap().len() >= expected
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(backend.heartbeats.lock().unwrap().len(), expected);
+        assert_eq!(backend.renewals.lock().unwrap().len(), expected);
+    }
+
+    assert_eq!(
+        *backend.heartbeats.lock().unwrap(),
+        vec![(0, 1, 1), (5_000, 1, 3), (10_000, 1, 5)]
+    );
+    let renewal_summary = backend
+        .renewals
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|request| {
+            (
+                request.authentication.sequence,
+                request.renewal_id.clone(),
+                request.csr_pem.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        renewal_summary
+            .iter()
+            .map(|(sequence, _, _)| *sequence)
+            .collect::<Vec<_>>(),
+        vec![2, 4, 6]
+    );
+    assert!(renewal_summary
+        .windows(2)
+        .all(|pair| pair[0].1 == pair[1].1 && pair[0].2 == pair[1].2));
+    assert!(supervised.available_permits() > 0);
+
+    let calls_before_shutdown = (
+        backend.heartbeats.lock().unwrap().len(),
+        backend.renewals.lock().unwrap().len(),
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    tokio::time::advance(Duration::from_secs(20)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        (
+            backend.heartbeats.lock().unwrap().len(),
+            backend.renewals.lock().unwrap().len(),
+        ),
+        calls_before_shutdown
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn lost_renewal_response_recovers_after_old_certificate_heartbeat_is_rejected() {
+    let issuer = Arc::new(TestCertificateAuthority::new());
+    let clock = Arc::new(TokioTestClock::new(CERT_NOW_UNIX_SECONDS));
+    let backend = Arc::new(LostResponseRenewBackend {
+        issuer: issuer.clone(),
+        enrollment_csr: Mutex::default(),
+        renewals: Mutex::default(),
+        heartbeats: Mutex::default(),
+        clock: clock.clone(),
+        committed_certificate: Mutex::default(),
+    });
+    let fs = Arc::new(MemoryIdentityFs::default());
+    let mut identity =
+        CertificateState::new(fs, "relay-hkg-1", &issuer.pem(), clock.clone()).unwrap();
+    identity
+        .enroll(backend.as_ref(), enrollment_request())
         .await
+        .unwrap();
+    assert!(identity.pickup(backend.as_ref()).await.unwrap());
+    let expires_at = identity
+        .active_certificate()
         .unwrap()
-        .unwrap()
-        .forget();
-    tokio::time::timeout(Duration::from_secs(2), heartbeat_sent.acquire())
+        .expires_at_unix_seconds;
+    clock.set_unix_seconds(expires_at - 86_400);
+
+    let state_store = Arc::new(FakeRuntimeStateStore::default());
+    *state_store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([1; 32]),
+        ..RuntimeStateSnapshot::default()
+    };
+    let backend_port: Arc<dyn RelayBackendPort> = backend.clone();
+    let dependencies = PortableRelayAgentDeps {
+        identity,
+        enrollment_backend: backend.clone(),
+        initial_backend: backend_port.clone(),
+        factory: Arc::new(StaticBackendFactory(backend_port)),
+        coturn: Arc::new(FakeCoturn::default()),
+        clock,
+        sleeper: Arc::new(TokioTestSleeper::default()),
+        jitter: Arc::new(FixedJitter(0)),
+        state_store,
+        metrics: Arc::new(FakeMetrics(CoturnMetrics::default())),
+        probe: Arc::new(NonEvidenceProbe),
+    };
+    let config = PortableRelayAgentConfig {
+        enrollment: None,
+        endpoints: vec!["turn:relay.example:3478?transport=udp".into()],
+        max_allocations: 100,
+        max_egress_bps: 1_000_000,
+        pressure: HostPressureSnapshot::default(),
+        renewal_window: Duration::from_secs(86_400),
+        backend_backoff_cap: Duration::from_secs(1),
+    };
+    let task = tokio::spawn(run_agent(dependencies, config));
+
+    for _ in 0..300 {
+        if !backend.heartbeats.lock().unwrap().is_empty()
+            && !backend.renewals.lock().unwrap().is_empty()
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(*backend.heartbeats.lock().unwrap(), vec![(0, 1, 1)]);
+    assert_eq!(backend.renewals.lock().unwrap().len(), 1);
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    for _ in 0..300 {
+        if task.is_finished() || backend.renewals.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    if task.is_finished() {
+        let result = task.await.unwrap();
+        panic!("agent stopped before its exact lost-response retry: {result:?}");
+    }
+    assert_eq!(backend.renewals.lock().unwrap().len(), 2);
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    for _ in 0..300 {
+        if backend
+            .heartbeats
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|(_, epoch, _)| *epoch == 2)
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        *backend.heartbeats.lock().unwrap(),
+        vec![(0, 1, 1), (5_000, 1, 3), (10_000, 2, 1)]
+    );
+    {
+        let renewals = backend.renewals.lock().unwrap();
+        assert_eq!(renewals[0].authentication.sequence, 2);
+        assert_eq!(renewals[1].authentication.sequence, 4);
+        assert_eq!(renewals[0].renewal_id, renewals[1].renewal_id);
+        assert_eq!(renewals[0].csr_pem, renewals[1].csr_pem);
+    }
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test(start_paused = true)]
+async fn overtaken_renewal_409_retries_same_operation_with_a_new_sequence_and_recovers_epoch() {
+    let issuer = Arc::new(TestCertificateAuthority::new());
+    let clock = Arc::new(TokioTestClock::new(CERT_NOW_UNIX_SECONDS));
+    let first_renewal_entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release_first_renewal = Arc::new(tokio::sync::Semaphore::new(0));
+    let backend = Arc::new(OvertakenRenewBackend {
+        issuer: issuer.clone(),
+        enrollment_csr: Mutex::default(),
+        renewals: Mutex::default(),
+        heartbeats: Mutex::default(),
+        clock: clock.clone(),
+        first_renewal_entered: first_renewal_entered.clone(),
+        release_first_renewal,
+        first_renewal_error: BackendError::Conflict,
+    });
+    let fs = Arc::new(MemoryIdentityFs::default());
+    let mut identity =
+        CertificateState::new(fs, "relay-hkg-1", &issuer.pem(), clock.clone()).unwrap();
+    identity
+        .enroll(backend.as_ref(), enrollment_request())
         .await
+        .unwrap();
+    assert!(identity.pickup(backend.as_ref()).await.unwrap());
+    let expires_at = identity
+        .active_certificate()
         .unwrap()
-        .unwrap()
-        .forget();
-    tokio::time::timeout(Duration::from_secs(1), supervised.acquire())
-        .await
-        .unwrap()
-        .unwrap()
-        .forget();
+        .expires_at_unix_seconds;
+    clock.set_unix_seconds(expires_at - 86_400);
+
+    let sleeper = Arc::new(TokioTestSleeper::default());
+    let state_store = Arc::new(FakeRuntimeStateStore::default());
+    *state_store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([1; 32]),
+        ..RuntimeStateSnapshot::default()
+    };
+    let backend_port: Arc<dyn RelayBackendPort> = backend.clone();
+    let dependencies = PortableRelayAgentDeps {
+        identity,
+        enrollment_backend: backend.clone(),
+        initial_backend: backend_port.clone(),
+        factory: Arc::new(StaticBackendFactory(backend_port)),
+        coturn: Arc::new(FakeCoturn::default()),
+        clock,
+        sleeper,
+        jitter: Arc::new(FixedJitter(0)),
+        state_store,
+        metrics: Arc::new(FakeMetrics(CoturnMetrics::default())),
+        probe: Arc::new(NonEvidenceProbe),
+    };
+    let config = PortableRelayAgentConfig {
+        enrollment: None,
+        endpoints: vec!["turn:relay.example:3478?transport=udp".into()],
+        max_allocations: 100,
+        max_egress_bps: 1_000_000,
+        pressure: HostPressureSnapshot::default(),
+        renewal_window: Duration::from_secs(86_400),
+        backend_backoff_cap: Duration::from_secs(1),
+    };
+    let task = tokio::spawn(run_agent(dependencies, config));
+
+    for _ in 0..300 {
+        if backend.heartbeats.lock().unwrap().len() >= 2
+            && first_renewal_entered.available_permits() >= 1
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(backend.heartbeats.lock().unwrap().len(), 2);
+    assert_eq!(backend.renewals.lock().unwrap().len(), 1);
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    for _ in 0..300 {
+        if backend.heartbeats.lock().unwrap().len() >= 3
+            && backend.renewals.lock().unwrap().len() >= 2
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(backend.renewals.lock().unwrap().len(), 2);
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    for _ in 0..300 {
+        if backend
+            .heartbeats
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|(_, epoch, _)| *epoch == 2)
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        *backend.heartbeats.lock().unwrap(),
+        vec![(0, 1, 1), (5_000, 1, 3), (10_000, 1, 4), (15_000, 2, 1)]
+    );
+    let renewal_summary = {
+        let renewals = backend.renewals.lock().unwrap();
+        (
+            renewals[0].authentication.sequence,
+            renewals[1].authentication.sequence,
+            renewals[0].renewal_id.clone(),
+            renewals[1].renewal_id.clone(),
+            renewals[0].csr_pem.clone(),
+            renewals[1].csr_pem.clone(),
+        )
+    };
+    assert_eq!(renewal_summary.0, 2);
+    assert_eq!(renewal_summary.1, 5);
+    assert_eq!(renewal_summary.2, renewal_summary.3);
+    assert_eq!(renewal_summary.4, renewal_summary.5);
     assert!(!task.is_finished());
     task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+}
+
+async fn spawn_interleaved_renewal_agent(
+    first_renewal_error: BackendError,
+) -> (
+    Arc<OvertakenRenewBackend>,
+    tokio::task::JoinHandle<Result<(), RuntimeError>>,
+) {
+    let issuer = Arc::new(TestCertificateAuthority::new());
+    let clock = Arc::new(TokioTestClock::new(CERT_NOW_UNIX_SECONDS));
+    let backend = Arc::new(OvertakenRenewBackend {
+        issuer: issuer.clone(),
+        enrollment_csr: Mutex::default(),
+        renewals: Mutex::default(),
+        heartbeats: Mutex::default(),
+        clock: clock.clone(),
+        first_renewal_entered: Arc::new(tokio::sync::Semaphore::new(0)),
+        release_first_renewal: Arc::new(tokio::sync::Semaphore::new(0)),
+        first_renewal_error,
+    });
+    let fs = Arc::new(MemoryIdentityFs::default());
+    let mut identity =
+        CertificateState::new(fs, "relay-hkg-1", &issuer.pem(), clock.clone()).unwrap();
+    identity
+        .enroll(backend.as_ref(), enrollment_request())
+        .await
+        .unwrap();
+    assert!(identity.pickup(backend.as_ref()).await.unwrap());
+    let expires_at = identity
+        .active_certificate()
+        .unwrap()
+        .expires_at_unix_seconds;
+    clock.set_unix_seconds(expires_at - 86_400);
+
+    let state_store = Arc::new(FakeRuntimeStateStore::default());
+    *state_store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([1; 32]),
+        ..RuntimeStateSnapshot::default()
+    };
+    let backend_port: Arc<dyn RelayBackendPort> = backend.clone();
+    let dependencies = PortableRelayAgentDeps {
+        identity,
+        enrollment_backend: backend.clone(),
+        initial_backend: backend_port.clone(),
+        factory: Arc::new(StaticBackendFactory(backend_port)),
+        coturn: Arc::new(FakeCoturn::default()),
+        clock,
+        sleeper: Arc::new(TokioTestSleeper::default()),
+        jitter: Arc::new(FixedJitter(0)),
+        state_store,
+        metrics: Arc::new(FakeMetrics(CoturnMetrics::default())),
+        probe: Arc::new(NonEvidenceProbe),
+    };
+    let config = PortableRelayAgentConfig {
+        enrollment: None,
+        endpoints: vec!["turn:relay.example:3478?transport=udp".into()],
+        max_allocations: 100,
+        max_egress_bps: 1_000_000,
+        pressure: HostPressureSnapshot::default(),
+        renewal_window: Duration::from_secs(86_400),
+        backend_backoff_cap: Duration::from_secs(1),
+    };
+    (backend, tokio::spawn(run_agent(dependencies, config)))
+}
+
+#[tokio::test(start_paused = true)]
+async fn overtaken_non_conflict_rejection_remains_fatal() {
+    let (backend, task) = spawn_interleaved_renewal_agent(BackendError::Rejected).await;
+
+    for _ in 0..300 {
+        if task.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(backend.heartbeats.lock().unwrap().len(), 2);
+    assert_eq!(backend.renewals.lock().unwrap().len(), 1);
+    if !task.is_finished() {
+        task.abort();
+        let _ = task.await;
+        panic!("non-conflict rejection was incorrectly treated as a recoverable 409");
+    }
+    assert_eq!(
+        task.await.unwrap(),
+        Err(RuntimeError::Backend(BackendError::Rejected))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn fatal_identity_persistence_error_propagates_and_cancels_the_whole_agent() {
+    let (fs, enrollment_backend, mut identity, csr) = pending_certificate_state().await;
+    enrollment_backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(
+            enrollment_backend.issuer.issue(&csr, LeafProfile::Client),
+        )));
+    identity.pickup(enrollment_backend.as_ref()).await.unwrap();
+    let clock = Arc::new(TokioTestClock::new(CERT_NOW_UNIX_SECONDS));
+    let backend = Arc::new(UnavailableCadenceBackend {
+        clock: clock.clone(),
+        renewals: Mutex::default(),
+        heartbeats: Mutex::default(),
+    });
+    let sleeper = Arc::new(TokioTestSleeper::default());
+    let supervised = Arc::new(tokio::sync::Semaphore::new(0));
+    let state_store = Arc::new(FakeRuntimeStateStore::default());
+    *state_store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([1; 32]),
+        ..RuntimeStateSnapshot::default()
+    };
+    let backend_port: Arc<dyn RelayBackendPort> = backend.clone();
+    let dependencies = PortableRelayAgentDeps {
+        identity,
+        enrollment_backend,
+        initial_backend: backend_port.clone(),
+        factory: Arc::new(StaticBackendFactory(backend_port)),
+        coturn: Arc::new(NotifyingCoturn {
+            supervised: supervised.clone(),
+        }),
+        clock,
+        sleeper: sleeper.clone(),
+        jitter: Arc::new(FixedJitter(0)),
+        state_store,
+        metrics: Arc::new(FakeMetrics(CoturnMetrics::default())),
+        probe: Arc::new(NonEvidenceProbe),
+    };
+    let config = PortableRelayAgentConfig {
+        enrollment: None,
+        endpoints: vec!["turn:relay.example:3478?transport=udp".into()],
+        max_allocations: 100,
+        max_egress_bps: 1_000_000,
+        pressure: HostPressureSnapshot::default(),
+        renewal_window: Duration::from_secs(86_400),
+        backend_backoff_cap: Duration::from_secs(1),
+    };
+    *fs.fail_next_writes.lock().unwrap() = 1;
+    let task = tokio::spawn(run_agent(dependencies, config));
+    for _ in 0..200 {
+        if task.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(task.await.unwrap(), Err(RuntimeError::IdentityIo));
+    assert!(backend.heartbeats.lock().unwrap().is_empty());
+
+    let supervisor_cycles = sleeper.supervisor_cycles.load(Ordering::SeqCst);
+    let supervisor_snapshots = supervised.available_permits();
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        sleeper.supervisor_cycles.load(Ordering::SeqCst),
+        supervisor_cycles
+    );
+    assert_eq!(supervised.available_permits(), supervisor_snapshots);
+}
+
+#[tokio::test]
+async fn two_phase_enrollment_rejects_an_invalid_receipt_before_persist_or_pickup() {
+    let fs = Arc::new(MemoryIdentityFs::default());
+    let backend = Arc::new(FakeBackend::default());
+    backend
+        .enrollment_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(EnrollmentStatus::Pending {
+            enrollment_id: "enrollment-invalid-receipt".into(),
+            receipt: secrecy::SecretString::from("too-short"),
+        }));
+    let mut identity = certificate_state(fs.clone(), &backend);
+    assert_eq!(
+        identity
+            .enroll(backend.as_ref(), enrollment_request())
+            .await,
+        Err(RuntimeError::IdentityInvalid)
+    );
+    assert!(!identity.has_pending_enrollment());
+    assert_eq!(fs.writes.lock().unwrap().len(), 1);
+    assert!(backend.pickups.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -3523,11 +4433,11 @@ async fn generated_secret_rotation_persists_intent_uses_monotonic_window_and_req
         .advance_secret_rotation(&mut identity)
         .await
         .unwrap());
-    coturn
-        .snapshots
-        .lock()
-        .unwrap()
-        .push_back(Ok(CoturnSnapshot::healthy(0, 0)));
+    coturn.snapshots.lock().unwrap().extend([
+        Ok(CoturnSnapshot::healthy(0, 0).with_generation(1, 1)),
+        Ok(CoturnSnapshot::healthy(0, 0).with_generation(2, 2)),
+        Ok(CoturnSnapshot::healthy(0, 0).with_generation(2, 2)),
+    ]);
     coturn
         .probes
         .lock()
@@ -3563,11 +4473,11 @@ async fn generated_secret_rotation_persists_intent_uses_monotonic_window_and_req
         store,
     )
     .unwrap();
-    coturn
-        .snapshots
-        .lock()
-        .unwrap()
-        .push_back(Ok(CoturnSnapshot::healthy(0, 0)));
+    coturn.snapshots.lock().unwrap().extend([
+        Ok(CoturnSnapshot::healthy(0, 0).with_generation(3, 2)),
+        Ok(CoturnSnapshot::healthy(0, 0).with_generation(4, 2)),
+        Ok(CoturnSnapshot::healthy(0, 0).with_generation(4, 2)),
+    ]);
     coturn
         .probes
         .lock()
@@ -3577,7 +4487,7 @@ async fn generated_secret_rotation_persists_intent_uses_monotonic_window_and_req
         restarted.advance_secret_rotation(&mut identity).await,
         Err(RuntimeError::Process(ProcessError::ProbeInvalid))
     );
-    assert_eq!(*coturn.secret_versions.lock().unwrap(), vec![2]);
+    assert_eq!(*coturn.secret_versions.lock().unwrap(), vec![2, 2]);
     assert!(backend.commits.lock().unwrap().is_empty());
     drop(identity_fs);
 }
@@ -3794,9 +4704,14 @@ async fn commit_unknown_queries_status_before_any_retry_and_pending_requires_fre
         .push_back(Ok(SecretRotationStatus::Pending {
             active_secret_version: 1,
         }));
+    let coturn = Arc::new(FakeCoturn::default());
+    coturn.snapshots.lock().unwrap().extend([
+        Ok(CoturnSnapshot::healthy(0, 0).with_generation(8, 2)),
+        Ok(CoturnSnapshot::healthy(0, 0).with_generation(9, 2)),
+    ]);
     let mut restarted = AgentRuntime::new_with_state_store(
         backend.clone(),
-        Arc::new(FakeCoturn::default()),
+        coturn.clone(),
         clock,
         Arc::new(FakeSleeper::default()),
         Arc::new(FixedJitter(0)),
@@ -3810,6 +4725,7 @@ async fn commit_unknown_queries_status_before_any_retry_and_pending_requires_fre
     );
     assert_eq!(backend.statuses.lock().unwrap().len(), 1);
     assert!(backend.commits.lock().unwrap().is_empty());
+    assert_eq!(*coturn.secret_versions.lock().unwrap(), vec![2]);
     let state = store.state.lock().unwrap();
     assert_eq!(state.secret_version, 1);
     let pending = state.pending_rotation.as_ref().unwrap();
@@ -3886,7 +4802,7 @@ async fn pending_rotation_blocks_identity_renewal_and_reconciles_before_epoch_ch
         }));
     let mut runtime = AgentRuntime::new_with_state_store(
         slot.clone(),
-        coturn,
+        coturn.clone(),
         clock,
         sleeper,
         Arc::new(FixedJitter(0)),
@@ -3902,6 +4818,10 @@ async fn pending_rotation_blocks_identity_renewal_and_reconciles_before_epoch_ch
     .unwrap();
     let factory = FakeBackendFactory::new(0, backend.clone());
     let mut lifecycle = IdentityLifecycle::new(Duration::from_secs(86_400)).unwrap();
+    coturn.snapshots.lock().unwrap().extend([
+        Ok(CoturnSnapshot::healthy(0, 0).with_generation(8, 2)),
+        Ok(CoturnSnapshot::healthy(0, 0).with_generation(9, 2)),
+    ]);
 
     assert_eq!(
         backend_worker_once(
@@ -3923,6 +4843,7 @@ async fn pending_rotation_blocks_identity_renewal_and_reconciles_before_epoch_ch
     );
     assert!(backend.renewals.lock().unwrap().is_empty());
     assert_eq!(backend.statuses.lock().unwrap().len(), 1);
+    assert_eq!(*coturn.secret_versions.lock().unwrap(), vec![2]);
     assert_eq!(identity.identity_epoch(), 1);
     let state = store.state.lock().unwrap();
     assert_eq!(state.secret_version, 1);

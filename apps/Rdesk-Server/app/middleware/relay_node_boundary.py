@@ -9,7 +9,7 @@ from typing import Any
 
 _MAX_BODY_BYTES = 65_536
 _NODE_PATH = re.compile(
-    r"^/api/v1/relays/(?:enroll|enrollments/[^/]+/pickup|[^/]+/(?:heartbeat|renew|secret-rotation/(?:upload|commit)))$"
+    r"^/api/v1/relays/(?:enroll|enrollments/[^/]+/pickup|[^/]+/(?:heartbeat|renew|secret-rotation/(?:upload|commit|status)))$"
 )
 _CONTENT_LENGTH = re.compile(rb"^(0|[1-9][0-9]{0,19})$")
 _FORWARDED_HEADERS = {
@@ -107,38 +107,61 @@ class RelayNodeBoundaryMiddleware:
                 await _error(send, 413, "relay_request_too_large", "relay request too large")
                 return
 
-        body = bytearray()
-        while True:
-            message = await receive()
-            if message.get("type") == "http.disconnect":
-                return
-            if message.get("type") != "http.request":
+        body = _new_request_body_buffer()
+        try:
+            while True:
+                message = await receive()
+                if message.get("type") == "http.disconnect":
+                    return
+                if message.get("type") != "http.request":
+                    await _error(send, 400, "relay_request_invalid", "relay request invalid")
+                    return
+                body.extend(message.get("body", b""))
+                if len(body) > _MAX_BODY_BYTES:
+                    await _error(
+                        send, 413, "relay_request_too_large", "relay request too large"
+                    )
+                    return
+                if declared is not None and len(body) > declared:
+                    await _error(send, 400, "relay_request_invalid", "relay request invalid")
+                    return
+                if not message.get("more_body", False):
+                    break
+            if declared is not None and len(body) != declared:
                 await _error(send, 400, "relay_request_invalid", "relay request invalid")
                 return
-            body.extend(message.get("body", b""))
-            if len(body) > _MAX_BODY_BYTES:
-                await _error(send, 413, "relay_request_too_large", "relay request too large")
-                return
-            if declared is not None and len(body) > declared:
-                await _error(send, 400, "relay_request_invalid", "relay request invalid")
-                return
-            if not message.get("more_body", False):
-                break
-        exact_body = bytes(body)
-        if declared is not None and len(exact_body) != declared:
-            await _error(send, 400, "relay_request_invalid", "relay request invalid")
-            return
-        scope.setdefault("state", {})["relay_raw_body"] = exact_body
-        delivered = False
+            # Starlette/FastAPI requires an immutable ASGI message body.  The
+            # mutable accumulator is our final controllable owner; framework
+            # and TLS-stack copies beyond this boundary cannot be zeroized by
+            # application code. Create that copy only for a request that will
+            # actually cross the framework boundary.
+            exact_body = bytes(body)
+            scope.setdefault("state", {})["relay_raw_body"] = exact_body
+            delivered = False
 
-        async def replay() -> dict[str, Any]:
-            nonlocal delivered
-            if delivered:
-                return await receive()
-            delivered = True
-            return {"type": "http.request", "body": exact_body, "more_body": False}
+            async def replay() -> dict[str, Any]:
+                nonlocal delivered
+                if delivered:
+                    return await receive()
+                delivered = True
+                return {
+                    "type": "http.request",
+                    "body": exact_body,
+                    "more_body": False,
+                }
 
-        await self.app(scope, replay, send)
+            await self.app(scope, replay, send)
+        finally:
+            _zeroize(body)
+
+
+def _new_request_body_buffer() -> bytearray:
+    return bytearray()
+
+
+def _zeroize(value: bytearray) -> None:
+    for index in range(len(value)):
+        value[index] = 0
 
 
 def _networks(configured: str) -> tuple[Network, ...]:

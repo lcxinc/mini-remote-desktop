@@ -91,24 +91,16 @@ def test_boot_id_is_exactly_canonical_base64url_for_sixteen_bytes() -> None:
 def test_boot_id_validator_clears_controllable_base64_codec_buffers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import app.schemas.relay as relay_schemas
+    from app.core import mutable_base64url
 
-    real_decode = base64.urlsafe_b64decode
-    real_encode = base64.urlsafe_b64encode
     codec_buffers: list[bytearray] = []
 
-    def tracked_decode(value: object) -> bytearray:
-        buffer = bytearray(real_decode(value))
+    def tracked_buffer() -> bytearray:
+        buffer = bytearray()
         codec_buffers.append(buffer)
         return buffer
 
-    def tracked_encode(value: object) -> bytearray:
-        buffer = bytearray(real_encode(value))
-        codec_buffers.append(buffer)
-        return buffer
-
-    monkeypatch.setattr(relay_schemas.base64, "urlsafe_b64decode", tracked_decode)
-    monkeypatch.setattr(relay_schemas.base64, "urlsafe_b64encode", tracked_encode)
+    monkeypatch.setattr(mutable_base64url, "_new_buffer", tracked_buffer)
     RelayHeartbeatRequest.model_validate(_fixture_heartbeat_payload())
     assert codec_buffers
     assert all(buffer == bytearray(len(buffer)) for buffer in codec_buffers)
@@ -225,25 +217,18 @@ def test_shared_secret_rotation_fixture_is_exact_for_upload_commit_and_status() 
 def test_rotation_proof_clears_controllable_base64_codec_buffers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from app.core import mutable_base64url
     import app.services.relay_registry as relay_registry
 
-    real_decode = base64.urlsafe_b64decode
-    real_encode = base64.urlsafe_b64encode
-    challenge = real_encode(b"c" * 32).rstrip(b"=").decode("ascii")
+    challenge = base64.urlsafe_b64encode(b"c" * 32).rstrip(b"=").decode("ascii")
     codec_buffers: list[bytearray] = []
 
-    def tracked_decode(value: object) -> bytearray:
-        buffer = bytearray(real_decode(value))
+    def tracked_buffer() -> bytearray:
+        buffer = bytearray()
         codec_buffers.append(buffer)
         return buffer
 
-    def tracked_encode(value: object) -> bytearray:
-        buffer = bytearray(real_encode(value))
-        codec_buffers.append(buffer)
-        return buffer
-
-    monkeypatch.setattr(relay_registry.base64, "urlsafe_b64decode", tracked_decode)
-    monkeypatch.setattr(relay_registry.base64, "urlsafe_b64encode", tracked_encode)
+    monkeypatch.setattr(mutable_base64url, "_new_buffer", tracked_buffer)
     relay_registry.rotation_proof_message(
         node_id=NODE_ID,
         identity_epoch=1,
@@ -260,29 +245,22 @@ def test_rotation_proof_clears_controllable_base64_codec_buffers(
 def test_turn_secret_validation_clears_controllable_base64_codec_buffers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from app.core import mutable_base64url
     import app.services.relay_registry as relay_registry
     from app.services.relay_repository import AesGcmRelaySecretCipher
     from pydantic import SecretStr
 
-    real_decode = base64.urlsafe_b64decode
-    real_encode = base64.urlsafe_b64encode
-    encoded_secret = real_encode(hashlib.sha256(b"buffer-owned-secret").digest()).rstrip(
-        b"="
-    ).decode("ascii")
+    encoded_secret = base64.urlsafe_b64encode(
+        hashlib.sha256(b"buffer-owned-secret").digest()
+    ).rstrip(b"=").decode("ascii")
     codec_buffers: list[bytearray] = []
 
-    def tracked_decode(value: object) -> bytearray:
-        buffer = bytearray(real_decode(value))
+    def tracked_buffer() -> bytearray:
+        buffer = bytearray()
         codec_buffers.append(buffer)
         return buffer
 
-    def tracked_encode(value: object) -> bytearray:
-        buffer = bytearray(real_encode(value))
-        codec_buffers.append(buffer)
-        return buffer
-
-    monkeypatch.setattr(relay_registry.base64, "urlsafe_b64decode", tracked_decode)
-    monkeypatch.setattr(relay_registry.base64, "urlsafe_b64encode", tracked_encode)
+    monkeypatch.setattr(mutable_base64url, "_new_buffer", tracked_buffer)
     registry = relay_registry.RelayRegistry(
         object(),
         enrollment_token_pepper="11" * 32,
@@ -293,6 +271,36 @@ def test_turn_secret_validation_clears_controllable_base64_codec_buffers(
     )
     assert codec_buffers
     assert all(buffer == bytearray(len(buffer)) for buffer in codec_buffers)
+
+
+def test_registry_turn_secret_quality_failure_clears_mutable_codec_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.core import mutable_base64url
+    import app.services.relay_registry as relay_registry
+    from app.services.relay_repository import AesGcmRelaySecretCipher
+    from pydantic import SecretStr
+
+    owners: list[bytearray] = []
+
+    def tracked_buffer() -> bytearray:
+        owner = bytearray()
+        owners.append(owner)
+        return owner
+
+    monkeypatch.setattr(mutable_base64url, "_new_buffer", tracked_buffer)
+    registry = relay_registry.RelayRegistry(
+        object(),
+        enrollment_token_pepper="11" * 32,
+        turn_secret_cipher=AesGcmRelaySecretCipher(bytes.fromhex("22" * 32)),
+    )
+    repeated = base64.urlsafe_b64encode(b"x" * 32).rstrip(b"=").decode("ascii")
+    with pytest.raises(relay_registry.RelayRegistryError):
+        registry._protect_turn_secret(  # noqa: SLF001
+            SecretStr(repeated), node_id=NODE_ID
+        )
+    assert owners
+    assert all(not any(owner) for owner in owners)
 
 
 def _approval_body(node_id: str = NODE_ID) -> dict[str, str]:
@@ -1090,29 +1098,17 @@ def test_node_generated_secret_rotation_is_authenticated_encrypted_and_atomic(
         payload=commit_payload,
         replace_payload=True,
     )
-    import app.services.relay_registry as relay_registry
+    from app.core import mutable_base64url
 
-    real_decode = base64.urlsafe_b64decode
-    real_encode = base64.urlsafe_b64encode
     codec_buffers: list[bytearray] = []
 
-    def tracked_decode(value: object) -> bytearray:
-        buffer = bytearray(real_decode(value))
-        codec_buffers.append(buffer)
-        return buffer
-
-    def tracked_encode(value: object) -> bytearray:
-        buffer = bytearray(real_encode(value))
+    def tracked_buffer() -> bytearray:
+        buffer = bytearray()
         codec_buffers.append(buffer)
         return buffer
 
     with monkeypatch.context() as codec_patch:
-        codec_patch.setattr(
-            relay_registry.base64, "urlsafe_b64decode", tracked_decode
-        )
-        codec_patch.setattr(
-            relay_registry.base64, "urlsafe_b64encode", tracked_encode
-        )
+        codec_patch.setattr(mutable_base64url, "_new_buffer", tracked_buffer)
         committed = client.post(
             commit_path, content=commit_body, headers=commit_headers
         )

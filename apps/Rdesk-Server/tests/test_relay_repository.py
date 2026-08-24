@@ -51,31 +51,41 @@ ENDPOINTS = [
 def test_turn_secret_validator_clears_controllable_base64_codec_buffers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    real_decode = base64.urlsafe_b64decode
-    real_encode = base64.urlsafe_b64encode
+    from app.core import mutable_base64url
+
     codec_buffers: list[bytearray] = []
 
-    def tracked_decode(value: object) -> bytearray:
-        buffer = bytearray(real_decode(value))
+    def tracked_buffer() -> bytearray:
+        buffer = bytearray()
         codec_buffers.append(buffer)
         return buffer
 
-    def tracked_encode(value: object) -> bytearray:
-        buffer = bytearray(real_encode(value))
-        codec_buffers.append(buffer)
-        return buffer
-
-    monkeypatch.setattr(
-        relay_repository_module.base64, "urlsafe_b64decode", tracked_decode
-    )
-    monkeypatch.setattr(
-        relay_repository_module.base64, "urlsafe_b64encode", tracked_encode
-    )
-    assert relay_repository_module._validated_turn_secret(TURN_SECRET) == (  # noqa: SLF001
-        TURN_SECRET.encode("ascii")
-    )
+    monkeypatch.setattr(mutable_base64url, "_new_buffer", tracked_buffer)
+    owner = relay_repository_module._validated_turn_secret(TURN_SECRET)  # noqa: SLF001
+    assert owner == TURN_SECRET.encode("ascii")
     assert codec_buffers
+    mutable_base64url.zeroize(owner)
     assert all(buffer == bytearray(len(buffer)) for buffer in codec_buffers)
+
+
+def test_turn_secret_quality_failure_clears_mutable_codec_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.core import mutable_base64url
+
+    owners: list[bytearray] = []
+
+    def tracked_buffer() -> bytearray:
+        owner = bytearray()
+        owners.append(owner)
+        return owner
+
+    monkeypatch.setattr(mutable_base64url, "_new_buffer", tracked_buffer)
+    repeated = base64.urlsafe_b64encode(b"x" * 32).rstrip(b"=").decode("ascii")
+    with pytest.raises(RelayRepositoryError, match="TURN secret required"):
+        relay_repository_module._validated_turn_secret(repeated)  # noqa: SLF001
+    assert owners
+    assert all(not any(owner) for owner in owners)
 
 
 class AsyncSessionShim:

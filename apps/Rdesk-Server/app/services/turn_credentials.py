@@ -8,6 +8,12 @@ import time
 from dataclasses import dataclass, field as dataclass_field
 from typing import Callable, Protocol
 
+from app.core.mutable_base64url import (
+    decode_canonical_base64url,
+    encode_unpadded_base64url,
+    zeroize,
+)
+
 
 SCOPE_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
@@ -234,69 +240,56 @@ def _coturn_wire_secret(secret: bytearray) -> tuple[bytearray, bool]:
     """Return canonical string bytes and whether a legacy raw envelope was read."""
 
     if len(secret) == 32 and _raw_turn_secret_has_minimum_quality(secret):
-        encoded_result = base64.urlsafe_b64encode(secret)
-        encoded = (
-            encoded_result
-            if isinstance(encoded_result, bytearray)
-            else bytearray(encoded_result)
-        )
-        while encoded.endswith(b"="):
-            encoded.pop()
-        return encoded, True
-    if (
-        len(secret) != 43
-        or any(byte > 0x7F for byte in secret)
-        or re.fullmatch(rb"[A-Za-z0-9_-]{43}", bytes(secret)) is None
-    ):
+        return encode_unpadded_base64url(memoryview(secret)), True
+    if len(secret) != 43:
         raise TurnCredentialConfigurationError(
             "relay credential material is unavailable"
         )
-    padded = bytearray(secret)
-    padded.extend(b"=")
-    decoded: bytearray | None = None
-    canonical: bytearray | None = None
     try:
-        decoded_result = base64.urlsafe_b64decode(padded)
-        decoded = (
-            decoded_result
-            if isinstance(decoded_result, bytearray)
-            else bytearray(decoded_result)
+        decoded = decode_canonical_base64url(
+            memoryview(secret), expected_length=32
         )
-        canonical_result = base64.urlsafe_b64encode(decoded)
-        canonical = (
-            canonical_result
-            if isinstance(canonical_result, bytearray)
-            else bytearray(canonical_result)
-        )
-        while canonical.endswith(b"="):
-            canonical.pop()
-        if (
-            len(decoded) != 32
-            or not hmac.compare_digest(canonical, secret)
-            or not _raw_turn_secret_has_minimum_quality(decoded)
-        ):
+        if not _raw_turn_secret_has_minimum_quality(decoded):
             raise TurnCredentialConfigurationError(
                 "relay credential material is unavailable"
             )
         return secret, False
-    except (ValueError, TypeError):
+    except ValueError:
         raise TurnCredentialConfigurationError(
             "relay credential material is unavailable"
         ) from None
     finally:
-        for buffer in (canonical, decoded, padded):
-            if buffer is not None:
-                for index in range(len(buffer)):
-                    buffer[index] = 0
+        if "decoded" in locals():
+            zeroize(decoded)
 
 
 def _raw_turn_secret_has_minimum_quality(secret: bytes | bytearray) -> bool:
-    lowered = bytes(secret).lower()
+    def contains_case_insensitive(marker: bytes) -> bool:
+        if len(marker) > len(secret):
+            return False
+        for offset in range(len(secret) - len(marker) + 1):
+            if all(
+                (
+                    secret[offset + index] + 32
+                    if 65 <= secret[offset + index] <= 90
+                    else secret[offset + index]
+                )
+                == marker[index]
+                for index in range(len(marker))
+            ):
+                return True
+        return False
+
+    unique_count = 0
+    for index in range(len(secret)):
+        if all(secret[prior] != secret[index] for prior in range(index)):
+            unique_count += 1
+
     return (
         len(secret) == 32
-        and len(set(secret)) >= 8
+        and unique_count >= 8
         and not any(
-            marker in lowered
+            contains_case_insensitive(marker)
             for marker in (b"placeholder", b"changeme", b"change-me")
         )
     )

@@ -26,6 +26,7 @@ from app.core.config import settings
 from app.api.v1.relays import _relay_turn_secret_cipher
 from app.models.relay_node import RelayNode
 from app.models.relay_node_registration import RelayNodeRegistration
+from app.models.relay_audit_event import RelayAuditEvent
 from app.middleware.relay_node_boundary import RelayNodeBoundaryMiddleware
 from app.services.turn_credentials import NodeTurnCredentialService
 from test_relay_node_api import (
@@ -245,6 +246,226 @@ def _renewal_request(
     )
     headers["X-Relay-Renewal-Id"] = renewal_id
     return body, headers
+
+
+def test_renewal_fails_closed_without_consuming_rotation_state_or_sequence(
+    api: tuple[TestClient, object],
+) -> None:
+    client, engine = api
+    old_key, _, _ = _enroll_with_receipt(client)
+    _, old_fingerprint = _approve(client)
+    rotated = client.post(
+        f"/api/v1/relays/{NODE_ID}/rotate-secret",
+        json={"credential_ttl_seconds": 300},
+    )
+    assert rotated.status_code == 202, rotated.text
+
+    with Session(engine) as session:
+        before = session.get(RelayNode, NODE_ID)
+        assert before is not None
+        invariant = (
+            before.identity_epoch,
+            before.heartbeat_sequence,
+            before.desired_secret_version,
+            before.desired_draining,
+            before.state,
+            before.rotation_challenge,
+            before.secret_not_before,
+            before.old_credential_deadline,
+        )
+        audit_count = session.query(RelayAuditEvent).count()
+
+    csr_pem, _ = _csr(NODE_ID)
+    body, headers = _renewal_request(
+        old_key,
+        old_fingerprint,
+        renewal_id=str(uuid4()),
+        csr_pem=csr_pem,
+        sequence=21,
+    )
+    rejected = client.post(
+        f"/api/v1/relays/{NODE_ID}/renew", content=body, headers=headers
+    )
+    assert (rejected.status_code, _error_code(rejected)) == (
+        409,
+        "relay_renewal_conflict",
+    )
+
+    with Session(engine) as session:
+        after = session.get(RelayNode, NODE_ID)
+        assert after is not None
+        assert (
+            after.identity_epoch,
+            after.heartbeat_sequence,
+            after.desired_secret_version,
+            after.desired_draining,
+            after.state,
+            after.rotation_challenge,
+            after.secret_not_before,
+            after.old_credential_deadline,
+        ) == invariant
+        assert session.query(RelayAuditEvent).count() == audit_count
+
+
+def test_admin_drain_survives_renewal_and_remains_authoritative_on_heartbeat(
+    api: tuple[TestClient, object],
+) -> None:
+    client, engine = api
+    old_key, _, _ = _enroll_with_receipt(client)
+    _, old_fingerprint = _approve(client)
+    drained = client.post(f"/api/v1/relays/{NODE_ID}/drain")
+    assert drained.status_code == 200, drained.text
+
+    csr_pem, new_key = _csr(NODE_ID)
+    renewal_id = str(uuid4())
+    body, headers = _renewal_request(
+        old_key,
+        old_fingerprint,
+        renewal_id=renewal_id,
+        csr_pem=csr_pem,
+        sequence=21,
+    )
+    renewed = client.post(
+        f"/api/v1/relays/{NODE_ID}/renew", content=body, headers=headers
+    )
+    assert renewed.status_code == 200, renewed.text
+    assert isinstance(new_key, ed25519.Ed25519PrivateKey)
+
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        assert node.identity_epoch == 2
+        assert node.desired_draining is True
+        assert node.state == "draining"
+
+    heartbeat_body, heartbeat_headers = _heartbeat_request(
+        new_key,
+        renewed.json()["fingerprint"],
+        sequence=1,
+        payload={"identity_epoch": 2},
+    )
+    heartbeat = client.post(
+        f"/api/v1/relays/{NODE_ID}/heartbeat",
+        content=heartbeat_body,
+        headers=heartbeat_headers,
+    )
+    assert heartbeat.status_code == 200, heartbeat.text
+    assert heartbeat.json()["state"] == "draining"
+    assert heartbeat.json()["desired"]["draining"] is True
+
+
+def test_exact_previous_epoch_renewal_retry_preserves_later_rotation_state(
+    api: tuple[TestClient, object],
+) -> None:
+    client, engine = api
+    old_key, _, _ = _enroll_with_receipt(client)
+    _, old_fingerprint = _approve(client)
+    csr_pem, new_key = _csr(NODE_ID)
+    renewal_id = str(uuid4())
+    first_body, first_headers = _renewal_request(
+        old_key,
+        old_fingerprint,
+        renewal_id=renewal_id,
+        csr_pem=csr_pem,
+        sequence=21,
+    )
+    first = client.post(
+        f"/api/v1/relays/{NODE_ID}/renew",
+        content=first_body,
+        headers=first_headers,
+    )
+    assert first.status_code == 200, first.text
+    with Session(engine) as session:
+        ordinary = session.get(RelayNode, NODE_ID)
+        assert ordinary is not None
+        assert ordinary.state == "unavailable"
+        assert ordinary.desired_draining is False
+        assert ordinary.desired_secret_version == ordinary.active_secret_version
+
+    rotated = client.post(
+        f"/api/v1/relays/{NODE_ID}/rotate-secret",
+        json={"credential_ttl_seconds": 300},
+    )
+    assert rotated.status_code == 202, rotated.text
+    with Session(engine) as session:
+        before = session.get(RelayNode, NODE_ID)
+        assert before is not None
+        rotation_invariant = (
+            before.heartbeat_sequence,
+            before.desired_draining,
+            before.desired_secret_version,
+            before.state,
+            before.secret_not_before,
+            before.old_credential_deadline,
+            before.pending_secret_version,
+            before.rotation_challenge,
+        )
+        updated_at = before.updated_at
+        audit_count = session.query(RelayAuditEvent).count()
+
+    retry_body, retry_headers = _renewal_request(
+        old_key,
+        old_fingerprint,
+        renewal_id=renewal_id,
+        csr_pem=csr_pem,
+        sequence=22,
+    )
+    retried = client.post(
+        f"/api/v1/relays/{NODE_ID}/renew",
+        content=retry_body,
+        headers=retry_headers,
+    )
+    assert retried.status_code == 200, retried.text
+    assert retried.json() == first.json()
+
+    with Session(engine) as session:
+        after = session.get(RelayNode, NODE_ID)
+        assert after is not None
+        assert after.previous_identity_sequence == 22
+        assert (
+            after.heartbeat_sequence,
+            after.desired_draining,
+            after.desired_secret_version,
+            after.state,
+            after.secret_not_before,
+            after.old_credential_deadline,
+            after.pending_secret_version,
+            after.rotation_challenge,
+        ) == rotation_invariant
+        assert after.updated_at == updated_at
+        assert session.query(RelayAuditEvent).count() == audit_count
+
+    current_body, current_headers = _renewal_request(
+        new_key,
+        first.json()["fingerprint"],
+        renewal_id=renewal_id,
+        csr_pem=csr_pem,
+        sequence=1,
+    )
+    current_retry = client.post(
+        f"/api/v1/relays/{NODE_ID}/renew",
+        content=current_body,
+        headers=current_headers,
+    )
+    assert current_retry.status_code == 409, current_retry.text
+    assert _error_code(current_retry) == "relay_renewal_conflict"
+
+    with Session(engine) as session:
+        after_current_retry = session.get(RelayNode, NODE_ID)
+        assert after_current_retry is not None
+        assert after_current_retry.previous_identity_sequence == 22
+        assert (
+            after_current_retry.heartbeat_sequence,
+            after_current_retry.desired_draining,
+            after_current_retry.desired_secret_version,
+            after_current_retry.state,
+            after_current_retry.secret_not_before,
+            after_current_retry.old_credential_deadline,
+            after_current_retry.pending_secret_version,
+            after_current_retry.rotation_challenge,
+        ) == rotation_invariant
+        assert after_current_retry.updated_at == updated_at
+        assert session.query(RelayAuditEvent).count() == audit_count
 
 
 def test_enrollment_returns_once_only_receipt_and_stores_only_digest(
@@ -978,6 +1199,7 @@ async def _run_boundary_asgi(
     *,
     headers: list[tuple[bytes, bytes]],
     messages: list[dict[str, object]],
+    path: str = "/api/v1/relays/enroll",
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     downstream_messages: list[dict[str, object]] = []
     sent: list[dict[str, object]] = []
@@ -1006,7 +1228,7 @@ async def _run_boundary_asgi(
         {
             "type": "http",
             "method": "POST",
-            "path": "/api/v1/relays/enroll",
+            "path": path,
             "headers": [(b"x-rdesk-client-tls", b"verified"), *headers],
             "client": ("127.0.0.1", 41000),
             "state": {},
@@ -1015,6 +1237,112 @@ async def _run_boundary_asgi(
         send,
     )
     return sent, downstream_messages
+
+
+_ROTATION_BOUNDARY_PATHS = tuple(
+    f"/api/v1/relays/{NODE_ID}/secret-rotation/{suffix}"
+    for suffix in ("upload", "commit", "status")
+)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("path", _ROTATION_BOUNDARY_PATHS)
+async def test_every_secret_rotation_path_replays_an_exact_64k_stream(path: str) -> None:
+    sent, downstream = await _run_boundary_asgi(
+        path=path,
+        headers=[(b"transfer-encoding", b"chunked")],
+        messages=[
+            {"type": "http.request", "body": b"a" * 32_768, "more_body": True},
+            {"type": "http.request", "body": b"b" * 32_768, "more_body": False},
+            {"type": "http.disconnect"},
+        ],
+    )
+    assert sent[0]["status"] == 204
+    assert downstream == [
+        {
+            "type": "http.request",
+            "body": b"a" * 32_768 + b"b" * 32_768,
+            "more_body": False,
+        },
+        {"type": "http.disconnect"},
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("path", _ROTATION_BOUNDARY_PATHS)
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [(b"x-relay-signature", b"one"), (b"x-relay-signature", b"two")],
+        [(b"x-rdesk-client-tls", b"unverified")],
+        [(b"content-length", b"2"), (b"content-length", b"2")],
+        [(b"content-length", b"2"), (b"transfer-encoding", b"chunked")],
+    ],
+)
+async def test_every_secret_rotation_path_rejects_ambiguous_headers(
+    path: str, headers: list[tuple[bytes, bytes]]
+) -> None:
+    sent, downstream = await _run_boundary_asgi(
+        path=path,
+        headers=headers,
+        messages=[{"type": "http.request", "body": b"{}", "more_body": False}],
+    )
+    assert sent[0]["status"] in {400, 401, 403}
+    assert downstream == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("path", _ROTATION_BOUNDARY_PATHS)
+async def test_every_secret_rotation_path_rejects_streamed_body_over_64k(
+    path: str,
+) -> None:
+    sent, downstream = await _run_boundary_asgi(
+        path=path,
+        headers=[(b"transfer-encoding", b"chunked")],
+        messages=[
+            {"type": "http.request", "body": b"a" * 32_768, "more_body": True},
+            {"type": "http.request", "body": b"b" * 32_769, "more_body": False},
+        ],
+    )
+    assert sent[0]["status"] == 413
+    assert downstream == []
+
+
+@pytest.mark.anyio
+async def test_request_accumulator_is_zeroized_when_downstream_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.middleware import relay_node_boundary as boundary_module
+
+    accumulator = bytearray()
+    monkeypatch.setattr(
+        boundary_module, "_new_request_body_buffer", lambda: accumulator
+    )
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"secret-json", "more_body": False}
+
+    async def send(_: dict[str, object]) -> None:
+        raise AssertionError("downstream should raise before sending")
+
+    async def downstream(*_: object) -> None:
+        raise RuntimeError("injected downstream failure")
+
+    middleware = RelayNodeBoundaryMiddleware(downstream, trusted_proxy="127.0.0.1")
+    with pytest.raises(RuntimeError, match="injected downstream failure"):
+        await middleware(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": _ROTATION_BOUNDARY_PATHS[0],
+                "headers": [(b"x-rdesk-client-tls", b"verified")],
+                "client": ("127.0.0.1", 41000),
+                "state": {},
+            },
+            receive,
+            send,
+        )
+    assert accumulator == bytearray(len(b"secret-json"))
 
 
 @pytest.mark.anyio

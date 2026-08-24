@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import base64
-import binascii
 from datetime import datetime
 from typing import Annotated, Literal
 
@@ -16,41 +14,18 @@ from pydantic import (
     model_validator,
 )
 
+from app.core.mutable_base64url import decode_canonical_base64url, zeroize
+
 
 def _canonical_base64url(value: str, decoded_length: int) -> str:
-    padded = bytearray(value.encode("ascii"))
-    padded.extend(b"=" * ((4 - len(value) % 4) % 4))
-    decoded: bytearray | None = None
-    canonical: bytearray | None = None
     try:
-        try:
-            decoded_result = base64.urlsafe_b64decode(padded)
-            decoded = (
-                decoded_result
-                if isinstance(decoded_result, bytearray)
-                else bytearray(decoded_result)
-            )
-            canonical_result = base64.urlsafe_b64encode(decoded)
-            canonical = (
-                canonical_result
-                if isinstance(canonical_result, bytearray)
-                else bytearray(canonical_result)
-            )
-            while canonical.endswith(b"="):
-                canonical.pop()
-        except (ValueError, binascii.Error):
-            raise ValueError("value must be canonical base64url") from None
-        if (
-            len(decoded) != decoded_length
-            or canonical.decode("ascii") != value
-        ):
-            raise ValueError("value must be canonical base64url")
+        decoded = decode_canonical_base64url(value, expected_length=decoded_length)
+    except ValueError:
+        raise ValueError("value must be canonical base64url") from None
+    try:
         return value
     finally:
-        for buffer in (canonical, decoded, padded):
-            if buffer is not None:
-                for index in range(len(buffer)):
-                    buffer[index] = 0
+        zeroize(decoded)
 
 
 def _canonical_base64url_16(value: str) -> str:
@@ -130,15 +105,13 @@ class RelayEnrollmentRequest(BaseModel):
     @classmethod
     def validate_turn_rest_secret(cls, value: SecretStr) -> SecretStr:
         encoded = value.get_secret_value()
-        if (
-            len(encoded) != 43
-            or not encoded.isascii()
-            or any(
-                character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
-                for character in encoded
-            )
-        ):
+        try:
+            decoded = decode_canonical_base64url(encoded, expected_length=32)
+        except ValueError:
             raise ValueError("TURN REST secret must be canonical base64url")
+        finally:
+            if "decoded" in locals():
+                zeroize(decoded)
         return value
 
 

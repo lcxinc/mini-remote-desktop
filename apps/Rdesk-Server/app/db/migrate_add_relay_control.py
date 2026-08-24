@@ -101,7 +101,15 @@ def _v8_constraints_sql(nodes: str) -> str:
         "EXCEPTION WHEN duplicate_object THEN NULL; END;"
         for name, expression in constraints
     )
-    return f"DO $$ BEGIN {statements} END $$"
+    # v7 represented draining only in ``state``.  Keep its semantic intent when
+    # v8 introduces the durable desired-state bit without widening the exact
+    # v7 -> v8 migration beyond the established ALTER / DO / INSERT sequence.
+    return (
+        "DO $$ BEGIN "
+        f"UPDATE {nodes} SET desired_draining = true "
+        "WHERE state = 'draining' AND desired_draining = false; "
+        f"{statements} END $$"
+    )
 
 
 async def migrate(
@@ -563,6 +571,15 @@ async def _migrate_connection(
         "directory_generation VARCHAR(64) NOT NULL DEFAULT 'legacy'",
     ):
         await connection.execute(text(statement))
+    # Generic upgrades from v1-v6 add the v8 columns individually.  Backfill
+    # the legacy state in the same advisory-locked transaction before exact
+    # constraints and the migration ledger are finalized.
+    await connection.execute(
+        text(
+            f"UPDATE {nodes} SET desired_draining = true "
+            "WHERE state = 'draining' AND desired_draining = false"
+        )
+    )
     # v3 used previous_auth_expires_at for both old-certificate retry and
     # renewal-response retention. Preserve that exact (possibly already
     # expired) boundary for complete in-flight records when adding v4's split

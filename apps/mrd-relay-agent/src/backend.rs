@@ -5,19 +5,27 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use bytes::Bytes;
 use reqwest::{Certificate, Client, Identity, StatusCode};
 use ring::{digest, signature};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
-use zeroize::Zeroizing;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use crate::process::SecretBytes;
 
 const REQUEST_CONTEXT: &[u8] = b"MRD_RELAY_REQUEST_V1\0";
 const MAX_BODY_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+
+fn bytes_from_zeroizing_owner<T>(owner: T) -> Bytes
+where
+    T: AsRef<[u8]> + ZeroizeOnDrop + Send + 'static,
+{
+    Bytes::from_owner(owner)
+}
 
 #[derive(Clone)]
 pub struct EnrollmentRequest {
@@ -150,6 +158,13 @@ pub struct SecretUploadRequest {
     pub secret_version: u64,
     pub turn_rest_secret: SecretString,
     pub authentication: RequestAuthentication,
+    signed_body: Bytes,
+}
+
+impl SecretUploadRequest {
+    pub fn signed_body(&self) -> &[u8] {
+        &self.signed_body
+    }
 }
 
 impl std::fmt::Debug for SecretUploadRequest {
@@ -448,6 +463,8 @@ pub struct SecretUpdate {
 pub enum BackendError {
     #[error("relay_backend_unavailable")]
     Unavailable,
+    #[error("relay_backend_conflict")]
+    Conflict,
     #[error("relay_backend_rejected")]
     Rejected,
     #[error("relay_backend_protocol_invalid")]
@@ -460,6 +477,7 @@ impl BackendError {
     pub fn reason_code(&self) -> &'static str {
         match self {
             Self::Unavailable => "relay_backend_unavailable",
+            Self::Conflict => "relay_backend_conflict",
             Self::Rejected => "relay_backend_rejected",
             Self::ProtocolInvalid => "relay_backend_protocol_invalid",
             Self::TlsInvalid => "relay_tls_invalid",
@@ -637,8 +655,11 @@ pub(crate) fn serialize_renewal_body(
     .map_err(|_| BackendError::ProtocolInvalid)
 }
 
-pub(crate) fn serialize_secret_upload_body(
-    request: &SecretUploadRequest,
+fn serialize_secret_upload_body(
+    identity_epoch: u64,
+    rotation_id: &str,
+    secret_version: u64,
+    turn_rest_secret: &str,
 ) -> Result<Zeroizing<Vec<u8>>, BackendError> {
     #[derive(Serialize)]
     struct Wire<'a> {
@@ -647,21 +668,88 @@ pub(crate) fn serialize_secret_upload_body(
         secret_version: u64,
         turn_rest_secret: &'a str,
     }
-    if request.identity_epoch == 0
-        || request.secret_version < 2
-        || !is_urlsafe_identifier(&request.rotation_id)
-        || !is_canonical_base64url(request.turn_rest_secret.expose_secret(), 32)
+    if identity_epoch == 0
+        || secret_version < 2
+        || !is_urlsafe_identifier(rotation_id)
+        || !is_canonical_base64url(turn_rest_secret, 32)
     {
         return Err(BackendError::ProtocolInvalid);
     }
-    serde_json::to_vec(&Wire {
-        identity_epoch: request.identity_epoch,
-        rotation_id: &request.rotation_id,
-        secret_version: request.secret_version,
-        turn_rest_secret: request.turn_rest_secret.expose_secret(),
+    let mut body = Zeroizing::new(Vec::new());
+    serde_json::to_writer(
+        &mut *body,
+        &Wire {
+            identity_epoch,
+            rotation_id,
+            secret_version,
+            turn_rest_secret,
+        },
+    )
+    .map_err(|_| BackendError::ProtocolInvalid)?;
+    Ok(body)
+}
+
+pub(crate) fn build_secret_upload_request<E>(
+    node_id: String,
+    identity_epoch: u64,
+    rotation_id: String,
+    secret_version: u64,
+    turn_rest_secret: SecretString,
+    signer: impl FnOnce(&[u8]) -> Result<RequestAuthentication, E>,
+) -> Result<SecretUploadRequest, E>
+where
+    E: From<BackendError>,
+{
+    if !is_node_identifier(&node_id) {
+        return Err(E::from(BackendError::ProtocolInvalid));
+    }
+    let body = serialize_secret_upload_body(
+        identity_epoch,
+        &rotation_id,
+        secret_version,
+        turn_rest_secret.expose_secret(),
+    )
+    .map_err(E::from)?;
+    let authentication = signer(body.as_ref())?;
+    Ok(SecretUploadRequest {
+        node_id,
+        identity_epoch,
+        rotation_id,
+        secret_version,
+        turn_rest_secret,
+        authentication,
+        signed_body: bytes_from_zeroizing_owner(body),
     })
-    .map(Zeroizing::new)
-    .map_err(|_| BackendError::ProtocolInvalid)
+}
+
+fn serialize_enrollment_body(request: &EnrollmentRequest) -> Result<Bytes, BackendError> {
+    #[derive(Serialize)]
+    struct EnrollmentWire<'a> {
+        token: &'a str,
+        node_id: &'a str,
+        region: &'a str,
+        failure_domain: &'a str,
+        endpoints: &'a [String],
+        max_allocations: u32,
+        max_egress_bps: u64,
+        csr_pem: &'a str,
+        turn_rest_secret: &'a str,
+    }
+
+    let wire = EnrollmentWire {
+        token: request.token.expose_secret(),
+        node_id: &request.node_id,
+        region: &request.region,
+        failure_domain: &request.failure_domain,
+        endpoints: &request.endpoints,
+        max_allocations: request.max_allocations,
+        max_egress_bps: request.max_egress_bps,
+        csr_pem: &request.csr_pem,
+        turn_rest_secret: request.turn_rest_secret.expose_secret(),
+    };
+    let mut body = Zeroizing::new(Vec::new());
+    serde_json::to_writer(&mut *body, &wire).map_err(|_| BackendError::ProtocolInvalid)?;
+    Ok(bytes_from_zeroizing_owner(body))
 }
 
 pub(crate) fn serialize_secret_commit_body(
@@ -1016,7 +1104,7 @@ pub fn decode_enrollment_response(
     if body.node_id != expected_node_id
         || body.status != "pending"
         || !is_urlsafe_identifier(&body.enrollment_id)
-        || !(20..=512).contains(&body.receipt.len())
+        || !valid_enrollment_receipt(&body.receipt)
     {
         return Err(BackendError::ProtocolInvalid);
     }
@@ -1146,6 +1234,15 @@ fn is_node_identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
+pub(crate) fn valid_enrollment_receipt(value: &str) -> bool {
+    (20..=512).contains(&value.len())
+        && value
+            .as_bytes()
+            .iter()
+            .copied()
+            .all(|byte| byte.is_ascii_graphic())
+}
+
 async fn read_bounded_response(
     mut response: reqwest::Response,
 ) -> Result<Zeroizing<Vec<u8>>, BackendError> {
@@ -1173,10 +1270,10 @@ fn backend_status_error(status: StatusCode) -> Option<BackendError> {
     if status.is_success() {
         return None;
     }
-    if matches!(status.as_u16(), 408 | 425 | 429 | 500 | 502 | 503 | 504) {
-        Some(BackendError::Unavailable)
-    } else {
-        Some(BackendError::Rejected)
+    match status.as_u16() {
+        408 | 425 | 429 | 500 | 502 | 503 | 504 => Some(BackendError::Unavailable),
+        409 => Some(BackendError::Conflict),
+        _ => Some(BackendError::Rejected),
     }
 }
 
@@ -1188,33 +1285,18 @@ fn require_success_status(status: StatusCode) -> Result<(), BackendError> {
 impl RelayBackendPort for ReqwestRelayBackend {
     async fn enroll(&self, request: EnrollmentRequest) -> Result<EnrollmentStatus, BackendError> {
         let expected_node_id = request.node_id.clone();
-        #[derive(Serialize)]
-        struct EnrollmentWire<'a> {
-            token: &'a str,
-            node_id: &'a str,
-            region: &'a str,
-            failure_domain: &'a str,
-            endpoints: &'a [String],
-            max_allocations: u32,
-            max_egress_bps: u64,
-            csr_pem: &'a str,
-            turn_rest_secret: &'a str,
-        }
-        let wire = EnrollmentWire {
-            token: request.token.expose_secret(),
-            node_id: &request.node_id,
-            region: &request.region,
-            failure_domain: &request.failure_domain,
-            endpoints: &request.endpoints,
-            max_allocations: request.max_allocations,
-            max_egress_bps: request.max_egress_bps,
-            csr_pem: &request.csr_pem,
-            turn_rest_secret: request.turn_rest_secret.expose_secret(),
-        };
+        let body = serialize_enrollment_body(&request)?;
+        // The serialized zeroizing owner is now authoritative; release the
+        // source SecretString owners before the network await.
+        drop(request);
         let response = self
             .enrollment_client
             .post(self.url("api/v1/relays/enroll")?)
-            .json(&wire)
+            .header("Content-Type", "application/json")
+            // The zeroizing Bytes owner covers every controllable plaintext
+            // allocation. Copies below reqwest/hyper/rustls are an upstream
+            // boundary with no accessible clearing API.
+            .body(body)
             .send()
             .await
             .map_err(|_| BackendError::Unavailable)?;
@@ -1327,22 +1409,31 @@ impl RelayBackendPort for ReqwestRelayBackend {
     }
 
     async fn upload_secret(&self, request: SecretUploadRequest) -> Result<(), BackendError> {
-        let path = format!("/api/v1/relays/{}/secret-rotation/upload", request.node_id);
-        let mut body = serialize_secret_upload_body(&request)?;
+        let SecretUploadRequest {
+            node_id,
+            identity_epoch,
+            rotation_id,
+            secret_version,
+            turn_rest_secret: _,
+            authentication,
+            signed_body,
+        } = request;
+        let path = format!("/api/v1/relays/{node_id}/secret-rotation/upload");
         let response = self
             .mtls_client
             .as_ref()
             .ok_or(BackendError::TlsInvalid)?
             .post(self.url(path.trim_start_matches('/'))?)
-            .header("X-Relay-Node-Id", &request.node_id)
-            .header("X-Relay-Timestamp", request.authentication.timestamp)
-            .header("X-Relay-Sequence", request.authentication.sequence)
-            .header("X-Relay-Signature", &request.authentication.signature_b64)
+            .header("X-Relay-Node-Id", &node_id)
+            .header("X-Relay-Timestamp", authentication.timestamp)
+            .header("X-Relay-Sequence", authentication.sequence)
+            .header("X-Relay-Signature", &authentication.signature_b64)
             .header("Content-Type", "application/json")
-            // Transfer the single allocation into reqwest without creating a
-            // second controllable plaintext JSON buffer. The Zeroizing owner
-            // is empty after the move.
-            .body(std::mem::take(&mut *body))
+            // This is the exact Bytes owner that was signed. It remains alive
+            // through reqwest's request-body lifetime and zeroizes on final
+            // drop. Copies below reqwest/hyper/rustls are an upstream boundary
+            // with no accessible clearing API.
+            .body(signed_body)
             .send()
             .await
             .map_err(|_| BackendError::Unavailable)?;
@@ -1354,10 +1445,10 @@ impl RelayBackendPort for ReqwestRelayBackend {
         require_private_no_store(&response)?;
         let body = read_bounded_response(response).await?;
         let body: SecretUploadResponse = decode_json(&body)?;
-        if body.node_id != request.node_id
-            || body.identity_epoch != request.identity_epoch
-            || body.rotation_id != request.rotation_id
-            || body.secret_version != request.secret_version
+        if body.node_id != node_id
+            || body.identity_epoch != identity_epoch
+            || body.rotation_id != rotation_id
+            || body.secret_version != secret_version
             || body.status != "uploaded"
         {
             return Err(BackendError::ProtocolInvalid);
@@ -1485,17 +1576,55 @@ fn parse_rfc3339_unix_seconds(value: &str) -> Result<i64, BackendError> {
 
 #[cfg(test)]
 mod response_security_tests {
-    use std::{net::IpAddr, sync::Arc};
+    use std::{
+        net::IpAddr,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        },
+    };
 
-    use super::{backend_status_error, headers_are_private_no_store, secure_client, BackendError};
+    use super::{
+        backend_status_error, build_secret_upload_request, bytes_from_zeroizing_owner,
+        decode_enrollment_response, headers_are_private_no_store, secure_client,
+        serialize_enrollment_body, BackendError, EnrollmentRequest, RequestAuthentication,
+    };
     use rcgen::{
         BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
         ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType, PKCS_ED25519,
     };
     use reqwest::header::{HeaderMap, HeaderValue, CACHE_CONTROL, PRAGMA};
     use rustls_pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use secrecy::{ExposeSecret, SecretString};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
+    use zeroize::{Zeroize, ZeroizeOnDrop};
+
+    struct ObservableZeroizingOwner {
+        bytes: Vec<u8>,
+        zeroized: Arc<AtomicBool>,
+    }
+
+    impl AsRef<[u8]> for ObservableZeroizingOwner {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Zeroize for ObservableZeroizingOwner {
+        fn zeroize(&mut self) {
+            self.bytes.zeroize();
+            self.zeroized.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for ObservableZeroizingOwner {
+        fn drop(&mut self) {
+            self.zeroize();
+        }
+    }
+
+    impl ZeroizeOnDrop for ObservableZeroizingOwner {}
 
     struct TestTlsAuthority {
         certificate: Certificate,
@@ -1584,13 +1713,172 @@ mod response_security_tests {
                 Some(BackendError::Unavailable)
             );
         }
-        for status in [400, 401, 403, 404, 409, 422] {
+        assert_eq!(
+            backend_status_error(reqwest::StatusCode::CONFLICT),
+            Some(BackendError::Conflict)
+        );
+        for status in [400, 401, 403, 404, 422] {
             assert_eq!(
                 backend_status_error(reqwest::StatusCode::from_u16(status).unwrap()),
                 Some(BackendError::Rejected)
             );
         }
         assert_eq!(backend_status_error(reqwest::StatusCode::OK), None);
+    }
+
+    #[test]
+    fn enrollment_receipt_is_always_safe_for_the_pickup_header() {
+        fn response(receipt: &str) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "enrollment_id": "enroll-0001",
+                "node_id": "relay-hkg-1",
+                "status": "pending",
+                "receipt": receipt,
+            }))
+            .unwrap()
+        }
+
+        for receipt in ["r".repeat(20), "r".repeat(512)] {
+            assert!(decode_enrollment_response(&response(&receipt), "relay-hkg-1").is_ok());
+            assert!(reqwest::header::HeaderValue::from_str(&receipt).is_ok());
+        }
+        for byte in b'!'..=b'~' {
+            let receipt = char::from(byte).to_string().repeat(20);
+            assert!(decode_enrollment_response(&response(&receipt), "relay-hkg-1").is_ok());
+            assert!(reqwest::header::HeaderValue::from_str(&receipt).is_ok());
+        }
+
+        for receipt in [
+            "r".repeat(19),
+            "r".repeat(513),
+            format!("{} {}", "r".repeat(10), "r".repeat(10)),
+            format!("{}\r{}", "r".repeat(10), "r".repeat(10)),
+            format!("{}\n{}", "r".repeat(10), "r".repeat(10)),
+            format!("{}\0{}", "r".repeat(10), "r".repeat(10)),
+            format!("{}\u{7f}{}", "r".repeat(10), "r".repeat(10)),
+            format!("{}é{}", "r".repeat(10), "r".repeat(10)),
+        ] {
+            assert!(
+                matches!(
+                    decode_enrollment_response(&response(&receipt), "relay-hkg-1"),
+                    Err(BackendError::ProtocolInvalid)
+                ),
+                "receipt should be rejected: {receipt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_owner_is_zeroized_only_after_the_last_body_clone_drops() {
+        let zeroized = Arc::new(AtomicBool::new(false));
+        let body = bytes_from_zeroizing_owner(ObservableZeroizingOwner {
+            bytes: b"a controllable secret body".to_vec(),
+            zeroized: zeroized.clone(),
+        });
+        let request_body = body.clone();
+        drop(body);
+        assert!(!zeroized.load(Ordering::SeqCst));
+        drop(request_body);
+        assert!(zeroized.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn secret_upload_signs_and_carries_one_exact_canonical_body() {
+        let calls = AtomicUsize::new(0);
+        let mut signed = Vec::new();
+        let mut request = build_secret_upload_request(
+            "relay-hkg-1".to_owned(),
+            7,
+            "rotation-0001".to_owned(),
+            8,
+            SecretString::from("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"),
+            |body| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                signed.extend_from_slice(body);
+                Ok::<_, BackendError>(RequestAuthentication {
+                    timestamp: 2_500,
+                    sequence: 41,
+                    signature_b64: "signature".to_owned(),
+                })
+            },
+        )
+        .unwrap();
+
+        let expected = br#"{"identity_epoch":7,"rotation_id":"rotation-0001","secret_version":8,"turn_rest_secret":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"}"#;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(signed, expected);
+        assert_eq!(request.signed_body(), expected);
+
+        request.turn_rest_secret =
+            SecretString::from("AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI");
+        assert_ne!(
+            request.turn_rest_secret.expose_secret().as_bytes(),
+            request.signed_body()
+        );
+        assert_eq!(request.signed_body(), expected);
+
+        let source = include_str!("backend.rs");
+        let builder_start = source
+            .find("pub(crate) fn build_secret_upload_request")
+            .unwrap();
+        let builder_end = source[builder_start..]
+            .find("fn serialize_enrollment_body")
+            .map(|offset| builder_start + offset)
+            .unwrap();
+        assert_eq!(
+            source[builder_start..builder_end]
+                .matches("serialize_secret_upload_body(")
+                .count(),
+            1
+        );
+        let implementation = source
+            .split_once("impl RelayBackendPort for ReqwestRelayBackend")
+            .unwrap()
+            .1;
+        let upload_start = implementation.find("async fn upload_secret(&self").unwrap();
+        let upload_end = implementation[upload_start..]
+            .find("async fn commit_secret(&self")
+            .map(|offset| upload_start + offset)
+            .unwrap();
+        let upload = &implementation[upload_start..upload_end];
+        assert!(!upload.contains("serialize_secret_upload_body"));
+        assert!(!upload.contains("mem::take"));
+    }
+
+    #[test]
+    fn enrollment_secrets_are_serialized_into_the_zeroizing_body_owner() {
+        let request = EnrollmentRequest {
+            token: SecretString::from("private-enrollment-token"),
+            node_id: "relay-hkg-1".to_owned(),
+            region: "ap-east".to_owned(),
+            failure_domain: "hkg-a".to_owned(),
+            endpoints: vec!["turn:relay.example:3478?transport=udp".to_owned()],
+            max_allocations: 100,
+            max_egress_bps: 1_000_000,
+            csr_pem: "csr".to_owned(),
+            turn_rest_secret: SecretString::from("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"),
+        };
+        let body = serialize_enrollment_body(&request).unwrap();
+        assert_eq!(
+            body.as_ref(),
+            br#"{"token":"private-enrollment-token","node_id":"relay-hkg-1","region":"ap-east","failure_domain":"hkg-a","endpoints":["turn:relay.example:3478?transport=udp"],"max_allocations":100,"max_egress_bps":1000000,"csr_pem":"csr","turn_rest_secret":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"}"#
+        );
+
+        let source = include_str!("backend.rs");
+        let implementation = source
+            .split_once("impl RelayBackendPort for ReqwestRelayBackend")
+            .unwrap()
+            .1;
+        let enroll_start = implementation.find("async fn enroll(&self").unwrap();
+        let enroll_end = implementation[enroll_start..]
+            .find("async fn pickup(&self")
+            .map(|offset| enroll_start + offset)
+            .unwrap();
+        let enroll = &implementation[enroll_start..enroll_end];
+        assert!(enroll.contains("serialize_enrollment_body(&request)"));
+        assert!(enroll.contains("drop(request);"));
+        assert!(enroll.contains(".body(body)"));
+        assert!(!enroll.contains(".json("));
     }
 
     #[test]

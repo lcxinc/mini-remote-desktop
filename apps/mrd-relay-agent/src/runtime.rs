@@ -1,7 +1,9 @@
 use std::{
     fs::{self, OpenOptions},
+    future::Future,
     io::Write,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -19,11 +21,11 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     backend::{
-        BackendError, EnrollmentRequest, HeartbeatPayload, NodeDirective,
-        RelayBackendClientFactoryPort, RelayBackendPort, RelayHealth, SecretRotationStatus,
-        SignedHeartbeat, SwappableRelayBackend,
+        BackendError, EnrollmentRequest, EnrollmentStatus, HeartbeatPayload, NodeCertificate,
+        NodeDirective, PickupRequest, RelayBackendClientFactoryPort, RelayBackendPort, RelayHealth,
+        RenewalRequest, SecretRotationStatus, SignedHeartbeat, SwappableRelayBackend,
     },
-    identity::{CertificateState, IdentityFsPort},
+    identity::{CertificateState, IdentityFsPort, RenewalPreparation},
     metrics::MetricsPort,
     process::{
         AllocationProbeEvidence, CoturnRuntimePort, LocalAllocationProbePort, ProcessError,
@@ -36,6 +38,7 @@ const MAX_RESTART_ATTEMPTS: u8 = 3;
 const MAX_BACKEND_BACKOFF_MS: u64 = 30_000;
 const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const LOCAL_SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
+const IDENTITY_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[allow(clippy::too_many_arguments)]
 fn generate_pending_rotation(
@@ -65,6 +68,7 @@ fn generate_pending_rotation(
         observed_wall_unix_seconds,
         observed_monotonic_ms,
         phase: SecretRotationPhase::Intent,
+        applied_generation: None,
         probe_evidence_sha256: None,
         probe_generation: None,
     })
@@ -101,12 +105,14 @@ fn pending_secret_digest(pending: &PendingSecretRotation) -> Result<[u8; 32], Ru
 fn commit_unknown_can_retry_exact(
     loaded_from_store: bool,
     pending_generation: Option<u64>,
+    applied_generation: Option<u64>,
     pending_secret_version: u64,
     current: &crate::process::CoturnSnapshot,
 ) -> bool {
     !loaded_from_store
         && pending_generation.is_some_and(|generation| generation != 0)
         && pending_generation == Some(current.generation)
+        && applied_generation == pending_generation
         && current.applied_secret_version == pending_secret_version
         && current.health == ProcessHealth::Healthy
 }
@@ -215,6 +221,129 @@ pub enum IdentityMaintenance {
     Activated { identity_epoch: u64 },
     Ready { identity_epoch: u64 },
     Renewed { identity_epoch: u64 },
+}
+
+#[derive(Clone)]
+enum IdentityNetworkOperation {
+    Enrollment(EnrollmentRequest),
+    Pickup(PickupRequest),
+    Renewal {
+        identity_epoch: u64,
+        request: RenewalRequest,
+    },
+}
+
+enum IdentityNetworkRetry {
+    Exact(IdentityNetworkOperation),
+    Renewal {
+        identity_epoch: u64,
+        renewal_id: String,
+        csr_pem: String,
+    },
+}
+
+enum IdentityNetworkCompletion {
+    Enrollment {
+        request: EnrollmentRequest,
+        result: Result<EnrollmentStatus, BackendError>,
+    },
+    Pickup {
+        request: PickupRequest,
+        result: Result<Option<NodeCertificate>, BackendError>,
+    },
+    Renewal {
+        identity_epoch: u64,
+        request: RenewalRequest,
+        result: Result<NodeCertificate, BackendError>,
+    },
+}
+
+type IdentityNetworkFuture =
+    Pin<Box<dyn Future<Output = IdentityNetworkCompletion> + Send + 'static>>;
+
+struct InFlightIdentityNetwork {
+    operation: IdentityNetworkOperation,
+    future: IdentityNetworkFuture,
+}
+
+impl InFlightIdentityNetwork {
+    fn new(backend: Arc<dyn RelayBackendPort>, operation: IdentityNetworkOperation) -> Self {
+        Self {
+            future: identity_network_future(backend, operation.clone()),
+            operation,
+        }
+    }
+}
+
+fn identity_network_future(
+    backend: Arc<dyn RelayBackendPort>,
+    operation: IdentityNetworkOperation,
+) -> IdentityNetworkFuture {
+    Box::pin(async move {
+        match operation {
+            IdentityNetworkOperation::Enrollment(request) => {
+                let result = tokio::time::timeout(
+                    IDENTITY_MAINTENANCE_TIMEOUT,
+                    backend.enroll(request.clone()),
+                )
+                .await
+                .unwrap_or(Err(BackendError::Unavailable));
+                IdentityNetworkCompletion::Enrollment { request, result }
+            }
+            IdentityNetworkOperation::Pickup(request) => {
+                let result = tokio::time::timeout(
+                    IDENTITY_MAINTENANCE_TIMEOUT,
+                    backend.pickup(request.clone()),
+                )
+                .await
+                .unwrap_or(Err(BackendError::Unavailable));
+                IdentityNetworkCompletion::Pickup { request, result }
+            }
+            IdentityNetworkOperation::Renewal {
+                identity_epoch,
+                request,
+            } => {
+                let result = tokio::time::timeout(
+                    IDENTITY_MAINTENANCE_TIMEOUT,
+                    backend.renew(request.clone()),
+                )
+                .await
+                .unwrap_or(Err(BackendError::Unavailable));
+                IdentityNetworkCompletion::Renewal {
+                    identity_epoch,
+                    request,
+                    result,
+                }
+            }
+        }
+    })
+}
+
+fn start_identity_network(
+    enrollment_backend: &Arc<dyn RelayBackendPort>,
+    slot: &Arc<SwappableRelayBackend>,
+    operation: IdentityNetworkOperation,
+) -> InFlightIdentityNetwork {
+    let backend: Arc<dyn RelayBackendPort> = match &operation {
+        IdentityNetworkOperation::Renewal { .. } => slot.clone(),
+        IdentityNetworkOperation::Enrollment(_) | IdentityNetworkOperation::Pickup(_) => {
+            enrollment_backend.clone()
+        }
+    };
+    InFlightIdentityNetwork::new(backend, operation)
+}
+
+fn renewal_in_flight_for_epoch(
+    operation: Option<&IdentityNetworkOperation>,
+    identity_epoch: u64,
+) -> bool {
+    matches!(
+        operation,
+        Some(IdentityNetworkOperation::Renewal {
+            identity_epoch: expected,
+            ..
+        }) if *expected == identity_epoch
+    )
 }
 
 pub struct IdentityLifecycle {
@@ -616,8 +745,6 @@ fn retryable_identity_maintenance_error(error: &RuntimeError) -> bool {
     matches!(
         error,
         RuntimeError::Backend(BackendError::Unavailable | BackendError::TlsInvalid)
-            | RuntimeError::IdentityIo
-            | RuntimeError::IdentityPermissions
     )
 }
 
@@ -632,12 +759,94 @@ fn active_identity_can_heartbeat<F: IdentityFsPort>(
             .is_ok()
 }
 
+enum IdentityNetworkDisposition {
+    Progress,
+    Retry(IdentityNetworkRetry),
+    PendingApproval(IdentityNetworkOperation),
+    Activated,
+    Renewed { identity_epoch: u64 },
+}
+
+fn apply_identity_network_completion<F: IdentityFsPort>(
+    lifecycle: &mut IdentityLifecycle,
+    identity: &mut CertificateState<F>,
+    completion: IdentityNetworkCompletion,
+    slot: &SwappableRelayBackend,
+    factory: &dyn RelayBackendClientFactoryPort,
+) -> Result<IdentityNetworkDisposition, RuntimeError> {
+    match completion {
+        IdentityNetworkCompletion::Enrollment { request, result } => match result {
+            Ok(status) => {
+                identity.complete_enrollment_response(&request, status)?;
+                Ok(IdentityNetworkDisposition::Progress)
+            }
+            Err(BackendError::Unavailable) => Ok(IdentityNetworkDisposition::Retry(
+                IdentityNetworkRetry::Exact(IdentityNetworkOperation::Enrollment(request)),
+            )),
+            Err(error) => Err(RuntimeError::Backend(error)),
+        },
+        IdentityNetworkCompletion::Pickup { request, result } => match result {
+            Ok(certificate) => {
+                if !identity.complete_pickup_response(&request, certificate)? {
+                    return Ok(IdentityNetworkDisposition::PendingApproval(
+                        IdentityNetworkOperation::Pickup(request),
+                    ));
+                }
+                identity.install_active_backend(factory, slot)?;
+                lifecycle.mtls_installed = true;
+                Ok(IdentityNetworkDisposition::Activated)
+            }
+            Err(BackendError::Unavailable) => Ok(IdentityNetworkDisposition::Retry(
+                IdentityNetworkRetry::Exact(IdentityNetworkOperation::Pickup(request)),
+            )),
+            Err(error) => Err(RuntimeError::Backend(error)),
+        },
+        IdentityNetworkCompletion::Renewal {
+            identity_epoch,
+            request,
+            result,
+        } => match result {
+            Ok(certificate) => {
+                identity.complete_renewal_response(identity_epoch, &request, certificate)?;
+                identity.finalize_pending_renewal_and_swap(
+                    identity_epoch,
+                    &request.renewal_id,
+                    factory,
+                    slot,
+                )?;
+                Ok(IdentityNetworkDisposition::Renewed {
+                    identity_epoch: identity.identity_epoch(),
+                })
+            }
+            Err(BackendError::Unavailable) => Ok(IdentityNetworkDisposition::Retry(
+                IdentityNetworkRetry::Renewal {
+                    identity_epoch,
+                    renewal_id: request.renewal_id,
+                    csr_pem: request.csr_pem,
+                },
+            )),
+            Err(BackendError::Conflict)
+                if identity.renewal_request_was_overtaken(identity_epoch, &request) =>
+            {
+                Ok(IdentityNetworkDisposition::Retry(
+                    IdentityNetworkRetry::Renewal {
+                        identity_epoch,
+                        renewal_id: request.renewal_id,
+                        csr_pem: request.csr_pem,
+                    },
+                ))
+            }
+            Err(error) => Err(RuntimeError::Backend(error)),
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_backend_worker<F, C, K, S, J, M>(
     lifecycle: &mut IdentityLifecycle,
     identity: &mut CertificateState<F>,
-    enrollment_backend: &dyn RelayBackendPort,
-    slot: &SwappableRelayBackend,
+    enrollment_backend: Arc<dyn RelayBackendPort>,
+    slot: Arc<SwappableRelayBackend>,
     factory: &dyn RelayBackendClientFactoryPort,
     enrollment: Option<EnrollmentRequest>,
     runtime: &mut AgentRuntime<SwappableRelayBackend, C, K, S, J>,
@@ -654,43 +863,341 @@ where
     M: MetricsPort,
 {
     let mut backend_attempt = 0u32;
+    let mut in_flight: Option<InFlightIdentityNetwork> = None;
+    let mut retry_operation: Option<IdentityNetworkRetry> = None;
+
+    runtime.validate_identity_secret_linkage(identity)?;
+    if identity.active_certificate().is_none()
+        && !identity.has_pending_enrollment()
+        && runtime.bootstrap_secret.is_none()
+    {
+        if let Some(enrollment) = enrollment.as_ref() {
+            runtime.stage_initial_secret(&enrollment.turn_rest_secret)?;
+        }
+    }
+
     loop {
-        runtime.wait_until_next_heartbeat().await;
-        let health = supervisor_health.snapshot_for_heartbeat(runtime.clock.monotonic_ms());
-        match backend_worker_once_impl(
-            lifecycle,
-            identity,
-            enrollment_backend,
-            slot,
-            factory,
-            enrollment.clone(),
-            runtime,
-            sampler,
-            health.process,
-            health.listener,
-            health.probe,
-            pressure,
-            false,
-        )
-        .await
-        {
-            Ok(IdentityMaintenance::PendingApproval) => {
-                backend_attempt = 0;
-                runtime.sleeper.sleep(Duration::from_secs(5)).await;
+        if identity.active_certificate().is_none() {
+            if in_flight.is_none() {
+                let operation = if let Some(retry) = retry_operation.take() {
+                    match retry {
+                        IdentityNetworkRetry::Exact(operation) => operation,
+                        IdentityNetworkRetry::Renewal { .. } => {
+                            return Err(RuntimeError::StateInvalid);
+                        }
+                    }
+                } else if identity.has_pending_enrollment() {
+                    IdentityNetworkOperation::Pickup(identity.prepare_pickup_request()?)
+                } else {
+                    IdentityNetworkOperation::Enrollment(identity.prepare_enrollment_request(
+                        enrollment.clone().ok_or(RuntimeError::EnrollmentMissing)?,
+                    )?)
+                };
+                in_flight = Some(start_identity_network(
+                    &enrollment_backend,
+                    &slot,
+                    operation,
+                ));
             }
-            Ok(_) => backend_attempt = 0,
-            Err(
-                RuntimeError::Backend(BackendError::Unavailable)
-                | RuntimeError::MetricsUnavailable
-                | RuntimeError::Process(_),
-            ) => {
-                let delay = runtime.backend_retry_delay(backend_attempt);
+
+            let completion = in_flight
+                .as_mut()
+                .ok_or(RuntimeError::StateInvalid)?
+                .future
+                .as_mut()
+                .await;
+            in_flight = None;
+            match apply_identity_network_completion(
+                lifecycle,
+                identity,
+                completion,
+                slot.as_ref(),
+                factory,
+            )? {
+                IdentityNetworkDisposition::Progress => {
+                    backend_attempt = 0;
+                }
+                IdentityNetworkDisposition::Retry(operation) => {
+                    retry_operation = Some(operation);
+                    let delay = runtime.backend_retry_delay(backend_attempt);
+                    backend_attempt = backend_attempt.saturating_add(1);
+                    runtime.sleeper.sleep(delay).await;
+                    tokio::task::yield_now().await;
+                }
+                IdentityNetworkDisposition::PendingApproval(operation) => {
+                    backend_attempt = 0;
+                    retry_operation = Some(IdentityNetworkRetry::Exact(operation));
+                    runtime.sleeper.sleep(Duration::from_secs(5)).await;
+                    tokio::task::yield_now().await;
+                }
+                IdentityNetworkDisposition::Activated => {
+                    backend_attempt = 0;
+                    runtime.activate_staged_initial_secret().await?;
+                }
+                IdentityNetworkDisposition::Renewed { .. } => {
+                    return Err(RuntimeError::StateInvalid);
+                }
+            }
+            continue;
+        }
+
+        identity.validate_active_certificate_at(runtime.clock.unix_seconds())?;
+        if !lifecycle.mtls_installed {
+            identity.install_active_backend(factory, slot.as_ref())?;
+            lifecycle.mtls_installed = true;
+        }
+        runtime.activate_staged_initial_secret().await?;
+
+        let completion_before_deadline = if let Some(operation) = in_flight.as_mut() {
+            tokio::select! {
+                biased;
+                completion = operation.future.as_mut() => Some(completion),
+                () = runtime.wait_until_next_heartbeat() => None,
+            }
+        } else {
+            runtime.wait_until_next_heartbeat().await;
+            None
+        };
+
+        if let Some(completion) = completion_before_deadline {
+            in_flight = None;
+            match apply_identity_network_completion(
+                lifecycle,
+                identity,
+                completion,
+                slot.as_ref(),
+                factory,
+            )? {
+                IdentityNetworkDisposition::Retry(operation) => {
+                    retry_operation = Some(operation);
+                    backend_attempt = backend_attempt.saturating_add(1);
+                }
+                IdentityNetworkDisposition::Renewed { identity_epoch } => {
+                    backend_attempt = 0;
+                    retry_operation = None;
+                    runtime.activate_identity_epoch(identity_epoch)?;
+                }
+                IdentityNetworkDisposition::Progress
+                | IdentityNetworkDisposition::PendingApproval(_)
+                | IdentityNetworkDisposition::Activated => {
+                    return Err(RuntimeError::StateInvalid);
+                }
+            }
+            continue;
+        }
+
+        if runtime.rotation_requires_reconcile_before_heartbeat() {
+            let reconciled = tokio::time::timeout(
+                LOCAL_SAMPLE_TIMEOUT,
+                runtime.advance_secret_rotation(identity),
+            )
+            .await
+            .map_err(|_| RuntimeError::Backend(BackendError::Unavailable))??;
+            if !reconciled {
+                return Err(RuntimeError::Backend(BackendError::Unavailable));
+            }
+        }
+
+        let health = supervisor_health.snapshot_for_heartbeat(runtime.clock.monotonic_ms());
+        let heartbeat_epoch = identity.identity_epoch();
+        let renewal_recovery_pending = renewal_in_flight_for_epoch(
+            in_flight.as_ref().map(|operation| &operation.operation),
+            heartbeat_epoch,
+        ) || matches!(
+            retry_operation.as_ref(),
+            Some(IdentityNetworkRetry::Renewal { identity_epoch, .. })
+                if *identity_epoch == heartbeat_epoch
+        );
+        let (heartbeat_result, completion_during_heartbeat) = {
+            let heartbeat = runtime.heartbeat_cycle_at_deadline(
+                identity,
+                sampler,
+                health.process,
+                health.listener,
+                health.probe,
+                pressure,
+            );
+            tokio::pin!(heartbeat);
+            if let Some(operation) = in_flight.as_mut() {
+                tokio::select! {
+                    biased;
+                    completion = operation.future.as_mut() => {
+                        (heartbeat.await, Some(completion))
+                    }
+                    result = &mut heartbeat => (result, None),
+                }
+            } else {
+                (heartbeat.await, None)
+            }
+        };
+
+        let heartbeat_succeeded = match heartbeat_result {
+            Ok(()) => {
+                backend_attempt = 0;
+                true
+            }
+            Err(RuntimeError::Backend(BackendError::Rejected | BackendError::Conflict))
+                if renewal_recovery_pending =>
+            {
+                // A renewal may have committed remotely even when its response
+                // was lost.  The old certificate's heartbeat then fails before
+                // the exact renewal retry can recover the cached certificate.
+                // Suppress only while that exact persisted renewal is pending;
+                // the renewal retry itself remains fail-closed.
+                false
+            }
+            Err(RuntimeError::MetricsUnavailable) => {
+                // Sampling failed before `heartbeat_once` could consume the
+                // absolute deadline. Keep attempts on the 5s cadence.
+                runtime.note_heartbeat_attempt();
                 backend_attempt = backend_attempt.saturating_add(1);
-                runtime.sleeper.sleep(delay).await;
-                tokio::task::yield_now().await;
+                false
+            }
+            Err(RuntimeError::Backend(BackendError::Unavailable) | RuntimeError::Process(_)) => {
+                backend_attempt = backend_attempt.saturating_add(1);
+                false
             }
             Err(error) => return Err(error),
+        };
+
+        if let Some(completion) = completion_during_heartbeat {
+            in_flight = None;
+            match apply_identity_network_completion(
+                lifecycle,
+                identity,
+                completion,
+                slot.as_ref(),
+                factory,
+            )? {
+                IdentityNetworkDisposition::Retry(operation) => {
+                    retry_operation = Some(operation);
+                    backend_attempt = backend_attempt.saturating_add(1);
+                }
+                IdentityNetworkDisposition::Renewed { identity_epoch } => {
+                    backend_attempt = 0;
+                    retry_operation = None;
+                    runtime.activate_identity_epoch(identity_epoch)?;
+                }
+                IdentityNetworkDisposition::Progress
+                | IdentityNetworkDisposition::PendingApproval(_)
+                | IdentityNetworkDisposition::Activated => {
+                    return Err(RuntimeError::StateInvalid);
+                }
+            }
         }
+
+        if heartbeat_succeeded {
+            match tokio::time::timeout(
+                LOCAL_SAMPLE_TIMEOUT,
+                runtime.advance_secret_rotation(identity),
+            )
+            .await
+            {
+                Ok(result) => {
+                    let _ = result?;
+                }
+                Err(_) => return Err(RuntimeError::Process(ProcessError::ProbeUnavailable)),
+            }
+        }
+
+        if runtime.has_pending_rotation()
+            && matches!(
+                in_flight.as_ref().map(|operation| &operation.operation),
+                Some(IdentityNetworkOperation::Renewal { .. })
+            )
+        {
+            // Dropping the owned future synchronously cancels its HTTP future;
+            // the persisted candidate remains available after rotation closes.
+            in_flight = None;
+            retry_operation = None;
+        }
+
+        if in_flight.is_none() && !runtime.has_pending_rotation() {
+            let operation = if let Some(retry) = retry_operation.take() {
+                match retry {
+                    IdentityNetworkRetry::Exact(operation) => Some(operation),
+                    IdentityNetworkRetry::Renewal {
+                        identity_epoch: expected_epoch,
+                        renewal_id,
+                        csr_pem,
+                    } => match identity
+                        .prepare_renewal_request(&renewal_id, runtime.clock.unix_seconds())?
+                    {
+                        RenewalPreparation::Request {
+                            identity_epoch,
+                            request,
+                        } if identity_epoch == expected_epoch && request.csr_pem == csr_pem => {
+                            Some(IdentityNetworkOperation::Renewal {
+                                identity_epoch,
+                                request,
+                            })
+                        }
+                        RenewalPreparation::Ready {
+                            identity_epoch,
+                            renewal_id,
+                        } if identity_epoch == expected_epoch => {
+                            identity.finalize_pending_renewal_and_swap(
+                                identity_epoch,
+                                &renewal_id,
+                                factory,
+                                slot.as_ref(),
+                            )?;
+                            runtime.activate_identity_epoch(identity.identity_epoch())?;
+                            None
+                        }
+                        _ => return Err(RuntimeError::RenewalConflict),
+                    },
+                }
+            } else {
+                let certificate = identity
+                    .active_certificate()
+                    .ok_or(RuntimeError::EnrollmentMissing)?;
+                let renewal_due_at = certificate.expires_at_unix_seconds.saturating_sub(
+                    i64::try_from(lifecycle.renewal_window.as_secs()).unwrap_or(i64::MAX),
+                );
+                if runtime.clock.unix_seconds() >= renewal_due_at {
+                    let renewal_id = identity
+                        .pending_renewal_id()
+                        .map(str::to_owned)
+                        .unwrap_or(generate_rotation_identifier()?);
+                    match identity
+                        .prepare_renewal_request(&renewal_id, runtime.clock.unix_seconds())?
+                    {
+                        RenewalPreparation::Request {
+                            identity_epoch,
+                            request,
+                        } => Some(IdentityNetworkOperation::Renewal {
+                            identity_epoch,
+                            request,
+                        }),
+                        RenewalPreparation::Ready {
+                            identity_epoch,
+                            renewal_id,
+                        } => {
+                            identity.finalize_pending_renewal_and_swap(
+                                identity_epoch,
+                                &renewal_id,
+                                factory,
+                                slot.as_ref(),
+                            )?;
+                            runtime.activate_identity_epoch(identity.identity_epoch())?;
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(operation) = operation {
+                in_flight = Some(start_identity_network(
+                    &enrollment_backend,
+                    &slot,
+                    operation,
+                ));
+            }
+        }
+
+        tokio::task::yield_now().await;
     }
 }
 
@@ -1008,8 +1515,8 @@ where
             run_backend_worker(
                 &mut self.lifecycle,
                 &mut self.identity,
-                self.enrollment_backend.as_ref(),
-                self.slot.as_ref(),
+                self.enrollment_backend.clone(),
+                self.slot.clone(),
                 self.factory.as_ref(),
                 self.enrollment.clone(),
                 &mut self.runtime,
@@ -1172,6 +1679,8 @@ pub struct PendingSecretRotation {
     pub observed_wall_unix_seconds: i64,
     pub observed_monotonic_ms: u64,
     pub phase: SecretRotationPhase,
+    #[serde(default)]
+    pub applied_generation: Option<u64>,
     pub probe_evidence_sha256: Option<[u8; 32]>,
     #[serde(default)]
     pub probe_generation: Option<u64>,
@@ -1193,6 +1702,7 @@ impl std::fmt::Debug for PendingSecretRotation {
             )
             .field("rotation_challenge", &"REDACTED")
             .field("phase", &self.phase)
+            .field("applied_generation", &self.applied_generation)
             .field("probe_evidence_sha256", &self.probe_evidence_sha256)
             .field("probe_generation", &self.probe_generation)
             .finish()
@@ -1570,9 +2080,28 @@ where
             return Err(RuntimeError::StateInvalid);
         }
         if let Some(pending) = state.pending_rotation.as_mut() {
+            // State written before `applied_generation` existed can recover the
+            // binding from proof evidence. It is still revalidated against the
+            // live coturn snapshot before the value is trusted.
+            if matches!(
+                pending.phase,
+                SecretRotationPhase::Probed | SecretRotationPhase::CommitUnknown
+            ) && pending.applied_generation.is_none()
+            {
+                pending.applied_generation = pending.probe_generation;
+            }
             if pending.identity_epoch != state.identity_epoch
                 || pending.secret_version <= state.secret_version
                 || pending.old_credential_deadline_unix_seconds < pending.not_before_unix_seconds
+                || pending.applied_generation == Some(0)
+                || (matches!(
+                    pending.phase,
+                    SecretRotationPhase::Intent | SecretRotationPhase::Uploaded
+                ) && pending.applied_generation.is_some())
+                || (matches!(
+                    pending.phase,
+                    SecretRotationPhase::Probed | SecretRotationPhase::CommitUnknown
+                ) && pending.applied_generation != pending.probe_generation)
                 || (matches!(
                     pending.phase,
                     SecretRotationPhase::Probed | SecretRotationPhase::CommitUnknown
@@ -1981,6 +2510,7 @@ where
                 commit_unknown_can_retry_exact(
                     false,
                     pending.probe_generation,
+                    pending.applied_generation,
                     pending.secret_version,
                     &current,
                 )
@@ -2032,6 +2562,7 @@ where
                     active_secret_version,
                 } if active_secret_version == self.secret_version => {
                     pending.phase = SecretRotationPhase::Applied;
+                    pending.applied_generation = None;
                     pending.probe_evidence_sha256 = None;
                     pending.probe_generation = None;
                     self.persist_pending_rotation(pending.clone())?;
@@ -2061,7 +2592,7 @@ where
         if !safe_window_elapsed(&pending, self.clock.as_ref()) {
             return Ok(false);
         }
-        let snapshot = self
+        let mut snapshot = self
             .coturn
             .snapshot()
             .await
@@ -2069,24 +2600,66 @@ where
         if snapshot.active_allocations != 0 {
             return Ok(false);
         }
-        if pending.phase == SecretRotationPhase::Uploaded {
-            let secret = URL_SAFE_NO_PAD
-                .decode(pending.turn_rest_secret.expose())
-                .map(SecretBytes::new)
-                .map_err(|_| RuntimeError::StateInvalid)?;
-            self.coturn
-                .apply_secret(pending.secret_version, secret)
-                .await
-                .map_err(RuntimeError::Process)?;
+        if pending.phase == SecretRotationPhase::Probed
+            && (pending.applied_generation != Some(snapshot.generation)
+                || pending.probe_generation != Some(snapshot.generation)
+                || snapshot.applied_secret_version != pending.secret_version
+                || snapshot.health != ProcessHealth::Healthy)
+        {
+            // The proof belongs to a different process/config generation. Drop
+            // it before any side effect, and force the target secret through
+            // coturn again even when the reported version number happens to
+            // match.
             pending.phase = SecretRotationPhase::Applied;
+            pending.applied_generation = None;
+            pending.probe_evidence_sha256 = None;
+            pending.probe_generation = None;
+            self.persist_pending_rotation(pending.clone())?;
+        }
+        if pending.phase == SecretRotationPhase::Uploaded {
+            pending.phase = SecretRotationPhase::Applied;
+            pending.applied_generation = None;
+            pending.probe_evidence_sha256 = None;
+            pending.probe_generation = None;
             self.persist_pending_rotation(pending.clone())?;
         }
         if pending.phase == SecretRotationPhase::Applied {
-            let before = self
-                .coturn
-                .snapshot()
-                .await
-                .map_err(RuntimeError::Process)?;
+            let needs_apply = pending.applied_generation != Some(snapshot.generation)
+                || snapshot.applied_secret_version != pending.secret_version
+                || snapshot.health != ProcessHealth::Healthy;
+            if needs_apply {
+                // Persist a replayable needs-apply state before changing coturn.
+                // A crash after apply will therefore repeat the idempotent
+                // versioned operation instead of trusting an unbound version.
+                pending.applied_generation = None;
+                pending.probe_evidence_sha256 = None;
+                pending.probe_generation = None;
+                self.persist_pending_rotation(pending.clone())?;
+
+                let secret = URL_SAFE_NO_PAD
+                    .decode(pending.turn_rest_secret.expose())
+                    .map(SecretBytes::new)
+                    .map_err(|_| RuntimeError::StateInvalid)?;
+                self.coturn
+                    .apply_secret(pending.secret_version, secret)
+                    .await
+                    .map_err(RuntimeError::Process)?;
+                snapshot = self
+                    .coturn
+                    .snapshot()
+                    .await
+                    .map_err(RuntimeError::Process)?;
+                if snapshot.generation == 0
+                    || snapshot.applied_secret_version != pending.secret_version
+                    || snapshot.health != ProcessHealth::Healthy
+                {
+                    return Err(RuntimeError::Process(ProcessError::ProbeInvalid));
+                }
+                pending.applied_generation = Some(snapshot.generation);
+                self.persist_pending_rotation(pending.clone())?;
+            }
+
+            let before = snapshot;
             let evidence = self
                 .coturn
                 .probe_local_allocation()
@@ -2101,6 +2674,7 @@ where
                 .proof_sha256()
                 .ok_or(RuntimeError::Process(ProcessError::ProbeInvalid))?;
             if before.generation == 0
+                || pending.applied_generation != Some(before.generation)
                 || after.generation != before.generation
                 || after.applied_secret_version != pending.secret_version
                 || after.health != ProcessHealth::Healthy
@@ -2117,11 +2691,13 @@ where
             .snapshot()
             .await
             .map_err(RuntimeError::Process)?;
-        if pending.probe_generation != Some(current.generation)
+        if pending.applied_generation != Some(current.generation)
+            || pending.probe_generation != Some(current.generation)
             || current.applied_secret_version != pending.secret_version
             || current.health != ProcessHealth::Healthy
         {
             pending.phase = SecretRotationPhase::Applied;
+            pending.applied_generation = None;
             pending.probe_evidence_sha256 = None;
             pending.probe_generation = None;
             self.persist_pending_rotation(pending)?;
@@ -2165,12 +2741,15 @@ where
             .map_err(RuntimeError::Process)?;
         if expected_generation.is_some_and(|generation| {
             initial.generation != generation
+                || pending.applied_generation != Some(generation)
                 || initial.applied_secret_version != pending.secret_version
                 || initial.health != ProcessHealth::Healthy
         }) {
             return Err(RuntimeError::Process(ProcessError::ProbeInvalid));
         }
-        if initial.applied_secret_version != pending.secret_version {
+        if pending.applied_generation != Some(initial.generation)
+            || initial.applied_secret_version != pending.secret_version
+        {
             let secret = URL_SAFE_NO_PAD
                 .decode(pending.turn_rest_secret.expose())
                 .map(SecretBytes::new)
@@ -2325,9 +2904,10 @@ mod identifier_tests {
     };
 
     use super::{
-        commit_unknown_can_retry_exact, generate_rotation_identifier_with, AgentRuntime, ClockPort,
-        JitterPort, ProcessHealth, RuntimeError, RuntimeStateSnapshot, RuntimeStateStorePort,
-        SleeperPort,
+        commit_unknown_can_retry_exact, generate_pending_rotation,
+        generate_rotation_identifier_with, AgentRuntime, ClockPort, JitterPort,
+        PendingSecretRotation, ProcessHealth, RuntimeError, RuntimeStateSnapshot,
+        RuntimeStateStorePort, SecretRotationPhase, SleeperPort,
     };
     use crate::{
         backend::{
@@ -2372,11 +2952,37 @@ mod identifier_tests {
     #[test]
     fn commit_unknown_only_retries_exact_body_in_the_same_live_process_generation() {
         let current = CoturnSnapshot::healthy(0, 0).with_generation(7, 2);
-        assert!(commit_unknown_can_retry_exact(false, Some(7), 2, &current));
-        assert!(!commit_unknown_can_retry_exact(true, Some(7), 2, &current));
-        assert!(!commit_unknown_can_retry_exact(false, Some(8), 2, &current));
+        assert!(commit_unknown_can_retry_exact(
+            false,
+            Some(7),
+            Some(7),
+            2,
+            &current
+        ));
+        assert!(!commit_unknown_can_retry_exact(
+            true,
+            Some(7),
+            Some(7),
+            2,
+            &current
+        ));
         assert!(!commit_unknown_can_retry_exact(
             false,
+            Some(8),
+            Some(8),
+            2,
+            &current
+        ));
+        assert!(!commit_unknown_can_retry_exact(
+            false,
+            Some(7),
+            Some(8),
+            2,
+            &current
+        ));
+        assert!(!commit_unknown_can_retry_exact(
+            false,
+            Some(7),
             Some(7),
             2,
             &CoturnSnapshot {
@@ -2386,6 +2992,7 @@ mod identifier_tests {
         ));
         assert!(!commit_unknown_can_retry_exact(
             false,
+            Some(7),
             Some(7),
             2,
             &CoturnSnapshot {
@@ -2413,10 +3020,12 @@ mod identifier_tests {
         }
     }
 
+    #[derive(Default)]
     struct TestBackend {
         commits: Mutex<Vec<SecretCommitRequest>>,
         statuses: Mutex<Vec<SecretRotationStatusRequest>>,
         commit_results: Mutex<VecDeque<Result<(), BackendError>>>,
+        status_results: Mutex<VecDeque<Result<SecretRotationStatus, BackendError>>>,
     }
 
     #[async_trait]
@@ -2464,13 +3073,19 @@ mod identifier_tests {
             request: SecretRotationStatusRequest,
         ) -> Result<SecretRotationStatus, BackendError> {
             self.statuses.lock().unwrap().push(request);
-            Err(BackendError::ProtocolInvalid)
+            self.status_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err(BackendError::ProtocolInvalid))
         }
     }
 
+    #[derive(Default)]
     struct TestCoturn {
         snapshots: Mutex<VecDeque<CoturnSnapshot>>,
         probes: Mutex<VecDeque<AllocationProbeEvidence>>,
+        applied_secret_versions: Mutex<Vec<u64>>,
     }
 
     #[async_trait]
@@ -2489,9 +3104,10 @@ mod identifier_tests {
 
         async fn apply_secret(
             &self,
-            _version: u64,
+            version: u64,
             _secret: SecretBytes,
         ) -> Result<(), ProcessError> {
+            self.applied_secret_versions.lock().unwrap().push(version);
             Ok(())
         }
 
@@ -2562,12 +3178,246 @@ mod identifier_tests {
         params.self_signed(&key).unwrap().pem()
     }
 
+    fn persisted_rotation(phase: SecretRotationPhase) -> PendingSecretRotation {
+        let mut pending = generate_pending_rotation(
+            1,
+            1,
+            2,
+            1_800_000_000,
+            1_800_000_000,
+            "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI".into(),
+            1_800_000_000,
+            1_800_000_000_000,
+        )
+        .unwrap();
+        pending.phase = phase;
+        if matches!(
+            phase,
+            SecretRotationPhase::Probed | SecretRotationPhase::CommitUnknown
+        ) {
+            pending.probe_evidence_sha256 = Some([0x33; 32]);
+            pending.probe_generation = Some(7);
+        }
+        pending
+    }
+
+    fn persisted_rotation_state(phase: SecretRotationPhase) -> RuntimeStateSnapshot {
+        RuntimeStateSnapshot {
+            identity_epoch: 1,
+            last_directive_sequence: 1,
+            secret_version: 1,
+            secret_digest: Some([1; 32]),
+            draining: true,
+            pending_rotation: Some(persisted_rotation(phase)),
+            ..RuntimeStateSnapshot::default()
+        }
+    }
+
+    fn test_identity(clock: Arc<TestClock>) -> CertificateState<TestIdentityFs> {
+        CertificateState::new(
+            Arc::new(TestIdentityFs::default()),
+            "relay-hkg-1",
+            &test_ca_pem(),
+            clock,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn persisted_probed_rotation_reapplies_on_generation_change_before_commit() {
+        let backend = Arc::new(TestBackend::default());
+        let generation_eight = CoturnSnapshot::healthy(0, 0).with_generation(8, 2);
+        let generation_nine = CoturnSnapshot::healthy(0, 0).with_generation(9, 2);
+        let coturn = Arc::new(TestCoturn {
+            snapshots: Mutex::new(VecDeque::from([
+                generation_eight,
+                generation_nine.clone(),
+                generation_nine.clone(),
+                generation_nine,
+            ])),
+            probes: Mutex::new(VecDeque::from([AllocationProbeEvidence::Live(
+                LiveAllocationEvidence::from_verified_roundtrip([0x55; 32]),
+            )])),
+            ..TestCoturn::default()
+        });
+        let state_store = Arc::new(TestStateStore(Mutex::new(persisted_rotation_state(
+            SecretRotationPhase::Probed,
+        ))));
+        let clock = Arc::new(TestClock);
+        let mut runtime = AgentRuntime::new_with_state_store(
+            backend.clone(),
+            coturn.clone(),
+            clock.clone(),
+            Arc::new(TestSleeper),
+            Arc::new(TestJitter),
+            state_store.clone(),
+        )
+        .unwrap();
+        let mut identity = test_identity(clock);
+
+        assert!(runtime
+            .advance_secret_rotation(&mut identity)
+            .await
+            .unwrap());
+        assert_eq!(*coturn.applied_secret_versions.lock().unwrap(), vec![2]);
+        assert_eq!(coturn.probes.lock().unwrap().len(), 0);
+        assert_eq!(backend.commits.lock().unwrap().len(), 1);
+        let persisted = state_store.0.lock().unwrap();
+        assert_eq!(persisted.secret_version, 2);
+        assert!(persisted.pending_rotation.is_none());
+    }
+
+    #[tokio::test]
+    async fn persisted_commit_unknown_committed_exact_reapplies_in_current_generation() {
+        let backend = Arc::new(TestBackend {
+            status_results: Mutex::new(VecDeque::from([Ok(
+                SecretRotationStatus::CommittedExact {
+                    active_secret_version: 2,
+                },
+            )])),
+            ..TestBackend::default()
+        });
+        let generation_eight = CoturnSnapshot::healthy(0, 0).with_generation(8, 2);
+        let generation_nine = CoturnSnapshot::healthy(0, 0).with_generation(9, 2);
+        let coturn = Arc::new(TestCoturn {
+            snapshots: Mutex::new(VecDeque::from([
+                generation_eight,
+                generation_nine.clone(),
+                generation_nine,
+            ])),
+            probes: Mutex::new(VecDeque::from([AllocationProbeEvidence::Live(
+                LiveAllocationEvidence::from_verified_roundtrip([0x66; 32]),
+            )])),
+            ..TestCoturn::default()
+        });
+        let state_store = Arc::new(TestStateStore(Mutex::new(persisted_rotation_state(
+            SecretRotationPhase::CommitUnknown,
+        ))));
+        let clock = Arc::new(TestClock);
+        let mut runtime = AgentRuntime::new_with_state_store(
+            backend.clone(),
+            coturn.clone(),
+            clock.clone(),
+            Arc::new(TestSleeper),
+            Arc::new(TestJitter),
+            state_store.clone(),
+        )
+        .unwrap();
+        let mut identity = test_identity(clock);
+
+        assert!(runtime
+            .advance_secret_rotation(&mut identity)
+            .await
+            .unwrap());
+        assert_eq!(backend.statuses.lock().unwrap().len(), 1);
+        assert!(backend.commits.lock().unwrap().is_empty());
+        assert_eq!(*coturn.applied_secret_versions.lock().unwrap(), vec![2]);
+        assert_eq!(coturn.probes.lock().unwrap().len(), 0);
+        let persisted = state_store.0.lock().unwrap();
+        assert_eq!(persisted.secret_version, 2);
+        assert!(persisted.pending_rotation.is_none());
+    }
+
+    #[tokio::test]
+    async fn persisted_commit_unknown_pending_status_returns_to_apply_before_new_commit() {
+        let backend = Arc::new(TestBackend {
+            status_results: Mutex::new(VecDeque::from([Ok(SecretRotationStatus::Pending {
+                active_secret_version: 1,
+            })])),
+            ..TestBackend::default()
+        });
+        let generation_eight = CoturnSnapshot::healthy(0, 0).with_generation(8, 2);
+        let generation_nine = CoturnSnapshot::healthy(0, 0).with_generation(9, 2);
+        let coturn = Arc::new(TestCoturn {
+            snapshots: Mutex::new(VecDeque::from([
+                generation_eight,
+                generation_nine.clone(),
+                generation_nine.clone(),
+                generation_nine,
+            ])),
+            probes: Mutex::new(VecDeque::from([AllocationProbeEvidence::Live(
+                LiveAllocationEvidence::from_verified_roundtrip([0x77; 32]),
+            )])),
+            ..TestCoturn::default()
+        });
+        let state_store = Arc::new(TestStateStore(Mutex::new(persisted_rotation_state(
+            SecretRotationPhase::CommitUnknown,
+        ))));
+        let clock = Arc::new(TestClock);
+        let mut runtime = AgentRuntime::new_with_state_store(
+            backend.clone(),
+            coturn.clone(),
+            clock.clone(),
+            Arc::new(TestSleeper),
+            Arc::new(TestJitter),
+            state_store.clone(),
+        )
+        .unwrap();
+        let mut identity = test_identity(clock);
+
+        assert!(runtime
+            .advance_secret_rotation(&mut identity)
+            .await
+            .unwrap());
+        assert_eq!(backend.statuses.lock().unwrap().len(), 1);
+        assert_eq!(backend.commits.lock().unwrap().len(), 1);
+        assert_eq!(*coturn.applied_secret_versions.lock().unwrap(), vec![2]);
+        assert_eq!(coturn.probes.lock().unwrap().len(), 0);
+        let persisted = state_store.0.lock().unwrap();
+        assert_eq!(persisted.secret_version, 2);
+        assert!(persisted.pending_rotation.is_none());
+    }
+
+    #[tokio::test]
+    async fn persisted_applied_rotation_non_evidence_never_commits_after_reapply() {
+        let backend = Arc::new(TestBackend::default());
+        let generation_eight = CoturnSnapshot::healthy(0, 0).with_generation(8, 2);
+        let generation_nine = CoturnSnapshot::healthy(0, 0).with_generation(9, 2);
+        let coturn = Arc::new(TestCoturn {
+            snapshots: Mutex::new(VecDeque::from([
+                generation_eight,
+                generation_nine.clone(),
+                generation_nine,
+            ])),
+            probes: Mutex::new(VecDeque::from([AllocationProbeEvidence::NonEvidence])),
+            ..TestCoturn::default()
+        });
+        let state_store = Arc::new(TestStateStore(Mutex::new(persisted_rotation_state(
+            SecretRotationPhase::Applied,
+        ))));
+        let clock = Arc::new(TestClock);
+        let mut runtime = AgentRuntime::new_with_state_store(
+            backend.clone(),
+            coturn.clone(),
+            clock.clone(),
+            Arc::new(TestSleeper),
+            Arc::new(TestJitter),
+            state_store.clone(),
+        )
+        .unwrap();
+        let mut identity = test_identity(clock);
+
+        assert_eq!(
+            runtime.advance_secret_rotation(&mut identity).await,
+            Err(RuntimeError::Process(ProcessError::ProbeInvalid))
+        );
+        assert_eq!(*coturn.applied_secret_versions.lock().unwrap(), vec![2]);
+        assert!(backend.commits.lock().unwrap().is_empty());
+        let persisted = state_store.0.lock().unwrap();
+        assert_eq!(persisted.secret_version, 1);
+        assert_eq!(
+            persisted.pending_rotation.as_ref().unwrap().phase,
+            SecretRotationPhase::Applied
+        );
+    }
+
     #[tokio::test]
     async fn same_generation_commit_unknown_freshly_probes_then_retries_exact_persisted_proof() {
         let backend = Arc::new(TestBackend {
             commits: Mutex::new(Vec::new()),
             statuses: Mutex::new(Vec::new()),
             commit_results: Mutex::new(VecDeque::from([Err(BackendError::Unavailable), Ok(())])),
+            status_results: Mutex::new(VecDeque::new()),
         });
         let generation_one = CoturnSnapshot::healthy(0, 0).with_generation(7, 1);
         let generation_two = CoturnSnapshot::healthy(0, 0).with_generation(7, 2);
@@ -2590,6 +3440,7 @@ mod identifier_tests {
                     [0x22; 32],
                 )),
             ])),
+            applied_secret_versions: Mutex::new(Vec::new()),
         });
         let state_store = Arc::new(TestStateStore(Mutex::new(RuntimeStateSnapshot {
             identity_epoch: 1,
