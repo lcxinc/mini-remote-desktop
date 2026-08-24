@@ -20,15 +20,20 @@ HTTPS is rejected unless a future interface supplies a separate pinned CA, so
 metrics cannot silently re-enable the platform trust store. Sensitive
 responses, including heartbeat directives, require both
 `Cache-Control: private, no-store` and `Pragma: no-cache` before their bodies
-are accepted.
+are accepted. Renewal error bodies cross the same bounded, no-store boundary
+before strict decoding. Only a stable `relay_heartbeat_replayed` 409 is a
+sequence-replay candidate; every other well-formed renewal 409 is rejected and
+a malformed error body is protocol-invalid.
 
 All signed `RelayRegistry` PostgreSQL node mutations acquire the same per-node
 transaction advisory lock and then issue a fresh `SELECT ... FOR UPDATE` that
 refreshes the ORM identity map. Authentication performed before the lock is
 only preliminary; fingerprint, identity epoch, sequence, directive and
 rotation state are checked again from the locked row. Heartbeat sequence is
-monotonic under every signed mutation and rotation upload/commit auditing is
-exactly once.
+monotonic under every signed mutation. Rotation status does not change the
+rotation outcome, audit history, or business timestamp, but it does consume
+and persist its authentication sequence under that same lock. Rotation
+upload/commit auditing is exactly once.
 
 ## Portable runtime and crash recovery
 
@@ -49,11 +54,14 @@ request is detached with `spawn`. Identity, permission, certificate and
 persisted-state errors propagate through the agent's `try_join`, which drops
 the in-flight request and cancels coturn supervision; transient network errors
 leave both the exact heartbeat cadence and coturn supervision running.
-If a renewal committed remotely but its response was lost, the old
-certificate's rejected heartbeat is suppressed only while the same-epoch exact
-renewal retry is pending; the retry then retrieves the cached certificate with
-the same renewal id and CSR but a fresh sequence. A rejection from the renewal
-request itself remains fatal unless it is a proven overtaken HTTP 409 conflict.
+If a renewal committed remotely but its response was lost, only the old
+certificate heartbeat's 401 authorization failure is suppressed while the
+same-epoch exact renewal retry is pending; a 403 revocation or any other
+rejection still stops the agent. The retry then retrieves the cached
+certificate with the same renewal id and CSR but a fresh sequence. A 401 from
+the renewal request itself remains fatal. A renewal 409 is recoverable only
+when both its stable reason is `relay_heartbeat_replayed` and the local
+heartbeat watermark proves that exact request sequence was overtaken.
 
 The active certificate identity epoch is authoritative on restart. Equal
 epochs are a no-op. An exact `N -> N+1` crash-window may clear the old sequence
@@ -70,7 +78,9 @@ Persisted probe evidence is never sufficient to start a pending commit. For an
 unknown response in the same coturn generation, a fresh validation probe is
 required but the agent retries the byte-identical persisted commit proof/body
 so the server can recognize the transaction exactly. If the generation
-changed, the agent first sends a signed, read-only rotation-status request.
+changed, the agent first sends a signed rotation-status request. It is
+read-only with respect to the rotation result, but consumes the signed request
+sequence as an authentication watermark; a replay of that sequence is 409.
 `CommittedExact` establishes the server transaction outcome, but the agent
 still reapplies the target secret when necessary and requires a fresh Live
 allocation roundtrip in the current coturn generation before it finalizes the
@@ -127,16 +137,23 @@ mutations (the backfill stays inside its existing `DO`), steady-state migration
 is read-only, and v7 and generic-upgrade failures roll back schema, data and
 ledger together.
 
-Rotation forces desired drain until atomic commit. A failed or non-evidence
-heartbeat cannot erase the desired drain, and admin resume is rejected while a
-rotation is pending. Probe health has one shared vocabulary; non-live states do
-not renew a healthy lease or cause an unbounded restart loop.
+`desired_draining` is durable administrator provenance. Rotation safety drain
+is derived from the locked transaction fields, and effective drain is their
+union. Thus a pure rotation directs `draining=true` before commit and returns
+to unavailable after commit without manufacturing administrator intent. An
+administrator drain set before or during rotation survives commit as
+`desired_draining=true` and `state='draining'` until explicit resume. A failed
+or non-evidence heartbeat cannot erase effective drain, and admin resume is
+rejected while a rotation is pending. Probe health has one shared vocabulary;
+non-live states do not renew a healthy lease or cause an unbounded restart
+loop.
 
 Certificate renewal reads the freshly locked row. New renewals fail closed
 before certificate issuance whenever a rotation intent, pending upload,
 challenge, or credential transition window exists. A pure administrator drain
 is preserved as desired drain and `draining` state across the new identity
 epoch; an ordinary renewal starts unavailable. An exact cached lost-response
-retry may return the already-issued certificate while advancing only the
-previous-epoch replay watermark, never current sequence, drain/rotation state,
-or audit history.
+retry is available only to the previous identity and may return the
+already-issued certificate while advancing only the previous-epoch replay
+watermark, never current sequence, drain/rotation state, or audit history. The
+current identity receives 409 even when renewal id and CSR match exactly.

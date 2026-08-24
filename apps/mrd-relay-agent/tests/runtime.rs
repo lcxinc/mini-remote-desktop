@@ -384,6 +384,7 @@ struct LostResponseRenewBackend {
     heartbeats: Mutex<Vec<(u64, u64, u64)>>,
     clock: Arc<TokioTestClock>,
     committed_certificate: Mutex<Option<NodeCertificate>>,
+    old_identity_heartbeat_error: BackendError,
 }
 
 #[async_trait]
@@ -497,7 +498,7 @@ impl RelayBackendPort for LostResponseRenewBackend {
             heartbeat.sequence,
         ));
         if self.committed_certificate.lock().unwrap().is_some() && heartbeat.identity_epoch == 1 {
-            return Err(BackendError::Rejected);
+            return Err(self.old_identity_heartbeat_error.clone());
         }
         Ok(directive_for_heartbeat(&heartbeat))
     }
@@ -3257,8 +3258,12 @@ async fn repeated_503_renewal_uses_fresh_sequences_without_shifting_heartbeat_de
     );
 }
 
-#[tokio::test(start_paused = true)]
-async fn lost_renewal_response_recovers_after_old_certificate_heartbeat_is_rejected() {
+async fn spawn_lost_response_renewal_agent(
+    old_identity_heartbeat_error: BackendError,
+) -> (
+    Arc<LostResponseRenewBackend>,
+    tokio::task::JoinHandle<Result<(), RuntimeError>>,
+) {
     let issuer = Arc::new(TestCertificateAuthority::new());
     let clock = Arc::new(TokioTestClock::new(CERT_NOW_UNIX_SECONDS));
     let backend = Arc::new(LostResponseRenewBackend {
@@ -3268,6 +3273,7 @@ async fn lost_renewal_response_recovers_after_old_certificate_heartbeat_is_rejec
         heartbeats: Mutex::default(),
         clock: clock.clone(),
         committed_certificate: Mutex::default(),
+        old_identity_heartbeat_error,
     });
     let fs = Arc::new(MemoryIdentityFs::default());
     let mut identity =
@@ -3313,7 +3319,12 @@ async fn lost_renewal_response_recovers_after_old_certificate_heartbeat_is_rejec
         renewal_window: Duration::from_secs(86_400),
         backend_backoff_cap: Duration::from_secs(1),
     };
-    let task = tokio::spawn(run_agent(dependencies, config));
+    (backend, tokio::spawn(run_agent(dependencies, config)))
+}
+
+#[tokio::test(start_paused = true)]
+async fn lost_renewal_response_recovers_after_old_certificate_heartbeat_is_unauthorized() {
+    let (backend, task) = spawn_lost_response_renewal_agent(BackendError::Unauthorized).await;
 
     for _ in 0..300 {
         if !backend.heartbeats.lock().unwrap().is_empty()
@@ -3365,6 +3376,40 @@ async fn lost_renewal_response_recovers_after_old_certificate_heartbeat_is_rejec
     }
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test(start_paused = true)]
+async fn revoked_rejection_during_pending_renewal_stops_before_exact_retry() {
+    let (backend, task) = spawn_lost_response_renewal_agent(BackendError::Rejected).await;
+
+    for _ in 0..300 {
+        if !backend.heartbeats.lock().unwrap().is_empty()
+            && !backend.renewals.lock().unwrap().is_empty()
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(*backend.heartbeats.lock().unwrap(), vec![(0, 1, 1)]);
+    assert_eq!(backend.renewals.lock().unwrap().len(), 1);
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    for _ in 0..300 {
+        if task.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    if !task.is_finished() {
+        task.abort();
+        let _ = task.await;
+        panic!("revoked heartbeat was incorrectly treated as lost-renewal evidence");
+    }
+    assert_eq!(
+        task.await.unwrap(),
+        Err(RuntimeError::Backend(BackendError::Rejected))
+    );
+    assert_eq!(backend.renewals.lock().unwrap().len(), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -3555,7 +3600,7 @@ async fn spawn_interleaved_renewal_agent(
 }
 
 #[tokio::test(start_paused = true)]
-async fn overtaken_non_conflict_rejection_remains_fatal() {
+async fn overtaken_renewal_conflict_rejection_remains_fatal() {
     let (backend, task) = spawn_interleaved_renewal_agent(BackendError::Rejected).await;
 
     for _ in 0..300 {
@@ -3569,11 +3614,34 @@ async fn overtaken_non_conflict_rejection_remains_fatal() {
     if !task.is_finished() {
         task.abort();
         let _ = task.await;
-        panic!("non-conflict rejection was incorrectly treated as a recoverable 409");
+        panic!("renewal conflict was incorrectly treated as a recoverable sequence replay");
     }
     assert_eq!(
         task.await.unwrap(),
         Err(RuntimeError::Backend(BackendError::Rejected))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn overtaken_renewal_unauthorized_remains_fatal() {
+    let (backend, task) = spawn_interleaved_renewal_agent(BackendError::Unauthorized).await;
+
+    for _ in 0..300 {
+        if task.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(backend.heartbeats.lock().unwrap().len(), 2);
+    assert_eq!(backend.renewals.lock().unwrap().len(), 1);
+    if !task.is_finished() {
+        task.abort();
+        let _ = task.await;
+        panic!("renewal authorization failure was incorrectly retried");
+    }
+    assert_eq!(
+        task.await.unwrap(),
+        Err(RuntimeError::Backend(BackendError::Unauthorized))
     );
 }
 

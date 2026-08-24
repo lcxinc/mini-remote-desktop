@@ -64,6 +64,7 @@ from app.services.relay_registry import (
     RelayIdentity,
     RelayRegistry,
     RelayRegistryError,
+    relay_effective_draining,
 )
 from app.services.relay_directory import RelayAccessError, RelayAccessService
 from app.services.relay_repository import AesGcmRelaySecretCipher, RelayRepository
@@ -572,7 +573,7 @@ async def record_relay_heartbeat(
         state=node.state,
         sequence=node.heartbeat_sequence,
         desired={
-            "draining": node.desired_draining,
+            "draining": relay_effective_draining(node),
             "secret_version": node.desired_secret_version,
             "not_before": node.secret_not_before,
             "old_credential_deadline": node.old_credential_deadline,
@@ -665,7 +666,7 @@ async def rotate_relay_secret(
         node_id=node.node_id,
         identity_epoch=node.identity_epoch,
         secret_version=node.desired_secret_version,
-        draining=True,
+        draining=relay_effective_draining(node),
         not_before=node.secret_not_before,
         old_credential_deadline=node.old_credential_deadline,
         rotation_challenge=node.rotation_challenge,
@@ -751,12 +752,14 @@ async def commit_relay_secret(
 async def get_relay_secret_rotation_status(
     node_id: str,
     payload: RelaySecretRotationStatusRequest,
+    request: Request,
     identity: RelayIdentity = Depends(get_verified_relay_node),
     db: AsyncSession = Depends(get_db),
 ) -> RelaySecretRotationStatusResponse:
     try:
         result = await _registry(db).secret_rotation_status(
             identity=identity,
+            sequence=request.state.relay_sequence,
             identity_epoch=payload.identity_epoch,
             rotation_id=payload.rotation_id,
             secret_version=payload.secret_version,
@@ -765,6 +768,7 @@ async def get_relay_secret_rotation_status(
             proof_mac=payload.proof_mac,
             now=_now(),
         )
+        await _commit(db)
     except RelayRegistryError as error:
         _raise_domain(error)
     return RelaySecretRotationStatusResponse(**result.__dict__)

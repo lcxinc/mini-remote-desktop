@@ -958,6 +958,13 @@ def test_node_generated_secret_rotation_is_authenticated_encrypted_and_atomic(
     challenge = directive["rotation_challenge"]
     assert len(challenge) == 43
     assert "turn_rest_secret" not in requested.text
+    with Session(engine) as session:
+        requested_node = session.get(RelayNode, NODE_ID)
+        assert requested_node is not None
+        # Rotation drain is derived from the in-flight transaction.  The
+        # persisted desired bit is reserved for an administrator's intent.
+        assert requested_node.desired_draining is False
+        assert requested_node.state == "draining"
     repeated_request = client.post(
         f"/api/v1/relays/{NODE_ID}/rotate-secret",
         json={"credential_ttl_seconds": 60},
@@ -1150,6 +1157,8 @@ def test_node_generated_secret_rotation_is_authenticated_encrypted_and_atomic(
         assert node is not None
         assert node.active_secret_version == 2
         assert node.applied_secret_version == 2
+        assert node.desired_draining is False
+        assert node.state == "unavailable"
         assert node.pending_encrypted_turn_secret is None
         assert node.rotation_challenge is None
         assert node.committed_rotation_challenge == challenge
@@ -1206,6 +1215,126 @@ def test_admin_drain_and_resume_persist_desired_state_and_audit_idempotently(
         assert len(resume_audits) == 1
 
 
+@pytest.mark.parametrize("drain_timing", ["before", "during"])
+def test_admin_drain_intent_survives_rotation_commit_until_explicit_resume(
+    api: tuple[TestClient, object],
+    drain_timing: str,
+) -> None:
+    from app.models.relay_node import RelayNode
+    from app.services.relay_registry import rotation_proof_message
+
+    client, engine = api
+    key, _ = _enroll(client)
+    _, fingerprint = _approve(client)
+
+    if drain_timing == "before":
+        drained = client.post(f"/api/v1/relays/{NODE_ID}/drain")
+        assert drained.status_code == 200, drained.text
+
+    requested = client.post(
+        f"/api/v1/relays/{NODE_ID}/rotate-secret",
+        json={"credential_ttl_seconds": 60},
+    )
+    assert requested.status_code == 202, requested.text
+    directive = requested.json()
+    assert directive["draining"] is True
+
+    if drain_timing == "during":
+        with Session(engine) as session:
+            rotation_only = session.get(RelayNode, NODE_ID)
+            assert rotation_only is not None
+            assert rotation_only.desired_draining is False
+            assert rotation_only.state == "draining"
+        drained = client.post(f"/api/v1/relays/{NODE_ID}/drain")
+        assert drained.status_code == 200, drained.text
+
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        assert node.desired_draining is True
+        assert node.state == "draining"
+        node.old_credential_deadline = datetime.now(UTC) - timedelta(seconds=1)
+        session.commit()
+
+    # Administrators cannot resume away the transaction's effective drain.
+    resume_during_rotation = client.post(f"/api/v1/relays/{NODE_ID}/resume")
+    assert resume_during_rotation.status_code == 409
+    assert _error_code(resume_during_rotation) == "relay_secret_rotation_conflict"
+
+    rotation_id = f"admin-{drain_timing}-rotation"
+    new_secret = base64.urlsafe_b64encode(
+        hashlib.sha256(rotation_id.encode("ascii")).digest()
+    ).rstrip(b"=").decode("ascii")
+    upload_path = f"/api/v1/relays/{NODE_ID}/secret-rotation/upload"
+    upload_payload = {
+        "identity_epoch": 1,
+        "rotation_id": rotation_id,
+        "secret_version": directive["secret_version"],
+        "turn_rest_secret": new_secret,
+    }
+    upload_body, upload_headers = _heartbeat_request(
+        key,
+        fingerprint,
+        sequence=1,
+        path=upload_path,
+        payload=upload_payload,
+        replace_payload=True,
+    )
+    uploaded = client.post(upload_path, content=upload_body, headers=upload_headers)
+    assert uploaded.status_code == 202, uploaded.text
+
+    pending_digest = hashlib.sha256(
+        base64.urlsafe_b64decode(new_secret + "=")
+    ).digest()
+    evidence = hashlib.sha256(f"{rotation_id}-probe".encode("ascii")).digest()
+    commit_payload = {
+        "identity_epoch": 1,
+        "rotation_id": rotation_id,
+        "secret_version": directive["secret_version"],
+        "rotation_challenge": directive["rotation_challenge"],
+        "probe_evidence_sha256": evidence.hex(),
+        "proof_mac": "",
+    }
+    proof_message = rotation_proof_message(
+        node_id=NODE_ID,
+        identity_epoch=1,
+        rotation_id=rotation_id,
+        secret_version=directive["secret_version"],
+        rotation_challenge=directive["rotation_challenge"],
+        pending_secret_digest=pending_digest,
+        probe_evidence_sha256=evidence,
+    )
+    commit_payload["proof_mac"] = hmac.new(
+        new_secret.encode("ascii"), proof_message, hashlib.sha256
+    ).hexdigest()
+    commit_path = f"/api/v1/relays/{NODE_ID}/secret-rotation/commit"
+    commit_body, commit_headers = _heartbeat_request(
+        key,
+        fingerprint,
+        sequence=2,
+        path=commit_path,
+        payload=commit_payload,
+        replace_payload=True,
+    )
+    committed = client.post(commit_path, content=commit_body, headers=commit_headers)
+    assert committed.status_code == 200, committed.text
+
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        assert node.active_secret_version == directive["secret_version"]
+        assert node.desired_draining is True
+        assert node.state == "draining"
+
+    resumed = client.post(f"/api/v1/relays/{NODE_ID}/resume")
+    assert resumed.status_code == 200, resumed.text
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        assert node.desired_draining is False
+        assert node.state == "unavailable"
+
+
 def test_non_evidence_heartbeat_keeps_rotation_drain_and_resume_is_rejected(
     api: tuple[TestClient, object],
 ) -> None:
@@ -1243,7 +1372,7 @@ def test_non_evidence_heartbeat_keeps_rotation_drain_and_resume_is_rejected(
     with Session(engine) as session:
         node = session.get(RelayNode, NODE_ID)
         assert node is not None
-        assert node.desired_draining is True
+        assert node.desired_draining is False
         assert node.state == "unavailable"
 
     resume = client.post(f"/api/v1/relays/{NODE_ID}/resume")
@@ -1316,7 +1445,7 @@ def test_non_evidence_heartbeat_keeps_rotation_drain_and_resume_is_rejected(
     assert committed.json()["active_secret_version"] == directive["secret_version"]
 
 
-def test_signed_rotation_status_is_exact_and_does_not_consume_request_sequence(
+def test_signed_rotation_status_consumes_only_the_request_sequence(
     api: tuple[TestClient, object],
 ) -> None:
     from app.models.relay_audit_event import RelayAuditEvent
@@ -1387,6 +1516,26 @@ def test_signed_rotation_status_is_exact_and_does_not_consume_request_sequence(
         payload=status_payload,
         replace_payload=True,
     )
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        business_before_status = {
+            column.name: getattr(node, column.name)
+            for column in RelayNode.__table__.columns
+            if column.name != "heartbeat_sequence"
+        }
+        audits_before_status = sorted(
+            (
+                event.id,
+                event.action,
+                event.actor_id,
+                event.details,
+                event.created_at,
+            )
+            for event in session.scalars(
+                select(RelayAuditEvent).where(RelayAuditEvent.node_id == NODE_ID)
+            ).all()
+        )
     pending = client.post(status_path, content=status_body, headers=status_headers)
     assert pending.status_code == 200, pending.text
     assert pending.json()["status"] == "pending"
@@ -1394,7 +1543,53 @@ def test_signed_rotation_status_is_exact_and_does_not_consume_request_sequence(
     with Session(engine) as session:
         node = session.get(RelayNode, NODE_ID)
         assert node is not None
-        assert node.heartbeat_sequence == 1
+        assert node.heartbeat_sequence == 2
+        business_after_status = {
+            column.name: getattr(node, column.name)
+            for column in RelayNode.__table__.columns
+            if column.name != "heartbeat_sequence"
+        }
+        assert business_after_status == business_before_status
+        audits_after_status = sorted(
+            (
+                event.id,
+                event.action,
+                event.actor_id,
+                event.details,
+                event.created_at,
+            )
+            for event in session.scalars(
+                select(RelayAuditEvent).where(RelayAuditEvent.node_id == NODE_ID)
+            ).all()
+        )
+        assert audits_after_status == audits_before_status
+
+    replay = client.post(status_path, content=status_body, headers=status_headers)
+    assert replay.status_code == 409, replay.text
+    assert _error_code(replay) == "relay_heartbeat_replayed"
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        assert node.heartbeat_sequence == 2
+        replay_business_state = {
+            column.name: getattr(node, column.name)
+            for column in RelayNode.__table__.columns
+            if column.name != "heartbeat_sequence"
+        }
+        assert replay_business_state == business_before_status
+        replay_audits = sorted(
+            (
+                event.id,
+                event.action,
+                event.actor_id,
+                event.details,
+                event.created_at,
+            )
+            for event in session.scalars(
+                select(RelayAuditEvent).where(RelayAuditEvent.node_id == NODE_ID)
+            ).all()
+        )
+        assert replay_audits == audits_before_status
         node.old_credential_deadline = datetime.now(UTC) - timedelta(seconds=1)
         session.commit()
 
@@ -1402,7 +1597,7 @@ def test_signed_rotation_status_is_exact_and_does_not_consume_request_sequence(
     commit_body, commit_headers = _heartbeat_request(
         key,
         fingerprint,
-        sequence=2,
+        sequence=3,
         path=commit_path,
         payload=status_payload,
         replace_payload=True,
@@ -1413,7 +1608,7 @@ def test_signed_rotation_status_is_exact_and_does_not_consume_request_sequence(
     exact_body, exact_headers = _heartbeat_request(
         key,
         fingerprint,
-        sequence=3,
+        sequence=4,
         path=status_path,
         payload=status_payload,
         replace_payload=True,
@@ -1428,7 +1623,7 @@ def test_signed_rotation_status_is_exact_and_does_not_consume_request_sequence(
     mismatch_body, mismatch_headers = _heartbeat_request(
         key,
         fingerprint,
-        sequence=3,
+        sequence=5,
         path=status_path,
         payload=mismatched_payload,
         replace_payload=True,
@@ -1439,7 +1634,7 @@ def test_signed_rotation_status_is_exact_and_does_not_consume_request_sequence(
     with Session(engine) as session:
         node = session.get(RelayNode, NODE_ID)
         assert node is not None
-        assert node.heartbeat_sequence == 2
+        assert node.heartbeat_sequence == 5
         status_audits = session.scalars(
             select(RelayAuditEvent).where(
                 RelayAuditEvent.node_id == NODE_ID,

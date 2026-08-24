@@ -925,6 +925,21 @@ def test_renewal_lost_response_retry_rotates_once_and_old_cert_is_renew_only(
     assert old_retry.status_code == 200
     assert old_retry.json() == first.json()
 
+    with Session(engine) as session:
+        before_current = session.get(RelayNode, NODE_ID)
+        before_registration = session.get(RelayNodeRegistration, NODE_ID)
+        assert before_current is not None
+        assert before_registration is not None
+        node_invariant = {
+            column.name: getattr(before_current, column.name)
+            for column in RelayNode.__table__.columns
+        }
+        registration_invariant = {
+            column.name: getattr(before_registration, column.name)
+            for column in RelayNodeRegistration.__table__.columns
+        }
+        audit_count = session.query(RelayAuditEvent).count()
+
     current_retry_body, current_retry_headers = _renewal_request(
         new_key,
         new_fingerprint,
@@ -937,8 +952,23 @@ def test_renewal_lost_response_retry_rotates_once_and_old_cert_is_renew_only(
         content=current_retry_body,
         headers=current_retry_headers,
     )
-    assert current_retry.status_code == 200
-    assert current_retry.json() == first.json()
+    assert current_retry.status_code == 409, current_retry.text
+    assert _error_code(current_retry) == "relay_renewal_conflict"
+
+    with Session(engine) as session:
+        after_current = session.get(RelayNode, NODE_ID)
+        after_registration = session.get(RelayNodeRegistration, NODE_ID)
+        assert after_current is not None
+        assert after_registration is not None
+        assert {
+            column.name: getattr(after_current, column.name)
+            for column in RelayNode.__table__.columns
+        } == node_invariant
+        assert {
+            column.name: getattr(after_registration, column.name)
+            for column in RelayNodeRegistration.__table__.columns
+        } == registration_invariant
+        assert session.query(RelayAuditEvent).count() == audit_count
 
     different_csr, _ = _csr(NODE_ID)
     conflicting_body, conflicting_headers = _renewal_request(

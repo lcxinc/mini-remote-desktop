@@ -2437,18 +2437,22 @@ async def test_v4_backfills_only_complete_v3_inflight_renewals_without_extending
                 "renewal_record_retention_seconds": 3600,
                 "now": now,
             }
-            current_retry = await registry.renew(
-                identity=current_identity, **renewal_kwargs
-            )
+            with pytest.raises(RelayRegistryError) as current_retry:
+                await registry.renew(identity=current_identity, **renewal_kwargs)
+            assert current_retry.value.code == "relay_renewal_conflict"
+            assert current_retry.value.status_code == 409
+            assert active_node.heartbeat_sequence == 0
+            assert active_node.previous_identity_sequence is None
+            assert active_node.updated_at == now
             previous_retry = await registry.renew(
                 identity=previous_identity, **renewal_kwargs
             )
-            assert current_retry.certificate.certificate_pem == (
+            assert previous_retry.certificate.certificate_pem == (
                 "CACHED RENEWED CERTIFICATE"
             )
-            assert previous_retry.certificate.certificate_pem == (
-                current_retry.certificate.certificate_pem
-            )
+            assert active_node.heartbeat_sequence == 0
+            assert active_node.previous_identity_sequence == 1
+            assert active_node.updated_at == now
             renewed_audits = await verification_session.scalar(
                 select(func.count())
                 .select_from(RelayAuditEvent)

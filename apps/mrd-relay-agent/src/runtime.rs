@@ -1036,14 +1036,12 @@ where
                 backend_attempt = 0;
                 true
             }
-            Err(RuntimeError::Backend(BackendError::Rejected | BackendError::Conflict))
-                if renewal_recovery_pending =>
-            {
+            Err(RuntimeError::Backend(BackendError::Unauthorized)) if renewal_recovery_pending => {
                 // A renewal may have committed remotely even when its response
                 // was lost.  The old certificate's heartbeat then fails before
                 // the exact renewal retry can recover the cached certificate.
                 // Suppress only while that exact persisted renewal is pending;
-                // the renewal retry itself remains fail-closed.
+                // conflicts and revocation remain fail-closed.
                 false
             }
             Err(RuntimeError::MetricsUnavailable) => {

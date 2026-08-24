@@ -149,6 +149,28 @@ class RelayRotationStatus:
     status: str
 
 
+def relay_rotation_in_flight(node: RelayNode) -> bool:
+    """Return whether the locked node has any live rotation transaction state."""
+
+    return (
+        node.desired_secret_version > node.active_secret_version
+        or node.pending_secret_version is not None
+        or node.pending_encrypted_turn_secret is not None
+        or node.pending_secret_digest is not None
+        or node.pending_rotation_id is not None
+        or node.pending_secret_uploaded_at is not None
+        or node.rotation_challenge is not None
+        or node.secret_not_before is not None
+        or node.old_credential_deadline is not None
+    )
+
+
+def relay_effective_draining(node: RelayNode) -> bool:
+    """Combine durable administrator intent with transient rotation safety."""
+
+    return node.desired_draining or relay_rotation_in_flight(node)
+
+
 class RelayRegistry:
     def __init__(
         self,
@@ -638,17 +660,7 @@ class RelayRegistry:
             or self._as_utc(registration.previous_certificate_expires_at) <= now
         ):
             self._error("relay_renewal_conflict", 409, "relay renewal conflicts")
-        rotation_in_flight = (
-            node.desired_secret_version > node.active_secret_version
-            or node.pending_secret_version is not None
-            or node.pending_encrypted_turn_secret is not None
-            or node.pending_secret_digest is not None
-            or node.pending_rotation_id is not None
-            or node.pending_secret_uploaded_at is not None
-            or node.rotation_challenge is not None
-            or node.secret_not_before is not None
-            or node.old_credential_deadline is not None
-        )
+        rotation_in_flight = relay_rotation_in_flight(node)
         # Only the previous certificate can prove a lost-response retry.  A
         # current-certificate replay means the caller already received the new
         # certificate; advancing its shared sequence here could invalidate an
@@ -685,6 +697,10 @@ class RelayRegistry:
                 and registration.renewal_certificate_expires_at is not None
                 and self._as_utc(registration.renewal_certificate_expires_at) > now
             ):
+                if not identity.is_previous:
+                    self._error(
+                        "relay_renewal_conflict", 409, "relay renewal conflicts"
+                    )
                 assert registration.ca_certificate_pem is not None
                 certificate = IssuedRelayCertificate(
                     certificate_pem=registration.renewal_certificate_pem.decode(),
@@ -694,10 +710,7 @@ class RelayRegistry:
                         registration.renewal_certificate_expires_at
                     ),
                 )
-                if identity.is_previous:
-                    node.previous_identity_sequence = sequence
-                else:
-                    node.heartbeat_sequence = sequence
+                node.previous_identity_sequence = sequence
                 await self._session.flush()
                 return ApprovedRelay(node=node, certificate=certificate)
             if existing_renewal_id == renewal_id or identity.is_previous:
@@ -873,7 +886,7 @@ class RelayRegistry:
             )
             if heartbeat_healthy:
                 lease_expires_at = now + timedelta(seconds=15)
-                if node.desired_draining or node.state == "draining":
+                if relay_effective_draining(node) or node.state == "draining":
                     next_streak = node.healthy_heartbeat_streak
                     next_state = "draining"
                 elif fresh_ready:
@@ -945,10 +958,9 @@ class RelayRegistry:
                 self._error("relay_node_not_found", 404, "relay node not found")
             if node.state == "revoked":
                 self._error("relay_node_revoked", 409, "relay node revoked")
-            if node.desired_secret_version > node.active_secret_version:
+            if relay_rotation_in_flight(node):
                 return node
             node.desired_secret_version = node.active_secret_version + 1
-            node.desired_draining = True
             node.secret_not_before = now
             node.old_credential_deadline = now + timedelta(
                 seconds=credential_ttl_seconds
@@ -1013,7 +1025,7 @@ class RelayRegistry:
             if sequence <= node.heartbeat_sequence:
                 self._error("relay_heartbeat_replayed", 409, "relay heartbeat replayed")
             if (
-                not node.desired_draining
+                not relay_rotation_in_flight(node)
                 or secret_version != node.desired_secret_version
                 or secret_version <= node.active_secret_version
                 or node.rotation_challenge is None
@@ -1117,7 +1129,7 @@ class RelayRegistry:
                 else None
             )
             if (
-                not node.desired_draining
+                not relay_rotation_in_flight(node)
                 or node.active_allocations != 0
                 or deadline is None
                 or now < deadline
@@ -1194,10 +1206,9 @@ class RelayRegistry:
             node.committed_probe_evidence_sha256 = evidence
             node.committed_proof_mac = supplied_proof
             node.rotation_challenge = None
-            node.desired_draining = False
             node.secret_not_before = None
             node.old_credential_deadline = None
-            node.state = "unavailable"
+            node.state = "draining" if node.desired_draining else "unavailable"
             node.lease_expires_at = None
             node.healthy_heartbeat_streak = 0
             node.heartbeat_sequence = sequence
@@ -1216,6 +1227,7 @@ class RelayRegistry:
         self,
         *,
         identity: RelayIdentity,
+        sequence: int,
         identity_epoch: int,
         rotation_id: str,
         secret_version: int,
@@ -1246,6 +1258,10 @@ class RelayRegistry:
                 now=now,
             )
             assert node is not None
+            if sequence <= node.heartbeat_sequence:
+                self._error(
+                    "relay_heartbeat_replayed", 409, "relay heartbeat replayed"
+                )
             committed_exact = (
                 node.active_secret_version == secret_version
                 and node.applied_secret_version == secret_version
@@ -1275,6 +1291,8 @@ class RelayRegistry:
                 if pending
                 else "unknown"
             )
+            node.heartbeat_sequence = sequence
+            await self._session.flush()
             return RelayRotationStatus(
                 node_id=node.node_id,
                 identity_epoch=node.identity_epoch,
@@ -1299,11 +1317,7 @@ class RelayRegistry:
                 node.state = "draining"
                 audit_action = "relay_node_drained"
             elif action == "resume":
-                if (
-                    node.desired_secret_version > node.active_secret_version
-                    or node.pending_secret_version is not None
-                    or node.rotation_challenge is not None
-                ):
+                if relay_rotation_in_flight(node):
                     self._error(
                         "relay_secret_rotation_conflict",
                         409,

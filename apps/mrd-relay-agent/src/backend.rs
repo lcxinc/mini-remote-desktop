@@ -465,6 +465,8 @@ pub enum BackendError {
     Unavailable,
     #[error("relay_backend_conflict")]
     Conflict,
+    #[error("relay_backend_unauthorized")]
+    Unauthorized,
     #[error("relay_backend_rejected")]
     Rejected,
     #[error("relay_backend_protocol_invalid")]
@@ -478,6 +480,7 @@ impl BackendError {
         match self {
             Self::Unavailable => "relay_backend_unavailable",
             Self::Conflict => "relay_backend_conflict",
+            Self::Unauthorized => "relay_backend_unauthorized",
             Self::Rejected => "relay_backend_rejected",
             Self::ProtocolInvalid => "relay_backend_protocol_invalid",
             Self::TlsInvalid => "relay_tls_invalid",
@@ -1016,6 +1019,20 @@ struct RenewalResponse {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct BackendErrorResponse {
+    detail: BackendErrorDetail,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackendErrorDetail {
+    code: String,
+    #[serde(rename = "message")]
+    _message: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HeartbeatResponse {
     node_id: String,
     identity_epoch: u64,
@@ -1272,6 +1289,7 @@ fn backend_status_error(status: StatusCode) -> Option<BackendError> {
     }
     match status.as_u16() {
         408 | 425 | 429 | 500 | 502 | 503 | 504 => Some(BackendError::Unavailable),
+        401 => Some(BackendError::Unauthorized),
         409 => Some(BackendError::Conflict),
         _ => Some(BackendError::Rejected),
     }
@@ -1279,6 +1297,22 @@ fn backend_status_error(status: StatusCode) -> Option<BackendError> {
 
 fn require_success_status(status: StatusCode) -> Result<(), BackendError> {
     backend_status_error(status).map_or(Ok(()), Err)
+}
+
+fn decode_renewal_error_response(
+    status: StatusCode,
+    body: &[u8],
+) -> Result<BackendError, BackendError> {
+    let response: BackendErrorResponse = decode_json(body)?;
+    if !is_urlsafe_identifier(&response.detail.code) {
+        return Err(BackendError::ProtocolInvalid);
+    }
+    Ok(match status.as_u16() {
+        401 => BackendError::Unauthorized,
+        409 if response.detail.code == "relay_heartbeat_replayed" => BackendError::Conflict,
+        409 => BackendError::Rejected,
+        _ => backend_status_error(status).unwrap_or(BackendError::ProtocolInvalid),
+    })
 }
 
 #[async_trait]
@@ -1355,9 +1389,12 @@ impl RelayBackendPort for ReqwestRelayBackend {
             .send()
             .await
             .map_err(|_| BackendError::Unavailable)?;
-        require_success_status(response.status())?;
+        let status = response.status();
         require_private_no_store(&response)?;
         let body = read_bounded_response(response).await?;
+        if !status.is_success() {
+            return Err(decode_renewal_error_response(status, &body)?);
+        }
         let body: RenewalResponse = decode_json(&body)?;
         if body.node_id != expected_node_id
             || body.renewal_id != expected_renewal_id
@@ -1587,7 +1624,8 @@ mod response_security_tests {
     use super::{
         backend_status_error, build_secret_upload_request, bytes_from_zeroizing_owner,
         decode_enrollment_response, headers_are_private_no_store, secure_client,
-        serialize_enrollment_body, BackendError, EnrollmentRequest, RequestAuthentication,
+        serialize_enrollment_body, BackendError, EnrollmentRequest, RelayBackendPort,
+        RenewalRequest, RequestAuthentication, ReqwestRelayBackend,
     };
     use rcgen::{
         BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
@@ -1664,7 +1702,10 @@ mod response_security_tests {
         }
     }
 
-    async fn spawn_https_server(config: ServerConfig) -> std::net::SocketAddr {
+    async fn spawn_https_response_server(
+        config: ServerConfig,
+        response: Vec<u8>,
+    ) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1677,11 +1718,71 @@ mod response_security_tests {
             };
             let mut request = [0u8; 2048];
             let _ = stream.read(&mut request).await;
-            let _ = stream
-                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
-                .await;
+            let _ = stream.write_all(&response).await;
         });
         address
+    }
+
+    async fn spawn_https_server(config: ServerConfig) -> std::net::SocketAddr {
+        spawn_https_response_server(
+            config,
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        )
+        .await
+    }
+
+    fn renewal_error_response(
+        status: &str,
+        body: &str,
+        cache_headers: bool,
+        content_length: usize,
+    ) -> Vec<u8> {
+        let cache_headers = if cache_headers {
+            "Cache-Control: private, no-store\r\nPragma: no-cache\r\n"
+        } else {
+            ""
+        };
+        format!(
+            "HTTP/1.1 {status}\r\n{cache_headers}Content-Type: application/json\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n{body}"
+        )
+        .into_bytes()
+    }
+
+    async fn renew_against_response(
+        authority: &TestTlsAuthority,
+        response: Vec<u8>,
+    ) -> Result<super::NodeCertificate, BackendError> {
+        let address = spawn_https_response_server(
+            authority.server_config(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            response,
+        )
+        .await;
+        let identity_key = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+        let identity_certificate = CertificateParams::default()
+            .self_signed(&identity_key)
+            .unwrap();
+        let backend = ReqwestRelayBackend::new(
+            format!("https://{address}/").parse().unwrap(),
+            authority.certificate.pem().as_bytes(),
+        )
+        .unwrap()
+        .with_mtls_identity(
+            identity_certificate.pem().as_bytes(),
+            identity_key.serialize_pem().as_bytes(),
+        )
+        .unwrap();
+        backend
+            .renew(RenewalRequest {
+                node_id: "relay-hkg-1".to_owned(),
+                renewal_id: "renewal-0001".to_owned(),
+                csr_pem: "csr".to_owned(),
+                authentication: RequestAuthentication {
+                    timestamp: 2_500,
+                    sequence: 7,
+                    signature_b64: "signature".to_owned(),
+                },
+            })
+            .await
     }
 
     #[test]
@@ -1717,13 +1818,86 @@ mod response_security_tests {
             backend_status_error(reqwest::StatusCode::CONFLICT),
             Some(BackendError::Conflict)
         );
-        for status in [400, 401, 403, 404, 422] {
+        assert_eq!(
+            backend_status_error(reqwest::StatusCode::UNAUTHORIZED),
+            Some(BackendError::Unauthorized)
+        );
+        for status in [400, 403, 404, 422] {
             assert_eq!(
                 backend_status_error(reqwest::StatusCode::from_u16(status).unwrap()),
                 Some(BackendError::Rejected)
             );
         }
         assert_eq!(backend_status_error(reqwest::StatusCode::OK), None);
+    }
+
+    #[tokio::test]
+    async fn renew_http_conflict_is_recoverable_only_for_stable_heartbeat_replay_code() {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let authority = TestTlsAuthority::new("renew response root");
+
+        for (code, expected) in [
+            ("relay_heartbeat_replayed", BackendError::Conflict),
+            ("relay_renewal_conflict", BackendError::Rejected),
+            ("relay_secret_rotation_conflict", BackendError::Rejected),
+        ] {
+            let body = format!(r#"{{"detail":{{"code":"{code}","message":"renewal rejected"}}}}"#);
+            let response = renewal_error_response("409 Conflict", &body, true, body.len());
+            assert_eq!(
+                renew_against_response(&authority, response).await,
+                Err(expected),
+                "unexpected classification for {code}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn renew_http_errors_require_bounded_strict_private_no_store_bodies() {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let authority = TestTlsAuthority::new("renew error security root");
+        let replay = r#"{"detail":{"code":"relay_heartbeat_replayed","message":"replayed"}}"#;
+
+        let malformed = r#"{"detail":{"message":"missing code"}}"#;
+        assert_eq!(
+            renew_against_response(
+                &authority,
+                renewal_error_response("409 Conflict", malformed, true, malformed.len()),
+            )
+            .await,
+            Err(BackendError::ProtocolInvalid)
+        );
+        assert_eq!(
+            renew_against_response(
+                &authority,
+                renewal_error_response("409 Conflict", replay, false, replay.len()),
+            )
+            .await,
+            Err(BackendError::ProtocolInvalid)
+        );
+        assert_eq!(
+            renew_against_response(
+                &authority,
+                renewal_error_response(
+                    "409 Conflict",
+                    replay,
+                    true,
+                    super::MAX_RESPONSE_BYTES + 1,
+                ),
+            )
+            .await,
+            Err(BackendError::ProtocolInvalid)
+        );
+
+        let unauthorized =
+            r#"{"detail":{"code":"relay_certificate_invalid","message":"unauthorized"}}"#;
+        assert_eq!(
+            renew_against_response(
+                &authority,
+                renewal_error_response("401 Unauthorized", unauthorized, true, unauthorized.len(),),
+            )
+            .await,
+            Err(BackendError::Unauthorized)
+        );
     }
 
     #[test]
