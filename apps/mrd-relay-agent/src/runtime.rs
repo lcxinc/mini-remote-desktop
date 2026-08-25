@@ -1199,6 +1199,30 @@ where
     }
 }
 
+fn validate_coturn_restart_budget(
+    budget: Option<&CoturnRestartBudget>,
+    now_unix_seconds: i64,
+) -> Result<(), RuntimeError> {
+    let Some(budget) = budget else {
+        return Ok(());
+    };
+    if !(1..=MAX_RESTART_ATTEMPTS).contains(&budget.attempts)
+        || budget.failure_generation == 0
+        || now_unix_seconds < budget.observed_wall_unix_seconds
+    {
+        return Err(RuntimeError::StateInvalid);
+    }
+    let expected_delay = 1i64 << (budget.attempts - 1);
+    if budget
+        .observed_wall_unix_seconds
+        .checked_add(expected_delay)
+        != Some(budget.not_before_unix_seconds)
+    {
+        return Err(RuntimeError::StateInvalid);
+    }
+    Ok(())
+}
+
 pub struct CoturnSupervisor<C, S, P>
 where
     C: CoturnRuntimePort,
@@ -1212,6 +1236,8 @@ where
     local_ready: Arc<AtomicBool>,
     shared_health: SharedRelayHealth,
     restart_attempts: u8,
+    resume_not_before_unix_seconds: Option<i64>,
+    state_store: Arc<dyn RuntimeStateStorePort>,
 }
 
 impl<C, S, P> CoturnSupervisor<C, S, P>
@@ -1249,6 +1275,27 @@ where
             shared_health,
             clock,
             Arc::new(AtomicBool::new(true)),
+            Arc::new(VolatileRuntimeStateStore::default()),
+        )
+        .expect("a new volatile coturn restart budget is valid")
+    }
+
+    pub fn new_with_state_store(
+        coturn: Arc<C>,
+        sleeper: Arc<S>,
+        probe: Arc<P>,
+        shared_health: SharedRelayHealth,
+        clock: Arc<dyn ClockPort>,
+        state_store: Arc<dyn RuntimeStateStorePort>,
+    ) -> Result<Self, RuntimeError> {
+        Self::new_with_clock_and_readiness(
+            coturn,
+            sleeper,
+            probe,
+            shared_health,
+            clock,
+            Arc::new(AtomicBool::new(true)),
+            state_store,
         )
     }
 
@@ -1259,20 +1306,43 @@ where
         shared_health: SharedRelayHealth,
         clock: Arc<dyn ClockPort>,
         local_ready: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
+        state_store: Arc<dyn RuntimeStateStorePort>,
+    ) -> Result<Self, RuntimeError> {
+        let state = state_store.load()?;
+        validate_coturn_restart_budget(state.coturn_restart_budget.as_ref(), clock.unix_seconds())?;
+        let restart_attempts = state
+            .coturn_restart_budget
+            .as_ref()
+            .map_or(0, |budget| budget.attempts);
+        let resume_not_before_unix_seconds = state
+            .coturn_restart_budget
+            .as_ref()
+            .map(|budget| budget.not_before_unix_seconds);
+        Ok(Self {
             coturn,
             sleeper,
             probe,
             clock,
             local_ready,
             shared_health,
-            restart_attempts: 0,
-        }
+            restart_attempts,
+            resume_not_before_unix_seconds,
+            state_store,
+        })
     }
 
     pub fn restart_attempts(&self) -> u8 {
         self.restart_attempts
+    }
+
+    fn store_restart_budget(
+        &self,
+        budget: Option<CoturnRestartBudget>,
+    ) -> Result<(), RuntimeError> {
+        self.state_store.mutate(&mut |state| {
+            state.coturn_restart_budget = budget.clone();
+            Ok(())
+        })
     }
 
     pub async fn supervise_once(&mut self) -> Result<(), RuntimeError> {
@@ -1354,17 +1424,73 @@ where
             generation,
             self.clock.monotonic_ms(),
         );
+        let mut persisted = self.state_store.load()?.coturn_restart_budget;
+        let validated_wall_unix_seconds = self.clock.unix_seconds();
+        validate_coturn_restart_budget(persisted.as_ref(), validated_wall_unix_seconds)?;
+        if persisted.as_ref().map_or(0, |budget| budget.attempts) != self.restart_attempts {
+            return Err(RuntimeError::StateInvalid);
+        }
+        if let Some(budget) = persisted.as_ref() {
+            if generation != 0 && generation < budget.failure_generation {
+                return Err(RuntimeError::StateInvalid);
+            }
+        }
+        let mut failure_generation_changed = false;
+        if !verified_healthy {
+            if let Some(budget) = persisted.as_mut() {
+                if generation > budget.failure_generation {
+                    budget.failure_generation = generation;
+                    failure_generation_changed = true;
+                }
+            }
+        }
         if verified_healthy {
-            self.restart_attempts = 0;
+            if self.restart_attempts != 0 {
+                self.store_restart_budget(None)?;
+                self.restart_attempts = 0;
+                self.resume_not_before_unix_seconds = None;
+            }
         } else if process_health != ProcessHealth::Degraded
+            && generation != 0
             && self.restart_attempts < MAX_RESTART_ATTEMPTS
         {
+            let observed_wall_unix_seconds =
+                if let Some(not_before) = self.resume_not_before_unix_seconds {
+                    let now = self.clock.unix_seconds();
+                    if now < not_before {
+                        let remaining = u64::try_from(not_before - now)
+                            .map_err(|_| RuntimeError::StateInvalid)?;
+                        self.sleeper.sleep(Duration::from_secs(remaining)).await;
+                    }
+                    let after_wait = self.clock.unix_seconds();
+                    validate_coturn_restart_budget(persisted.as_ref(), after_wait)?;
+                    if after_wait < not_before {
+                        return Err(RuntimeError::StateInvalid);
+                    }
+                    self.resume_not_before_unix_seconds = None;
+                    after_wait
+                } else {
+                    validated_wall_unix_seconds
+                };
+            let next_attempts = self.restart_attempts.saturating_add(1);
             let delay_seconds = 1u64 << self.restart_attempts;
+            let delay_i64 = i64::try_from(delay_seconds).map_err(|_| RuntimeError::StateInvalid)?;
+            let not_before_unix_seconds = observed_wall_unix_seconds
+                .checked_add(delay_i64)
+                .ok_or(RuntimeError::StateInvalid)?;
+            self.store_restart_budget(Some(CoturnRestartBudget {
+                attempts: next_attempts,
+                failure_generation: generation,
+                observed_wall_unix_seconds,
+                not_before_unix_seconds,
+            }))?;
+            self.restart_attempts = next_attempts;
             self.sleeper
                 .sleep(Duration::from_secs(delay_seconds.min(4)))
                 .await;
-            self.restart_attempts = self.restart_attempts.saturating_add(1);
             let _ = self.coturn.restart().await;
+        } else if failure_generation_changed {
+            self.store_restart_budget(persisted)?;
         }
         Ok(())
     }
@@ -1470,6 +1596,9 @@ where
     ) -> Result<Self, RuntimeError> {
         let shared_health = SharedRelayHealth::default();
         let slot = Arc::new(SwappableRelayBackend::new(initial_backend));
+        let state_store: Arc<dyn RuntimeStateStorePort> =
+            Arc::new(SerializedRuntimeStateStore::new(state_store));
+        let supervisor_state_store = state_store.clone();
         let mut runtime = AgentRuntime::new_with_state_store_and_backoff_cap(
             slot.clone(),
             coturn.clone(),
@@ -1492,7 +1621,8 @@ where
             shared_health.clone(),
             runtime.clock.clone(),
             runtime.local_ready.clone(),
-        );
+            supervisor_state_store,
+        )?;
         Ok(Self {
             lifecycle: IdentityLifecycle::new(renewal_window)?,
             identity,
@@ -1719,6 +1849,17 @@ pub struct RuntimeStateSnapshot {
     pub draining: bool,
     #[serde(default)]
     pub pending_rotation: Option<PendingSecretRotation>,
+    #[serde(default)]
+    pub coturn_restart_budget: Option<CoturnRestartBudget>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CoturnRestartBudget {
+    pub attempts: u8,
+    pub failure_generation: u64,
+    pub observed_wall_unix_seconds: i64,
+    pub not_before_unix_seconds: i64,
 }
 
 impl Default for RuntimeStateSnapshot {
@@ -1731,6 +1872,7 @@ impl Default for RuntimeStateSnapshot {
             bootstrap_secret: None,
             draining: false,
             pending_rotation: None,
+            coturn_restart_budget: None,
         }
     }
 }
@@ -1749,6 +1891,7 @@ impl std::fmt::Debug for RuntimeStateSnapshot {
             )
             .field("draining", &self.draining)
             .field("pending_rotation", &self.pending_rotation)
+            .field("coturn_restart_budget", &self.coturn_restart_budget)
             .finish()
     }
 }
@@ -1756,10 +1899,75 @@ impl std::fmt::Debug for RuntimeStateSnapshot {
 pub trait RuntimeStateStorePort: Send + Sync {
     fn load(&self) -> Result<RuntimeStateSnapshot, RuntimeError>;
     fn atomic_store(&self, state: &RuntimeStateSnapshot) -> Result<(), RuntimeError>;
+
+    fn mutate(
+        &self,
+        mutation: &mut dyn FnMut(&mut RuntimeStateSnapshot) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.load()?;
+        mutation(&mut state)?;
+        self.atomic_store(&state)
+    }
+}
+
+fn atomic_store_runtime_state_preserving_restart_budget(
+    store: &dyn RuntimeStateStorePort,
+    next: &RuntimeStateSnapshot,
+) -> Result<(), RuntimeError> {
+    store.mutate(&mut |current| {
+        let restart_budget = current.coturn_restart_budget.clone();
+        *current = next.clone();
+        current.coturn_restart_budget = restart_budget;
+        Ok(())
+    })
+}
+
+pub struct SerializedRuntimeStateStore {
+    inner: Arc<dyn RuntimeStateStorePort>,
+    mutation_lock: Mutex<()>,
+}
+
+impl SerializedRuntimeStateStore {
+    pub fn new(inner: Arc<dyn RuntimeStateStorePort>) -> Self {
+        Self {
+            inner,
+            mutation_lock: Mutex::new(()),
+        }
+    }
+}
+
+impl RuntimeStateStorePort for SerializedRuntimeStateStore {
+    fn load(&self) -> Result<RuntimeStateSnapshot, RuntimeError> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| RuntimeError::StateIo)?;
+        self.inner.load()
+    }
+
+    fn atomic_store(&self, state: &RuntimeStateSnapshot) -> Result<(), RuntimeError> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| RuntimeError::StateIo)?;
+        self.inner.atomic_store(state)
+    }
+
+    fn mutate(
+        &self,
+        mutation: &mut dyn FnMut(&mut RuntimeStateSnapshot) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| RuntimeError::StateIo)?;
+        self.inner.mutate(mutation)
+    }
 }
 
 pub struct StdRuntimeStateStore {
     path: PathBuf,
+    mutation_lock: Mutex<()>,
 }
 
 impl StdRuntimeStateStore {
@@ -1767,7 +1975,10 @@ impl StdRuntimeStateStore {
         if !path.is_absolute() || path.file_name().is_none() {
             return Err(RuntimeError::StateInvalid);
         }
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            mutation_lock: Mutex::new(()),
+        })
     }
 
     fn temporary_path(&self) -> PathBuf {
@@ -1777,10 +1988,8 @@ impl StdRuntimeStateStore {
             rand::random::<u64>()
         ))
     }
-}
 
-impl RuntimeStateStorePort for StdRuntimeStateStore {
-    fn load(&self) -> Result<RuntimeStateSnapshot, RuntimeError> {
+    fn load_unlocked(&self) -> Result<RuntimeStateSnapshot, RuntimeError> {
         let metadata = match fs::metadata(&self.path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1802,7 +2011,7 @@ impl RuntimeStateStorePort for StdRuntimeStateStore {
         serde_json::from_slice(&body).map_err(|_| RuntimeError::StateInvalid)
     }
 
-    fn atomic_store(&self, state: &RuntimeStateSnapshot) -> Result<(), RuntimeError> {
+    fn atomic_store_unlocked(&self, state: &RuntimeStateSnapshot) -> Result<(), RuntimeError> {
         let parent = self.path.parent().ok_or(RuntimeError::StateInvalid)?;
         fs::create_dir_all(parent).map_err(|_| RuntimeError::StateIo)?;
         let temporary = self.temporary_path();
@@ -1831,6 +2040,37 @@ impl RuntimeStateStorePort for StdRuntimeStateStore {
             let _ = fs::remove_file(&temporary);
         }
         result
+    }
+}
+
+impl RuntimeStateStorePort for StdRuntimeStateStore {
+    fn load(&self) -> Result<RuntimeStateSnapshot, RuntimeError> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| RuntimeError::StateIo)?;
+        self.load_unlocked()
+    }
+
+    fn atomic_store(&self, state: &RuntimeStateSnapshot) -> Result<(), RuntimeError> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| RuntimeError::StateIo)?;
+        self.atomic_store_unlocked(state)
+    }
+
+    fn mutate(
+        &self,
+        mutation: &mut dyn FnMut(&mut RuntimeStateSnapshot) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| RuntimeError::StateIo)?;
+        let mut state = self.load_unlocked()?;
+        mutation(&mut state)?;
+        self.atomic_store_unlocked(&state)
     }
 }
 
@@ -1880,6 +2120,17 @@ impl RuntimeStateStorePort for VolatileRuntimeStateStore {
 
     fn atomic_store(&self, state: &RuntimeStateSnapshot) -> Result<(), RuntimeError> {
         *self.state.lock().map_err(|_| RuntimeError::StateIo)? = state.clone();
+        Ok(())
+    }
+
+    fn mutate(
+        &self,
+        mutation: &mut dyn FnMut(&mut RuntimeStateSnapshot) -> Result<(), RuntimeError>,
+    ) -> Result<(), RuntimeError> {
+        let mut current = self.state.lock().map_err(|_| RuntimeError::StateIo)?;
+        let mut next = current.clone();
+        mutation(&mut next)?;
+        *current = next;
         Ok(())
     }
 }
@@ -2063,6 +2314,7 @@ where
         }
         let now = clock.monotonic_ms();
         let mut state = state_store.load()?;
+        validate_coturn_restart_budget(state.coturn_restart_budget.as_ref(), clock.unix_seconds())?;
         if (state.secret_version == 0) != state.secret_digest.is_none() {
             return Err(RuntimeError::StateInvalid);
         }
@@ -2196,8 +2448,9 @@ where
             bootstrap_secret: Some(staged.clone()),
             draining: self.draining,
             pending_rotation: self.pending_rotation.clone(),
+            coturn_restart_budget: None,
         };
-        self.state_store.atomic_store(&state)?;
+        atomic_store_runtime_state_preserving_restart_budget(self.state_store.as_ref(), &state)?;
         self.bootstrap_secret = Some(staged);
         Ok(())
     }
@@ -2246,8 +2499,12 @@ where
             bootstrap_secret: None,
             draining: self.draining,
             pending_rotation: self.pending_rotation.clone(),
+            coturn_restart_budget: None,
         };
-        self.state_store.atomic_store(&committed)?;
+        atomic_store_runtime_state_preserving_restart_budget(
+            self.state_store.as_ref(),
+            &committed,
+        )?;
         self.secret_version = 1;
         self.secret_digest = Some(digest);
         self.bootstrap_secret = None;
@@ -2429,8 +2686,12 @@ where
                         bootstrap_secret: self.bootstrap_secret.clone(),
                         draining: self.draining,
                         pending_rotation: next_pending_rotation.clone(),
+                        coturn_restart_budget: None,
                     };
-                    self.state_store.atomic_store(&intent)?;
+                    atomic_store_runtime_state_preserving_restart_budget(
+                        self.state_store.as_ref(),
+                        &intent,
+                    )?;
                     self.pending_rotation = intent.pending_rotation;
                 }
             }
@@ -2467,8 +2728,9 @@ where
             bootstrap_secret: self.bootstrap_secret.clone(),
             draining: directive.desired.draining,
             pending_rotation: next_pending_rotation,
+            coturn_restart_budget: None,
         };
-        self.state_store.atomic_store(&next)?;
+        atomic_store_runtime_state_preserving_restart_budget(self.state_store.as_ref(), &next)?;
         self.last_directive_sequence = next.last_directive_sequence;
         self.secret_version = next.secret_version;
         self.secret_digest = next.secret_digest;
@@ -2797,8 +3059,12 @@ where
             bootstrap_secret: None,
             draining: self.draining,
             pending_rotation: None,
+            coturn_restart_budget: None,
         };
-        self.state_store.atomic_store(&committed)?;
+        atomic_store_runtime_state_preserving_restart_budget(
+            self.state_store.as_ref(),
+            &committed,
+        )?;
         self.secret_version = committed.secret_version;
         self.secret_digest = committed.secret_digest;
         self.pending_rotation = None;
@@ -2818,8 +3084,9 @@ where
             bootstrap_secret: self.bootstrap_secret.clone(),
             draining: self.draining,
             pending_rotation: Some(pending.clone()),
+            coturn_restart_budget: None,
         };
-        self.state_store.atomic_store(&state)?;
+        atomic_store_runtime_state_preserving_restart_budget(self.state_store.as_ref(), &state)?;
         self.pending_rotation = Some(pending);
         Ok(())
     }
@@ -2871,8 +3138,9 @@ where
             // Fail safe: renewal never silently resumes a draining node.
             draining: self.draining,
             pending_rotation: None,
+            coturn_restart_budget: None,
         };
-        self.state_store.atomic_store(&state)?;
+        atomic_store_runtime_state_preserving_restart_budget(self.state_store.as_ref(), &state)?;
         self.identity_epoch = identity_epoch;
         self.last_directive_sequence = 0;
         self.pending_rotation = None;
@@ -2903,9 +3171,10 @@ mod identifier_tests {
 
     use super::{
         commit_unknown_can_retry_exact, generate_pending_rotation,
-        generate_rotation_identifier_with, AgentRuntime, ClockPort, JitterPort,
-        PendingSecretRotation, ProcessHealth, RuntimeError, RuntimeStateSnapshot,
-        RuntimeStateStorePort, SecretRotationPhase, SleeperPort,
+        generate_rotation_identifier_with, AgentRuntime, ClockPort, CoturnRestartBudget,
+        CoturnSupervisor, JitterPort, PendingSecretRotation, ProcessHealth, RuntimeError,
+        RuntimeStateSnapshot, RuntimeStateStorePort, SecretRotationPhase, SharedRelayHealth,
+        SleeperPort,
     };
     use crate::{
         backend::{
@@ -2917,7 +3186,7 @@ mod identifier_tests {
         identity::{CertificateState, IdentityFsPort, StoredIdentity},
         process::{
             AllocationProbeEvidence, CoturnRuntimePort, CoturnSnapshot, LiveAllocationEvidence,
-            ProcessError, SecretBytes,
+            LocalAllocationProbePort, ProcessError, SecretBytes,
         },
     };
 
@@ -3161,6 +3430,66 @@ mod identifier_tests {
             *self.0.lock().unwrap() = state.clone();
             Ok(())
         }
+    }
+
+    struct TestLocalProbe(Mutex<VecDeque<AllocationProbeEvidence>>);
+
+    #[async_trait]
+    impl LocalAllocationProbePort for TestLocalProbe {
+        async fn probe(&self) -> Result<AllocationProbeEvidence, ProcessError> {
+            self.0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or(ProcessError::ProbeUnavailable)
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_budget_clears_only_after_a_stable_generation_live_probe() {
+        let coturn = Arc::new(TestCoturn {
+            snapshots: Mutex::new(VecDeque::from([
+                CoturnSnapshot::healthy(0, 0).with_generation(8, 1),
+                CoturnSnapshot::healthy(0, 0).with_generation(9, 1),
+                CoturnSnapshot::healthy(0, 0).with_generation(9, 1),
+                CoturnSnapshot::healthy(0, 0).with_generation(9, 1),
+            ])),
+            ..TestCoturn::default()
+        });
+        let probe = Arc::new(TestLocalProbe(Mutex::new(VecDeque::from([
+            AllocationProbeEvidence::Live(LiveAllocationEvidence::from_verified_roundtrip(
+                [0x42; 32],
+            )),
+            AllocationProbeEvidence::Live(LiveAllocationEvidence::from_verified_roundtrip(
+                [0x43; 32],
+            )),
+        ]))));
+        let store = Arc::new(TestStateStore(Mutex::new(RuntimeStateSnapshot {
+            coturn_restart_budget: Some(CoturnRestartBudget {
+                attempts: 3,
+                failure_generation: 7,
+                observed_wall_unix_seconds: 1_799_999_996,
+                not_before_unix_seconds: 1_800_000_000,
+            }),
+            ..RuntimeStateSnapshot::default()
+        })));
+        let mut supervisor = CoturnSupervisor::new_with_state_store(
+            coturn,
+            Arc::new(TestSleeper),
+            probe,
+            SharedRelayHealth::default(),
+            Arc::new(TestClock),
+            store.clone(),
+        )
+        .unwrap();
+
+        supervisor.supervise_once().await.unwrap();
+        assert!(store.0.lock().unwrap().coturn_restart_budget.is_some());
+        assert_eq!(supervisor.restart_attempts(), 3);
+
+        supervisor.supervise_once().await.unwrap();
+        assert!(store.0.lock().unwrap().coturn_restart_budget.is_none());
+        assert_eq!(supervisor.restart_attempts(), 0);
     }
 
     fn test_ca_pem() -> String {

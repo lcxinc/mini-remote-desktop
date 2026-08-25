@@ -67,14 +67,69 @@ impl AllocationProbeEvidence {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveAllocationEvidence {
     proof_sha256: [u8; 32],
+    packets_sent: u64,
+    packets_received: u64,
+    bytes_sent: u64,
+    bytes_received: u64,
 }
 
 impl LiveAllocationEvidence {
     /// Constructs evidence only after the caller has completed the production
     /// allocation + bidirectional relay roundtrip. Kept crate-private so
     /// downstream adapters and external tests cannot manufacture `Live`.
+    #[cfg(test)]
     pub(crate) fn from_verified_roundtrip(proof_sha256: [u8; 32]) -> Self {
-        Self { proof_sha256 }
+        Self {
+            proof_sha256,
+            packets_sent: 1,
+            packets_received: 1,
+            bytes_sent: 1,
+            bytes_received: 1,
+        }
+    }
+
+    pub(crate) fn from_broker_roundtrip(
+        proof_sha256: [u8; 32],
+        packets_sent: u64,
+        packets_received: u64,
+        bytes_sent: u64,
+        bytes_received: u64,
+    ) -> Option<Self> {
+        if proof_sha256.iter().all(|byte| *byte == 0)
+            || packets_sent == 0
+            || packets_received == 0
+            || bytes_sent == 0
+            || bytes_received == 0
+        {
+            return None;
+        }
+        Some(Self {
+            proof_sha256,
+            packets_sent,
+            packets_received,
+            bytes_sent,
+            bytes_received,
+        })
+    }
+
+    pub fn packets_sent(&self) -> u64 {
+        self.packets_sent
+    }
+
+    pub fn proof_sha256(&self) -> [u8; 32] {
+        self.proof_sha256
+    }
+
+    pub fn packets_received(&self) -> u64 {
+        self.packets_received
+    }
+
+    pub fn bytes_sent(&self) -> u64 {
+        self.bytes_sent
+    }
+
+    pub fn bytes_received(&self) -> u64 {
+        self.bytes_received
     }
 }
 
@@ -189,9 +244,15 @@ impl LocalAllocationProbePort for WebRtcLocalAllocationProbe {
         hasher.update(pair.bytes_sent.to_be_bytes());
         hasher.update(pair.bytes_received.to_be_bytes());
         let proof_sha256: [u8; 32] = hasher.finalize().into();
-        Ok(AllocationProbeEvidence::Live(
-            LiveAllocationEvidence::from_verified_roundtrip(proof_sha256),
-        ))
+        let live = LiveAllocationEvidence::from_broker_roundtrip(
+            proof_sha256,
+            u64::from(pair.packets_sent),
+            u64::from(pair.packets_received),
+            pair.bytes_sent,
+            pair.bytes_received,
+        )
+        .ok_or(ProcessError::ProbeInvalid)?;
+        Ok(AllocationProbeEvidence::Live(live))
     }
 }
 
@@ -209,6 +270,14 @@ impl SecretBytes {
         let mut result = [0u8; 32];
         result.copy_from_slice(value.as_ref());
         result
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 

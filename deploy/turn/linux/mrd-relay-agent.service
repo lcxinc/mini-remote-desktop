@@ -1,0 +1,64 @@
+[Unit]
+Description=MRD relay node agent
+Documentation=file:/usr/share/doc/mrd-relay-agent/README.md
+Wants=network-online.target
+After=network-online.target mrd-relay-coturn-control.socket
+Requires=mrd-relay-coturn-control.socket
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=mrd-relay
+Group=mrd-relay
+UMask=0077
+LoadCredential=agent-config:/etc/mrd-relay-agent/agent.json
+LoadCredential=enrollment-token:/etc/mrd-relay-agent/secrets/enrollment-token
+LoadCredential=turn-rest-secret:/etc/mrd-relay-agent/secrets/turn-rest-secret
+LoadCredential=trusted-ca:/etc/mrd-relay-agent/secrets/trusted-ca.pem
+Environment=MRD_RELAY_COTURN_TARGET=linux-systemd
+Environment=MRD_RELAY_COTURN_CONTROL_SOCKET=/run/mrd-relay-coturn-control/control.sock
+ExecStartPre=/usr/local/bin/mrd-relay-agent validate --config %d/agent-config
+ExecStart=/usr/local/bin/mrd-relay-agent run --config %d/agent-config
+Restart=on-failure
+RestartPreventExitStatus=64 65 66 77 78
+RestartSec=5s
+TimeoutStartSec=45s
+TimeoutStopSec=30s
+LimitNOFILE=65536
+StateDirectory=mrd-relay-agent
+StateDirectoryMode=0700
+RuntimeDirectory=mrd-relay-agent
+RuntimeDirectoryMode=0700
+ReadWritePaths=/var/lib/mrd-relay-agent
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mrd-relay-agent
+
+[Install]
+WantedBy=multi-user.target

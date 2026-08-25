@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -1190,6 +1191,7 @@ def test_admin_drain_and_resume_persist_desired_state_and_audit_idempotently(
         assert node is not None
         assert node.state == "draining"
         assert node.desired_draining is True
+        assert node.active_allocations == 0
         drain_audits = session.scalars(
             select(RelayAuditEvent).where(
                 RelayAuditEvent.node_id == NODE_ID,
@@ -1213,6 +1215,113 @@ def test_admin_drain_and_resume_persist_desired_state_and_audit_idempotently(
             )
         ).all()
         assert len(resume_audits) == 1
+
+
+def test_resume_rejects_active_allocations_without_mutating_admin_drain(
+    api: tuple[TestClient, object],
+) -> None:
+    from app.models.relay_audit_event import RelayAuditEvent
+    from app.models.relay_node import RelayNode
+
+    client, engine = api
+    _enroll(client)
+    _approve(client)
+    drained = client.post(f"/api/v1/relays/{NODE_ID}/drain")
+    assert drained.status_code == 200, drained.text
+
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        node.active_allocations = 1
+        session.commit()
+        before_updated_at = node.updated_at
+
+    response = client.post(f"/api/v1/relays/{NODE_ID}/resume")
+    assert response.status_code == 409
+    assert _error_code(response) == "relay_node_drain_in_progress"
+
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        assert node.active_allocations == 1
+        assert node.desired_draining is True
+        assert node.state == "draining"
+        assert node.updated_at == before_updated_at
+        resume_audits = session.scalars(
+            select(RelayAuditEvent).where(
+                RelayAuditEvent.node_id == NODE_ID,
+                RelayAuditEvent.action == "relay_node_resumed",
+            )
+        ).all()
+        assert resume_audits == []
+
+
+def test_resume_rechecks_active_allocations_from_the_locked_row(
+    api: tuple[TestClient, object],
+) -> None:
+    from app.models.relay_node import RelayNode
+    from app.services.relay_registry import RelayRegistry, RelayRegistryError
+
+    client, engine = api
+    _enroll(client)
+    _approve(client)
+    drained = client.post(f"/api/v1/relays/{NODE_ID}/drain")
+    assert drained.status_code == 200, drained.text
+
+    with Session(engine, expire_on_commit=False) as stale_session:
+        stale_node = stale_session.get(RelayNode, NODE_ID)
+        assert stale_node is not None
+        assert stale_node.active_allocations == 0
+
+        with Session(engine) as concurrent_session:
+            current_node = concurrent_session.get(RelayNode, NODE_ID)
+            assert current_node is not None
+            current_node.active_allocations = 1
+            concurrent_session.commit()
+
+        registry = RelayRegistry(
+            AsyncSessionShim(stale_session),
+            enrollment_token_pepper="22" * 32,
+        )
+        with pytest.raises(RelayRegistryError) as captured:
+            asyncio.run(
+                registry.transition(
+                    node_id=NODE_ID,
+                    action="resume",
+                    actor_id="admin-id",
+                    now=datetime.now(UTC),
+                )
+            )
+        assert captured.value.status_code == 409
+        assert captured.value.code == "relay_node_drain_in_progress"
+        assert stale_node.active_allocations == 1
+
+
+def test_rotation_conflict_takes_priority_over_active_allocation_resume_guard(
+    api: tuple[TestClient, object],
+) -> None:
+    from app.models.relay_node import RelayNode
+
+    client, engine = api
+    _enroll(client)
+    _approve(client)
+    drained = client.post(f"/api/v1/relays/{NODE_ID}/drain")
+    assert drained.status_code == 200, drained.text
+    rotation = client.post(
+        f"/api/v1/relays/{NODE_ID}/rotate-secret",
+        json={"credential_ttl_seconds": 60},
+    )
+    assert rotation.status_code == 202, rotation.text
+
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        node.active_allocations = 1
+        session.commit()
+
+    response = client.post(f"/api/v1/relays/{NODE_ID}/resume")
+    assert response.status_code == 409
+    assert _error_code(response) == "relay_secret_rotation_conflict"
 
 
 @pytest.mark.parametrize("drain_timing", ["before", "during"])

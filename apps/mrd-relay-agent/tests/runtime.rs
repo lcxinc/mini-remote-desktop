@@ -4,7 +4,7 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex,
+        mpsc, Arc, Barrier, Mutex,
     },
     time::Duration,
 };
@@ -32,11 +32,12 @@ use mrd_relay_agent::{
     },
     runtime::{
         backend_worker_once, run_agent, run_backend_worker, AgentRuntime, ClockPort,
-        CoturnSupervisor, HeartbeatSampler, HostPressureSnapshot, IdentityLifecycle,
-        IdentityMaintenance, JitterPort, PortableRelayAgent, PortableRelayAgentConfig,
-        PortableRelayAgentDeps, RandomJitter, RuntimeError, RuntimeStateSnapshot,
-        RuntimeStateStorePort, SecretRotationPhase, SharedRelayHealth, SleeperPort,
-        StdRuntimeStateStore, SystemClock,
+        CoturnRestartBudget, CoturnSupervisor, HeartbeatSampler, HostPressureSnapshot,
+        IdentityLifecycle, IdentityMaintenance, JitterPort, PortableRelayAgent,
+        PortableRelayAgentConfig, PortableRelayAgentDeps, RandomJitter, RuntimeError,
+        RuntimeStateSnapshot, RuntimeStateStorePort, SecretRotationPhase,
+        SerializedRuntimeStateStore, SharedRelayHealth, SleeperPort, StdRuntimeStateStore,
+        SystemClock,
     },
 };
 use rcgen::{
@@ -850,6 +851,17 @@ struct AdvancingSleeper {
     sleeps: Mutex<Vec<Duration>>,
 }
 
+struct WallAdvancingSleeper {
+    clock: Arc<FakeClock>,
+    sleeps: Mutex<Vec<Duration>>,
+}
+
+struct WallRewindingSleeper {
+    clock: Arc<FakeClock>,
+    rewound_unix_seconds: i64,
+    sleeps: Mutex<Vec<Duration>>,
+}
+
 struct TokioTestClock {
     origin: tokio::time::Instant,
     unix_base: Mutex<i64>,
@@ -931,6 +943,28 @@ impl SleeperPort for AdvancingSleeper {
 }
 
 #[async_trait]
+impl SleeperPort for WallAdvancingSleeper {
+    async fn sleep(&self, duration: Duration) {
+        self.sleeps.lock().unwrap().push(duration);
+        let delta_ms = u64::try_from(duration.as_millis()).unwrap();
+        let mut monotonic = self.clock.monotonic_ms.lock().unwrap();
+        *monotonic = monotonic.saturating_add(delta_ms);
+        drop(monotonic);
+        let delta_seconds = i64::try_from(duration.as_secs()).unwrap();
+        let mut wall = self.clock.unix_seconds.lock().unwrap();
+        *wall = wall.saturating_add(delta_seconds);
+    }
+}
+
+#[async_trait]
+impl SleeperPort for WallRewindingSleeper {
+    async fn sleep(&self, duration: Duration) {
+        self.sleeps.lock().unwrap().push(duration);
+        *self.clock.unix_seconds.lock().unwrap() = self.rewound_unix_seconds;
+    }
+}
+
+#[async_trait]
 impl SleeperPort for TokioTestSleeper {
     async fn sleep(&self, duration: Duration) {
         if duration == Duration::from_secs(1) {
@@ -978,6 +1012,18 @@ impl RuntimeStateStorePort for FakeRuntimeStateStore {
     fn atomic_store(&self, state: &RuntimeStateSnapshot) -> Result<(), RuntimeError> {
         *self.state.lock().unwrap() = state.clone();
         Ok(())
+    }
+}
+
+struct RejectingRuntimeStateStore;
+
+impl RuntimeStateStorePort for RejectingRuntimeStateStore {
+    fn load(&self) -> Result<RuntimeStateSnapshot, RuntimeError> {
+        Ok(RuntimeStateSnapshot::default())
+    }
+
+    fn atomic_store(&self, _state: &RuntimeStateSnapshot) -> Result<(), RuntimeError> {
+        Err(RuntimeError::StateIo)
     }
 }
 
@@ -4203,6 +4249,92 @@ async fn coturn_restart_is_attempted_exactly_three_times_then_stays_failed() {
 }
 
 #[tokio::test]
+async fn coturn_restart_budget_survives_supervisor_reconstruction() {
+    let coturn = Arc::new(FakeCoturn::default());
+    let sleeper = Arc::new(FakeSleeper::default());
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = 1_000;
+    let store = Arc::new(FakeRuntimeStateStore::default());
+    for _ in 0..4 {
+        coturn
+            .snapshots
+            .lock()
+            .unwrap()
+            .push_back(Ok(CoturnSnapshot {
+                generation: 7,
+                applied_secret_version: 1,
+                health: ProcessHealth::Failed,
+                active_allocations: 0,
+                current_egress_bps: 0,
+            }));
+    }
+
+    for expected_attempts in 1..=3 {
+        let mut supervisor = CoturnSupervisor::new_with_state_store(
+            coturn.clone(),
+            sleeper.clone(),
+            Arc::new(NonEvidenceProbe),
+            SharedRelayHealth::default(),
+            clock.clone(),
+            store.clone(),
+        )
+        .unwrap();
+        supervisor.supervise_once().await.unwrap();
+        let state = store.state.lock().unwrap().clone();
+        let budget = state.coturn_restart_budget.unwrap();
+        assert_eq!(budget.attempts, expected_attempts);
+        *clock.unix_seconds.lock().unwrap() = budget.not_before_unix_seconds;
+    }
+
+    let mut exhausted = CoturnSupervisor::new_with_state_store(
+        coturn.clone(),
+        sleeper,
+        Arc::new(NonEvidenceProbe),
+        SharedRelayHealth::default(),
+        clock,
+        store,
+    )
+    .unwrap();
+    exhausted.supervise_once().await.unwrap();
+    assert_eq!(*coturn.restarts.lock().unwrap(), 3);
+    assert_eq!(exhausted.restart_attempts(), 3);
+}
+
+#[tokio::test]
+async fn coturn_never_restarts_when_the_attempt_cannot_be_persisted_first() {
+    let coturn = Arc::new(FakeCoturn::default());
+    coturn
+        .snapshots
+        .lock()
+        .unwrap()
+        .push_back(Ok(CoturnSnapshot {
+            generation: 7,
+            applied_secret_version: 1,
+            health: ProcessHealth::Failed,
+            active_allocations: 0,
+            current_egress_bps: 0,
+        }));
+    let sleeper = Arc::new(FakeSleeper::default());
+    let mut supervisor = CoturnSupervisor::new_with_state_store(
+        coturn.clone(),
+        sleeper.clone(),
+        Arc::new(NonEvidenceProbe),
+        SharedRelayHealth::default(),
+        Arc::new(FakeClock::default()),
+        Arc::new(RejectingRuntimeStateStore),
+    )
+    .unwrap();
+
+    assert_eq!(
+        supervisor.supervise_once().await,
+        Err(RuntimeError::StateIo)
+    );
+    assert_eq!(*coturn.restarts.lock().unwrap(), 0);
+    assert!(sleeper.sleeps.lock().unwrap().is_empty());
+    assert_eq!(supervisor.restart_attempts(), 0);
+}
+
+#[tokio::test]
 async fn production_supervisor_does_not_reset_restart_budget_on_healthy_process_non_evidence() {
     let coturn = Arc::new(FakeCoturn::default());
     let sleeper = Arc::new(FakeSleeper::default());
@@ -4229,6 +4361,490 @@ async fn production_supervisor_does_not_reset_restart_budget_on_healthy_process_
     let health = shared.snapshot();
     assert_eq!(health.process, ProcessHealth::Healthy);
     assert_eq!(health.probe, RelayHealth::NonEvidence);
+}
+
+#[tokio::test]
+async fn runtime_state_updates_preserve_the_supervisor_restart_budget() {
+    let store = Arc::new(FakeRuntimeStateStore::default());
+    *store.state.lock().unwrap() = RuntimeStateSnapshot {
+        identity_epoch: 1,
+        secret_version: 1,
+        secret_digest: Some([1; 32]),
+        coturn_restart_budget: Some(CoturnRestartBudget {
+            attempts: 2,
+            failure_generation: 7,
+            observed_wall_unix_seconds: 1_000,
+            not_before_unix_seconds: 1_002,
+        }),
+        ..RuntimeStateSnapshot::default()
+    };
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = 1_002;
+    let mut runtime = AgentRuntime::new_with_state_store(
+        Arc::new(FakeBackend::default()),
+        Arc::new(FakeCoturn::default()),
+        clock,
+        Arc::new(FakeSleeper::default()),
+        Arc::new(FixedJitter(0)),
+        store.clone(),
+    )
+    .unwrap();
+
+    runtime
+        .apply_directive(NodeDirective::state(1, true))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .state
+            .lock()
+            .unwrap()
+            .coturn_restart_budget
+            .as_ref()
+            .map(|budget| budget.attempts),
+        Some(2)
+    );
+}
+
+#[test]
+fn corrupt_persisted_coturn_restart_budget_fails_closed() {
+    for budget in [
+        CoturnRestartBudget {
+            attempts: 0,
+            failure_generation: 7,
+            observed_wall_unix_seconds: 1_000,
+            not_before_unix_seconds: 1_001,
+        },
+        CoturnRestartBudget {
+            attempts: 4,
+            failure_generation: 7,
+            observed_wall_unix_seconds: 1_000,
+            not_before_unix_seconds: 1_004,
+        },
+        CoturnRestartBudget {
+            attempts: 1,
+            failure_generation: 0,
+            observed_wall_unix_seconds: 1_000,
+            not_before_unix_seconds: 1_001,
+        },
+        CoturnRestartBudget {
+            attempts: 2,
+            failure_generation: 7,
+            observed_wall_unix_seconds: 1_000,
+            not_before_unix_seconds: 1_001,
+        },
+    ] {
+        let store = Arc::new(FakeRuntimeStateStore::default());
+        store.state.lock().unwrap().coturn_restart_budget = Some(budget);
+        let clock = Arc::new(FakeClock::default());
+        *clock.unix_seconds.lock().unwrap() = 1_004;
+        assert!(matches!(
+            AgentRuntime::new_with_state_store(
+                Arc::new(FakeBackend::default()),
+                Arc::new(FakeCoturn::default()),
+                clock,
+                Arc::new(FakeSleeper::default()),
+                Arc::new(FixedJitter(0)),
+                store,
+            ),
+            Err(RuntimeError::StateInvalid)
+        ));
+    }
+
+    let with_unknown_field = serde_json::json!({
+        "identity_epoch": 1,
+        "last_directive_sequence": 0,
+        "secret_version": 0,
+        "secret_digest": null,
+        "bootstrap_secret": null,
+        "draining": false,
+        "pending_rotation": null,
+        "coturn_restart_budget": {
+            "attempts": 1,
+            "failure_generation": 7,
+            "observed_wall_unix_seconds": 1_000,
+            "not_before_unix_seconds": 1_001,
+            "unexpected": true
+        }
+    });
+    assert!(serde_json::from_value::<RuntimeStateSnapshot>(with_unknown_field).is_err());
+}
+
+#[test]
+fn serialized_runtime_store_preserves_backend_and_supervisor_mutations() {
+    let inner = Arc::new(FakeRuntimeStateStore::default());
+    let store = Arc::new(SerializedRuntimeStateStore::new(inner.clone()));
+    let first_entered = Arc::new(Barrier::new(2));
+    let (release_first_tx, release_first_rx) = mpsc::channel();
+    let first_store = store.clone();
+    let first_barrier = first_entered.clone();
+    let first = std::thread::spawn(move || {
+        first_store
+            .mutate(&mut |state| {
+                state.draining = true;
+                first_barrier.wait();
+                release_first_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+    });
+    first_entered.wait();
+
+    let (second_started_tx, second_started_rx) = mpsc::channel();
+    let (second_entered_tx, second_entered_rx) = mpsc::channel();
+    let second_store = store;
+    let second = std::thread::spawn(move || {
+        second_started_tx.send(()).unwrap();
+        second_store
+            .mutate(&mut |state| {
+                second_entered_tx.send(()).unwrap();
+                state.coturn_restart_budget = Some(CoturnRestartBudget {
+                    attempts: 1,
+                    failure_generation: 7,
+                    observed_wall_unix_seconds: 1_000,
+                    not_before_unix_seconds: 1_001,
+                });
+                Ok(())
+            })
+            .unwrap();
+    });
+    second_started_rx.recv().unwrap();
+    assert!(second_entered_rx
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
+    release_first_tx.send(()).unwrap();
+    first.join().unwrap();
+    second.join().unwrap();
+
+    let state = inner.state.lock().unwrap().clone();
+    assert!(state.draining);
+    assert_eq!(
+        state
+            .coturn_restart_budget
+            .as_ref()
+            .map(|budget| budget.attempts),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn coturn_restart_budget_carries_forward_across_new_generations() {
+    let store = Arc::new(FakeRuntimeStateStore::default());
+    store.state.lock().unwrap().coturn_restart_budget = Some(CoturnRestartBudget {
+        attempts: 1,
+        failure_generation: 7,
+        observed_wall_unix_seconds: 1_000,
+        not_before_unix_seconds: 1_001,
+    });
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = 1_001;
+    let coturn = Arc::new(FakeCoturn::default());
+    for generation in [8, 9, 10] {
+        coturn
+            .snapshots
+            .lock()
+            .unwrap()
+            .push_back(Ok(CoturnSnapshot {
+                generation,
+                applied_secret_version: 1,
+                health: ProcessHealth::Failed,
+                active_allocations: 0,
+                current_egress_bps: 0,
+            }));
+    }
+
+    for expected_attempts in 2..=3 {
+        let mut supervisor = CoturnSupervisor::new_with_state_store(
+            coturn.clone(),
+            Arc::new(FakeSleeper::default()),
+            Arc::new(NonEvidenceProbe),
+            SharedRelayHealth::default(),
+            clock.clone(),
+            store.clone(),
+        )
+        .unwrap();
+        supervisor.supervise_once().await.unwrap();
+        let budget = store
+            .state
+            .lock()
+            .unwrap()
+            .coturn_restart_budget
+            .clone()
+            .unwrap();
+        assert_eq!(budget.attempts, expected_attempts);
+        assert_eq!(budget.failure_generation, u64::from(expected_attempts) + 6);
+        *clock.unix_seconds.lock().unwrap() = budget.not_before_unix_seconds;
+    }
+
+    let mut exhausted = CoturnSupervisor::new_with_state_store(
+        coturn.clone(),
+        Arc::new(FakeSleeper::default()),
+        Arc::new(NonEvidenceProbe),
+        SharedRelayHealth::default(),
+        clock,
+        store,
+    )
+    .unwrap();
+    exhausted.supervise_once().await.unwrap();
+    assert_eq!(exhausted.restart_attempts(), 3);
+    assert_eq!(*coturn.restarts.lock().unwrap(), 2);
+}
+
+#[tokio::test]
+async fn reconstructed_supervisor_honors_persisted_not_before_before_next_attempt() {
+    let store = Arc::new(FakeRuntimeStateStore::default());
+    store.state.lock().unwrap().coturn_restart_budget = Some(CoturnRestartBudget {
+        attempts: 1,
+        failure_generation: 7,
+        observed_wall_unix_seconds: 1_000,
+        not_before_unix_seconds: 1_001,
+    });
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = 1_000;
+    let sleeper = Arc::new(WallAdvancingSleeper {
+        clock: clock.clone(),
+        sleeps: Mutex::new(Vec::new()),
+    });
+    let coturn = Arc::new(FakeCoturn::default());
+    coturn
+        .snapshots
+        .lock()
+        .unwrap()
+        .push_back(Ok(CoturnSnapshot {
+            generation: 8,
+            applied_secret_version: 1,
+            health: ProcessHealth::Failed,
+            active_allocations: 0,
+            current_egress_bps: 0,
+        }));
+    let mut supervisor = CoturnSupervisor::new_with_state_store(
+        coturn.clone(),
+        sleeper.clone(),
+        Arc::new(NonEvidenceProbe),
+        SharedRelayHealth::default(),
+        clock,
+        store.clone(),
+    )
+    .unwrap();
+
+    supervisor.supervise_once().await.unwrap();
+
+    assert_eq!(
+        *sleeper.sleeps.lock().unwrap(),
+        vec![Duration::from_secs(1), Duration::from_secs(2)]
+    );
+    let budget = store
+        .state
+        .lock()
+        .unwrap()
+        .coturn_restart_budget
+        .clone()
+        .unwrap();
+    assert_eq!(budget.attempts, 2);
+    assert_eq!(budget.failure_generation, 8);
+    assert_eq!(budget.observed_wall_unix_seconds, 1_001);
+    assert_eq!(budget.not_before_unix_seconds, 1_003);
+    assert_eq!(*coturn.restarts.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn coturn_generation_regression_fails_closed_without_spending_or_restarting() {
+    let store = Arc::new(FakeRuntimeStateStore::default());
+    store.state.lock().unwrap().coturn_restart_budget = Some(CoturnRestartBudget {
+        attempts: 1,
+        failure_generation: 9,
+        observed_wall_unix_seconds: 1_000,
+        not_before_unix_seconds: 1_001,
+    });
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = 1_001;
+    let coturn = Arc::new(FakeCoturn::default());
+    coturn
+        .snapshots
+        .lock()
+        .unwrap()
+        .push_back(Ok(CoturnSnapshot {
+            generation: 8,
+            applied_secret_version: 1,
+            health: ProcessHealth::Failed,
+            active_allocations: 0,
+            current_egress_bps: 0,
+        }));
+    let mut supervisor = CoturnSupervisor::new_with_state_store(
+        coturn.clone(),
+        Arc::new(FakeSleeper::default()),
+        Arc::new(NonEvidenceProbe),
+        SharedRelayHealth::default(),
+        clock,
+        store.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        supervisor.supervise_once().await,
+        Err(RuntimeError::StateInvalid)
+    );
+    assert_eq!(*coturn.restarts.lock().unwrap(), 0);
+    assert_eq!(
+        store
+            .state
+            .lock()
+            .unwrap()
+            .coturn_restart_budget
+            .as_ref()
+            .map(|budget| budget.attempts),
+        Some(1)
+    );
+}
+
+#[tokio::test]
+async fn exhausted_budget_tracks_the_latest_unready_generation_for_regression_checks() {
+    let store = Arc::new(FakeRuntimeStateStore::default());
+    store.state.lock().unwrap().coturn_restart_budget = Some(CoturnRestartBudget {
+        attempts: 3,
+        failure_generation: 7,
+        observed_wall_unix_seconds: 1_000,
+        not_before_unix_seconds: 1_004,
+    });
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = 1_004;
+    let coturn = Arc::new(FakeCoturn::default());
+    coturn.snapshots.lock().unwrap().extend([
+        Ok(CoturnSnapshot::healthy(0, 0).with_generation(9, 1)),
+        Ok(CoturnSnapshot {
+            generation: 8,
+            applied_secret_version: 1,
+            health: ProcessHealth::Failed,
+            active_allocations: 0,
+            current_egress_bps: 0,
+        }),
+    ]);
+    let mut supervisor = CoturnSupervisor::new_with_state_store(
+        coturn.clone(),
+        Arc::new(FakeSleeper::default()),
+        Arc::new(NonEvidenceProbe),
+        SharedRelayHealth::default(),
+        clock,
+        store.clone(),
+    )
+    .unwrap();
+
+    supervisor.supervise_once().await.unwrap();
+    assert_eq!(
+        store
+            .state
+            .lock()
+            .unwrap()
+            .coturn_restart_budget
+            .as_ref()
+            .map(|budget| budget.failure_generation),
+        Some(9)
+    );
+    assert_eq!(
+        supervisor.supervise_once().await,
+        Err(RuntimeError::StateInvalid)
+    );
+    assert_eq!(*coturn.restarts.lock().unwrap(), 0);
+}
+
+#[test]
+fn persisted_restart_budget_rejects_wall_clock_rollback() {
+    let store = Arc::new(FakeRuntimeStateStore::default());
+    store.state.lock().unwrap().coturn_restart_budget = Some(CoturnRestartBudget {
+        attempts: 1,
+        failure_generation: 7,
+        observed_wall_unix_seconds: 1_000,
+        not_before_unix_seconds: 1_001,
+    });
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = 999;
+
+    assert!(matches!(
+        CoturnSupervisor::new_with_state_store(
+            Arc::new(FakeCoturn::default()),
+            Arc::new(FakeSleeper::default()),
+            Arc::new(NonEvidenceProbe),
+            SharedRelayHealth::default(),
+            clock,
+            store,
+        ),
+        Err(RuntimeError::StateInvalid)
+    ));
+}
+
+#[tokio::test]
+async fn persisted_restart_budget_rechecks_wall_clock_after_waiting_for_not_before() {
+    let store = Arc::new(FakeRuntimeStateStore::default());
+    store.state.lock().unwrap().coturn_restart_budget = Some(CoturnRestartBudget {
+        attempts: 1,
+        failure_generation: 7,
+        observed_wall_unix_seconds: 1_000,
+        not_before_unix_seconds: 1_001,
+    });
+    let clock = Arc::new(FakeClock::default());
+    *clock.unix_seconds.lock().unwrap() = 1_000;
+    let sleeper = Arc::new(WallRewindingSleeper {
+        clock: clock.clone(),
+        rewound_unix_seconds: 999,
+        sleeps: Mutex::new(Vec::new()),
+    });
+    let coturn = Arc::new(FakeCoturn::default());
+    coturn
+        .snapshots
+        .lock()
+        .unwrap()
+        .push_back(Ok(CoturnSnapshot {
+            generation: 7,
+            applied_secret_version: 1,
+            health: ProcessHealth::Failed,
+            active_allocations: 0,
+            current_egress_bps: 0,
+        }));
+    let mut supervisor = CoturnSupervisor::new_with_state_store(
+        coturn.clone(),
+        sleeper.clone(),
+        Arc::new(NonEvidenceProbe),
+        SharedRelayHealth::default(),
+        clock,
+        store.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        supervisor.supervise_once().await,
+        Err(RuntimeError::StateInvalid)
+    );
+    assert_eq!(*coturn.restarts.lock().unwrap(), 0);
+    assert_eq!(
+        *sleeper.sleeps.lock().unwrap(),
+        vec![Duration::from_secs(1)]
+    );
+    assert_eq!(
+        store
+            .state
+            .lock()
+            .unwrap()
+            .coturn_restart_budget
+            .as_ref()
+            .map(|budget| budget.attempts),
+        Some(1)
+    );
+}
+
+#[test]
+fn runtime_state_without_restart_budget_remains_backward_compatible() {
+    let state: RuntimeStateSnapshot = serde_json::from_value(serde_json::json!({
+        "identity_epoch": 1,
+        "last_directive_sequence": 0,
+        "secret_version": 0,
+        "secret_digest": null,
+        "bootstrap_secret": null,
+        "draining": false,
+        "pending_rotation": null
+    }))
+    .unwrap();
+    assert!(state.coturn_restart_budget.is_none());
 }
 
 #[tokio::test]
@@ -4263,16 +4879,11 @@ async fn supervisor_invalidates_old_healthy_evidence_before_a_new_probe_can_bloc
 }
 
 #[tokio::test]
-async fn snapshot_and_restart_errors_still_stop_after_exactly_three_attempts() {
+async fn snapshot_errors_without_a_generation_fail_closed_before_restart() {
     let coturn = Arc::new(FakeCoturn::default());
     for _ in 0..5 {
         coturn
             .snapshots
-            .lock()
-            .unwrap()
-            .push_back(Err(ProcessError::Unavailable));
-        coturn
-            .restart_results
             .lock()
             .unwrap()
             .push_back(Err(ProcessError::Unavailable));
@@ -4287,8 +4898,8 @@ async fn snapshot_and_restart_errors_still_stop_after_exactly_three_attempts() {
     for _ in 0..5 {
         supervisor.supervise_once().await.unwrap();
     }
-    assert_eq!(*coturn.restarts.lock().unwrap(), 3);
-    assert_eq!(supervisor.restart_attempts(), 3);
+    assert_eq!(*coturn.restarts.lock().unwrap(), 0);
+    assert_eq!(supervisor.restart_attempts(), 0);
     assert_eq!(shared.snapshot().process, ProcessHealth::Failed);
 }
 
@@ -4432,6 +5043,7 @@ async fn generated_secret_rotation_persists_intent_uses_monotonic_window_and_req
         bootstrap_secret: None,
         draining: false,
         pending_rotation: None,
+        coturn_restart_budget: None,
     };
     let mut runtime = AgentRuntime::new_with_state_store(
         backend.clone(),
@@ -5626,6 +6238,7 @@ fn production_runtime_state_store_is_atomic_bounded_and_requires_absolute_path()
         bootstrap_secret: None,
         draining: true,
         pending_rotation: None,
+        coturn_restart_budget: None,
     };
     store.atomic_store(&state).unwrap();
     assert_eq!(store.load().unwrap(), state);
@@ -5725,14 +6338,14 @@ fn secret_and_error_rendering_are_always_redacted_and_reason_codes_are_stable() 
 }
 
 #[test]
-fn main_without_native_adapter_exits_nonzero_with_stable_reason() {
+fn main_without_a_command_exits_with_the_strict_cli_reason() {
     let output = Command::new(env!("CARGO_BIN_EXE_mrd-relay-agent"))
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(78));
+    assert_eq!(output.status.code(), Some(64));
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
-        "relay_native_adapter_unavailable\n"
+        "relay_cli_invalid\n"
     );
     assert!(output.stdout.is_empty());
 }

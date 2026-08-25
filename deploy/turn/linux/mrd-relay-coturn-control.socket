@@ -1,0 +1,19 @@
+[Unit]
+Description=MRD root coturn control socket
+
+[Socket]
+ListenStream=/run/mrd-relay-coturn-control/control.sock
+FileDescriptorName=mrd-relay-coturn-control
+SocketUser=root
+SocketGroup=mrd-relay
+SocketMode=0660
+DirectoryMode=0750
+Accept=yes
+RemoveOnStop=yes
+MaxConnections=16
+MaxConnectionsPerSource=4
+TriggerLimitIntervalSec=30s
+TriggerLimitBurst=30
+
+[Install]
+WantedBy=sockets.target

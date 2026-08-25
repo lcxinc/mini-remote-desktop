@@ -1,0 +1,28 @@
+[Unit]
+Description=MRD reversible relay ingress policy
+Before=mrd-coturn.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/libexec/mrd-relay-firewall apply
+ExecStart=/usr/local/libexec/mrd-relay-firewall verify
+# Deliberately remain inactive after success.  Every coturn start therefore
+# pulls a fresh apply+verify job through Requires=/After=.
+RemainAfterExit=no
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mrd-coturn -/etc/firewalld -/etc/ufw
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+RestrictAddressFamilies=AF_NETLINK AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

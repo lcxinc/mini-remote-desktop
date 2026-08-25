@@ -5,7 +5,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -24,8 +23,19 @@ from test_relay_node_api import (
     _error_code,
     _heartbeat_request,
     _issue_token,
-    api,
+    api as relay_node_api_fixture,
 )
+
+
+@pytest.fixture(name="api")
+def relay_admin_api_fixture(
+    request: pytest.FixtureRequest,
+) -> tuple[TestClient, object]:
+    # Referencing the imported fixture object keeps the dependency explicit;
+    # request-by-name avoids shadowing its module binding under Ruff F811.
+    if relay_node_api_fixture is None:  # pragma: no cover - import invariant
+        raise RuntimeError("relay_node_api_fixture_missing")
+    return request.getfixturevalue("relay_node_api_fixture")
 
 
 def _override_role(client: TestClient, role: str | None) -> None:
@@ -112,7 +122,12 @@ def test_enrollment_heartbeat_and_admin_transitions_are_durably_audited(
     client, engine = api
     key, _ = _enroll(client)
     _, fingerprint = _approve(client)
-    body, headers = _heartbeat_request(key, fingerprint)
+    # The audited resume path is intentionally capacity-gated.  Keep this
+    # lifecycle fixture drained so it exercises the successful transition;
+    # active-allocation rejection has dedicated coverage in test_relay_node_api.
+    body, headers = _heartbeat_request(
+        key, fingerprint, payload={"active_allocations": 0}
+    )
     assert client.post(
         f"/api/v1/relays/{NODE_ID}/heartbeat", content=body, headers=headers
     ).status_code == 200

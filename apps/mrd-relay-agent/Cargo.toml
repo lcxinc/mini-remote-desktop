@@ -35,7 +35,25 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"
 tokio-rustls = "0.26"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Globalization",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Security_Cryptography",
+  "Win32_Security_Cryptography_Catalog",
+  "Win32_Security_Cryptography_Sip",
+  "Win32_Security_WinTrust",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
+  "Win32_System_Pipes",
+  "Win32_System_WindowsProgramming",
+  "Win32_UI_Shell",
+] }
+windows-service = "0.8.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [lib]
 path = "src/lib.rs"
@@ -43,3 +61,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "mrd-relay-agent"
 path = "src/main.rs"
+
+[[bin]]
+name = "mrd-relay-coturn-control"
+path = "src/bin/mrd-relay-coturn-control.rs"

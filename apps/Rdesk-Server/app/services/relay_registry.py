@@ -1323,6 +1323,12 @@ class RelayRegistry:
                         409,
                         "relay secret rotation conflict",
                     )
+                if node.desired_draining and node.active_allocations > 0:
+                    self._error(
+                        "relay_node_drain_in_progress",
+                        409,
+                        "relay node drain in progress",
+                    )
                 should_audit = node.desired_draining or node.state == "draining"
                 node.desired_draining = False
                 node.state = "unavailable"

@@ -1,0 +1,55 @@
+[Unit]
+Description=MRD hardened coturn relay
+Documentation=https://github.com/coturn/coturn
+Wants=network-online.target
+Requires=mrd-relay-firewall.service
+After=network-online.target
+After=mrd-relay-firewall.service
+
+[Service]
+Type=simple
+User=mrd-coturn
+Group=mrd-coturn
+UMask=0077
+RuntimeDirectory=mrd-coturn
+RuntimeDirectoryMode=0700
+LoadCredential=turnserver.conf:/etc/mrd-relay-agent/secrets/turnserver.generated.conf
+LoadCredential=turn-cert:/etc/mrd-relay-agent/tls/fullchain.pem
+LoadCredential=turn-key:/etc/mrd-relay-agent/tls/privkey.pem
+ExecStart=/usr/bin/turnserver -c %d/turnserver.conf
+# Never self-restart around the relay agent's bounded restart owner.
+# A SIGUSR1 drain exits cleanly and stays stopped until an agent resume/restart.
+Restart=no
+TimeoutStartSec=30s
+TimeoutStopSec=120s
+LimitNOFILE=65536
+IPAccounting=yes
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mrd-coturn

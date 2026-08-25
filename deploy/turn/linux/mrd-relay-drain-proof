@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
+
+readonly validator=/usr/local/libexec/mrd-validate-drain-proof
+readonly agent=/usr/local/bin/mrd-relay-agent
+readonly socket_unit=mrd-relay-coturn-control.socket
+
+fail() {
+  printf '%s\n' "${1:-relay_drain_proof_failed}" >&2
+  exit 1
+}
+
+assert_trusted_ancestors() {
+  local current=$1
+  while [[ "$current" != / ]]; do
+    if [[ -e "$current" ]]; then
+      [[ ! -L "$current" ]] || fail relay_drain_proof_symlink_ancestor_rejected
+      [[ "$(/usr/bin/stat -c '%u' -- "$current")" == 0 ]] \
+        || fail relay_drain_proof_owner_invalid
+      local mode
+      mode="$(/usr/bin/stat -c '%a' -- "$current")"
+      (( (8#$mode & 0022) == 0 )) || fail relay_drain_proof_mode_invalid
+    fi
+    current="${current%/*}"
+    [[ -n "$current" ]] || current=/
+  done
+}
+
+if [[ "$#" -eq 1 && "$1" == --self-test ]]; then
+  test_python="${MRD_RELAY_TEST_PYTHON:-/usr/bin/python3}"
+  test_validator="${MRD_RELAY_TEST_VALIDATOR:-$validator}"
+  "$test_python" "$test_validator" self-test || fail relay_drain_proof_self_test_failed
+  printf '%s\n' relay_drain_proof_self_test_passed
+  exit 0
+fi
+[[ "$#" -eq 2 && "$1" == --config ]] || exit 64
+config=$2
+[[ "${EUID}" -eq 0 ]] || fail relay_drain_proof_requires_root
+[[ "$config" == /* && -f "$config" && ! -L "$config" ]] || fail relay_drain_proof_config_invalid
+[[ "$(/usr/bin/realpath -e -- "$config")" == "$config" ]] || fail relay_drain_proof_config_invalid
+[[ "$(/usr/bin/stat -c '%U:%G:%a' -- "$config")" == root:root:600 ]] \
+  || fail relay_drain_proof_config_mode_invalid
+assert_trusted_ancestors "$config"
+assert_trusted_ancestors "$agent"
+assert_trusted_ancestors "$validator"
+[[ "$(/usr/bin/stat -c '%U:%G:%a' -- "$agent")" == root:root:755 ]] \
+  || fail relay_drain_proof_agent_mode_invalid
+[[ "$(/usr/bin/stat -c '%U:%G:%a' -- "$validator")" == root:root:755 ]] \
+  || fail relay_drain_proof_validator_mode_invalid
+for executable in /usr/sbin/runuser /usr/bin/openssl /usr/bin/python3 /usr/bin/install \
+  /usr/bin/mktemp /usr/bin/systemctl "$agent" "$validator"; do
+  [[ -x "$executable" && ! -L "$executable" ]] || fail relay_drain_proof_dependency_invalid
+done
+/usr/bin/systemctl is-active --quiet "$socket_unit" || fail relay_drain_proof_socket_inactive
+
+temporary_config="$(/usr/bin/mktemp --tmpdir=/run .mrd-relay-maintenance-config.XXXXXX)"
+evidence_file="$(/usr/bin/mktemp --tmpdir=/run .mrd-relay-drain-proof.XXXXXX)"
+cleanup() {
+  if [[ -f "$temporary_config" && ! -L "$temporary_config" ]]; then /usr/bin/rm -f -- "$temporary_config"; fi
+  if [[ -f "$evidence_file" && ! -L "$evidence_file" ]]; then /usr/bin/rm -f -- "$evidence_file"; fi
+}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+/usr/bin/install -o root -g mrd-relay -m 0640 -- "$config" "$temporary_config"
+/usr/bin/chown root:root "$evidence_file"
+/usr/bin/chmod 0600 "$evidence_file"
+challenge="$(/usr/bin/openssl rand -hex 32)" || fail relay_drain_proof_challenge_failed
+[[ "$challenge" =~ ^[0-9a-f]{64}$ && "$challenge" != 0000000000000000000000000000000000000000000000000000000000000000 ]] \
+  || fail relay_drain_proof_challenge_failed
+/usr/sbin/runuser --user mrd-relay -- \
+  "$agent" drain-proof --config "$temporary_config" --challenge "$challenge" \
+  > "$evidence_file" || fail relay_drain_proof_command_failed
+/usr/bin/python3 "$validator" validate "$evidence_file" "$challenge" linux-systemd \
+  || fail relay_drain_proof_evidence_invalid

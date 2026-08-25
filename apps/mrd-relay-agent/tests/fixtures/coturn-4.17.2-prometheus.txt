@@ -1,0 +1,31 @@
+# Source: coturn 4.17.2 tag f80f121aabd59634d0009d032ed60e624a4041cf
+# Metric definitions: src/apps/relay/prom_server.c in that exact tag.
+# HELP turn_total_allocations Represents current allocations number
+# TYPE turn_total_allocations gauge
+turn_total_allocations{type="UDP"} 7.0
+turn_total_allocations{type="TCP"} 3
+turn_total_allocations{type="TLS/TCP"} 2
+# HELP turn_total_traffic_sentb Represents total finished sessions sent bytes
+# TYPE turn_total_traffic_sentb counter
+turn_total_traffic_sentb 3145728
+# HELP turn_total_traffic_rcvb Represents total finished sessions received bytes
+# TYPE turn_total_traffic_rcvb counter
+turn_total_traffic_rcvb 524288
+# HELP turn_packet_dropped Incoming packet dropped
+# TYPE turn_packet_dropped counter
+turn_packet_dropped 2
+# HELP stun_binding_error STUN Binding errors
+# TYPE stun_binding_error counter
+stun_binding_error 1
+# HELP turn_unauthenticated_401_requests UDP requests requiring a 401 Unauthorized response
+# TYPE turn_unauthenticated_401_requests counter
+turn_unauthenticated_401_requests 500
+# HELP turn_unauthenticated_401_responses UDP 401 Unauthorized responses emitted
+# TYPE turn_unauthenticated_401_responses counter
+turn_unauthenticated_401_responses 500
+# HELP turn_unauthenticated_401_dropped_responses UDP 401 responses suppressed by DDoS mitigation
+# TYPE turn_unauthenticated_401_dropped_responses counter
+turn_unauthenticated_401_dropped_responses 4
+# HELP turn_ratelimit_hash_collisions 401 rate-limit hash-bucket collisions
+# TYPE turn_ratelimit_hash_collisions counter
+turn_ratelimit_hash_collisions 1
