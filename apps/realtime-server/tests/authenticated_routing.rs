@@ -1,12 +1,16 @@
 use mrd_identity::DeviceIdentity;
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use mrd_signal_proto::{
-    relay_candidate_fingerprint, AuthClaims, AuthenticatedRegister, AuthenticatedSignalMessage,
-    PresenceHeartbeat, PresenceHeartbeatPayload, ProtocolReasonCode, RegisterPayload,
-    RelayMigrationAnswer, RelayMigrationAnswerPayload, RelayMigrationCandidate,
-    RelayMigrationCandidatePayload, RelayMigrationOffer, RelayMigrationOfferPayload, SessionClose,
-    SessionClosePayload, SessionGrant, SessionGrantPayload, SessionIntent, SessionIntentPayload,
-    SignalEnvelope, WebRtcCandidate, WebRtcCandidatePayload, WebRtcOffer, WebRtcOfferPayload,
+    relay_candidate_fingerprint, webrtc_candidate_fingerprint_v3, AuthClaims,
+    AuthenticatedRegister, AuthenticatedSignalMessage, PresenceHeartbeat, PresenceHeartbeatPayload,
+    ProtocolReasonCode, RegisterPayload, RelayMigrationAnswer, RelayMigrationAnswerPayload,
+    RelayMigrationCandidate, RelayMigrationCandidatePayload, RelayMigrationOffer,
+    RelayMigrationOfferPayload, SessionClose, SessionClosePayload, SessionGrantV3,
+    SessionGrantV3Payload, SessionIntentPayload, SessionIntentV3, SessionIntentV3Payload,
+    SignalEnvelope, SignedSignal, WanAccessModeV3, WanPermissionScopeV3, WanRoutePolicyV3,
+    WanSessionRequestV3, WebRtcAnswerV3, WebRtcAnswerV3Payload, WebRtcCandidateV3,
+    WebRtcCandidateV3Payload, WebRtcDescriptionRoleV3, WebRtcOfferV3, WebRtcOfferV3Payload,
+    SIGNAL_PROTOCOL_V2,
 };
 use realtime_server::{
     BackendTokenError, BackendTokenVerifier, ConnectionId, CoreConfig, DeliveryTarget,
@@ -131,6 +135,180 @@ fn register(core: &mut RealtimeCore, device: &mut TestDevice, role: BackendRole)
     ));
 }
 
+fn wan_request(
+    controller: &TestDevice,
+    target: &TestDevice,
+    session_id: &str,
+    idempotency_key: [u8; 16],
+) -> WanSessionRequestV3 {
+    WanSessionRequestV3 {
+        session_id: SessionId(session_id.into()),
+        idempotency_key,
+        controller_device_id: controller.device_id.clone(),
+        target_device_id: target.device_id.clone(),
+        access_mode: WanAccessModeV3::Attended,
+        requested_scopes: vec![
+            WanPermissionScopeV3::InputKeyboard,
+            WanPermissionScopeV3::ScreenView,
+        ],
+        requested_profile: None,
+        route_policy: WanRoutePolicyV3::RelayOnly,
+    }
+}
+
+fn signed_intent_v3(
+    controller: &mut TestDevice,
+    target: &TestDevice,
+    session_id: &str,
+    idempotency_key: [u8; 16],
+) -> SessionIntentV3 {
+    let request = wan_request(controller, target, session_id, idempotency_key);
+    let request_commitment = request.commitment().unwrap();
+    let claims = controller.claims(&target.device_id);
+    SessionIntentV3::sign(
+        &controller.identity,
+        SessionIntentV3Payload {
+            claims,
+            request,
+            request_commitment,
+        },
+    )
+    .unwrap()
+}
+
+fn signed_grant_v3(
+    target: &mut TestDevice,
+    controller: &TestDevice,
+    intent: &SessionIntentV3,
+) -> SessionGrantV3 {
+    let request = &intent.payload.request;
+    let claims = target.claims(&controller.device_id);
+    SessionGrantV3::sign(
+        &target.identity,
+        SessionGrantV3Payload {
+            claims,
+            session_id: request.session_id.clone(),
+            controller_device_id: controller.device_id.clone(),
+            target_device_id: target.device_id.clone(),
+            intent_commitment: intent.commitment().unwrap(),
+            approved_scopes: vec![WanPermissionScopeV3::ScreenView],
+            approved_profile: None,
+            backend_policy_revision: 7,
+            policy_expires_at_ms: NOW + 60_000,
+            relay_generation: 0,
+            relay_directory_id: "directory-1".into(),
+            primary_relay_node_id: "relay-1".into(),
+            route_policy: WanRoutePolicyV3::RelayOnly,
+        },
+    )
+    .unwrap()
+}
+
+fn signed_offer_v3(
+    controller: &mut TestDevice,
+    target_device_id: DeviceId,
+    session_id: &str,
+    grant_commitment: String,
+    candidate_fingerprints: Vec<String>,
+) -> WebRtcOfferV3 {
+    let claims = controller.claims(&target_device_id);
+    WebRtcOfferV3::sign(
+        &controller.identity,
+        WebRtcOfferV3Payload {
+            claims,
+            session_id: SessionId(session_id.into()),
+            controller_device_id: controller.device_id.clone(),
+            target_device_id,
+            grant_commitment,
+            sdp: "opaque-controller-description".into(),
+            candidate_fingerprints,
+        },
+    )
+    .unwrap()
+}
+
+fn signed_answer_v3(
+    target: &mut TestDevice,
+    controller: &TestDevice,
+    session_id: &str,
+    grant_commitment: String,
+    candidate_fingerprints: Vec<String>,
+) -> WebRtcAnswerV3 {
+    let claims = target.claims(&controller.device_id);
+    WebRtcAnswerV3::sign(
+        &target.identity,
+        WebRtcAnswerV3Payload {
+            claims,
+            session_id: SessionId(session_id.into()),
+            controller_device_id: controller.device_id.clone(),
+            target_device_id: target.device_id.clone(),
+            grant_commitment,
+            sdp: "opaque-target-description".into(),
+            candidate_fingerprints,
+        },
+    )
+    .unwrap()
+}
+
+fn signed_candidate_v3(
+    controller_device_id: DeviceId,
+    target_device_id: DeviceId,
+    sender: &mut TestDevice,
+    grant_commitment: String,
+    role: WebRtcDescriptionRoleV3,
+) -> WebRtcCandidateV3 {
+    let intended_peer = match role {
+        WebRtcDescriptionRoleV3::Offer => &target_device_id,
+        WebRtcDescriptionRoleV3::Answer => &controller_device_id,
+    };
+    let session_id = SessionId("session-1".into());
+    let candidate = "opaque-relay-candidate".to_string();
+    let sdp_mid = Some("0".to_string());
+    let sdp_mline_index = Some(0);
+    let username_fragment = Some("opaque-fragment".to_string());
+    let candidate_fingerprint = webrtc_candidate_fingerprint_v3(
+        &session_id,
+        &grant_commitment,
+        role,
+        &candidate,
+        sdp_mid.as_deref(),
+        sdp_mline_index,
+        username_fragment.as_deref(),
+    );
+    let claims = sender.claims(intended_peer);
+    WebRtcCandidateV3::sign(
+        &sender.identity,
+        WebRtcCandidateV3Payload {
+            claims,
+            session_id,
+            controller_device_id,
+            target_device_id,
+            grant_commitment,
+            description_role: role,
+            candidate,
+            sdp_mid,
+            sdp_mline_index,
+            username_fragment,
+            candidate_fingerprint,
+        },
+    )
+    .unwrap()
+}
+
+fn assert_routes_to(
+    core: &mut RealtimeCore,
+    sender: ConnectionId,
+    recipient: ConnectionId,
+    message: AuthenticatedSignalMessage,
+    now_ms: u64,
+) {
+    let envelope = SignalEnvelope::new(message);
+    let deliveries = core.handle(sender, envelope.clone(), now_ms).unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].target, DeliveryTarget::Connection(recipient));
+    assert_eq!(deliveries[0].envelope, envelope);
+}
+
 #[test]
 fn register_requires_challenge_key_proof_and_unexpired_backend_token() {
     let mut controller = TestDevice::new("controller-1", 1);
@@ -214,7 +392,7 @@ fn register_requires_challenge_key_proof_and_unexpired_backend_token() {
 }
 
 #[test]
-fn session_intent_routes_only_to_authenticated_target_and_is_idempotent() {
+fn v3_initial_all_five_messages_route_unchanged_only_to_the_signed_peer() {
     let mut controller = TestDevice::new("controller-1", 1);
     let mut target = TestDevice::new("target-1", 2);
     let mut core = core_with(&[
@@ -224,138 +402,252 @@ fn session_intent_routes_only_to_authenticated_target_and_is_idempotent() {
     register(&mut core, &mut controller, BackendRole::Controller);
     register(&mut core, &mut target, BackendRole::Agent);
 
-    let idempotency_key = [44; 16];
-    for _ in 0..2 {
-        let intent_claims = controller.claims(&target.device_id.clone());
-        let intent = SessionIntent::sign(
-            &controller.identity,
-            SessionIntentPayload {
-                claims: intent_claims,
-                session_id: SessionId("session-1".into()),
-                idempotency_key,
-                target_device_id: target.device_id.clone(),
-                requested_transport: "webrtc".into(),
-            },
-        )
-        .unwrap();
-        let deliveries = core
-            .handle(
-                controller.connection_id,
-                SignalEnvelope::new(AuthenticatedSignalMessage::SessionIntent(intent)),
-                NOW + 2,
-            )
-            .unwrap();
-        assert_eq!(
-            deliveries[0].target,
-            DeliveryTarget::Connection(target.connection_id)
-        );
-    }
+    let intent = signed_intent_v3(&mut controller, &target, "session-1", [44; 16]);
+    assert_routes_to(
+        &mut core,
+        controller.connection_id,
+        target.connection_id,
+        AuthenticatedSignalMessage::SessionIntentV3(intent.clone()),
+        NOW + 2,
+    );
+    let duplicate = signed_intent_v3(&mut controller, &target, "session-1", [44; 16]);
+    assert_routes_to(
+        &mut core,
+        controller.connection_id,
+        target.connection_id,
+        AuthenticatedSignalMessage::SessionIntentV3(duplicate),
+        NOW + 2,
+    );
+    assert_eq!(core.route_count(), 1);
+    let grant = signed_grant_v3(&mut target, &controller, &intent);
+    assert_routes_to(
+        &mut core,
+        target.connection_id,
+        controller.connection_id,
+        AuthenticatedSignalMessage::SessionGrantV3(grant.clone()),
+        NOW + 3,
+    );
+    let grant_commitment = grant.commitment().unwrap();
+    let offer_fingerprint = "a".repeat(64);
+    let offer = signed_offer_v3(
+        &mut controller,
+        target.device_id.clone(),
+        "session-1",
+        grant_commitment.clone(),
+        vec![offer_fingerprint],
+    );
+    assert_routes_to(
+        &mut core,
+        controller.connection_id,
+        target.connection_id,
+        AuthenticatedSignalMessage::WebrtcOfferV3(offer),
+        NOW + 4,
+    );
+    let answer = signed_answer_v3(
+        &mut target,
+        &controller,
+        "session-1",
+        grant_commitment.clone(),
+        vec!["b".repeat(64)],
+    );
+    assert_routes_to(
+        &mut core,
+        target.connection_id,
+        controller.connection_id,
+        AuthenticatedSignalMessage::WebrtcAnswerV3(answer),
+        NOW + 5,
+    );
+    let candidate = signed_candidate_v3(
+        controller.device_id.clone(),
+        target.device_id.clone(),
+        &mut controller,
+        grant_commitment,
+        WebRtcDescriptionRoleV3::Offer,
+    );
+    assert_routes_to(
+        &mut core,
+        controller.connection_id,
+        target.connection_id,
+        AuthenticatedSignalMessage::WebrtcCandidateV3(candidate),
+        NOW + 6,
+    );
     assert_eq!(core.route_count(), 1);
 }
 
 #[test]
-fn random_peer_cannot_inject_offer_candidate_or_close() {
+fn v3_initial_rejects_v2_cross_version_wrong_route_oversize_and_invalid_signature() {
     let mut controller = TestDevice::new("controller-1", 1);
     let mut target = TestDevice::new("target-1", 2);
-    let mut random = TestDevice::new("random-1", 3);
     let mut core = core_with(&[
         (&controller, BackendRole::Controller),
         (&target, BackendRole::Agent),
-        (&random, BackendRole::Controller),
     ]);
     register(&mut core, &mut controller, BackendRole::Controller);
     register(&mut core, &mut target, BackendRole::Agent);
-    register(&mut core, &mut random, BackendRole::Controller);
-    authorize_route(&mut core, &mut controller, &mut target);
+    let intent = signed_intent_v3(&mut controller, &target, "session-1", [45; 16]);
+    assert_routes_to(
+        &mut core,
+        controller.connection_id,
+        target.connection_id,
+        AuthenticatedSignalMessage::SessionIntentV3(intent.clone()),
+        NOW + 2,
+    );
+    let grant = signed_grant_v3(&mut target, &controller, &intent);
+    assert_routes_to(
+        &mut core,
+        target.connection_id,
+        controller.connection_id,
+        AuthenticatedSignalMessage::SessionGrantV3(grant.clone()),
+        NOW + 3,
+    );
+    let grant_commitment = grant.commitment().unwrap();
 
-    let fingerprint = "a".repeat(64);
-    let offer_claims = random.claims(&target.device_id.clone());
-    let offer = WebRtcOffer::sign(
-        &random.identity,
-        WebRtcOfferPayload {
-            claims: offer_claims,
-            session_id: SessionId("session-1".into()),
-            sdp: "v=0".into(),
-            candidate_fingerprints: BTreeSet::from([fingerprint.clone()]),
-        },
-    )
-    .unwrap();
-    let candidate_claims = random.claims(&target.device_id.clone());
-    let candidate = WebRtcCandidate::sign(
-        &random.identity,
-        WebRtcCandidatePayload {
-            claims: candidate_claims,
-            session_id: SessionId("session-1".into()),
-            candidate: "candidate:1".into(),
-            sdp_mid: Some("0".into()),
-            sdp_mline_index: Some(0),
-            candidate_fingerprint: fingerprint,
-        },
-    )
-    .unwrap();
-    let close_claims = random.claims(&target.device_id.clone());
-    let close = SessionClose::sign(
-        &random.identity,
-        SessionClosePayload {
-            claims: close_claims,
-            session_id: SessionId("session-1".into()),
-            reason: ProtocolReasonCode::Conflict,
-        },
-    )
-    .unwrap();
-
-    for message in [
-        AuthenticatedSignalMessage::WebrtcOffer(offer),
-        AuthenticatedSignalMessage::WebrtcCandidate(candidate),
-        AuthenticatedSignalMessage::SessionClose(close),
-    ] {
-        assert_eq!(
-            core.handle(random.connection_id, SignalEnvelope::new(message), NOW + 4)
-                .unwrap_err()
-                .reason_code(),
-            ProtocolReasonCode::UnauthorizedRoute
-        );
-    }
-}
-
-fn authorize_route(core: &mut RealtimeCore, controller: &mut TestDevice, target: &mut TestDevice) {
-    let fingerprint = "a".repeat(64);
-    let intent_claims = controller.claims(&target.device_id.clone());
-    let intent = SessionIntent::sign(
-        &controller.identity,
-        SessionIntentPayload {
-            claims: intent_claims,
-            session_id: SessionId("session-1".into()),
-            idempotency_key: [45; 16],
+    let legacy = SignedSignal {
+        payload: SessionIntentPayload {
+            claims: controller.claims(&target.device_id),
+            session_id: SessionId("legacy-session".into()),
+            idempotency_key: [46; 16],
             target_device_id: target.device_id.clone(),
             requested_transport: "webrtc".into(),
         },
-    )
-    .unwrap();
+        signer_public_key: Vec::new(),
+        signature: Vec::new(),
+    };
+    let legacy_error = core
+        .handle(
+            controller.connection_id,
+            SignalEnvelope {
+                version: SIGNAL_PROTOCOL_V2,
+                message: AuthenticatedSignalMessage::SessionIntent(legacy),
+            },
+            NOW + 4,
+        )
+        .unwrap_err();
+    assert_eq!(
+        legacy_error.reason_code(),
+        ProtocolReasonCode::UnsupportedVersion
+    );
+
+    let cross_version = signed_offer_v3(
+        &mut controller,
+        target.device_id.clone(),
+        "session-1",
+        grant_commitment.clone(),
+        vec!["a".repeat(64)],
+    );
+    assert_eq!(
+        core.handle(
+            controller.connection_id,
+            SignalEnvelope {
+                version: SIGNAL_PROTOCOL_V2,
+                message: AuthenticatedSignalMessage::WebrtcOfferV3(cross_version),
+            },
+            NOW + 5,
+        )
+        .unwrap_err()
+        .reason_code(),
+        ProtocolReasonCode::UnsupportedVersion
+    );
+
+    let wrong_room = signed_offer_v3(
+        &mut controller,
+        target.device_id.clone(),
+        "other-session",
+        grant_commitment.clone(),
+        vec!["a".repeat(64)],
+    );
+    assert_eq!(
+        core.handle(
+            controller.connection_id,
+            SignalEnvelope::new(AuthenticatedSignalMessage::WebrtcOfferV3(wrong_room)),
+            NOW + 6,
+        )
+        .unwrap_err()
+        .reason_code(),
+        ProtocolReasonCode::UnknownSession
+    );
+
+    let wrong_peer = signed_offer_v3(
+        &mut controller,
+        DeviceId("other-target".into()),
+        "session-1",
+        grant_commitment.clone(),
+        vec!["a".repeat(64)],
+    );
+    assert_eq!(
+        core.handle(
+            controller.connection_id,
+            SignalEnvelope::new(AuthenticatedSignalMessage::WebrtcOfferV3(wrong_peer)),
+            NOW + 7,
+        )
+        .unwrap_err()
+        .reason_code(),
+        ProtocolReasonCode::UnauthorizedRoute
+    );
+
+    let mut oversized = signed_offer_v3(
+        &mut controller,
+        target.device_id.clone(),
+        "session-1",
+        grant_commitment.clone(),
+        vec!["a".repeat(64)],
+    );
+    oversized.payload.candidate_fingerprints =
+        (0..257).map(|index| format!("{index:064x}")).collect();
+    assert_eq!(
+        core.handle(
+            controller.connection_id,
+            SignalEnvelope::new(AuthenticatedSignalMessage::WebrtcOfferV3(oversized)),
+            NOW + 8,
+        )
+        .unwrap_err()
+        .reason_code(),
+        ProtocolReasonCode::Malformed
+    );
+
+    let mut invalid_signature = signed_offer_v3(
+        &mut controller,
+        target.device_id.clone(),
+        "session-1",
+        grant_commitment,
+        vec!["a".repeat(64)],
+    );
+    invalid_signature.signature[0] ^= 1;
+    let signature_error = core
+        .handle(
+            controller.connection_id,
+            SignalEnvelope::new(AuthenticatedSignalMessage::WebrtcOfferV3(invalid_signature)),
+            NOW + 9,
+        )
+        .unwrap_err();
+    assert_eq!(
+        signature_error.reason_code(),
+        ProtocolReasonCode::AuthenticationFailed
+    );
+    let error_text = format!("{legacy_error} {signature_error}");
+    assert!(!error_text.contains("opaque-controller-description"));
+}
+
+fn authorize_route(
+    core: &mut RealtimeCore,
+    controller: &mut TestDevice,
+    target: &mut TestDevice,
+) -> SessionIntentV3 {
+    let intent = signed_intent_v3(controller, target, "session-1", [45; 16]);
     core.handle(
         controller.connection_id,
-        SignalEnvelope::new(AuthenticatedSignalMessage::SessionIntent(intent)),
+        SignalEnvelope::new(AuthenticatedSignalMessage::SessionIntentV3(intent.clone())),
         NOW + 2,
     )
     .unwrap();
-    let grant_claims = target.claims(&controller.device_id.clone());
-    let grant = SessionGrant::sign(
-        &target.identity,
-        SessionGrantPayload {
-            claims: grant_claims,
-            session_id: SessionId("session-1".into()),
-            controller_device_id: controller.device_id.clone(),
-            accepted_transport: "webrtc".into(),
-            accepted_candidate_fingerprints: BTreeSet::from([fingerprint]),
-        },
-    )
-    .unwrap();
+    let grant = signed_grant_v3(target, controller, &intent);
     core.handle(
         target.connection_id,
-        SignalEnvelope::new(AuthenticatedSignalMessage::SessionGrant(grant)),
+        SignalEnvelope::new(AuthenticatedSignalMessage::SessionGrantV3(grant)),
         NOW + 3,
     )
     .unwrap();
+    intent
 }
 
 #[test]
@@ -371,14 +663,14 @@ fn relay_migration_enforces_generation_binding_grant_participants_and_close() {
     register(&mut core, &mut controller, BackendRole::Controller);
     register(&mut core, &mut target, BackendRole::Agent);
     register(&mut core, &mut random, BackendRole::Controller);
-    authorize_route(&mut core, &mut controller, &mut target);
+    let intent = authorize_route(&mut core, &mut controller, &mut target);
 
     let session_id = SessionId("session-1".into());
     let fingerprint = "a".repeat(64);
     let target_candidate_fingerprint = relay_candidate_fingerprint(
         &session_id,
         1,
-        "candidate:relay",
+        "opaque-relay-candidate",
         Some("0"),
         Some(0),
         Some("restart-ufrag"),
@@ -399,7 +691,7 @@ fn relay_migration_enforces_generation_binding_grant_participants_and_close() {
                 migration_generation: generation,
                 directory_id: directory_id.into(),
                 node_id: node_id.into(),
-                sdp: "v=0".into(),
+                sdp: "opaque-migration-offer".into(),
                 restart_route_token: "1".repeat(64),
                 candidate_fingerprints: BTreeSet::from([fingerprint.to_owned()]),
             },
@@ -436,7 +728,7 @@ fn relay_migration_enforces_generation_binding_grant_participants_and_close() {
             migration_generation: 1,
             directory_id: "directory-1".into(),
             node_id: "relay-1".into(),
-            sdp: "v=0".into(),
+            sdp: "opaque-migration-answer".into(),
             restart_route_token: "1".repeat(64),
             candidate_fingerprints: BTreeSet::from([target_candidate_fingerprint.clone()]),
         },
@@ -458,7 +750,7 @@ fn relay_migration_enforces_generation_binding_grant_participants_and_close() {
             migration_generation: 1,
             directory_id: "directory-1".into(),
             node_id: "relay-1".into(),
-            candidate: "candidate:relay".into(),
+            candidate: "opaque-relay-candidate".into(),
             sdp_mid: Some("0".into()),
             sdp_mline_index: Some(0),
             username_fragment: Some("restart-ufrag".into()),
@@ -523,7 +815,7 @@ fn relay_migration_enforces_generation_binding_grant_participants_and_close() {
             migration_generation: 2,
             directory_id: "different-directory".into(),
             node_id: "relay-2".into(),
-            sdp: "v=0".into(),
+            sdp: "opaque-migration-answer".into(),
             restart_route_token: "1".repeat(64),
             candidate_fingerprints: BTreeSet::from([fingerprint.clone()]),
         },
@@ -540,21 +832,10 @@ fn relay_migration_enforces_generation_binding_grant_participants_and_close() {
         ProtocolReasonCode::Conflict
     );
 
-    let refreshed_grant_claims = target.claims(&controller.device_id);
-    let refreshed_grant = SessionGrant::sign(
-        &target.identity,
-        SessionGrantPayload {
-            claims: refreshed_grant_claims,
-            session_id: session_id.clone(),
-            controller_device_id: controller.device_id.clone(),
-            accepted_transport: "webrtc".into(),
-            accepted_candidate_fingerprints: BTreeSet::from([fingerprint.clone()]),
-        },
-    )
-    .unwrap();
+    let refreshed_grant = signed_grant_v3(&mut target, &controller, &intent);
     core.handle(
         target.connection_id,
-        SignalEnvelope::new(AuthenticatedSignalMessage::SessionGrant(refreshed_grant)),
+        SignalEnvelope::new(AuthenticatedSignalMessage::SessionGrantV3(refreshed_grant)),
         NOW + 11,
     )
     .unwrap();
@@ -568,7 +849,7 @@ fn relay_migration_enforces_generation_binding_grant_participants_and_close() {
             migration_generation: 2,
             directory_id: "directory-2".into(),
             node_id: "relay-2".into(),
-            sdp: "v=0".into(),
+            sdp: "opaque-migration-answer".into(),
             restart_route_token: "1".repeat(64),
             candidate_fingerprints: BTreeSet::from([fingerprint.clone()]),
         },
@@ -666,7 +947,7 @@ fn replay_rate_limit_and_disconnect_cleanup_fail_closed() {
     ]);
     register(&mut core, &mut controller, BackendRole::Controller);
     register(&mut core, &mut target, BackendRole::Agent);
-    authorize_route(&mut core, &mut controller, &mut target);
+    let _intent = authorize_route(&mut core, &mut controller, &mut target);
 
     let heartbeat_claims = controller.claims(&core.config().server_device_id.clone());
     let heartbeat = PresenceHeartbeat::sign(
