@@ -438,8 +438,46 @@ generation, secret version, target, and evidence, so a fixed-shape or replayed
 response fails.
 
 This evidence is explicitly `scope=local`; it proves listener, credential, allocation, permission, and bidirectional relay traffic.
-It does not claim public readiness. Public UDP/TCP/TLS/SNI/relay-range testing belongs to Task 11, and missing public Task 11 evidence is INFRA_FAIL rather than a pass.
+It does not claim public readiness. Public UDP/TCP/TLS/SNI/relay-range and
+cross-region recovery testing belongs to the multi-region device-lab runner;
+missing live evidence is `INFRA_FAIL` rather than a pass.
 Port-open or process-running checks alone are never TURN acceptance.
+
+## Multi-region device-lab acceptance
+
+Run the fail-closed acceptance entrypoint from a Windows device-lab controller:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File tests/benchmarks/scripts/run_multi_region_relay.ps1 `
+  -Scenario all `
+  -OutputRoot artifacts/e2e/multi-region-relay
+```
+
+The controller requires `MRD_RELAY_LAB_CONTROL`, controller/agent/primary/
+backup/Windows host identifiers, primary and backup certificate paths, UDP and
+TLS ports, and `MRD_RELAY_LAB_AUTH_SECRET`. The lab-control executable receives
+one bounded JSON request on standard input and receives no secret-bearing
+arguments. It must implement preflight, process kill, regional network outage,
+UDP block, TLS fallback, drain, soft/hard capacity, certificate revocation,
+backend outage, cleanup, reset, and evidence collection. Reset is invoked from
+a `finally` block, and evidence is collected only after reset.
+
+The runner returns `0` for `PASS`, `2` for `PRODUCT_FAIL`, and `3` for
+`INFRA_FAIL`. Missing hosts, certificates, ports, control executable, quality
+gate command, or secret configuration must return `INFRA_FAIL`; there is no
+skip-success path. Artifacts are bound to the invocation and scenario and must
+contain a verified signed directory, node-bound reservations and allocations,
+a nominated runtime `relay/relay` pair, injected failure/detection/generation
+evidence, restored video/audio/control, unchanged permissions, `ReleaseAll`,
+and complete resource cleanup.
+
+The required Windows production host mode is Docker with the exact pinned
+image and immutable runtime contract described above, or an already-provisioned
+LocalSystem-owned WSL2 `MRDRelay` installation that passes every WSL gate.
+Fresh WSL2 provisioning and unqualified Native mode are not accepted. The
+current recorded result and rerun checklist are in
+`docs/release/multi-region-turn-relay-acceptance.md`.
 
 ## Regional bootstrap and disaster recovery
 
