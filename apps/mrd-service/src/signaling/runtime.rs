@@ -8,12 +8,14 @@ use mrd_identity::DeviceIdentity;
 use mrd_proto::BackendRole;
 use mrd_signal_proto::{
     AuthClaims, AuthenticatedSignalMessage, PresenceHeartbeat, PresenceHeartbeatPayload,
-    RegisterPayload, Registered, ServerChallenge, SignalEnvelope, SignalProtocolError,
+    RegisterPayload, Registered, RelayMigrationAnswer, RelayMigrationAnswerPayload,
+    RelayMigrationCandidate, RelayMigrationCandidatePayload, RelayMigrationOffer,
+    RelayMigrationOfferPayload, ServerChallenge, SignalEnvelope, SignalProtocolError,
     SignalReplayGuard,
 };
 use ring::{digest, rand::SecureRandom, rand::SystemRandom};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
@@ -24,6 +26,289 @@ const PEER_KEY_LIMIT: usize = 4_096;
 const MAX_CHALLENGE_LIFETIME_MS: u64 = 60_000;
 const MIN_HEARTBEAT_INTERVAL_MS: u64 = 250;
 const MAX_HEARTBEAT_INTERVAL_MS: u64 = 300_000;
+const RELAY_SIGNAL_QUEUE_CAPACITY: usize = 128;
+const RELAY_EVENT_QUEUE_CAPACITY: usize = 256;
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum OutboundRelayMigrationSignal {
+    Offer {
+        session_id: mrd_proto::SessionId,
+        migration_generation: u64,
+        directory_id: String,
+        node_id: String,
+        sdp: String,
+        restart_route_token: String,
+        candidate_fingerprints: BTreeSet<String>,
+    },
+    Answer {
+        session_id: mrd_proto::SessionId,
+        migration_generation: u64,
+        directory_id: String,
+        node_id: String,
+        sdp: String,
+        restart_route_token: String,
+        candidate_fingerprints: BTreeSet<String>,
+    },
+    Candidate {
+        session_id: mrd_proto::SessionId,
+        migration_generation: u64,
+        directory_id: String,
+        node_id: String,
+        candidate: String,
+        sdp_mid: Option<String>,
+        sdp_mline_index: Option<u16>,
+        username_fragment: Option<String>,
+        restart_route_token: String,
+        candidate_fingerprint: String,
+    },
+}
+
+impl std::fmt::Debug for OutboundRelayMigrationSignal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (kind, session_id, generation, directory_id, node_id) = match self {
+            Self::Offer {
+                session_id,
+                migration_generation,
+                directory_id,
+                node_id,
+                ..
+            } => (
+                "offer",
+                session_id,
+                migration_generation,
+                directory_id,
+                node_id,
+            ),
+            Self::Answer {
+                session_id,
+                migration_generation,
+                directory_id,
+                node_id,
+                ..
+            } => (
+                "answer",
+                session_id,
+                migration_generation,
+                directory_id,
+                node_id,
+            ),
+            Self::Candidate {
+                session_id,
+                migration_generation,
+                directory_id,
+                node_id,
+                ..
+            } => (
+                "candidate",
+                session_id,
+                migration_generation,
+                directory_id,
+                node_id,
+            ),
+        };
+        formatter
+            .debug_struct("OutboundRelayMigrationSignal")
+            .field("kind", &kind)
+            .field("session_id", session_id)
+            .field("migration_generation", generation)
+            .field("directory_id", directory_id)
+            .field("node_id", node_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelaySignalingCommand {
+    pub peer_device_id: mrd_proto::DeviceId,
+    pub signal: OutboundRelayMigrationSignal,
+}
+
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum RelaySignalingSendError {
+    #[error("authenticated signaling is unavailable")]
+    Unavailable,
+    #[error("relay signaling command is invalid")]
+    Invalid,
+}
+
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum RelaySignalingReceiveError {
+    #[error("authenticated relay signaling stream closed")]
+    Closed,
+    #[error("authenticated relay signaling stream overflowed")]
+    Lagged,
+}
+
+struct OutboundRelaySignalingRequest {
+    command: RelaySignalingCommand,
+    completion: tokio::sync::oneshot::Sender<Result<(), RelaySignalingSendError>>,
+}
+
+pub struct RelaySignalingBus {
+    outbound: tokio::sync::mpsc::Sender<OutboundRelaySignalingRequest>,
+    receiver: Mutex<Option<tokio::sync::mpsc::Receiver<OutboundRelaySignalingRequest>>>,
+    inbound: tokio::sync::broadcast::Sender<VerifiedSignalingEvent>,
+    history: Mutex<VecDeque<VerifiedSignalingEvent>>,
+    active: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Debug for RelaySignalingBus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RelaySignalingBus")
+            .field(
+                "active",
+                &self.active.load(std::sync::atomic::Ordering::Acquire),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for RelaySignalingBus {
+    fn default() -> Self {
+        let (outbound, receiver) = tokio::sync::mpsc::channel(RELAY_SIGNAL_QUEUE_CAPACITY);
+        let (inbound, _) = tokio::sync::broadcast::channel(RELAY_EVENT_QUEUE_CAPACITY);
+        Self {
+            outbound,
+            receiver: Mutex::new(Some(receiver)),
+            inbound,
+            history: Mutex::new(VecDeque::with_capacity(RELAY_EVENT_QUEUE_CAPACITY)),
+            active: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl RelaySignalingBus {
+    pub async fn send(
+        &self,
+        command: RelaySignalingCommand,
+    ) -> Result<(), RelaySignalingSendError> {
+        if !self.active.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(RelaySignalingSendError::Unavailable);
+        }
+        let (completion, completed) = tokio::sync::oneshot::channel();
+        self.outbound
+            .send(OutboundRelaySignalingRequest {
+                command,
+                completion,
+            })
+            .await
+            .map_err(|_| RelaySignalingSendError::Unavailable)?;
+        completed
+            .await
+            .map_err(|_| RelaySignalingSendError::Unavailable)?
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<VerifiedSignalingEvent> {
+        self.inbound.subscribe()
+    }
+
+    pub fn subscribe_migration(
+        &self,
+        session_id: mrd_proto::SessionId,
+        generation: u64,
+    ) -> RelaySignalingSubscription {
+        let live = self.inbound.subscribe();
+        let replay = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|event| relay_event_matches(event, &session_id, generation))
+            .cloned()
+            .collect();
+        RelaySignalingSubscription {
+            session_id,
+            generation,
+            replay,
+            live,
+        }
+    }
+
+    pub(crate) fn publish(&self, event: VerifiedSignalingEvent) {
+        {
+            let mut history = self
+                .history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if history.len() == RELAY_EVENT_QUEUE_CAPACITY {
+                history.pop_front();
+            }
+            history.push_back(event.clone());
+        }
+        let _ = self.inbound.send(event);
+    }
+
+    fn take_receiver(
+        &self,
+    ) -> Result<tokio::sync::mpsc::Receiver<OutboundRelaySignalingRequest>, SignalingRuntimeError>
+    {
+        self.receiver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or(SignalingRuntimeError::AlreadyStarted)
+    }
+
+    fn set_active(&self, active: bool) {
+        self.active
+            .store(active, std::sync::atomic::Ordering::Release);
+    }
+}
+
+pub struct RelaySignalingSubscription {
+    session_id: mrd_proto::SessionId,
+    generation: u64,
+    replay: VecDeque<VerifiedSignalingEvent>,
+    live: tokio::sync::broadcast::Receiver<VerifiedSignalingEvent>,
+}
+
+impl RelaySignalingSubscription {
+    pub async fn recv(&mut self) -> Result<VerifiedSignalingEvent, RelaySignalingReceiveError> {
+        if let Some(event) = self.replay.pop_front() {
+            return Ok(event);
+        }
+        loop {
+            match self.live.recv().await {
+                Ok(event) if relay_event_matches(&event, &self.session_id, self.generation) => {
+                    return Ok(event);
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(RelaySignalingReceiveError::Closed);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    return Err(RelaySignalingReceiveError::Lagged);
+                }
+            }
+        }
+    }
+}
+
+fn relay_event_matches(
+    event: &VerifiedSignalingEvent,
+    session_id: &mrd_proto::SessionId,
+    generation: u64,
+) -> bool {
+    match &event.signal {
+        AuthenticatedSessionSignal::RelayMigrationOffer {
+            session_id: current,
+            migration_generation,
+            ..
+        }
+        | AuthenticatedSessionSignal::RelayMigrationAnswer {
+            session_id: current,
+            migration_generation,
+            ..
+        }
+        | AuthenticatedSessionSignal::RelayMigrationCandidate {
+            session_id: current,
+            migration_generation,
+            ..
+        } => current == session_id && *migration_generation == generation,
+        _ => false,
+    }
+}
 
 /// Observable connection phase for service health projections.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -282,6 +567,88 @@ impl SignalingRuntimeCore {
         )))
     }
 
+    pub fn build_relay_migration_signal(
+        &mut self,
+        command: RelaySignalingCommand,
+        now_ms: u64,
+    ) -> Result<SignalEnvelope, SignalingRuntimeError> {
+        let claims = self.next_claims(command.peer_device_id, now_ms)?;
+        let message = match command.signal {
+            OutboundRelayMigrationSignal::Offer {
+                session_id,
+                migration_generation,
+                directory_id,
+                node_id,
+                sdp,
+                restart_route_token,
+                candidate_fingerprints,
+            } => AuthenticatedSignalMessage::RelayMigrationOffer(RelayMigrationOffer::sign(
+                &self.identity,
+                RelayMigrationOfferPayload {
+                    claims,
+                    session_id,
+                    migration_generation,
+                    directory_id,
+                    node_id,
+                    sdp,
+                    restart_route_token,
+                    candidate_fingerprints,
+                },
+            )?),
+            OutboundRelayMigrationSignal::Answer {
+                session_id,
+                migration_generation,
+                directory_id,
+                node_id,
+                sdp,
+                restart_route_token,
+                candidate_fingerprints,
+            } => AuthenticatedSignalMessage::RelayMigrationAnswer(RelayMigrationAnswer::sign(
+                &self.identity,
+                RelayMigrationAnswerPayload {
+                    claims,
+                    session_id,
+                    migration_generation,
+                    directory_id,
+                    node_id,
+                    sdp,
+                    restart_route_token,
+                    candidate_fingerprints,
+                },
+            )?),
+            OutboundRelayMigrationSignal::Candidate {
+                session_id,
+                migration_generation,
+                directory_id,
+                node_id,
+                candidate,
+                sdp_mid,
+                sdp_mline_index,
+                username_fragment,
+                restart_route_token,
+                candidate_fingerprint,
+            } => {
+                AuthenticatedSignalMessage::RelayMigrationCandidate(RelayMigrationCandidate::sign(
+                    &self.identity,
+                    RelayMigrationCandidatePayload {
+                        claims,
+                        session_id,
+                        migration_generation,
+                        directory_id,
+                        node_id,
+                        candidate,
+                        sdp_mid,
+                        sdp_mline_index,
+                        username_fragment,
+                        restart_route_token,
+                        candidate_fingerprint,
+                    },
+                )?)
+            }
+        };
+        Ok(SignalEnvelope::new(message))
+    }
+
     /// Verify, bind and map one inbound session envelope.
     pub fn handle_inbound(
         &mut self,
@@ -382,6 +749,7 @@ impl SignalingRuntimeCore {
                     directory_id: message.payload.directory_id.clone(),
                     node_id: message.payload.node_id.clone(),
                     sdp: message.payload.sdp.clone(),
+                    restart_route_token: message.payload.restart_route_token.clone(),
                     candidate_fingerprints: message
                         .payload
                         .candidate_fingerprints
@@ -399,6 +767,7 @@ impl SignalingRuntimeCore {
                     directory_id: message.payload.directory_id.clone(),
                     node_id: message.payload.node_id.clone(),
                     sdp: message.payload.sdp.clone(),
+                    restart_route_token: message.payload.restart_route_token.clone(),
                     candidate_fingerprints: message
                         .payload
                         .candidate_fingerprints
@@ -418,6 +787,8 @@ impl SignalingRuntimeCore {
                     candidate: message.payload.candidate.clone(),
                     sdp_mid: message.payload.sdp_mid.clone(),
                     sdp_mline_index: message.payload.sdp_mline_index,
+                    username_fragment: message.payload.username_fragment.clone(),
+                    restart_route_token: message.payload.restart_route_token.clone(),
                     candidate_fingerprint: message.payload.candidate_fingerprint.clone(),
                 },
             ),
@@ -658,22 +1029,40 @@ pub async fn spawn_from_env(
     let Some(config) = SignalingConfig::from_env(device_id, &device_name)? else {
         return Ok(None);
     };
-    Ok(Some(spawn(config, app_state)))
+    Ok(Some(spawn(config, app_state)?))
 }
 
 /// Spawn one explicitly configured service-owned signaling connection.
-pub fn spawn(config: SignalingConfig, app_state: Arc<AppState>) -> SignalingTask {
+pub fn spawn(
+    config: SignalingConfig,
+    app_state: Arc<AppState>,
+) -> Result<SignalingTask, SignalingRuntimeError> {
     let identity = app_state.device_identities.machine_identity();
     let status = Arc::clone(&app_state.signaling_status);
-    let mapper = Arc::new(ServiceSignalingMapper::new(app_state));
+    let relay_signaling = Arc::clone(&app_state.relay_signaling);
+    let outbound = relay_signaling.take_receiver()?;
+    relay_signaling.set_active(true);
+    let mapper = Arc::new(ServiceSignalingMapper::new(Arc::clone(&app_state)));
+    app_state
+        .bind_signaling_mapper(Arc::clone(&mapper))
+        .map_err(|_| SignalingRuntimeError::AlreadyStarted)?;
     let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
     let join = tokio::spawn(async move {
-        run_reconnect_loop(config, identity, status, mapper, shutdown_rx).await;
+        run_reconnect_loop(
+            config,
+            identity,
+            status,
+            mapper,
+            relay_signaling,
+            outbound,
+            shutdown_rx,
+        )
+        .await;
     });
-    SignalingTask {
+    Ok(SignalingTask {
         shutdown: Some(shutdown),
         join,
-    }
+    })
 }
 
 async fn run_reconnect_loop(
@@ -681,12 +1070,14 @@ async fn run_reconnect_loop(
     identity: Arc<DeviceIdentity>,
     status: Arc<SignalingStatus>,
     mapper: Arc<ServiceSignalingMapper>,
+    relay_signaling: Arc<RelaySignalingBus>,
+    mut outbound: tokio::sync::mpsc::Receiver<OutboundRelaySignalingRequest>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) {
     let mut core = SignalingRuntimeCore::with_status(config, identity, Arc::clone(&status));
     loop {
         status.note_connecting();
-        let connection = run_connection(&mut core, &mapper, &mut shutdown).await;
+        let connection = run_connection(&mut core, &mapper, &mut outbound, &mut shutdown).await;
         match connection {
             ConnectionExit::Shutdown => break,
             ConnectionExit::Failed(error) => {
@@ -705,6 +1096,12 @@ async fn run_reconnect_loop(
             }
         }
     }
+    relay_signaling.set_active(false);
+    while let Ok(request) = outbound.try_recv() {
+        let _ = request
+            .completion
+            .send(Err(RelaySignalingSendError::Unavailable));
+    }
     status.note_stopped();
 }
 
@@ -716,6 +1113,7 @@ enum ConnectionExit {
 async fn run_connection(
     core: &mut SignalingRuntimeCore,
     mapper: &Arc<ServiceSignalingMapper>,
+    outbound: &mut tokio::sync::mpsc::Receiver<OutboundRelaySignalingRequest>,
     shutdown: &mut tokio::sync::oneshot::Receiver<()>,
 ) -> ConnectionExit {
     use futures_util::{SinkExt, StreamExt};
@@ -781,6 +1179,31 @@ async fn run_connection(
                     Ok(None) => {}
                     Err(error) => return ConnectionExit::Failed(error),
                 }
+            }
+            request = outbound.recv() => {
+                let Some(request) = request else {
+                    return ConnectionExit::Failed(SignalingRuntimeError::OutboundClosed);
+                };
+                // A migration deadline may expire while signaling is reconnecting. Never emit
+                // that now-ownerless command after the caller dropped its completion receiver.
+                if request.completion.is_closed() {
+                    continue;
+                }
+                let envelope = match core.build_relay_migration_signal(request.command, unix_time_ms()) {
+                    Ok(envelope) => envelope,
+                    Err(_) => {
+                        let _ = request.completion.send(Err(RelaySignalingSendError::Invalid));
+                        continue;
+                    }
+                };
+                if request.completion.is_closed() {
+                    continue;
+                }
+                if let Err(error) = send_envelope(&mut writer, envelope).await {
+                    let _ = request.completion.send(Err(RelaySignalingSendError::Unavailable));
+                    return ConnectionExit::Failed(error);
+                }
+                let _ = request.completion.send(Ok(()));
             }
             message = reader.next() => {
                 let envelope = match decode_socket_message(message) {
@@ -879,6 +1302,10 @@ fn unix_time_ms() -> u64 {
 /// Authenticated signaling runtime failure.
 #[derive(Debug, Error)]
 pub enum SignalingRuntimeError {
+    #[error("authenticated signaling runtime is already started")]
+    AlreadyStarted,
+    #[error("authenticated signaling outbound channel closed")]
+    OutboundClosed,
     #[error(transparent)]
     Config(#[from] SignalingConfigError),
     #[error(transparent)]

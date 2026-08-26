@@ -100,6 +100,8 @@ pub enum AuthenticatedSessionSignal {
         node_id: String,
         /// Remote SDP migration offer.
         sdp: String,
+        /// Opaque restart route token bound into the signed offer.
+        restart_route_token: String,
         /// Candidate fingerprints committed by the migration offer.
         candidate_fingerprints: Vec<String>,
     },
@@ -115,6 +117,8 @@ pub enum AuthenticatedSessionSignal {
         node_id: String,
         /// Remote SDP migration answer.
         sdp: String,
+        /// Opaque restart route token bound into the signed answer.
+        restart_route_token: String,
         /// Candidate fingerprints committed by the migration answer.
         candidate_fingerprints: Vec<String>,
     },
@@ -134,6 +138,10 @@ pub enum AuthenticatedSessionSignal {
         sdp_mid: Option<String>,
         /// Optional SDP media-line index.
         sdp_mline_index: Option<u16>,
+        /// Optional ICE username fragment.
+        username_fragment: Option<String>,
+        /// Opaque restart route token bound into the signed candidate.
+        restart_route_token: String,
         /// SHA-256 candidate fingerprint committed by the grant.
         candidate_fingerprint: String,
     },

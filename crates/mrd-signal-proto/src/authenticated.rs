@@ -629,6 +629,7 @@ pub struct RelayMigrationOfferPayload {
     pub directory_id: String,
     pub node_id: String,
     pub sdp: String,
+    pub restart_route_token: String,
     pub candidate_fingerprints: BTreeSet<String>,
 }
 signed_payload!(
@@ -643,6 +644,7 @@ signed_payload!(
                 &message.directory_id,
                 &message.node_id,
                 &message.sdp,
+                &message.restart_route_token,
                 &message.candidate_fingerprints,
             )
         }
@@ -659,6 +661,7 @@ pub struct RelayMigrationAnswerPayload {
     pub directory_id: String,
     pub node_id: String,
     pub sdp: String,
+    pub restart_route_token: String,
     pub candidate_fingerprints: BTreeSet<String>,
 }
 signed_payload!(
@@ -673,6 +676,7 @@ signed_payload!(
                 &message.directory_id,
                 &message.node_id,
                 &message.sdp,
+                &message.restart_route_token,
                 &message.candidate_fingerprints,
             )
         }
@@ -691,6 +695,8 @@ pub struct RelayMigrationCandidatePayload {
     pub candidate: String,
     pub sdp_mid: Option<String>,
     pub sdp_mline_index: Option<u16>,
+    pub username_fragment: Option<String>,
+    pub restart_route_token: String,
     pub candidate_fingerprint: String,
 }
 signed_payload!(
@@ -709,7 +715,24 @@ signed_payload!(
             if let Some(mid) = &message.sdp_mid {
                 validate_text(mid, 1, 128)?;
             }
-            validate_fingerprint(&message.candidate_fingerprint)
+            if let Some(username_fragment) = &message.username_fragment {
+                validate_text(username_fragment, 1, 256)?;
+            }
+            validate_restart_route_token(&message.restart_route_token)?;
+            validate_fingerprint(&message.candidate_fingerprint)?;
+            if relay_candidate_fingerprint(
+                &message.session_id,
+                message.migration_generation,
+                &message.candidate,
+                message.sdp_mid.as_deref(),
+                message.sdp_mline_index,
+                message.username_fragment.as_deref(),
+                &message.restart_route_token,
+            ) != message.candidate_fingerprint
+            {
+                return Err(SignalProtocolError::Malformed);
+            }
+            Ok(())
         }
     }
 );
@@ -721,10 +744,12 @@ fn validate_migration_description(
     directory_id: &str,
     node_id: &str,
     sdp: &str,
+    restart_route_token: &str,
     candidate_fingerprints: &BTreeSet<String>,
 ) -> Result<(), SignalProtocolError> {
     validate_migration_binding(session_id, migration_generation, directory_id, node_id)?;
     validate_text(sdp, 1, 256 * 1_024)?;
+    validate_restart_route_token(restart_route_token)?;
     if candidate_fingerprints.is_empty() || candidate_fingerprints.len() > 256 {
         return Err(SignalProtocolError::Malformed);
     }
@@ -732,6 +757,51 @@ fn validate_migration_description(
         validate_fingerprint(fingerprint)?;
     }
     Ok(())
+}
+
+fn validate_restart_route_token(value: &str) -> Result<(), SignalProtocolError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(SignalProtocolError::Malformed);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn relay_candidate_fingerprint(
+    session_id: &SessionId,
+    generation: u64,
+    candidate: &str,
+    sdp_mid: Option<&str>,
+    sdp_mline_index: Option<u16>,
+    username_fragment: Option<&str>,
+    restart_route_token: &str,
+) -> String {
+    let generation = generation.to_be_bytes();
+    let sdp_mline_index = sdp_mline_index.unwrap_or(u16::MAX).to_be_bytes();
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    for field in [
+        b"MRD_RELAY_CANDIDATE_V1\0".as_slice(),
+        session_id.0.as_bytes(),
+        generation.as_slice(),
+        candidate.as_bytes(),
+        sdp_mid.unwrap_or_default().as_bytes(),
+        sdp_mline_index.as_slice(),
+        username_fragment.unwrap_or_default().as_bytes(),
+        restart_route_token.as_bytes(),
+    ] {
+        context.update(&(field.len() as u64).to_be_bytes());
+        context.update(field);
+    }
+    context
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn validate_migration_binding(

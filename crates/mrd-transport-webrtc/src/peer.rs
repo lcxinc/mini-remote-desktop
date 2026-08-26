@@ -1951,15 +1951,30 @@ impl WebRtcPeerConnection {
         &self,
         generation: u64,
     ) -> Result<IceCandidate, TransportError> {
+        self.next_restart_candidate_optional(generation)
+            .await?
+            .ok_or_else(|| {
+                TransportError::Message(format!(
+                    "restart candidate stream closed for generation {generation}"
+                ))
+            })
+    }
+
+    /// Return the next candidate for one pending restart, or `None` after ICE gathering
+    /// completed normally. Generation and opaque-route fencing are checked before and after
+    /// the await so a superseded route cannot leak candidates into a newer migration.
+    pub async fn next_restart_candidate_optional(
+        &self,
+        generation: u64,
+    ) -> Result<Option<IceCandidate>, TransportError> {
         let (route_id, route_token, peer) = self.ready_restart(generation)?;
         let Some(mut candidate) = peer.next_local_candidate_physical().await else {
-            return Err(TransportError::Message(format!(
-                "restart candidate stream closed for generation {generation}"
-            )));
+            self.require_ready_route(generation, route_id)?;
+            return Ok(None);
         };
         self.require_ready_route(generation, route_id)?;
         candidate.bind_restart(generation, route_token);
-        Ok(candidate)
+        Ok(Some(candidate))
     }
 
     pub async fn add_restart_candidate(

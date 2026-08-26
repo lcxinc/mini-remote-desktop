@@ -6,8 +6,9 @@ use mrd_identity::DeviceIdentity;
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use mrd_service::{
     signaling::{
-        spawn, InboundDisposition, ServiceSignalingMapper, SignalingConfig,
-        SignalingConnectionState, SignalingRuntimeCore, SignalingStatus,
+        relay_candidate_fingerprint, spawn, InboundDisposition, OutboundRelayMigrationSignal,
+        RelaySignalingCommand, ServiceSignalingMapper, SignalingConfig, SignalingConnectionState,
+        SignalingRuntimeCore, SignalingStatus,
     },
     AppState,
 };
@@ -269,6 +270,7 @@ fn signed_relay_migration_is_mapped_without_becoming_reconnect() {
             directory_id: "directory-1".into(),
             node_id: "relay-1".into(),
             sdp: "v=0".into(),
+            restart_route_token: "1".repeat(64),
             candidate_fingerprints: BTreeSet::from(["a".repeat(64)]),
         },
     )
@@ -291,6 +293,39 @@ fn signed_relay_migration_is_mapped_without_becoming_reconnect() {
     assert_eq!(
         runtime.handle_inbound(envelope, NOW + 2).unwrap(),
         InboundDisposition::Duplicate
+    );
+}
+
+#[test]
+fn outbound_relay_migration_is_signed_with_restart_route_binding() {
+    let server = identity();
+    let local = identity();
+    let mut runtime = SignalingRuntimeCore::new(config(&server), Arc::clone(&local));
+    let envelope = runtime
+        .build_relay_migration_signal(
+            RelaySignalingCommand {
+                peer_device_id: DeviceId("peer-device".into()),
+                signal: OutboundRelayMigrationSignal::Offer {
+                    session_id: SessionId("outbound-session".into()),
+                    migration_generation: 1,
+                    directory_id: "directory-1".into(),
+                    node_id: "relay-1".into(),
+                    sdp: "v=0".into(),
+                    restart_route_token: "1".repeat(64),
+                    candidate_fingerprints: BTreeSet::from(["a".repeat(64)]),
+                },
+            },
+            NOW,
+        )
+        .unwrap();
+    let AuthenticatedSignalMessage::RelayMigrationOffer(offer) = envelope.message else {
+        panic!("expected signed migration offer")
+    };
+    assert_eq!(offer.payload.claims.issuer_key_id, local.key_id());
+    assert_eq!(offer.payload.restart_route_token, "1".repeat(64));
+    assert_eq!(
+        offer.payload.claims.intended_peer_device_id,
+        DeviceId("peer-device".into())
     );
 }
 
@@ -510,6 +545,7 @@ async fn relay_migration_mapper_requires_the_bound_peer_grant_and_live_session()
                 directory_id: "directory-1".into(),
                 node_id: "relay-1".into(),
                 sdp: "v=0".into(),
+                restart_route_token: "1".repeat(64),
                 candidate_fingerprints: vec!["a".repeat(64)],
             },
         ))
@@ -524,12 +560,13 @@ async fn relay_migration_mapper_requires_the_bound_peer_grant_and_live_session()
                 directory_id: "directory-1".into(),
                 node_id: "relay-1".into(),
                 sdp: "v=0".into(),
+                restart_route_token: "1".repeat(64),
                 candidate_fingerprints: vec!["a".repeat(64)],
             },
         ))
         .await
         .is_err());
-    assert!(mapper
+    mapper
         .apply_authenticated_signal(verified_event(
             &peer,
             AuthenticatedSessionSignal::RelayMigrationOffer {
@@ -538,11 +575,12 @@ async fn relay_migration_mapper_requires_the_bound_peer_grant_and_live_session()
                 directory_id: "directory-2".into(),
                 node_id: "relay-2".into(),
                 sdp: "v=0".into(),
+                restart_route_token: "2".repeat(64),
                 candidate_fingerprints: vec!["b".repeat(64)],
             },
         ))
         .await
-        .is_err());
+        .unwrap();
 
     mapper
         .apply_authenticated_signal(verified_event(
@@ -563,7 +601,8 @@ async fn relay_migration_mapper_requires_the_bound_peer_grant_and_live_session()
                 directory_id: "directory-2".into(),
                 node_id: "relay-2".into(),
                 sdp: "v=0".into(),
-                candidate_fingerprints: vec!["a".repeat(64)],
+                restart_route_token: "2".repeat(64),
+                candidate_fingerprints: vec!["b".repeat(64)],
             },
         ))
         .await
@@ -599,6 +638,7 @@ async fn outbound_relay_migration_binding_fences_answer_candidate_and_generation
             1,
             "directory-1".into(),
             "relay-1".into(),
+            "1".repeat(64),
         )
         .await
         .is_err());
@@ -609,9 +649,19 @@ async fn outbound_relay_migration_binding_fences_answer_candidate_and_generation
             1,
             "directory-1".into(),
             "relay-1".into(),
+            "1".repeat(64),
         )
         .await
         .unwrap();
+    let committed_candidate_fingerprint = relay_candidate_fingerprint(
+        &session_id,
+        1,
+        "candidate:relay",
+        Some("0"),
+        Some(0),
+        Some("restart-ufrag"),
+        &"1".repeat(64),
+    );
 
     mapper
         .apply_authenticated_signal(verified_event(
@@ -622,7 +672,8 @@ async fn outbound_relay_migration_binding_fences_answer_candidate_and_generation
                 directory_id: "directory-1".into(),
                 node_id: "relay-1".into(),
                 sdp: "v=0".into(),
-                candidate_fingerprints: vec!["a".repeat(64)],
+                restart_route_token: "1".repeat(64),
+                candidate_fingerprints: vec![committed_candidate_fingerprint.clone()],
             },
         ))
         .await
@@ -638,7 +689,9 @@ async fn outbound_relay_migration_binding_fences_answer_candidate_and_generation
                 candidate: "candidate:relay".into(),
                 sdp_mid: Some("0".into()),
                 sdp_mline_index: Some(0),
-                candidate_fingerprint: "a".repeat(64),
+                username_fragment: Some("restart-ufrag".into()),
+                restart_route_token: "1".repeat(64),
+                candidate_fingerprint: committed_candidate_fingerprint.clone(),
             },
         ))
         .await
@@ -654,7 +707,9 @@ async fn outbound_relay_migration_binding_fences_answer_candidate_and_generation
                 candidate: "candidate:relay".into(),
                 sdp_mid: Some("0".into()),
                 sdp_mline_index: Some(0),
-                candidate_fingerprint: "a".repeat(64),
+                username_fragment: Some("restart-ufrag".into()),
+                restart_route_token: "1".repeat(64),
+                candidate_fingerprint: committed_candidate_fingerprint,
             },
         ))
         .await
@@ -666,6 +721,7 @@ async fn outbound_relay_migration_binding_fences_answer_candidate_and_generation
             3,
             "directory-3".into(),
             "relay-3".into(),
+            "3".repeat(64),
         )
         .await
         .is_err());
@@ -676,6 +732,7 @@ async fn outbound_relay_migration_binding_fences_answer_candidate_and_generation
             2,
             "directory-2".into(),
             "relay-2".into(),
+            "2".repeat(64),
         )
         .await
         .unwrap();
@@ -700,6 +757,7 @@ async fn outbound_relay_migration_binding_fences_answer_candidate_and_generation
                 directory_id: "directory-2".into(),
                 node_id: "relay-2".into(),
                 sdp: "v=0".into(),
+                restart_route_token: "2".repeat(64),
                 candidate_fingerprints: vec!["a".repeat(64)],
             },
         ))
@@ -712,6 +770,7 @@ async fn outbound_relay_migration_binding_fences_answer_candidate_and_generation
             1,
             "directory-reset".into(),
             "relay-reset".into(),
+            "1".repeat(64),
         )
         .await
         .unwrap();
@@ -853,7 +912,7 @@ async fn async_driver_completes_real_websocket_challenge_registration_and_shutdo
     )
     .unwrap();
 
-    let task = spawn(runtime_config, Arc::clone(&app_state));
+    let task = spawn(runtime_config, Arc::clone(&app_state)).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if app_state.signaling_status.snapshot().state

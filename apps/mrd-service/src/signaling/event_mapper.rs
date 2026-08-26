@@ -5,7 +5,10 @@ use mrd_application::{
     SessionSnapshot, VerifiedSignalingEvent,
 };
 use mrd_ipc::{RemoteAccessMode, RemotePermissionScope};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
@@ -20,6 +23,8 @@ struct RelayMigrationBinding {
     generation: u64,
     directory_id: String,
     node_id: String,
+    restart_route_token: String,
+    peer_candidate_fingerprints: HashSet<String>,
     direction: RelayMigrationDirection,
 }
 
@@ -35,12 +40,14 @@ pub struct ServiceSignalingMapper {
     signaling_state_gate: Mutex<()>,
     webrtc_grants: Mutex<HashMap<mrd_proto::SessionId, WebRtcGrantBinding>>,
     relay_migrations: Mutex<HashMap<mrd_proto::SessionId, RelayMigrationBinding>>,
+    relay_signaling: Arc<super::RelaySignalingBus>,
 }
 
 impl ServiceSignalingMapper {
     /// Bind the mapper to the service-owned application state.
     pub fn new(app_state: Arc<AppState>) -> Self {
         Self {
+            relay_signaling: Arc::clone(&app_state.relay_signaling),
             app_state,
             signaling_state_gate: Mutex::new(()),
             webrtc_grants: Mutex::new(HashMap::new()),
@@ -239,6 +246,25 @@ impl ServiceSignalingMapper {
         .await
     }
 
+    async fn terminate_relay_if_installed(
+        &self,
+        session_id: &mrd_proto::SessionId,
+        reason: crate::relay::RelayTerminalSecurityReason,
+    ) -> Result<()> {
+        let Some(coordinator) = self.app_state.relay_failover_coordinator() else {
+            return Ok(());
+        };
+        if coordinator.snapshot(session_id).await.is_err() {
+            return Ok(());
+        }
+        coordinator
+            .terminate_security(session_id, reason)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn apply_relay_migration_offer(
         &self,
         event: &VerifiedSignalingEvent,
@@ -246,14 +272,11 @@ impl ServiceSignalingMapper {
         generation: u64,
         directory_id: &str,
         node_id: &str,
+        restart_route_token: &str,
         candidate_fingerprints: &[String],
     ) -> Result<()> {
         self.require_live_session(event, session_id).await?;
         self.require_webrtc_grant(event, session_id).await?;
-        for fingerprint in candidate_fingerprints {
-            self.require_webrtc_fingerprint(event, session_id, fingerprint)
-                .await?;
-        }
         let mut migrations = self.relay_migrations.lock().await;
         let expected = match migrations.get(session_id) {
             Some(binding) => binding
@@ -272,12 +295,15 @@ impl ServiceSignalingMapper {
                 generation,
                 directory_id: directory_id.to_owned(),
                 node_id: node_id.to_owned(),
+                restart_route_token: restart_route_token.to_owned(),
+                peer_candidate_fingerprints: candidate_fingerprints.iter().cloned().collect(),
                 direction: RelayMigrationDirection::IncomingOffer,
             },
         );
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn require_relay_migration_binding(
         &self,
         event: &VerifiedSignalingEvent,
@@ -285,6 +311,7 @@ impl ServiceSignalingMapper {
         generation: u64,
         directory_id: &str,
         node_id: &str,
+        restart_route_token: &str,
         required_direction: Option<RelayMigrationDirection>,
     ) -> Result<()> {
         self.require_live_session(event, session_id).await?;
@@ -296,6 +323,7 @@ impl ServiceSignalingMapper {
             || binding.generation != generation
             || binding.directory_id != directory_id
             || binding.node_id != node_id
+            || binding.restart_route_token != restart_route_token
             || required_direction.is_some_and(|direction| binding.direction != direction)
         {
             bail!("relay migration signaling does not match the active generation");
@@ -311,6 +339,7 @@ impl ServiceSignalingMapper {
         generation: u64,
         directory_id: String,
         node_id: String,
+        restart_route_token: String,
     ) -> Result<()> {
         if generation == 0
             || peer_key_id.is_empty()
@@ -321,6 +350,7 @@ impl ServiceSignalingMapper {
             || node_id.is_empty()
             || node_id.len() > 256
             || node_id.chars().any(char::is_control)
+            || !valid_restart_route_token(&restart_route_token)
         {
             bail!("outbound relay migration binding is invalid");
         }
@@ -362,6 +392,8 @@ impl ServiceSignalingMapper {
                 generation,
                 directory_id,
                 node_id,
+                restart_route_token,
+                peer_candidate_fingerprints: HashSet::new(),
                 direction: RelayMigrationDirection::OutboundOffer,
             },
         );
@@ -390,6 +422,11 @@ impl AuthenticatedSessionSignalPort for ServiceSignalingMapper {
                 accepted_transport,
                 accepted_candidate_fingerprints,
             } => {
+                self.terminate_relay_if_installed(
+                    &session_id,
+                    crate::relay::RelayTerminalSecurityReason::PolicyChanged,
+                )
+                .await?;
                 self.update_session(&event, &session_id, |snapshot| {
                     if snapshot.lifecycle_state.is_terminal() {
                         bail!("terminal session cannot accept a signaling grant");
@@ -424,6 +461,11 @@ impl AuthenticatedSessionSignalPort for ServiceSignalingMapper {
                 .await?;
                 self.webrtc_grants.lock().await.remove(&session_id);
                 self.relay_migrations.lock().await.remove(&session_id);
+                self.terminate_relay_if_installed(
+                    &session_id,
+                    crate::relay::RelayTerminalSecurityReason::RelayRevoked,
+                )
+                .await?;
                 Ok(())
             }
             AuthenticatedSessionSignal::Closed { session_id, .. } => {
@@ -436,6 +478,11 @@ impl AuthenticatedSessionSignalPort for ServiceSignalingMapper {
                 .await?;
                 self.webrtc_grants.lock().await.remove(&session_id);
                 self.relay_migrations.lock().await.remove(&session_id);
+                self.terminate_relay_if_installed(
+                    &session_id,
+                    crate::relay::RelayTerminalSecurityReason::RelayRevoked,
+                )
+                .await?;
                 Ok(())
             }
             AuthenticatedSessionSignal::WebRtcCandidate {
@@ -468,6 +515,7 @@ impl AuthenticatedSessionSignalPort for ServiceSignalingMapper {
                 migration_generation,
                 directory_id,
                 node_id,
+                restart_route_token,
                 candidate_fingerprints,
                 ..
             } => {
@@ -477,15 +525,19 @@ impl AuthenticatedSessionSignalPort for ServiceSignalingMapper {
                     migration_generation,
                     &directory_id,
                     &node_id,
+                    &restart_route_token,
                     &candidate_fingerprints,
                 )
-                .await
+                .await?;
+                self.relay_signaling.publish(event);
+                Ok(())
             }
             AuthenticatedSessionSignal::RelayMigrationAnswer {
                 session_id,
                 migration_generation,
                 directory_id,
                 node_id,
+                restart_route_token,
                 candidate_fingerprints,
                 ..
             } => {
@@ -495,14 +547,18 @@ impl AuthenticatedSessionSignalPort for ServiceSignalingMapper {
                     migration_generation,
                     &directory_id,
                     &node_id,
+                    &restart_route_token,
                     Some(RelayMigrationDirection::OutboundOffer),
                 )
                 .await?;
                 self.require_webrtc_grant(&event, &session_id).await?;
-                for fingerprint in candidate_fingerprints {
-                    self.require_webrtc_fingerprint(&event, &session_id, &fingerprint)
-                        .await?;
-                }
+                let mut migrations = self.relay_migrations.lock().await;
+                let binding = migrations
+                    .get_mut(&session_id)
+                    .context("relay migration answer has no active binding")?;
+                binding.peer_candidate_fingerprints = candidate_fingerprints.into_iter().collect();
+                drop(migrations);
+                self.relay_signaling.publish(event);
                 Ok(())
             }
             AuthenticatedSessionSignal::RelayMigrationCandidate {
@@ -510,8 +566,12 @@ impl AuthenticatedSessionSignalPort for ServiceSignalingMapper {
                 migration_generation,
                 directory_id,
                 node_id,
+                candidate,
+                sdp_mid,
+                sdp_mline_index,
+                username_fragment,
+                restart_route_token,
                 candidate_fingerprint,
-                ..
             } => {
                 self.require_relay_migration_binding(
                     &event,
@@ -519,12 +579,43 @@ impl AuthenticatedSessionSignalPort for ServiceSignalingMapper {
                     migration_generation,
                     &directory_id,
                     &node_id,
+                    &restart_route_token,
                     None,
                 )
                 .await?;
-                self.require_webrtc_fingerprint(&event, &session_id, &candidate_fingerprint)
-                    .await
+                let computed = super::relay_candidate_fingerprint(
+                    &session_id,
+                    migration_generation,
+                    &candidate,
+                    sdp_mid.as_deref(),
+                    sdp_mline_index,
+                    username_fragment.as_deref(),
+                    &restart_route_token,
+                );
+                if computed != candidate_fingerprint {
+                    bail!("relay migration candidate fingerprint does not match its payload");
+                }
+                let migrations = self.relay_migrations.lock().await;
+                let binding = migrations
+                    .get(&session_id)
+                    .context("relay migration candidate has no active binding")?;
+                if !binding
+                    .peer_candidate_fingerprints
+                    .contains(&candidate_fingerprint)
+                {
+                    bail!("relay migration candidate was not committed by its description");
+                }
+                drop(migrations);
+                self.relay_signaling.publish(event);
+                Ok(())
             }
         }
     }
+}
+
+fn valid_restart_route_token(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }

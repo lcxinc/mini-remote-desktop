@@ -1,8 +1,8 @@
 use mrd_identity::DeviceIdentity;
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use mrd_signal_proto::{
-    AuthClaims, AuthenticatedRegister, AuthenticatedSignalMessage, RegisterPayload,
-    RelayMigrationCandidate, RelayMigrationCandidatePayload, RelayMigrationOffer,
+    relay_candidate_fingerprint, AuthClaims, AuthenticatedRegister, AuthenticatedSignalMessage,
+    RegisterPayload, RelayMigrationCandidate, RelayMigrationCandidatePayload, RelayMigrationOffer,
     RelayMigrationOfferPayload, SignalEnvelope, SignalProtocolError, SignalReplayGuard,
     SIGNAL_PROTOCOL_VERSION,
 };
@@ -195,6 +195,7 @@ fn relay_migration_payload_binds_generation_directory_node_and_fingerprints() {
             directory_id: "directory-20260822-0001".into(),
             node_id: "relay-us-east-1a".into(),
             sdp: "v=0".into(),
+            restart_route_token: "1".repeat(64),
             candidate_fingerprints: BTreeSet::from([fingerprint.clone()]),
         },
     )
@@ -217,6 +218,16 @@ fn relay_migration_payload_binds_generation_directory_node_and_fingerprints() {
         Err(SignalProtocolError::InvalidSignature)
     );
 
+    let candidate_line = "candidate:1 1 UDP 1 192.0.2.10 5000 typ relay";
+    let candidate_fingerprint = relay_candidate_fingerprint(
+        &SessionId("session-1".into()),
+        1,
+        candidate_line,
+        Some("0"),
+        Some(0),
+        Some("restart-ufrag"),
+        &"1".repeat(64),
+    );
     let candidate = RelayMigrationCandidate::sign(
         &identity,
         RelayMigrationCandidatePayload {
@@ -225,10 +236,12 @@ fn relay_migration_payload_binds_generation_directory_node_and_fingerprints() {
             migration_generation: 1,
             directory_id: "directory-20260822-0001".into(),
             node_id: "relay-us-east-1a".into(),
-            candidate: "candidate:1 1 UDP 1 192.0.2.10 5000 typ relay".into(),
+            candidate: candidate_line.into(),
             sdp_mid: Some("0".into()),
             sdp_mline_index: Some(0),
-            candidate_fingerprint: fingerprint,
+            username_fragment: Some("restart-ufrag".into()),
+            restart_route_token: "1".repeat(64),
+            candidate_fingerprint,
         },
     )
     .unwrap();
@@ -254,6 +267,7 @@ fn relay_migration_rejects_generation_zero_and_unbound_candidate_material() {
         directory_id: "directory-1".into(),
         node_id: "relay-1".into(),
         sdp: "v=0".into(),
+        restart_route_token: "1".repeat(64),
         candidate_fingerprints: BTreeSet::from(["a".repeat(64)]),
     };
     assert_eq!(
@@ -269,6 +283,11 @@ fn relay_migration_rejects_generation_zero_and_unbound_candidate_material() {
         RelayMigrationOfferPayload {
             migration_generation: 1,
             node_id: String::new(),
+            ..base.clone()
+        },
+        RelayMigrationOfferPayload {
+            migration_generation: 1,
+            restart_route_token: String::new(),
             ..base.clone()
         },
         RelayMigrationOfferPayload {

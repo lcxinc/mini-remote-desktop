@@ -1,8 +1,8 @@
 use mrd_proto::{DeviceId, SessionId};
 use mrd_signal_proto::{
-    RelayMigrationAnswerPayload, RelayMigrationCandidatePayload, RelayMigrationOfferPayload,
-    SessionGrantPayload, SessionIntentPayload, WebRtcAnswerPayload, WebRtcCandidatePayload,
-    WebRtcOfferPayload,
+    relay_candidate_fingerprint, RelayMigrationAnswerPayload, RelayMigrationCandidatePayload,
+    RelayMigrationOfferPayload, SessionGrantPayload, SessionIntentPayload, WebRtcAnswerPayload,
+    WebRtcCandidatePayload, WebRtcOfferPayload,
 };
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -24,6 +24,9 @@ struct MigrationBinding {
     directory_id: String,
     node_id: String,
     offerer: DeviceId,
+    restart_route_token: String,
+    offerer_fingerprints: HashSet<String>,
+    answerer_fingerprints: Option<HashSet<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -205,7 +208,6 @@ impl AuthorizedRoutes {
             .get_mut(&offer.session_id)
             .ok_or(RouteError::UnknownSession)?;
         let peer = peer(route, sender)?;
-        require_granted_fingerprints(route, &offer.candidate_fingerprints)?;
         let expected = route
             .latest_migration_generation
             .checked_add(1)
@@ -219,6 +221,9 @@ impl AuthorizedRoutes {
             directory_id: offer.directory_id.clone(),
             node_id: offer.node_id.clone(),
             offerer: sender.clone(),
+            restart_route_token: offer.restart_route_token.clone(),
+            offerer_fingerprints: offer.candidate_fingerprints.iter().cloned().collect(),
+            answerer_fingerprints: None,
         });
         route.last_activity_ms = now_ms;
         Ok(peer)
@@ -235,18 +240,20 @@ impl AuthorizedRoutes {
             .get_mut(&answer.session_id)
             .ok_or(RouteError::UnknownSession)?;
         let peer = peer(route, sender)?;
-        require_granted_fingerprints(route, &answer.candidate_fingerprints)?;
         let binding = route
             .migration
-            .as_ref()
+            .as_mut()
             .ok_or(RouteError::MigrationConflict)?;
         if &binding.offerer == sender
             || binding.generation != answer.migration_generation
             || binding.directory_id != answer.directory_id
             || binding.node_id != answer.node_id
+            || binding.restart_route_token != answer.restart_route_token
         {
             return Err(RouteError::MigrationConflict);
         }
+        binding.answerer_fingerprints =
+            Some(answer.candidate_fingerprints.iter().cloned().collect());
         route.last_activity_ms = now_ms;
         Ok(peer)
     }
@@ -262,13 +269,6 @@ impl AuthorizedRoutes {
             .get_mut(&candidate.session_id)
             .ok_or(RouteError::UnknownSession)?;
         let peer = peer(route, sender)?;
-        if !route
-            .granted_fingerprints
-            .as_ref()
-            .is_some_and(|accepted| accepted.contains(&candidate.candidate_fingerprint))
-        {
-            return Err(RouteError::FingerprintNotGranted);
-        }
         let binding = route
             .migration
             .as_ref()
@@ -276,8 +276,28 @@ impl AuthorizedRoutes {
         if binding.generation != candidate.migration_generation
             || binding.directory_id != candidate.directory_id
             || binding.node_id != candidate.node_id
+            || binding.restart_route_token != candidate.restart_route_token
         {
             return Err(RouteError::MigrationConflict);
+        }
+        let accepted = if &binding.offerer == sender {
+            Some(&binding.offerer_fingerprints)
+        } else {
+            binding.answerer_fingerprints.as_ref()
+        };
+        let computed = relay_candidate_fingerprint(
+            &candidate.session_id,
+            candidate.migration_generation,
+            &candidate.candidate,
+            candidate.sdp_mid.as_deref(),
+            candidate.sdp_mline_index,
+            candidate.username_fragment.as_deref(),
+            &candidate.restart_route_token,
+        );
+        if computed != candidate.candidate_fingerprint
+            || !accepted.is_some_and(|accepted| accepted.contains(&candidate.candidate_fingerprint))
+        {
+            return Err(RouteError::FingerprintNotGranted);
         }
         route.last_activity_ms = now_ms;
         Ok(peer)
@@ -362,23 +382,6 @@ fn peer(route: &SessionRoute, sender: &DeviceId) -> Result<DeviceId, RouteError>
     } else {
         Err(RouteError::Unauthorized)
     }
-}
-
-fn require_granted_fingerprints<'a>(
-    route: &SessionRoute,
-    fingerprints: impl IntoIterator<Item = &'a String>,
-) -> Result<(), RouteError> {
-    let accepted = route
-        .granted_fingerprints
-        .as_ref()
-        .ok_or(RouteError::NotGranted)?;
-    if !fingerprints
-        .into_iter()
-        .all(|fingerprint| accepted.contains(fingerprint))
-    {
-        return Err(RouteError::FingerprintNotGranted);
-    }
-    Ok(())
 }
 
 #[derive(Debug, Error)]

@@ -26,13 +26,14 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from app.core.config import settings
 from app.core.response_security import no_store_sensitive_response
 from app.core.security import (
-    get_current_user,
+    get_current_device,
     get_verified_relay_node,
     get_verified_relay_renewal_node,
     require_admin,
     trusted_mtls_proxy_scheme,
 )
 from app.db.session import get_db
+from app.models.device import Device
 from app.models.relay_node import RelayNode
 from app.models.user import User
 from app.schemas.relay import (
@@ -840,12 +841,20 @@ async def revoke_relay_node(
 )
 async def issue_relay_access(
     payload: RelayAccessRequest,
-    current_user: User = Depends(get_current_user),
+    current_device: Device = Depends(get_current_device),
     service: RelayAccessService = Depends(get_relay_access_service),
 ) -> RelayAccessResponse:
+    if not current_device.is_bound or current_device.bound_user_id is None:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "relay_access_denied",
+                "message": "relay access denied",
+            },
+        )
     try:
         result = await service.issue_access(
-            current_user_id=current_user.id,
+            current_user_id=current_device.bound_user_id,
             session_id=payload.session_id,
             policy_revision=payload.policy_revision,
             intended_peer_id=payload.intended_peer_id,

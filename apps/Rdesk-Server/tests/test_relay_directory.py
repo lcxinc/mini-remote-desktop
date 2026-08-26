@@ -20,7 +20,7 @@ from app.api.v1.relays import (
     router,
 )
 from app.api.v1.sessions import router as sessions_router
-from app.core.security import get_current_user
+from app.core.security import get_current_device, get_current_user
 from app.core.response_security import SensitiveResponseCacheMiddleware
 from app.core.config import settings
 from app.services.relay_directory import (
@@ -1260,8 +1260,8 @@ def test_access_api_requires_auth_and_returns_only_signed_directory_and_credenti
         authenticated_app.add_middleware(SensitiveResponseCacheMiddleware)
         authenticated_app.include_router(router, prefix="/api/v1")
         authenticated_app.dependency_overrides[get_relay_access_service] = lambda: service
-        authenticated_app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
-            id="user-42"
+        authenticated_app.dependency_overrides[get_current_device] = lambda: SimpleNamespace(
+            id="requester-device", is_bound=True, bound_user_id="user-42"
         )
         invalid = TestClient(authenticated_app).post(
             "/api/v1/relays/access", json={}
@@ -1319,7 +1319,12 @@ def test_production_request_owner_approval_and_both_participant_access_flow(
         }.items():
             monkeypatch.setitem(settings.__dict__, name, value)
         service._current_policy = configured_session_grant_policy(settings)
-        current = SimpleNamespace(user=session.get(User, "user-42"))
+        current = SimpleNamespace(
+            user=session.get(User, "user-42"),
+            device=SimpleNamespace(
+                id="requester-device", is_bound=True, bound_user_id="user-42"
+            ),
+        )
         async_session = service._session
 
         async def override_db():
@@ -1328,11 +1333,15 @@ def test_production_request_owner_approval_and_both_participant_access_flow(
         async def override_user():
             return current.user
 
+        async def override_device():
+            return current.device
+
         app = FastAPI()
         app.include_router(sessions_router, prefix="/api/v1")
         app.include_router(router, prefix="/api/v1")
         app.dependency_overrides[get_db] = override_db
         app.dependency_overrides[get_current_user] = override_user
+        app.dependency_overrides[get_current_device] = override_device
         app.dependency_overrides[get_relay_access_service] = lambda: service
         client = TestClient(app)
 
@@ -1353,6 +1362,9 @@ def test_production_request_owner_approval_and_both_participant_access_flow(
 
         for user_id in ("user-42", "owner-9"):
             current.user = session.get(User, user_id)
+            current.device = SimpleNamespace(
+                id=f"device-for-{user_id}", is_bound=True, bound_user_id=user_id
+            )
             access = client.post("/api/v1/relays/access", json=access_payload)
             assert access.status_code == 200, access.text
             assert access.json()["credentials"]

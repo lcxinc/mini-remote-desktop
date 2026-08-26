@@ -30,6 +30,7 @@ mrd-identity = { path = "../../crates/mrd-identity" }
 mrd-ipc = { path = "../../crates/mrd-ipc" }
 mrd-pipeline-core = { path = "../../crates/mrd-pipeline-core" }
 mrd-proto = { path = "../../crates/mrd-proto" }
+mrd-relay-control = { path = "../../crates/mrd-relay-control" }
 mrd-render = { path = "../../crates/mrd-render" }
 mrd-session = { path = "../../crates/mrd-session" }
 mrd-signal-client = { path = "../../crates/mrd-signal-client" }
@@ -42,6 +43,7 @@ bytes.workspace = true
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 ring.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -1,12 +1,12 @@
 use mrd_identity::DeviceIdentity;
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use mrd_signal_proto::{
-    AuthClaims, AuthenticatedRegister, AuthenticatedSignalMessage, PresenceHeartbeat,
-    PresenceHeartbeatPayload, ProtocolReasonCode, RegisterPayload, RelayMigrationAnswer,
-    RelayMigrationAnswerPayload, RelayMigrationCandidate, RelayMigrationCandidatePayload,
-    RelayMigrationOffer, RelayMigrationOfferPayload, SessionClose, SessionClosePayload,
-    SessionGrant, SessionGrantPayload, SessionIntent, SessionIntentPayload, SignalEnvelope,
-    WebRtcCandidate, WebRtcCandidatePayload, WebRtcOffer, WebRtcOfferPayload,
+    relay_candidate_fingerprint, AuthClaims, AuthenticatedRegister, AuthenticatedSignalMessage,
+    PresenceHeartbeat, PresenceHeartbeatPayload, ProtocolReasonCode, RegisterPayload,
+    RelayMigrationAnswer, RelayMigrationAnswerPayload, RelayMigrationCandidate,
+    RelayMigrationCandidatePayload, RelayMigrationOffer, RelayMigrationOfferPayload, SessionClose,
+    SessionClosePayload, SessionGrant, SessionGrantPayload, SessionIntent, SessionIntentPayload,
+    SignalEnvelope, WebRtcCandidate, WebRtcCandidatePayload, WebRtcOffer, WebRtcOfferPayload,
 };
 use realtime_server::{
     BackendTokenError, BackendTokenVerifier, ConnectionId, CoreConfig, DeliveryTarget,
@@ -375,6 +375,15 @@ fn relay_migration_enforces_generation_binding_grant_participants_and_close() {
 
     let session_id = SessionId("session-1".into());
     let fingerprint = "a".repeat(64);
+    let target_candidate_fingerprint = relay_candidate_fingerprint(
+        &session_id,
+        1,
+        "candidate:relay",
+        Some("0"),
+        Some(0),
+        Some("restart-ufrag"),
+        &"1".repeat(64),
+    );
     let offer = |sender: &mut TestDevice,
                  intended_peer: &DeviceId,
                  generation: u64,
@@ -391,6 +400,7 @@ fn relay_migration_enforces_generation_binding_grant_participants_and_close() {
                 directory_id: directory_id.into(),
                 node_id: node_id.into(),
                 sdp: "v=0".into(),
+                restart_route_token: "1".repeat(64),
                 candidate_fingerprints: BTreeSet::from([fingerprint.to_owned()]),
             },
         )
@@ -427,7 +437,8 @@ fn relay_migration_enforces_generation_binding_grant_participants_and_close() {
             directory_id: "directory-1".into(),
             node_id: "relay-1".into(),
             sdp: "v=0".into(),
-            candidate_fingerprints: BTreeSet::from([fingerprint.clone()]),
+            restart_route_token: "1".repeat(64),
+            candidate_fingerprints: BTreeSet::from([target_candidate_fingerprint.clone()]),
         },
     )
     .unwrap();
@@ -450,7 +461,9 @@ fn relay_migration_enforces_generation_binding_grant_participants_and_close() {
             candidate: "candidate:relay".into(),
             sdp_mid: Some("0".into()),
             sdp_mline_index: Some(0),
-            candidate_fingerprint: fingerprint.clone(),
+            username_fragment: Some("restart-ufrag".into()),
+            restart_route_token: "1".repeat(64),
+            candidate_fingerprint: target_candidate_fingerprint,
         },
     )
     .unwrap();
@@ -484,7 +497,7 @@ fn relay_migration_enforces_generation_binding_grant_participants_and_close() {
         );
     }
 
-    let ungranted = offer(
+    let newly_committed = offer(
         &mut controller,
         &target.device_id,
         2,
@@ -492,29 +505,12 @@ fn relay_migration_enforces_generation_binding_grant_participants_and_close() {
         "relay-2",
         &"b".repeat(64),
     );
-    assert_eq!(
-        core.handle(
-            controller.connection_id,
-            SignalEnvelope::new(AuthenticatedSignalMessage::RelayMigrationOffer(ungranted)),
-            NOW + 8,
-        )
-        .unwrap_err()
-        .reason_code(),
-        ProtocolReasonCode::UnauthorizedRoute
-    );
-
-    let second = offer(
-        &mut controller,
-        &target.device_id,
-        2,
-        "directory-2",
-        "relay-2",
-        &fingerprint,
-    );
     core.handle(
         controller.connection_id,
-        SignalEnvelope::new(AuthenticatedSignalMessage::RelayMigrationOffer(second)),
-        NOW + 9,
+        SignalEnvelope::new(AuthenticatedSignalMessage::RelayMigrationOffer(
+            newly_committed,
+        )),
+        NOW + 8,
     )
     .unwrap();
 
@@ -528,6 +524,7 @@ fn relay_migration_enforces_generation_binding_grant_participants_and_close() {
             directory_id: "different-directory".into(),
             node_id: "relay-2".into(),
             sdp: "v=0".into(),
+            restart_route_token: "1".repeat(64),
             candidate_fingerprints: BTreeSet::from([fingerprint.clone()]),
         },
     )
@@ -572,6 +569,7 @@ fn relay_migration_enforces_generation_binding_grant_participants_and_close() {
             directory_id: "directory-2".into(),
             node_id: "relay-2".into(),
             sdp: "v=0".into(),
+            restart_route_token: "1".repeat(64),
             candidate_fingerprints: BTreeSet::from([fingerprint.clone()]),
         },
     )

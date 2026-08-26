@@ -10,6 +10,4 @@ mrd-proto = { path = "../mrd-proto" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
 ring.workspace = true

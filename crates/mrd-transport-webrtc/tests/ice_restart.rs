@@ -461,6 +461,27 @@ async fn concurrent_restart_builds_keep_only_the_highest_generation() {
     peer.close().await.expect("close peer");
 }
 
+#[tokio::test]
+async fn optional_restart_candidate_stream_preserves_generation_fencing() {
+    let peer = WebRtcPeerConnection::new(loopback_config(PeerConnectionRole::Offerer))
+        .await
+        .expect("peer");
+    peer.create_restart_offer(1, fake_turn_servers())
+        .await
+        .expect("generation one offer");
+    peer.create_restart_offer(2, fake_turn_servers())
+        .await
+        .expect("generation two offer");
+
+    let stale = peer
+        .next_restart_candidate_optional(1)
+        .await
+        .expect_err("optional candidate stream must reject a stale generation");
+    assert!(stale.to_string().contains("generation"));
+
+    peer.close().await.expect("close peer");
+}
+
 #[test]
 fn temporary_credentials_route_tokens_candidates_and_urls_are_redacted() {
     let server = IceServerConfig::new(
