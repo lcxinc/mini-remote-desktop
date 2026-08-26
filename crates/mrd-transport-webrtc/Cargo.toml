@@ -12,10 +12,14 @@ rtp = "0.12"
 sha2 = "0.10"
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls = "0.26"
 webrtc = "0.12"
 zeroize.workspace = true
+rustls.workspace = true
+rustls-platform-verifier = "0.7"
 
 [dev-dependencies]
 mrd-encode-nvenc = { path = "../mrd-encode-nvenc" }
 mrd-observability = { path = "../mrd-observability" }
+rcgen = "0.13"
 serde_json = { workspace = true }

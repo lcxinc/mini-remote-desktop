@@ -22,6 +22,7 @@ mod control;
 mod peer;
 mod probe;
 mod stats;
+mod turn_stream;
 
 pub use cleanup::{cleanup_supervisor_snapshot, CleanupFailureSummary, CleanupSupervisorSnapshot};
 pub use config::{

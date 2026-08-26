@@ -52,6 +52,7 @@ use crate::{
         CTRL_RT_LABEL,
     },
     stats::selected_candidate_pair,
+    turn_stream::TurnStreamBridgeOwner,
     H264RtpIngress, H264RtpSender, SelectedCandidatePairStats, TransportError,
 };
 
@@ -746,6 +747,7 @@ struct PhysicalPeer {
     tasks: Arc<StdMutex<Vec<JoinHandle<()>>>>,
     active_tasks: Arc<AtomicUsize>,
     h264_sender: Arc<Mutex<H264RtpSender>>,
+    turn_stream_bridges: Box<TurnStreamBridgeOwner>,
     cleanup_permit: CleanupPermit,
 }
 
@@ -790,6 +792,7 @@ struct PartialPhysicalPeer {
     tasks: Arc<StdMutex<Vec<JoinHandle<()>>>>,
     active_tasks: Arc<AtomicUsize>,
     h264_sender: Option<Arc<Mutex<H264RtpSender>>>,
+    turn_stream_bridges: Box<TurnStreamBridgeOwner>,
     cleanup_permit: CleanupPermit,
 }
 
@@ -804,6 +807,7 @@ impl PartialPhysicalPeer {
                 .h264_sender
                 .take()
                 .expect("completed peer has an H.264 sender"),
+            turn_stream_bridges: self.turn_stream_bridges,
             cleanup_permit: self.cleanup_permit,
         }
     }
@@ -824,6 +828,7 @@ struct PhysicalCleanupOwners {
     tasks: Arc<StdMutex<Vec<JoinHandle<()>>>>,
     active_tasks: Arc<AtomicUsize>,
     h264_sender: Option<Arc<Mutex<H264RtpSender>>>,
+    turn_stream_bridges: Box<TurnStreamBridgeOwner>,
 }
 
 impl PhysicalCleanupPayload {
@@ -837,6 +842,7 @@ impl PhysicalCleanupPayload {
                     tasks: physical.tasks,
                     active_tasks: physical.active_tasks,
                     h264_sender: physical.h264_sender,
+                    turn_stream_bridges: physical.turn_stream_bridges,
                 }),
                 close_gate: None,
                 injected_failure: false,
@@ -862,6 +868,7 @@ impl PhysicalCleanupPayload {
                     tasks: physical.tasks,
                     active_tasks: physical.active_tasks,
                     h264_sender: Some(physical.h264_sender),
+                    turn_stream_bridges: physical.turn_stream_bridges,
                 }),
                 close_gate,
                 injected_failure,
@@ -886,6 +893,7 @@ impl PhysicalCleanupPayload {
                 .h264_sender
                 .take()
                 .expect("completed peer cleanup payload retains its sender"),
+            turn_stream_bridges: owners.turn_stream_bridges,
             cleanup_permit,
         }
     }
@@ -1136,6 +1144,9 @@ impl WebRtcPeerConnection {
             TransportError::Message(format!("WebRTC cleanup capacity unavailable: {error}"))
         })?;
         let mut config_secrets = secret_values(&config.ice_servers);
+        let turn_stream_bridges = TurnStreamBridgeOwner::prepare(&mut config.ice_servers)
+            .await
+            .map_err(|error| redact_error_with_secrets(error, &config_secrets))?;
         let mut media_engine = MediaEngine::default();
         media_engine
             .register_default_codecs()
@@ -1224,6 +1235,7 @@ impl WebRtcPeerConnection {
                 tasks: Arc::clone(&tasks),
                 active_tasks: Arc::clone(&active_tasks),
                 h264_sender: None,
+                turn_stream_bridges: Box::new(turn_stream_bridges),
                 cleanup_permit,
             }),
             completed_video_drops: Arc::clone(&completed_video_drops),
@@ -3089,6 +3101,7 @@ async fn close_physical_payload(payload: &mut PhysicalCleanupPayload) -> Result<
     for task in tasks {
         let _ = task.await;
     }
+    owners.turn_stream_bridges.shutdown().await;
     // webrtc-rs retains private parsed ICE/agent copies which this crate cannot access. Replace
     // the public configuration copy again before close; the construction path already did this
     // immediately after the gatherer consumed its configuration.
