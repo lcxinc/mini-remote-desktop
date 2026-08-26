@@ -1,18 +1,23 @@
 //! Versioned, end-to-end authenticated signaling messages.
 
+use crate::initial_v3::{
+    SessionGrantV3, SessionIntentV3, WebRtcAnswerV3, WebRtcCandidateV3, WebRtcOfferV3,
+};
 use mrd_identity::{public_key_id, verify_context_bytes, DeviceIdentity};
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::fmt;
 use thiserror::Error;
 
-pub const SIGNAL_PROTOCOL_VERSION: u16 = 2;
+pub const SIGNAL_PROTOCOL_V2: u16 = 2;
+pub const SIGNAL_PROTOCOL_V3: u16 = 3;
+pub const SIGNAL_PROTOCOL_VERSION: u16 = SIGNAL_PROTOCOL_V2;
 pub const SIGNAL_MAX_MESSAGE_LIFETIME_MS: u64 = 5 * 60 * 1_000;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SignalEnvelope {
-    #[serde(deserialize_with = "deserialize_protocol_version")]
     pub version: u16,
     pub message: AuthenticatedSignalMessage,
 }
@@ -20,29 +25,41 @@ pub struct SignalEnvelope {
 impl SignalEnvelope {
     pub fn new(message: AuthenticatedSignalMessage) -> Self {
         Self {
-            version: SIGNAL_PROTOCOL_VERSION,
+            version: message.required_version(),
             message,
         }
     }
 
     pub fn validate_version(&self) -> Result<(), SignalProtocolError> {
-        if self.version == SIGNAL_PROTOCOL_VERSION {
-            Ok(())
-        } else {
-            Err(SignalProtocolError::UnsupportedVersion)
+        if self.message.is_legacy_v2_initial() || self.version != self.message.required_version() {
+            return Err(SignalProtocolError::UnsupportedVersion);
         }
+        Ok(())
     }
 }
 
-fn deserialize_protocol_version<'de, D>(deserializer: D) -> Result<u16, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let version = u16::deserialize(deserializer)?;
-    if version != SIGNAL_PROTOCOL_VERSION {
-        return Err(D::Error::custom("unsupported signaling protocol version"));
+impl<'de> Deserialize<'de> for SignalEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawEnvelope {
+            version: u16,
+            message: AuthenticatedSignalMessage,
+        }
+
+        let raw = RawEnvelope::deserialize(deserializer)?;
+        let envelope = Self {
+            version: raw.version,
+            message: raw.message,
+        };
+        envelope
+            .validate_version()
+            .map_err(|error| D::Error::custom(error.to_string()))?;
+        Ok(envelope)
     }
-    Ok(version)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,6 +75,11 @@ pub enum AuthenticatedSignalMessage {
     WebrtcOffer(WebRtcOffer),
     WebrtcAnswer(WebRtcAnswer),
     WebrtcCandidate(WebRtcCandidate),
+    SessionIntentV3(SessionIntentV3),
+    SessionGrantV3(SessionGrantV3),
+    WebrtcOfferV3(WebRtcOfferV3),
+    WebrtcAnswerV3(WebRtcAnswerV3),
+    WebrtcCandidateV3(WebRtcCandidateV3),
     RelayMigrationOffer(RelayMigrationOffer),
     RelayMigrationAnswer(RelayMigrationAnswer),
     RelayMigrationCandidate(RelayMigrationCandidate),
@@ -68,6 +90,28 @@ pub enum AuthenticatedSignalMessage {
 }
 
 impl AuthenticatedSignalMessage {
+    pub fn required_version(&self) -> u16 {
+        match self {
+            Self::SessionIntentV3(_)
+            | Self::SessionGrantV3(_)
+            | Self::WebrtcOfferV3(_)
+            | Self::WebrtcAnswerV3(_)
+            | Self::WebrtcCandidateV3(_) => SIGNAL_PROTOCOL_V3,
+            _ => SIGNAL_PROTOCOL_V2,
+        }
+    }
+
+    fn is_legacy_v2_initial(&self) -> bool {
+        matches!(
+            self,
+            Self::SessionIntent(_)
+                | Self::SessionGrant(_)
+                | Self::WebrtcOffer(_)
+                | Self::WebrtcAnswer(_)
+                | Self::WebrtcCandidate(_)
+        )
+    }
+
     pub fn verify_for(
         &self,
         expected_peer: &DeviceId,
@@ -86,12 +130,17 @@ impl AuthenticatedSignalMessage {
             Self::Register(message) => verify!(message),
             Self::Registered(message) => verify!(message),
             Self::PresenceHeartbeat(message) => verify!(message),
-            Self::SessionIntent(message) => verify!(message),
-            Self::SessionGrant(message) => verify!(message),
+            Self::SessionIntent(_)
+            | Self::SessionGrant(_)
+            | Self::WebrtcOffer(_)
+            | Self::WebrtcAnswer(_)
+            | Self::WebrtcCandidate(_) => Err(SignalProtocolError::UnsupportedVersion),
+            Self::SessionIntentV3(message) => verify!(message),
+            Self::SessionGrantV3(message) => verify!(message),
+            Self::WebrtcOfferV3(message) => verify!(message),
+            Self::WebrtcAnswerV3(message) => verify!(message),
+            Self::WebrtcCandidateV3(message) => verify!(message),
             Self::SessionDeny(message) => verify!(message),
-            Self::WebrtcOffer(message) => verify!(message),
-            Self::WebrtcAnswer(message) => verify!(message),
-            Self::WebrtcCandidate(message) => verify!(message),
             Self::RelayMigrationOffer(message) => verify!(message),
             Self::RelayMigrationAnswer(message) => verify!(message),
             Self::RelayMigrationCandidate(message) => verify!(message),
@@ -159,12 +208,23 @@ pub trait AuthenticatedPayload: Serialize {
     fn validate_payload(&self) -> Result<(), SignalProtocolError>;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SignedSignal<T> {
     pub payload: T,
     pub signer_public_key: Vec<u8>,
     pub signature: Vec<u8>,
+}
+
+impl<T> fmt::Debug for SignedSignal<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SignedSignal")
+            .field("payload", &"REDACTED")
+            .field("signer_public_key_len", &self.signer_public_key.len())
+            .field("signature_len", &self.signature.len())
+            .finish()
+    }
 }
 
 impl<T> SignedSignal<T>
@@ -459,24 +519,6 @@ pub struct SessionIntentPayload {
     pub target_device_id: DeviceId,
     pub requested_transport: String,
 }
-signed_payload!(
-    SessionIntentPayload,
-    "MRD_SIGNAL_SESSION_INTENT_V2",
-    message,
-    {
-        {
-            validate_identifier(&message.session_id.0)?;
-            validate_identifier(&message.target_device_id.0)?;
-            if message.idempotency_key == [0; 16] {
-                return Err(SignalProtocolError::Malformed);
-            }
-            if message.target_device_id != message.claims.intended_peer_device_id {
-                return Err(SignalProtocolError::WrongIntendedPeer);
-            }
-            validate_text(&message.requested_transport, 1, 32)
-        }
-    }
-);
 pub type SessionIntent = SignedSignal<SessionIntentPayload>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -488,30 +530,6 @@ pub struct SessionGrantPayload {
     pub accepted_transport: String,
     pub accepted_candidate_fingerprints: BTreeSet<String>,
 }
-signed_payload!(
-    SessionGrantPayload,
-    "MRD_SIGNAL_SESSION_GRANT_V2",
-    message,
-    {
-        {
-            validate_identifier(&message.session_id.0)?;
-            validate_identifier(&message.controller_device_id.0)?;
-            if message.controller_device_id != message.claims.intended_peer_device_id {
-                return Err(SignalProtocolError::WrongIntendedPeer);
-            }
-            validate_text(&message.accepted_transport, 1, 32)?;
-            if message.accepted_transport == "webrtc"
-                && message.accepted_candidate_fingerprints.is_empty()
-            {
-                return Err(SignalProtocolError::Malformed);
-            }
-            for fingerprint in &message.accepted_candidate_fingerprints {
-                validate_fingerprint(fingerprint)?;
-            }
-            Ok(())
-        }
-    }
-);
 pub type SessionGrant = SignedSignal<SessionGrantPayload>;
 
 impl SessionGrantPayload {
@@ -552,11 +570,6 @@ pub struct WebRtcOfferPayload {
     pub sdp: String,
     pub candidate_fingerprints: BTreeSet<String>,
 }
-signed_payload!(WebRtcOfferPayload, "MRD_SIGNAL_WEBRTC_OFFER_V2", message, {
-    {
-        validate_description(message)
-    }
-});
 pub type WebRtcOffer = SignedSignal<WebRtcOfferPayload>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -567,31 +580,7 @@ pub struct WebRtcAnswerPayload {
     pub sdp: String,
     pub candidate_fingerprints: BTreeSet<String>,
 }
-signed_payload!(
-    WebRtcAnswerPayload,
-    "MRD_SIGNAL_WEBRTC_ANSWER_V2",
-    message,
-    {
-        {
-            validate_identifier(&message.session_id.0)?;
-            validate_text(&message.sdp, 1, 256 * 1_024)?;
-            for fingerprint in &message.candidate_fingerprints {
-                validate_fingerprint(fingerprint)?;
-            }
-            Ok(())
-        }
-    }
-);
 pub type WebRtcAnswer = SignedSignal<WebRtcAnswerPayload>;
-
-fn validate_description(value: &WebRtcOfferPayload) -> Result<(), SignalProtocolError> {
-    validate_identifier(&value.session_id.0)?;
-    validate_text(&value.sdp, 1, 256 * 1_024)?;
-    for fingerprint in &value.candidate_fingerprints {
-        validate_fingerprint(fingerprint)?;
-    }
-    Ok(())
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -603,21 +592,6 @@ pub struct WebRtcCandidatePayload {
     pub sdp_mline_index: Option<u16>,
     pub candidate_fingerprint: String,
 }
-signed_payload!(
-    WebRtcCandidatePayload,
-    "MRD_SIGNAL_WEBRTC_CANDIDATE_V2",
-    message,
-    {
-        {
-            validate_identifier(&message.session_id.0)?;
-            validate_text(&message.candidate, 1, 8_192)?;
-            if let Some(mid) = &message.sdp_mid {
-                validate_text(mid, 1, 128)?;
-            }
-            validate_fingerprint(&message.candidate_fingerprint)
-        }
-    }
-);
 pub type WebRtcCandidate = SignedSignal<WebRtcCandidatePayload>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
