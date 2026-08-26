@@ -174,5 +174,21 @@ class DeviceSessionOut(BaseModel):
     active_relay_generation: int | None = Field(default=None, ge=0)
 
 
+class DeviceSessionApprovalIn(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    approved_scopes: list[WanPermissionScopeV3] = Field(min_length=1, max_length=32)
+    approved_profile: WanMediaProfileV3 | None
+
+    @field_validator("approved_scopes")
+    @classmethod
+    def validate_approved_scopes(
+        cls, value: list[WanPermissionScopeV3]
+    ) -> list[WanPermissionScopeV3]:
+        if any(left >= right for left, right in zip(value, value[1:])):
+            raise ValueError("approved scopes are not normalized")
+        return value
+
+
 class DeviceSessionTransitionIn(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)

@@ -9,20 +9,23 @@ from fastapi.routing import APIRoute
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import get_current_device
+from app.core.security import capture_device_auth_snapshot, get_current_device
 from app.db.session import get_db
 from app.models.device import Device
 from app.schemas.session import (
+    DeviceSessionApprovalIn,
     DeviceSessionCreateIn,
     DeviceSessionId,
     DeviceSessionOut,
     DeviceSessionTransitionIn,
 )
+from app.services.relay_directory import RelayAccessError, RelayAccessService
 from app.services.device_sessions import (
     DeviceSessionError,
     DeviceSessionService,
     device_session_out,
 )
+from app.api.v1.relays import get_relay_access_service
 
 
 class DeviceSessionAPIRoute(APIRoute):
@@ -74,6 +77,13 @@ def _raise(error: DeviceSessionError) -> None:
     ) from None
 
 
+def _raise_relay(error: RelayAccessError) -> None:
+    raise HTTPException(
+        status_code=error.status_code,
+        detail={"code": error.code, "message": str(error)},
+    ) from None
+
+
 @router.post("", response_model=DeviceSessionOut)
 async def create_device_session(
     payload: DeviceSessionCreateIn,
@@ -115,6 +125,41 @@ async def inspect_device_session(
     except DeviceSessionError as error:
         await db.rollback()
         _raise(error)
+
+
+@router.post("/{session_id}/approve", response_model=DeviceSessionOut)
+async def approve_device_session(
+    session_id: DeviceSessionId,
+    payload: DeviceSessionApprovalIn,
+    current_device: Device = Depends(get_current_device),
+    db: AsyncSession = Depends(get_db),
+    relay_access: RelayAccessService = Depends(get_relay_access_service),
+) -> DeviceSessionOut:
+    auth_snapshot = capture_device_auth_snapshot(current_device)
+    try:
+        row = await _service(db).approve(
+            session_id=session_id,
+            current_device=current_device,
+            auth_snapshot=auth_snapshot,
+            payload=payload,
+            relay_access=relay_access,
+        )
+        response = device_session_out(row)
+        await _commit(db)
+        return response
+    except DeviceSessionError as error:
+        await db.rollback()
+        _raise(error)
+    except RelayAccessError as error:
+        await db.rollback()
+        _raise_relay(error)
+    except IntegrityError:
+        await db.rollback()
+        _raise(
+            DeviceSessionError(
+                "wan_session_conflict", 409, "WAN session state conflicts"
+            )
+        )
 
 
 async def _transition(

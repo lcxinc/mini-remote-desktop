@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import re
 from datetime import UTC, datetime, timedelta
@@ -15,14 +16,17 @@ import app.db.migrate_add_relay_access as relay_access_migration
 from app.db.migrate_add_relay_access import migrate as migrate_relay_access
 from app.db.migrate_add_relay_control import migrate as migrate_relay_control
 from app.db.session import Base
+from app.core.security import capture_device_auth_snapshot
 from app.models.device import Device
-from app.models.device_enrollment import DeviceEnrollment
+from app.models.relay_access_generation import RelayAccessGeneration
 from app.models.relay_enrollment import RelayEnrollment
 from app.models.relay_node import RelayNode
 from app.models.relay_node_registration import RelayNodeRegistration
 from app.models.relay_reservation import RelayReservation
 from app.models.session_request import SessionRequest
 from app.models.user import User
+from app.schemas.session import DeviceSessionApprovalIn, DeviceSessionCreateIn
+from app.services.device_sessions import DeviceSessionService
 from app.services.relay_directory import RelayAccessError, RelayAccessService
 from app.services.device_enrollment import device_serial_digest
 from app.services.relay_repository import AesGcmRelaySecretCipher, RelayRepository
@@ -48,6 +52,174 @@ def asyncpg_url(url: str) -> str:
     if url.startswith("postgresql://"):
         return "postgresql+asyncpg://" + url.removeprefix("postgresql://")
     return url
+
+
+def _wan_concurrency_policy() -> SessionGrantPolicy:
+    return SessionGrantPolicy(
+        grant_ttl_seconds=120,
+        policy_ttl_seconds=90,
+        revision=17,
+        allowed_regions=("ap-east",),
+        preferred_regions=("ap-east",),
+        accepted_transports=("udp",),
+    )
+
+
+def _wan_concurrency_relay_access(
+    session: object,
+    *,
+    cipher: AesGcmRelaySecretCipher,
+) -> RelayAccessService:
+    return RelayAccessService(
+        session=session,
+        repository=RelayRepository(
+            session,
+            enrollment_token_pepper=bytes.fromhex("a1" * 32),
+            secret_cipher=cipher,
+            max_reservations_per_session=2,
+        ),
+        signer=Ed25519RelayDirectorySigner(
+            key_id="wan-concurrency-key",
+            private_key_seed=bytes.fromhex("a2" * 32),
+        ),
+        credential_issuer=NodeTurnCredentialService(
+            cipher=cipher,
+            ttl_seconds=60,
+            now=lambda: int(NOW.timestamp()),
+        ),
+        current_policy=_wan_concurrency_policy(),
+        directory_ttl_seconds=30,
+        now=lambda: NOW,
+    )
+
+
+async def _seed_requested_wan_session(
+    session: object,
+    *,
+    cipher: AesGcmRelaySecretCipher,
+) -> None:
+    session.add_all(
+        [
+            User(
+                id="wan-controller-user",
+                username="wan-controller-user",
+                email="wan-controller@example.test",
+                password_hash="unused",
+                role="user",
+                tenant_id="tenant-wan",
+            ),
+            User(
+                id="wan-target-user",
+                username="wan-target-user",
+                email="wan-target@example.test",
+                password_hash="unused",
+                role="user",
+                tenant_id="tenant-wan",
+            ),
+        ]
+    )
+    await session.flush()
+    controller = Device(
+        id="wan-controller-row",
+        name="wan-controller",
+        device_id="wan-controller-public",
+        os="Linux",
+        tenant_id="tenant-wan",
+        is_bound=True,
+        bound_user_id="wan-controller-user",
+    )
+    target = Device(
+        id="wan-target-row",
+        name="wan-target",
+        device_id="wan-target-public",
+        os="Linux",
+        tenant_id="tenant-wan",
+        is_bound=True,
+        bound_user_id="wan-target-user",
+    )
+    session.add_all([controller, target])
+    await session.flush()
+    for index, (node_id, failure_domain) in enumerate(
+        (("wan-relay-a", "rack-a"), ("wan-relay-b", "rack-b")),
+        start=1,
+    ):
+        enrollment = RelayEnrollment(
+            id=f"wan-enrollment-{index}",
+            token_digest=f"{index + 20:064x}",
+            expires_at=NOW + timedelta(hours=1),
+            used_at=NOW,
+            enrolled_node_id=node_id,
+            created_at=NOW,
+        )
+        encrypted_secret = cipher.encrypt(
+            hashlib.sha256(f"wan-node-secret-{index}".encode()).digest(),
+            associated_data=node_id.encode(),
+        )
+        node = RelayNode(
+            node_id=node_id,
+            region="ap-east",
+            failure_domain=failure_domain,
+            physical_host_id=f"wan-host-{index}",
+            state="available",
+            endpoints=[f"turn:{node_id}.example.test:3478?transport=udp"],
+            certificate_fingerprint="sha256:" + f"{index + 20:064x}",
+            encrypted_turn_secret=encrypted_secret,
+            max_allocations=8,
+            active_allocations=0,
+            max_egress_bps=1_000_000,
+            current_egress_bps=0,
+            measured_rtt_ms=10 + index,
+            recent_failure_bps=0,
+            heartbeat_sequence=3,
+            healthy_heartbeat_streak=3,
+            lease_expires_at=NOW + timedelta(minutes=10),
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        registration = RelayNodeRegistration(
+            node_id=node_id,
+            enrollment_id=enrollment.id,
+            region=node.region,
+            failure_domain=node.failure_domain,
+            physical_host_id=node.physical_host_id,
+            topology_approved_at=NOW,
+            endpoints=node.endpoints,
+            max_allocations=node.max_allocations,
+            max_egress_bps=node.max_egress_bps,
+            csr_pem=b"fixture",
+            signing_public_key=bytes([index + 20]) * 32,
+            encrypted_turn_secret=encrypted_secret,
+            status="approved",
+            certificate_pem=b"fixture",
+            certificate_expires_at=NOW + timedelta(hours=1),
+            created_at=NOW,
+            approved_at=NOW,
+        )
+        session.add_all([enrollment, node, registration])
+    await session.flush()
+    await DeviceSessionService(session, now=lambda: NOW).create(
+        current_device=controller,
+        payload=DeviceSessionCreateIn(
+            session_id="wan-concurrent-session",
+            idempotency_key=list(range(1, 17)),
+            target_device_id=target.device_id,
+            access_mode="attended",
+            requested_scopes=["input.pointer", "screen.view"],
+            requested_profile=None,
+            route_policy="relay_only",
+        ),
+    )
+
+
+def _signed_directory_digest(value: dict[str, object]) -> str:
+    canonical = json.dumps(
+        value,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(b"MRD_TEST_PUBLIC_DIRECTORY_V1\x00" + canonical).hexdigest()
 
 
 @pytest.mark.anyio
@@ -82,6 +254,270 @@ async def test_access_migration_rejects_wrong_types_and_weakened_constraints(
                 await connection.execute(text(statement))
         with pytest.raises(relay_access_migration.RelayAccessMigrationError):
             await migrate_relay_access(engine)
+    finally:
+        await engine.dispose()
+        async with admin_engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        await admin_engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_concurrent_exact_duplicate_wan_approval_creates_one_generation_zero() -> (
+    None
+):
+    assert DATABASE_URL is not None
+    schema = "wan_approval_atomic_" + re.sub(r"[^a-z0-9]", "", uuid4().hex)
+    admin_engine = create_async_engine(asyncpg_url(DATABASE_URL))
+    async with admin_engine.begin() as connection:
+        await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+    engine = create_async_engine(
+        asyncpg_url(DATABASE_URL),
+        connect_args={"server_settings": {"search_path": schema}},
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    cipher = AesGcmRelaySecretCipher(bytes.fromhex("a3" * 32))
+    try:
+        async with engine.begin() as connection:
+            await migrate_relay_control(connection)
+            await connection.run_sync(Base.metadata.create_all)
+            await migrate_relay_access(connection)
+        async with sessions.begin() as setup:
+            await _seed_requested_wan_session(setup, cipher=cipher)
+
+        ready_lock = asyncio.Lock()
+        both_ready = asyncio.Event()
+        ready_count = 0
+
+        async def rendezvous() -> None:
+            nonlocal ready_count
+            async with ready_lock:
+                ready_count += 1
+                if ready_count == 2:
+                    both_ready.set()
+            await asyncio.wait_for(both_ready.wait(), timeout=5)
+
+        async def approve_once() -> tuple[str, int | None, str]:
+            async with sessions() as db:
+                target = await db.get(Device, "wan-target-row")
+                if target is None:
+                    raise AssertionError("WAN target fixture is unavailable")
+                await rendezvous()
+                row = await DeviceSessionService(db, now=lambda: NOW).approve(
+                    session_id="wan-concurrent-session",
+                    current_device=target,
+                    auth_snapshot=capture_device_auth_snapshot(target),
+                    payload=DeviceSessionApprovalIn(
+                        approved_scopes=["input.pointer", "screen.view"],
+                        approved_profile=None,
+                    ),
+                    relay_access=_wan_concurrency_relay_access(db, cipher=cipher),
+                )
+                generation = await db.get(
+                    RelayAccessGeneration,
+                    {
+                        "session_id": "wan-concurrent-session",
+                        "generation": 0,
+                    },
+                )
+                if generation is None:
+                    raise AssertionError("WAN generation zero is unavailable")
+                result = (
+                    row.status,
+                    row.active_relay_generation,
+                    generation.directory_id,
+                )
+                await db.commit()
+                return result
+
+        approvals = await asyncio.wait_for(
+            asyncio.gather(approve_once(), approve_once()),
+            timeout=10,
+        )
+        assert all(result[:2] == ("approved", 0) for result in approvals)
+        assert len({result[2] for result in approvals}) == 1
+
+        async with sessions() as verification:
+            request = await verification.get(SessionRequest, "wan-concurrent-session")
+            generations = list(
+                await verification.scalars(
+                    select(RelayAccessGeneration)
+                    .where(RelayAccessGeneration.session_id == "wan-concurrent-session")
+                    .order_by(RelayAccessGeneration.generation)
+                )
+            )
+            reservation_count = await verification.scalar(
+                select(func.count())
+                .select_from(RelayReservation)
+                .where(RelayReservation.session_id == "wan-concurrent-session")
+            )
+            reservation_node_count = await verification.scalar(
+                select(func.count(func.distinct(RelayReservation.node_id))).where(
+                    RelayReservation.session_id == "wan-concurrent-session"
+                )
+            )
+            assert request is not None
+            assert (request.status, request.active_relay_generation) == (
+                "approved",
+                0,
+            )
+            assert [item.generation for item in generations] == [0]
+            assert reservation_count == 2
+            assert reservation_node_count == 2
+            assert all(
+                item.directory_generation == generations[0].directory_id
+                for item in (
+                    await verification.scalars(
+                        select(RelayReservation).where(
+                            RelayReservation.session_id == "wan-concurrent-session"
+                        )
+                    )
+                )
+            )
+    finally:
+        await engine.dispose()
+        async with admin_engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        await admin_engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_concurrent_wan_refresh_expected_zero_creates_one_immutable_generation_one() -> (
+    None
+):
+    assert DATABASE_URL is not None
+    schema = "wan_refresh_cas_" + re.sub(r"[^a-z0-9]", "", uuid4().hex)
+    admin_engine = create_async_engine(asyncpg_url(DATABASE_URL))
+    async with admin_engine.begin() as connection:
+        await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+    engine = create_async_engine(
+        asyncpg_url(DATABASE_URL),
+        connect_args={"server_settings": {"search_path": schema}},
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    cipher = AesGcmRelaySecretCipher(bytes.fromhex("a4" * 32))
+    try:
+        async with engine.begin() as connection:
+            await migrate_relay_control(connection)
+            await connection.run_sync(Base.metadata.create_all)
+            await migrate_relay_access(connection)
+        async with sessions.begin() as setup:
+            await _seed_requested_wan_session(setup, cipher=cipher)
+        async with sessions() as approval_db:
+            target = await approval_db.get(Device, "wan-target-row")
+            if target is None:
+                raise AssertionError("WAN target fixture is unavailable")
+            await DeviceSessionService(approval_db, now=lambda: NOW).approve(
+                session_id="wan-concurrent-session",
+                current_device=target,
+                auth_snapshot=capture_device_auth_snapshot(target),
+                payload=DeviceSessionApprovalIn(
+                    approved_scopes=["input.pointer", "screen.view"],
+                    approved_profile=None,
+                ),
+                relay_access=_wan_concurrency_relay_access(approval_db, cipher=cipher),
+            )
+            await approval_db.commit()
+
+        async with sessions() as before_refresh:
+            generation_zero = await before_refresh.get(
+                RelayAccessGeneration,
+                {
+                    "session_id": "wan-concurrent-session",
+                    "generation": 0,
+                },
+            )
+            if generation_zero is None:
+                raise AssertionError("WAN generation zero is unavailable")
+            generation_zero_directory_id = generation_zero.directory_id
+            generation_zero_digest = _signed_directory_digest(
+                generation_zero.signed_directory
+            )
+
+        ready_lock = asyncio.Lock()
+        both_ready = asyncio.Event()
+        ready_count = 0
+
+        async def rendezvous() -> None:
+            nonlocal ready_count
+            async with ready_lock:
+                ready_count += 1
+                if ready_count == 2:
+                    both_ready.set()
+            await asyncio.wait_for(both_ready.wait(), timeout=5)
+
+        async def refresh_once() -> tuple[str, str, int | None, str | None]:
+            async with sessions() as db:
+                controller = await db.get(Device, "wan-controller-row")
+                if controller is None:
+                    raise AssertionError("WAN controller fixture is unavailable")
+                await rendezvous()
+                try:
+                    result = await _wan_concurrency_relay_access(
+                        db, cipher=cipher
+                    ).issue_wan_access(
+                        auth_snapshot=capture_device_auth_snapshot(controller),
+                        session_id="wan-concurrent-session",
+                        policy_revision=17,
+                        intended_peer_id="wan-target-public",
+                        generation=0,
+                        refresh=True,
+                    )
+                except RelayAccessError as error:
+                    await db.rollback()
+                    return "error", error.code, None, None
+                return (
+                    "success",
+                    "",
+                    result.generation,
+                    result.directory.payload.directory_id,
+                )
+
+        refreshes = await asyncio.wait_for(
+            asyncio.gather(refresh_once(), refresh_once()),
+            timeout=10,
+        )
+        successes = [result for result in refreshes if result[0] == "success"]
+        failures = [result for result in refreshes if result[0] == "error"]
+        assert successes
+        assert all(result[2] == 1 for result in successes)
+        assert len({result[3] for result in successes}) == 1
+        assert all(result[1] == "relay_access_denied" for result in failures)
+        assert len(successes) + len(failures) == 2
+
+        async with sessions() as verification:
+            request = await verification.get(SessionRequest, "wan-concurrent-session")
+            generations = list(
+                await verification.scalars(
+                    select(RelayAccessGeneration)
+                    .where(RelayAccessGeneration.session_id == "wan-concurrent-session")
+                    .order_by(RelayAccessGeneration.generation)
+                )
+            )
+            reservation_count = await verification.scalar(
+                select(func.count())
+                .select_from(RelayReservation)
+                .where(RelayReservation.session_id == "wan-concurrent-session")
+            )
+            current_reservation_count = await verification.scalar(
+                select(func.count())
+                .select_from(RelayReservation)
+                .where(
+                    RelayReservation.session_id == "wan-concurrent-session",
+                    RelayReservation.directory_generation
+                    == generations[-1].directory_id,
+                )
+            )
+            assert request is not None
+            assert request.active_relay_generation == 1
+            assert [item.generation for item in generations] == [0, 1]
+            assert generations[0].directory_id == generation_zero_directory_id
+            assert generations[1].directory_id != generation_zero_directory_id
+            assert (
+                _signed_directory_digest(generations[0].signed_directory)
+                == generation_zero_digest
+            )
+            assert reservation_count == 2
+            assert current_reservation_count == 2
     finally:
         await engine.dispose()
         async with admin_engine.begin() as connection:

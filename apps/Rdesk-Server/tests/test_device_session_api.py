@@ -585,3 +585,11 @@ def test_device_session_openapi_uses_only_closed_device_auth_contract(
     assert request_schema["additionalProperties"] is False
     response_schema = schema["components"]["schemas"]["DeviceSessionOut"]
     assert response_schema["additionalProperties"] is False
+    approve = schema["paths"]["/api/v1/device-sessions/{session_id}/approve"]["post"]
+    assert approve["security"] == [{"DeviceBearer": []}]
+    approval_schema = schema["components"]["schemas"]["DeviceSessionApprovalIn"]
+    assert approval_schema["additionalProperties"] is False
+    assert set(approval_schema["required"]) == {
+        "approved_scopes",
+        "approved_profile",
+    }

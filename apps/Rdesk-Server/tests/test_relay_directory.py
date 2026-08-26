@@ -1261,7 +1261,13 @@ def test_access_api_requires_auth_and_returns_only_signed_directory_and_credenti
         authenticated_app.include_router(router, prefix="/api/v1")
         authenticated_app.dependency_overrides[get_relay_access_service] = lambda: service
         authenticated_app.dependency_overrides[get_current_device] = lambda: SimpleNamespace(
-            id="requester-device", is_bound=True, bound_user_id="user-42"
+            id="requester-device",
+            device_id="requester-device-public",
+            auth_version=1,
+            is_bound=True,
+            bound_user_id="user-42",
+            tenant_id="tenant-a",
+            auth_revoked_at=None,
         )
         invalid = TestClient(authenticated_app).post(
             "/api/v1/relays/access", json={}
@@ -1322,7 +1328,13 @@ def test_production_request_owner_approval_and_both_participant_access_flow(
         current = SimpleNamespace(
             user=session.get(User, "user-42"),
             device=SimpleNamespace(
-                id="requester-device", is_bound=True, bound_user_id="user-42"
+                id="requester-device",
+                device_id="requester-device-public",
+                auth_version=1,
+                is_bound=True,
+                bound_user_id="user-42",
+                tenant_id="tenant-a",
+                auth_revoked_at=None,
             ),
         )
         async_session = service._session
@@ -1363,7 +1375,13 @@ def test_production_request_owner_approval_and_both_participant_access_flow(
         for user_id in ("user-42", "owner-9"):
             current.user = session.get(User, user_id)
             current.device = SimpleNamespace(
-                id=f"device-for-{user_id}", is_bound=True, bound_user_id=user_id
+                id=f"device-for-{user_id}",
+                device_id=f"device-for-{user_id}-public",
+                auth_version=1,
+                is_bound=True,
+                bound_user_id=user_id,
+                tenant_id="tenant-a",
+                auth_revoked_at=None,
             )
             access = client.post("/api/v1/relays/access", json=access_payload)
             assert access.status_code == 200, access.text

@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
+import json
 import re
 import secrets
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field as dataclass_field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Callable, Iterable, NoReturn, Protocol
 
 from sqlalchemy import func, select
 
+from app.core.security import DeviceAuthSnapshot
 from app.models.device import Device
+from app.models.relay_access_generation import RelayAccessGeneration
 from app.models.relay_audit_event import RelayAuditEvent
 from app.models.relay_node import RelayNode
 from app.models.relay_node_registration import RelayNodeRegistration
@@ -24,6 +28,7 @@ from app.services.relay_signing import (
     RelayDirectoryPayloadOut,
     RelayReservationOut,
     SignedRelayDirectoryOut,
+    canonical_directory_bytes,
 )
 from app.services.session_grants import (
     SessionGrantError,
@@ -123,7 +128,9 @@ class RelaySelectionDecision:
 @dataclass(frozen=True)
 class RelayAccessResult:
     directory: SignedRelayDirectoryOut
-    credentials: tuple[NodeTurnCredential, ...]
+    credentials: tuple[NodeTurnCredential, ...] = dataclass_field(repr=False)
+    generation: int | None = None
+    relay_url_digest: str | None = None
 
 
 class RelayDirectorySigner(Protocol):
@@ -152,6 +159,10 @@ class RelayAccessService:
         self._directory_ttl_seconds = directory_ttl_seconds
         self._now = now or (lambda: datetime.now(UTC))
 
+    @property
+    def current_policy(self) -> SessionGrantPolicy:
+        return self._current_policy
+
     async def issue_access(
         self,
         *,
@@ -160,15 +171,872 @@ class RelayAccessService:
         policy_revision: int,
         intended_peer_id: str,
     ) -> RelayAccessResult:
-        async with session_grant_identity_lock(
-            self._session, "session:" + session_id
-        ):
+        async with session_grant_identity_lock(self._session, "session:" + session_id):
             return await self._issue_access_locked(
                 current_user_id=current_user_id,
                 session_id=session_id,
                 policy_revision=policy_revision,
                 intended_peer_id=intended_peer_id,
             )
+
+    async def create_wan_generation_locked(
+        self,
+        *,
+        grant: SessionRequest,
+        target_device: Device,
+        generation: int,
+    ) -> RelayAccessGeneration:
+        """Create and persist one immutable public WAN generation.
+
+        The caller owns the session identity lock, the row lock, and the outer
+        transaction. This method never commits and never derives participant
+        credentials.
+        """
+
+        now = _utc(self._now())
+        if (
+            grant.requester_device_id is None
+            or grant.target_device_id != target_device.id
+            or grant.intended_peer_id != target_device.id
+            or grant.status != ("requested" if generation == 0 else "approved")
+            or not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 0
+            or generation
+            != (
+                0
+                if grant.active_relay_generation is None
+                else grant.active_relay_generation + 1
+            )
+        ):
+            _deny_access()
+        try:
+            persisted = await self._build_and_persist_wan_generation(
+                grant=grant,
+                target_device=target_device,
+                generation=generation,
+                now=now,
+            )
+            grant.active_relay_generation = generation
+            grant.status = "approved"
+            await self._session.flush()
+            return persisted
+        except RelayAccessError:
+            raise
+        except RelayRepositoryError as error:
+            if error.code in {
+                "INVALID_SESSION_ID",
+                "INVALID_USER_ID",
+                "SESSION_OWNER_MISMATCH",
+            }:
+                _deny_access()
+            raise RelayAccessError(
+                "relay_capacity_unavailable", 503, "relay capacity unavailable"
+            ) from None
+
+    async def validate_wan_generation_locked(
+        self,
+        *,
+        grant: SessionRequest,
+        target_device: Device,
+        generation: int,
+    ) -> RelayAccessGeneration:
+        persisted = await self._session.scalar(
+            select(RelayAccessGeneration)
+            .where(
+                RelayAccessGeneration.session_id == grant.id,
+                RelayAccessGeneration.generation == generation,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if persisted is None:
+            _deny_access()
+        directory = self._validate_persisted_wan_generation(
+            grant=grant,
+            target_device=target_device,
+            persisted=persisted,
+            now=_utc(self._now()),
+        )
+        await self._validate_wan_reservations_locked(
+            grant=grant,
+            persisted=persisted,
+            directory=directory,
+        )
+        return persisted
+
+    async def issue_wan_access(
+        self,
+        *,
+        auth_snapshot: DeviceAuthSnapshot,
+        session_id: str,
+        policy_revision: int,
+        intended_peer_id: str,
+        generation: int,
+        refresh: bool = False,
+    ) -> RelayAccessResult:
+        if refresh:
+            async with session_grant_identity_lock(
+                self._session, "session:" + session_id
+            ):
+                try:
+                    async with _issuance_transaction(self._session):
+                        now = _utc(self._now())
+                        (
+                            grant,
+                            controller,
+                            target,
+                            caller,
+                        ) = await self._locked_wan_context(
+                            auth_snapshot=auth_snapshot,
+                            session_id=session_id,
+                        )
+                        self._authorize_wan_access(
+                            grant=grant,
+                            controller=controller,
+                            target=target,
+                            caller=caller,
+                            auth_snapshot=auth_snapshot,
+                            requested_policy_revision=policy_revision,
+                            requested_peer_id=intended_peer_id,
+                            requested_generation=generation,
+                            now=now,
+                        )
+                        await self.create_wan_generation_locked(
+                            grant=grant,
+                            target_device=target,
+                            generation=generation + 1,
+                        )
+                except RelayAccessError:
+                    raise
+                except RelayRepositoryError:
+                    raise RelayAccessError(
+                        "relay_capacity_unavailable",
+                        503,
+                        "relay capacity unavailable",
+                    ) from None
+            generation += 1
+        return await self._fetch_wan_access(
+            auth_snapshot=auth_snapshot,
+            session_id=session_id,
+            policy_revision=policy_revision,
+            intended_peer_id=intended_peer_id,
+            generation=generation,
+        )
+
+    async def issue_authenticated_access(
+        self,
+        *,
+        current_device: Device,
+        auth_snapshot: DeviceAuthSnapshot,
+        session_id: str,
+        policy_revision: int,
+        intended_peer_id: str,
+        generation: int | None,
+        refresh: bool,
+    ) -> RelayAccessResult:
+        preview = await self._session.scalar(
+            select(SessionRequest).where(SessionRequest.id == session_id)
+        )
+        if preview is None:
+            _deny_access()
+        if preview.requester_device_id is None:
+            if generation is not None or refresh:
+                _deny_access()
+            if not current_device.is_bound or current_device.bound_user_id is None:
+                _deny_access()
+            return await self.issue_access(
+                current_user_id=current_device.bound_user_id,
+                session_id=session_id,
+                policy_revision=policy_revision,
+                intended_peer_id=intended_peer_id,
+            )
+        if generation is None:
+            _deny_access()
+        return await self.issue_wan_access(
+            auth_snapshot=auth_snapshot,
+            session_id=session_id,
+            policy_revision=policy_revision,
+            intended_peer_id=intended_peer_id,
+            generation=generation,
+            refresh=refresh,
+        )
+
+    async def _fetch_wan_access(
+        self,
+        *,
+        auth_snapshot: DeviceAuthSnapshot,
+        session_id: str,
+        policy_revision: int,
+        intended_peer_id: str,
+        generation: int,
+    ) -> RelayAccessResult:
+        async with session_grant_identity_lock(self._session, "session:" + session_id):
+            try:
+                async with _issuance_transaction(self._session):
+                    now = _utc(self._now())
+                    grant, controller, target, caller = await self._locked_wan_context(
+                        auth_snapshot=auth_snapshot,
+                        session_id=session_id,
+                    )
+                    self._authorize_wan_access(
+                        grant=grant,
+                        controller=controller,
+                        target=target,
+                        caller=caller,
+                        auth_snapshot=auth_snapshot,
+                        requested_policy_revision=policy_revision,
+                        requested_peer_id=intended_peer_id,
+                        requested_generation=generation,
+                        now=now,
+                    )
+                    persisted = await self._session.scalar(
+                        select(RelayAccessGeneration)
+                        .where(
+                            RelayAccessGeneration.session_id == session_id,
+                            RelayAccessGeneration.generation == generation,
+                        )
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                    if persisted is None:
+                        _deny_access()
+                    directory = self._validate_persisted_wan_generation(
+                        grant=grant,
+                        target_device=target,
+                        persisted=persisted,
+                        now=now,
+                    )
+                    credentials = await self._issue_wan_credentials_locked(
+                        grant=grant,
+                        caller=caller,
+                        persisted=persisted,
+                        directory=directory,
+                        now=now,
+                    )
+                    for candidate in directory.payload.candidates:
+                        self._session.add(
+                            RelayAuditEvent(
+                                action="wan_relay_access_issued",
+                                node_id=candidate.node_id,
+                                actor_id=caller.id,
+                                details={"generation": persisted.generation},
+                                created_at=now,
+                            )
+                        )
+                    await self._session.flush()
+                    return RelayAccessResult(
+                        directory=directory,
+                        credentials=credentials,
+                        generation=persisted.generation,
+                        relay_url_digest=persisted.relay_url_digest,
+                    )
+            except RelayAccessError:
+                raise
+            except RelayRepositoryError:
+                raise RelayAccessError(
+                    "relay_capacity_unavailable", 503, "relay capacity unavailable"
+                ) from None
+
+    async def _locked_wan_context(
+        self,
+        *,
+        auth_snapshot: DeviceAuthSnapshot,
+        session_id: str,
+    ) -> tuple[SessionRequest, Device, Device, Device]:
+        preview = await self._session.scalar(
+            select(SessionRequest)
+            .where(SessionRequest.id == session_id)
+            .execution_options(populate_existing=True)
+        )
+        if preview is None or preview.requester_device_id is None:
+            _deny_access()
+        devices = list(
+            await self._session.scalars(
+                select(Device)
+                .where(
+                    Device.id.in_(
+                        {
+                            preview.requester_device_id,
+                            preview.target_device_id,
+                            auth_snapshot.row_id,
+                        }
+                    )
+                )
+                .order_by(Device.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        by_id = {device.id: device for device in devices}
+        controller = by_id.get(preview.requester_device_id)
+        target = by_id.get(preview.target_device_id)
+        caller = by_id.get(auth_snapshot.row_id)
+        if controller is None or target is None or caller is None:
+            _deny_access()
+        user_ids = sorted(
+            {
+                value
+                for value in (
+                    preview.requester_user_id,
+                    controller.bound_user_id,
+                    target.bound_user_id,
+                    caller.bound_user_id,
+                )
+                if isinstance(value, str)
+            }
+        )
+        users = list(
+            await self._session.scalars(
+                select(User)
+                .where(User.id.in_(user_ids))
+                .order_by(User.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        users_by_id = {user.id: user for user in users}
+        grant = await self._session.scalar(
+            select(SessionRequest)
+            .where(SessionRequest.id == session_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if (
+            grant is None
+            or grant.requester_device_id != controller.id
+            or grant.target_device_id != target.id
+            or users_by_id.get(controller.bound_user_id) is None
+            or users_by_id.get(target.bound_user_id) is None
+            or users_by_id[controller.bound_user_id].tenant_id != grant.tenant_id
+            or users_by_id[target.bound_user_id].tenant_id != grant.tenant_id
+        ):
+            _deny_access()
+        return grant, controller, target, caller
+
+    def _authorize_wan_access(
+        self,
+        *,
+        grant: SessionRequest,
+        controller: Device | None,
+        target: Device | None,
+        caller: Device | None,
+        auth_snapshot: DeviceAuthSnapshot,
+        requested_policy_revision: int,
+        requested_peer_id: str,
+        requested_generation: int,
+        now: datetime,
+    ) -> None:
+        participant_ids = {grant.requester_device_id, grant.target_device_id}
+        valid = (
+            controller is not None
+            and target is not None
+            and caller is not None
+            and _matches_auth_snapshot(caller, auth_snapshot)
+            and caller.id in participant_ids
+            and controller.id != target.id
+            and controller.is_bound
+            and target.is_bound
+            and caller.is_bound
+            and controller.auth_revoked_at is None
+            and target.auth_revoked_at is None
+            and caller.auth_revoked_at is None
+            and controller.bound_user_id == grant.requester_user_id
+            and controller.tenant_id == grant.tenant_id
+            and target.tenant_id == grant.tenant_id
+            and caller.tenant_id == grant.tenant_id
+            and _wan_request_binding_valid(
+                grant=grant,
+                controller=controller,
+                target=target,
+            )
+            and target.device_id == requested_peer_id
+            and grant.intended_peer_id == target.id
+            and grant.status == "approved"
+            and isinstance(grant.grant_expires_at, datetime)
+            and _utc(grant.grant_expires_at) > now
+            and isinstance(grant.policy_expires_at, datetime)
+            and _utc(grant.policy_expires_at) > now
+            and requested_policy_revision == grant.policy_revision
+            and requested_generation == grant.active_relay_generation
+            and _grant_conforms_to_current_policy(
+                grant=grant,
+                current_policy=self._current_policy,
+                requested_policy_revision=requested_policy_revision,
+                now=now,
+            )
+        )
+        if not valid:
+            _deny_access()
+
+    async def _build_and_persist_wan_generation(
+        self,
+        *,
+        grant: SessionRequest,
+        target_device: Device,
+        generation: int,
+        now: datetime,
+    ) -> RelayAccessGeneration:
+        policy = _policy_from_grant(grant)
+        rows = await self._session.execute(
+            select(RelayNode, RelayNodeRegistration)
+            .join(
+                RelayNodeRegistration,
+                RelayNodeRegistration.node_id == RelayNode.node_id,
+            )
+            .order_by(RelayNode.node_id)
+        )
+        records = list(rows.all())
+        views = [_view(node, registration) for node, registration in records]
+        pending_rows = await self._session.execute(
+            select(RelayReservation.node_id, func.count(RelayReservation.id))
+            .where(
+                RelayReservation.node_id.in_([node.node_id for node, _ in records]),
+                RelayReservation.session_id != grant.id,
+                RelayReservation.expires_at > now,
+            )
+            .group_by(RelayReservation.node_id)
+        )
+        pending_by_node = {node_id: int(count) for node_id, count in pending_rows.all()}
+        views = [
+            replace(
+                view,
+                active_allocations=(
+                    view.active_allocations + pending_by_node.get(view.node_id, 0)
+                ),
+            )
+            for view in views
+        ]
+        decision = select_relay_nodes(policy, views, now=now)
+        by_id = {
+            node.node_id: (node, registration, view)
+            for (node, registration), view in zip(records, views, strict=True)
+        }
+        required_count = 1 + policy.max_backups
+        if len(decision.selected) < required_count:
+            raise RelayAccessError(
+                "relay_capacity_unavailable", 503, "relay capacity unavailable"
+            )
+        selected_ids = {item.node_id for item in decision.selected}
+        ordered_candidates = (
+            *decision.selected,
+            *(
+                item
+                for item in decision.eligible
+                if item.node_id not in selected_ids
+            ),
+        )[:8]
+        server_deadline_seconds = min(
+            int((now + timedelta(seconds=self._directory_ttl_seconds)).timestamp()),
+            _unix_seconds(grant.grant_expires_at),
+            _unix_seconds(grant.policy_expires_at),
+        )
+        server_deadline = datetime.fromtimestamp(server_deadline_seconds, tz=UTC)
+        if server_deadline <= now:
+            _deny_access()
+        directory_id = new_directory_id()
+        reservation_ttl = int((server_deadline - now).total_seconds())
+        if reservation_ttl <= 0:
+            _deny_access()
+        preexisting_reservation_ids = set(
+            (
+                await self._session.scalars(
+                    select(RelayReservation.id).where(
+                        RelayReservation.session_id == grant.id,
+                        RelayReservation.expires_at > now,
+                    )
+                )
+            ).all()
+        )
+        try:
+            reservations = await self._repository.reserve_capacity(
+                session_id=grant.id,
+                user_id=grant.requester_user_id,
+                ordered_node_ids=[item.node_id for item in ordered_candidates],
+                now=now,
+                ttl_seconds=reservation_ttl,
+                expires_at=server_deadline,
+                directory_generation=directory_id,
+                require_registration=True,
+                require_distinct_topology=True,
+                result_limit=required_count,
+            )
+        except BaseException:
+            await self._release_uncommitted_capacity(
+                session_id=grant.id,
+                directory_id=directory_id,
+                reservation_ids=None,
+            )
+            raise
+        new_reservation_ids = [
+            item.id
+            for item in reservations
+            if item.id not in preexisting_reservation_ids
+        ]
+        if len(reservations) != required_count:
+            await self._release_uncommitted_capacity(
+                session_id=grant.id,
+                directory_id=directory_id,
+                reservation_ids=new_reservation_ids,
+            )
+            raise RelayAccessError(
+                "relay_capacity_unavailable", 503, "relay capacity unavailable"
+            )
+        existing_reservations = [
+            item for item in reservations if item.id in preexisting_reservation_ids
+        ]
+        try:
+            reservations, reservation_expiry = await _cohere_reservations(
+                session=self._session,
+                reservations=reservations,
+                existing_reservations=existing_reservations,
+                by_id=by_id,
+                server_deadline=server_deadline,
+            )
+        except Exception:
+            await self._release_uncommitted_capacity(
+                session_id=grant.id,
+                directory_id=directory_id,
+                reservation_ids=new_reservation_ids,
+            )
+            raise
+        if len(reservations) != required_count or reservation_expiry <= now:
+            await self._release_uncommitted_capacity(
+                session_id=grant.id,
+                directory_id=directory_id,
+                reservation_ids=new_reservation_ids,
+            )
+            raise RelayAccessError(
+                "relay_capacity_unavailable", 503, "relay capacity unavailable"
+            )
+        await self._session.flush()
+        selection_order = {
+            item.node_id: index for index, item in enumerate(reservations)
+        }
+        reservation_by_node = {item.node_id: item for item in reservations}
+        signed_candidates: list[RelayDirectoryCandidateOut] = []
+        urls_by_node: dict[str, list[str]] = {}
+        for node_id in sorted(
+            reservation_by_node, key=lambda value: value.encode("utf-8")
+        ):
+            node, registration, _ = by_id[node_id]
+            locked_endpoints = tuple(
+                endpoint
+                for endpoint in node.endpoints
+                if endpoint_transport(endpoint) in policy.accepted_transports
+            )
+            if not locked_endpoints:
+                await self._release_uncommitted_capacity(
+                    session_id=grant.id,
+                    directory_id=directory_id,
+                    reservation_ids=new_reservation_ids,
+                )
+                raise RelayAccessError(
+                    "relay_capacity_unavailable", 503, "relay capacity unavailable"
+                )
+            endpoints = sorted(
+                (endpoint_parts(url) for url in locked_endpoints),
+                key=lambda item: (
+                    {"udp": 1, "tcp": 2, "tls": 3}[item[0]],
+                    item[1].encode("utf-8"),
+                    item[2],
+                ),
+            )
+            endpoint_models = [
+                RelayDirectoryEndpointOut(
+                    transport=transport,
+                    host=_signed_endpoint_host(host),
+                    port=port,
+                )
+                for transport, host, port in endpoints
+            ]
+            urls_by_node[node_id] = [
+                _canonical_endpoint_url(item) for item in endpoint_models
+            ]
+            signed_candidates.append(
+                RelayDirectoryCandidateOut(
+                    node_id=node_id,
+                    region=node.region,
+                    failure_domain=node.failure_domain,
+                    endpoints=endpoint_models,
+                    capabilities=_capabilities(locked_endpoints),
+                    load_class=_load_class(_view(node, registration)),
+                    selection_reason=(
+                        "preferred-region"
+                        if selection_order[node_id] == 0
+                        else "failure-domain-backup"
+                    ),
+                    reservation=RelayReservationOut(
+                        reservation_id=reservation_by_node[node_id].id,
+                        expires_at_ms=_unix_ms(reservation_by_node[node_id].expires_at),
+                    ),
+                )
+            )
+        payload = RelayDirectoryPayloadOut(
+            format_version=1,
+            policy_revision=grant.policy_revision,
+            directory_id=directory_id,
+            issued_at_ms=_unix_ms(now),
+            expires_at_ms=_unix_ms(reservation_expiry),
+            session_id=grant.id,
+            intended_peer_digest=intended_peer_digest(target_device.device_id),
+            candidates=signed_candidates,
+        )
+        try:
+            directory = self._signer.sign(payload)
+            if directory.payload != payload:
+                raise ValueError("signed directory payload changed")
+            canonical_directory_bytes(directory.payload)
+        except Exception:
+            await self._release_uncommitted_capacity(
+                session_id=grant.id,
+                directory_id=directory_id,
+                reservation_ids=new_reservation_ids,
+            )
+            raise RelayAccessError(
+                "relay_signing_unavailable", 503, "relay access unavailable"
+            ) from None
+        primary_node_id = next(
+            candidate.node_id
+            for candidate in signed_candidates
+            if candidate.selection_reason == "preferred-region"
+        )
+        persisted = RelayAccessGeneration(
+            session_id=grant.id,
+            generation=generation,
+            directory_id=directory.payload.directory_id,
+            signed_directory=directory.model_dump(mode="json"),
+            signing_key_id=directory.signing_key_id,
+            signature_b64=directory.signature_b64,
+            relay_url_digest=relay_url_digest(urls_by_node[primary_node_id]),
+            primary_node_id=primary_node_id,
+            reservation_ids=[
+                candidate.reservation.reservation_id for candidate in signed_candidates
+            ],
+            expires_at=reservation_expiry,
+            created_at=now,
+        )
+        self._session.add(persisted)
+        await self._session.flush()
+        return persisted
+
+    async def _release_uncommitted_capacity(
+        self,
+        *,
+        session_id: str,
+        directory_id: str,
+        reservation_ids: list[str] | None,
+    ) -> None:
+        if reservation_ids == []:
+            return
+        try:
+            await self._repository.release_uncommitted_generation(
+                session_id=session_id,
+                directory_generation=directory_id,
+                reservation_ids=reservation_ids,
+            )
+        except Exception:
+            # The outer transaction rollback remains the final ReleaseAll
+            # authority if the database cannot service this guarded cleanup.
+            return
+
+    def _validate_persisted_wan_generation(
+        self,
+        *,
+        grant: SessionRequest,
+        target_device: Device,
+        persisted: RelayAccessGeneration,
+        now: datetime,
+    ) -> SignedRelayDirectoryOut:
+        try:
+            directory = SignedRelayDirectoryOut.model_validate(
+                persisted.signed_directory
+            )
+            canonical_directory_bytes(directory.payload)
+            reservation_ids = [
+                candidate.reservation.reservation_id
+                for candidate in directory.payload.candidates
+            ]
+            primary_ids = [
+                candidate.node_id
+                for candidate in directory.payload.candidates
+                if candidate.selection_reason == "preferred-region"
+            ]
+            primary = next(
+                candidate
+                for candidate in directory.payload.candidates
+                if candidate.node_id == persisted.primary_node_id
+            )
+            urls = [_canonical_endpoint_url(endpoint) for endpoint in primary.endpoints]
+            expected_signature = self._signer.sign(directory.payload)
+            valid = (
+                persisted.session_id == grant.id
+                and persisted.generation == grant.active_relay_generation
+                and _utc(persisted.expires_at) > now
+                and directory.payload.expires_at_ms == _unix_ms(persisted.expires_at)
+                and directory.payload.session_id == grant.id
+                and directory.payload.policy_revision == grant.policy_revision
+                and directory.payload.directory_id == persisted.directory_id
+                and directory.payload.intended_peer_digest
+                == intended_peer_digest(target_device.device_id)
+                and directory.signing_key_id == persisted.signing_key_id
+                and directory.signature_b64 == persisted.signature_b64
+                and expected_signature.signing_key_id == directory.signing_key_id
+                and hmac.compare_digest(
+                    expected_signature.signature_b64, directory.signature_b64
+                )
+                and reservation_ids == persisted.reservation_ids
+                and primary_ids == [persisted.primary_node_id]
+                and all(endpoint_transport(url) is not None for url in urls)
+                and relay_url_digest(urls) == persisted.relay_url_digest
+            )
+        except Exception:
+            valid = False
+        if not valid:
+            _deny_access()
+        return directory
+
+    async def _validate_wan_reservations_locked(
+        self,
+        *,
+        grant: SessionRequest,
+        persisted: RelayAccessGeneration,
+        directory: SignedRelayDirectoryOut,
+    ) -> None:
+        rows = list(
+            await self._session.scalars(
+                select(RelayReservation)
+                .where(RelayReservation.id.in_(persisted.reservation_ids))
+                .order_by(RelayReservation.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        by_id = {row.id: row for row in rows}
+        if len(by_id) != len(persisted.reservation_ids):
+            _deny_access()
+        for candidate in directory.payload.candidates:
+            reservation = by_id.get(candidate.reservation.reservation_id)
+            if (
+                reservation is None
+                or reservation.session_id != grant.id
+                or reservation.user_id != grant.requester_user_id
+                or reservation.node_id != candidate.node_id
+                or reservation.directory_generation != persisted.directory_id
+                or reservation.superseded_at is not None
+                or _utc(reservation.expires_at) != _utc(persisted.expires_at)
+                or candidate.reservation.expires_at_ms
+                != _unix_ms(reservation.expires_at)
+            ):
+                _deny_access()
+
+    async def _issue_wan_credentials_locked(
+        self,
+        *,
+        grant: SessionRequest,
+        caller: Device,
+        persisted: RelayAccessGeneration,
+        directory: SignedRelayDirectoryOut,
+        now: datetime,
+    ) -> tuple[NodeTurnCredential, ...]:
+        node_ids = [candidate.node_id for candidate in directory.payload.candidates]
+        await self._validate_wan_reservations_locked(
+            grant=grant,
+            persisted=persisted,
+            directory=directory,
+        )
+        nodes = list(
+            await self._session.scalars(
+                select(RelayNode)
+                .where(RelayNode.node_id.in_(node_ids))
+                .order_by(RelayNode.node_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        registrations = list(
+            await self._session.scalars(
+                select(RelayNodeRegistration)
+                .where(RelayNodeRegistration.node_id.in_(node_ids))
+                .order_by(RelayNodeRegistration.node_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        registrations_by_id = {row.node_id: row for row in registrations}
+        by_id = {
+            node.node_id: (node, registrations_by_id[node.node_id])
+            for node in nodes
+            if node.node_id in registrations_by_id
+        }
+        credentials: list[NodeTurnCredential] = []
+        primary_urls: list[str] | None = None
+        policy = _policy_from_grant(grant)
+        for candidate in directory.payload.candidates:
+            pair = by_id.get(candidate.node_id)
+            if pair is None:
+                _deny_access()
+            node, registration = pair
+            urls = [_canonical_endpoint_url(item) for item in candidate.endpoints]
+            if candidate.node_id == persisted.primary_node_id:
+                primary_urls = urls
+            registered_urls = [
+                _canonical_endpoint_url(
+                    RelayDirectoryEndpointOut(
+                        transport=endpoint_parts(url)[0],
+                        host=endpoint_parts(url)[1],
+                        port=endpoint_parts(url)[2],
+                    )
+                )
+                for url in node.endpoints
+                if endpoint_transport(url) in policy.accepted_transports
+            ]
+            certificate_expiry = registration.certificate_expires_at
+            lease_expiry = node.lease_expires_at
+            if (
+                sorted(urls) != sorted(registered_urls)
+                or node.state not in {"available", "degraded"}
+                or node.revoked_at is not None
+                or registration.status != "approved"
+                or registration.topology_approved_at is None
+                or node.physical_host_id is None
+                or registration.physical_host_id is None
+                or registration.failure_domain != candidate.failure_domain
+                or registration.physical_host_id != node.physical_host_id
+                or node.failure_domain != candidate.failure_domain
+                or not isinstance(certificate_expiry, datetime)
+                or not isinstance(lease_expiry, datetime)
+            ):
+                _deny_access()
+            node_deadline = min(_utc(certificate_expiry), _utc(lease_expiry))
+            if node_deadline < _utc(persisted.expires_at):
+                _deny_access()
+            try:
+                credential = self._credential_issuer.issue(
+                    user_id=caller.device_id,
+                    session_id=grant.id,
+                    node_id=node.node_id,
+                    urls=urls,
+                    encrypted_secret=bytes(node.encrypted_turn_secret),
+                    grant_deadline_unix_seconds=_unix_seconds(grant.grant_expires_at),
+                    directory_deadline_unix_seconds=_unix_seconds(persisted.expires_at),
+                    policy_deadline_unix_seconds=_unix_seconds(grant.policy_expires_at),
+                    node_deadline_unix_seconds=_unix_seconds(node_deadline),
+                )
+            except Exception:
+                raise RelayAccessError(
+                    "relay_credential_unavailable", 503, "relay access unavailable"
+                ) from None
+            if credential.reencrypted_secret is not None:
+                node.encrypted_turn_secret = credential.reencrypted_secret
+                registration.encrypted_turn_secret = credential.reencrypted_secret
+            credentials.append(credential)
+        if (
+            primary_urls is None
+            or relay_url_digest(primary_urls) != persisted.relay_url_digest
+        ):
+            _deny_access()
+        return tuple(credentials)
 
     async def _issue_access_locked(
         self,
@@ -182,8 +1050,7 @@ class RelayAccessService:
         try:
             async with _issuance_transaction(self._session):
                 grant_preview = await self._session.scalar(
-                    select(SessionRequest)
-                    .where(SessionRequest.id == session_id)
+                    select(SessionRequest).where(SessionRequest.id == session_id)
                 )
                 if grant_preview is None:
                     _deny_access()
@@ -282,7 +1149,11 @@ class RelayAccessService:
                         "relay_capacity_unavailable", 503, "relay capacity unavailable"
                     )
                 server_deadline_seconds = min(
-                    int((now + timedelta(seconds=self._directory_ttl_seconds)).timestamp()),
+                    int(
+                        (
+                            now + timedelta(seconds=self._directory_ttl_seconds)
+                        ).timestamp()
+                    ),
                     _unix_seconds(grant.grant_expires_at),
                     _unix_seconds(grant.policy_expires_at),
                 )
@@ -294,9 +1165,7 @@ class RelayAccessService:
                 directory_id = new_directory_id()
                 # This snapshot is intentionally unlocked. Admission locks and
                 # revalidates only this bounded candidate set, never the table.
-                reservation_ttl = int(
-                    (server_deadline - now).total_seconds()
-                )
+                reservation_ttl = int((server_deadline - now).total_seconds())
                 if reservation_ttl < 0:
                     _deny_access()
                 preexisting_reservation_ids = set(
@@ -384,7 +1253,9 @@ class RelayAccessService:
                             ),
                             reservation=RelayReservationOut(
                                 reservation_id=reservation_by_node[node_id].id,
-                                expires_at_ms=_unix_ms(reservation_by_node[node_id].expires_at),
+                                expires_at_ms=_unix_ms(
+                                    reservation_by_node[node_id].expires_at
+                                ),
                             ),
                         )
                     )
@@ -428,9 +1299,15 @@ class RelayAccessService:
                                 ),
                             ),
                             encrypted_secret=bytes(node.encrypted_turn_secret),
-                            grant_deadline_unix_seconds=_unix_seconds(grant.grant_expires_at),
-                            directory_deadline_unix_seconds=_unix_seconds(reservation_expiry),
-                            policy_deadline_unix_seconds=_unix_seconds(grant.policy_expires_at),
+                            grant_deadline_unix_seconds=_unix_seconds(
+                                grant.grant_expires_at
+                            ),
+                            directory_deadline_unix_seconds=_unix_seconds(
+                                reservation_expiry
+                            ),
+                            policy_deadline_unix_seconds=_unix_seconds(
+                                grant.policy_expires_at
+                            ),
                             node_deadline_unix_seconds=_unix_seconds(
                                 min(
                                     _utc(registration.certificate_expires_at),
@@ -440,7 +1317,9 @@ class RelayAccessService:
                         )
                     except Exception:
                         raise RelayAccessError(
-                            "relay_credential_unavailable", 503, "relay access unavailable"
+                            "relay_credential_unavailable",
+                            503,
+                            "relay access unavailable",
                         ) from None
                     if issued_credential.reencrypted_secret is not None:
                         # The repository locked/revalidated both rows during
@@ -467,14 +1346,18 @@ class RelayAccessService:
                         )
                     )
                 await self._session.flush()
-                return RelayAccessResult(directory=directory, credentials=tuple(credentials))
+                return RelayAccessResult(
+                    directory=directory, credentials=tuple(credentials)
+                )
         except RelayAccessError as error:
             if error.code == "relay_capacity_unavailable":
                 await self._audit_capacity_rejection(now)
             raise
         except RelayRepositoryError as error:
             if error.code in {
-                "INVALID_SESSION_ID", "INVALID_USER_ID", "SESSION_OWNER_MISMATCH"
+                "INVALID_SESSION_ID",
+                "INVALID_USER_ID",
+                "SESSION_OWNER_MISMATCH",
             }:
                 _deny_access()
             await self._audit_capacity_rejection(now)
@@ -508,9 +1391,7 @@ async def _cohere_reservations(
     session: object,
     reservations: list[RelayReservation],
     existing_reservations: list[RelayReservation],
-    by_id: dict[
-        str, tuple[RelayNode, RelayNodeRegistration, RelayNodeView]
-    ],
+    by_id: dict[str, tuple[RelayNode, RelayNodeRegistration, RelayNodeView]],
     server_deadline: datetime,
 ) -> tuple[list[RelayReservation], datetime]:
     """Make a v1-coherent set without invalidating already-issued credentials."""
@@ -524,9 +1405,7 @@ async def _cohere_reservations(
         # PostgreSQL and certificate sources preserve microseconds while TURN
         # REST usernames carry whole Unix seconds. Floor the *final* minimum so
         # the row, signed directory and credential all expire at one instant.
-        deadline = datetime.fromtimestamp(
-            int(raw_deadline.timestamp()), tz=UTC
-        )
+        deadline = datetime.fromtimestamp(int(raw_deadline.timestamp()), tz=UTC)
         for reservation in reservations:
             if _utc(reservation.expires_at) > deadline:
                 reservation.expires_at = deadline
@@ -541,8 +1420,7 @@ async def _cohere_reservations(
         )
     deadline = next(iter(existing_expiries))
     if deadline > server_deadline or any(
-        _node_deadline(item.node_id, by_id) < deadline
-        for item in existing_reservations
+        _node_deadline(item.node_id, by_id) < deadline for item in existing_reservations
     ):
         raise RelayAccessError(
             "relay_capacity_unavailable", 503, "relay capacity unavailable"
@@ -587,7 +1465,8 @@ def select_relay_nodes(
     rejections: list[RelayRejection] = []
     for node in nodes:
         compatible = tuple(
-            endpoint for endpoint in node.endpoints
+            endpoint
+            for endpoint in node.endpoints
             if endpoint_transport(endpoint) in policy.accepted_transports
         )
         reason = _rejection_reason(policy, node, compatible, now)
@@ -653,6 +1532,7 @@ def authorize_relay_grant(
     participant = current_user_id in {requester_id, owner_id}
     valid = (
         participant
+        and getattr(grant, "requester_device_id", None) is None
         and requester_id != owner_id
         and getattr(current_user, "id", None) == current_user_id
         and getattr(requester_user, "id", None) == requester_id
@@ -663,7 +1543,8 @@ def authorize_relay_grant(
         and getattr(requester_user, "tenant_id", None) == tenant_id
         and getattr(target_owner, "tenant_id", None) == tenant_id
         and getattr(target_device, "tenant_id", None) == tenant_id
-        and getattr(target_device, "id", None) == getattr(grant, "target_device_id", None)
+        and getattr(target_device, "id", None)
+        == getattr(grant, "target_device_id", None)
         and getattr(grant, "intended_peer_id", None)
         == getattr(target_device, "id", None)
         and getattr(grant, "status", None) == "approved"
@@ -717,16 +1598,87 @@ def _grant_conforms_to_current_policy(
         and getattr(grant, "relay_accepted_transports", None)
         == list(current_policy.accepted_transports)
         and policy_deadline <= grant_deadline
-        and grant_deadline
-        <= now + timedelta(seconds=current_policy.grant_ttl_seconds)
+        and grant_deadline <= now + timedelta(seconds=current_policy.grant_ttl_seconds)
         and policy_deadline
         <= now + timedelta(seconds=current_policy.policy_ttl_seconds)
     )
 
 
 def intended_peer_digest(peer_id: str) -> str:
-    digest = hashlib.sha256(b"MRD_RELAY_PEER_V1\x00" + peer_id.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(
+        b"MRD_RELAY_PEER_V1\x00" + peer_id.encode("utf-8")
+    ).hexdigest()
     return f"peer-sha256-{digest}"
+
+
+def relay_url_digest(urls: Iterable[str]) -> str:
+    canonical = sorted(urls, key=lambda value: value.encode("utf-8"))
+    digest = hashlib.sha256(b"MRD_RELAY_URLS_V1\x00")
+    for url in canonical:
+        encoded = url.encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _canonical_endpoint_url(endpoint: RelayDirectoryEndpointOut) -> str:
+    host = _signed_endpoint_host(endpoint.host)
+    authority = f"[{host}]" if ":" in host else host
+    if endpoint.transport == "tls":
+        return f"turns:{authority}:{endpoint.port}?transport=tcp"
+    return f"turn:{authority}:{endpoint.port}?transport={endpoint.transport}"
+
+
+def _signed_endpoint_host(host: str) -> str:
+    if host.startswith("[") and host.endswith("]"):
+        return host[1:-1]
+    return host
+
+
+def _matches_auth_snapshot(
+    device: Device, snapshot: DeviceAuthSnapshot
+) -> bool:
+    return (
+        snapshot.auth_revoked_at is None
+        and snapshot.is_bound
+        and device.id == snapshot.row_id
+        and device.device_id == snapshot.device_id
+        and device.auth_version == snapshot.auth_version
+        and device.bound_user_id == snapshot.bound_user_id
+        and device.tenant_id == snapshot.tenant_id
+        and device.is_bound == snapshot.is_bound
+        and device.auth_revoked_at == snapshot.auth_revoked_at
+    )
+
+
+def _wan_request_binding_valid(
+    *, grant: SessionRequest, controller: Device, target: Device
+) -> bool:
+    payload = grant.request_payload
+    if not isinstance(payload, dict):
+        return False
+    try:
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return False
+    commitment = hashlib.sha256(
+        b"MRD_WAN_SESSION_REQUEST_V3\x00" + canonical
+    ).hexdigest()
+    return (
+        payload.get("session_id") == grant.id
+        and payload.get("controller_device_id") == controller.device_id
+        and payload.get("target_device_id") == target.device_id
+        and payload.get("access_mode") == "attended"
+        and payload.get("route_policy") == "relay_only"
+        and payload.get("requested_scopes") == grant.requested_scopes
+        and payload.get("requested_profile") == grant.requested_profile
+        and grant.request_commitment == commitment
+    )
 
 
 def new_directory_id() -> str:
@@ -944,9 +1896,7 @@ def _score(policy: RelaySelectionPolicy, node: RelayNodeView) -> int:
         region_reward = 0
     else:
         rank = len(policy.preferred_regions) - region_index
-        region_reward = _saturating_multiply(
-            rank, policy.weights.region_preference
-        )
+        region_reward = _saturating_multiply(rank, policy.weights.region_preference)
     rewards = _saturating_add(
         _saturating_add(policy.weights.base_score, region_reward),
         _weighted_bps(bandwidth_headroom, policy.weights.bandwidth_headroom_reward),

@@ -23,6 +23,7 @@ from app.core.mutable_base64url import (
     zeroize,
 )
 
+from app.models.relay_access_generation import RelayAccessGeneration
 from app.models.relay_enrollment import RelayEnrollment
 from app.models.relay_node import RelayNode
 from app.models.relay_node_registration import RelayNodeRegistration
@@ -804,6 +805,51 @@ class RelayRepository:
                     node.physical_host_id,
                 )
         return result
+
+    async def release_uncommitted_generation(
+        self,
+        *,
+        session_id: str,
+        directory_generation: str,
+        reservation_ids: list[str] | None,
+    ) -> int:
+        """Release only allocations proven not to belong to a committed generation."""
+
+        if not _valid_general_id(session_id):
+            raise RelayRepositoryError("INVALID_SESSION_ID", "invalid session id")
+        if not _valid_general_id(directory_generation):
+            raise RelayRepositoryError(
+                "INVALID_DIRECTORY_GENERATION", "invalid directory generation"
+            )
+        if reservation_ids is not None and (
+            not isinstance(reservation_ids, list)
+            or not 1 <= len(reservation_ids) <= 8
+            or len(set(reservation_ids)) != len(reservation_ids)
+            or any(not _valid_general_id(value) for value in reservation_ids)
+        ):
+            raise RelayRepositoryError(
+                "INVALID_RESERVATION_ID", "invalid reservation identifiers"
+            )
+        committed = await self._session.scalar(
+            select(RelayAccessGeneration.session_id).where(
+                RelayAccessGeneration.directory_id == directory_generation
+            )
+        )
+        if committed is not None:
+            return 0
+        predicate = (
+            RelayReservation.session_id == session_id,
+            RelayReservation.directory_generation == directory_generation,
+        )
+        statement = delete(RelayReservation).where(*predicate)
+        if reservation_ids is not None:
+            statement = statement.where(RelayReservation.id.in_(reservation_ids))
+        result = await self._session.execute(
+            statement.execution_options(synchronize_session=False)
+        )
+        await self._session.flush()
+        rowcount = getattr(result, "rowcount", 0)
+        return rowcount if isinstance(rowcount, int) and rowcount > 0 else 0
 
     async def _locked_node(self, node_id: str) -> RelayNode:
         if not _valid_general_id(node_id):

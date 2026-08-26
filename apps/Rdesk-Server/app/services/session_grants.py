@@ -122,7 +122,7 @@ class SessionGrantService:
             grant_preview = await self._session.scalar(
                 select(SessionRequest).where(SessionRequest.id == session_id)
             )
-            if grant_preview is None:
+            if grant_preview is None or grant_preview.requester_device_id is not None:
                 _deny()
             target = await self._session.scalar(
                 select(Device)
@@ -175,18 +175,12 @@ class SessionGrantService:
             ):
                 _deny()
             now = _utc(self._now())
-            grant.status = "approved"
-            grant.grant_expires_at = now + timedelta(
-                seconds=self._policy.grant_ttl_seconds
+            bind_session_grant_policy(
+                grant=grant,
+                target_device_id=target.id,
+                policy=self._policy,
+                now=now,
             )
-            grant.policy_revision = self._policy.revision
-            grant.policy_expires_at = now + timedelta(
-                seconds=self._policy.policy_ttl_seconds
-            )
-            grant.intended_peer_id = target.id
-            grant.relay_allowed_regions = list(self._policy.allowed_regions)
-            grant.relay_preferred_regions = list(self._policy.preferred_regions)
-            grant.relay_accepted_transports = list(self._policy.accepted_transports)
             self._audit(
                 action="session_approved",
                 grant=grant,
@@ -216,7 +210,7 @@ class SessionGrantService:
             preview = await self._session.scalar(
                 select(SessionRequest).where(SessionRequest.id == session_id)
             )
-            if preview is None:
+            if preview is None or preview.requester_device_id is not None:
                 _deny()
             target = await self._session.scalar(
                 select(Device)
@@ -378,6 +372,29 @@ def validate_session_grant_policy(policy: SessionGrantPolicy) -> None:
         raise SessionGrantError(
             "session_policy_unavailable", 503, "session policy unavailable"
         )
+
+
+def bind_session_grant_policy(
+    *,
+    grant: SessionRequest,
+    target_device_id: str,
+    policy: SessionGrantPolicy,
+    now: datetime,
+    set_status: bool = True,
+) -> None:
+    """Bind one validated policy bundle to an already row-locked grant."""
+
+    validate_session_grant_policy(policy)
+    now = _utc(now)
+    if set_status:
+        grant.status = "approved"
+    grant.grant_expires_at = now + timedelta(seconds=policy.grant_ttl_seconds)
+    grant.policy_revision = policy.revision
+    grant.policy_expires_at = now + timedelta(seconds=policy.policy_ttl_seconds)
+    grant.intended_peer_id = target_device_id
+    grant.relay_allowed_regions = list(policy.allowed_regions)
+    grant.relay_preferred_regions = list(policy.preferred_regions)
+    grant.relay_accepted_transports = list(policy.accepted_transports)
 
 
 def _valid_tenant(value: object) -> bool:

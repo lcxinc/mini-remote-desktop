@@ -39,8 +39,8 @@ class RelaySecretDecryptor(Protocol):
 @dataclass(frozen=True)
 class TurnCredential:
     urls: tuple[str, ...]
-    username: str
-    credential: str
+    username: str = dataclass_field(repr=False)
+    credential: str = dataclass_field(repr=False)
     expires_at_unix_seconds: int
     ttl_seconds: int
     transport_policy: str = "relay"
@@ -50,7 +50,7 @@ class TurnCredential:
 class NodeTurnCredential:
     node_id: str
     urls: tuple[str, ...]
-    username: str
+    username: str = dataclass_field(repr=False)
     credential: str = dataclass_field(repr=False)
     expires_at_unix_seconds: int
     reencrypted_secret: bytes | None = dataclass_field(

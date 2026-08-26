@@ -8,17 +8,25 @@ from typing import Callable
 from pydantic import ValidationError
 from sqlalchemy import select, update
 
+from app.core.security import DeviceAuthSnapshot
 from app.models.device import Device
 from app.models.relay_audit_event import RelayAuditEvent
 from app.models.relay_reservation import RelayReservation
 from app.models.session_request import SessionRequest
 from app.models.user import User
 from app.schemas.session import (
+    DeviceSessionApprovalIn,
     DeviceSessionCanonicalRequest,
     DeviceSessionCreateIn,
     DeviceSessionOut,
 )
-from app.services.session_grants import session_grant_identity_lock
+from app.services.relay_directory import RelayAccessService
+from app.services.session_grants import (
+    SessionGrantError,
+    bind_session_grant_policy,
+    session_grant_identity_lock,
+    validate_session_grant_policy,
+)
 
 
 _REQUEST_COMMITMENT_CONTEXT = b"MRD_WAN_SESSION_REQUEST_V3\x00"
@@ -165,6 +173,168 @@ class DeviceSessionService:
         if row is None or not _is_authorized_participant(row, current_device):
             _not_found()
         return row
+
+    async def approve(
+        self,
+        *,
+        session_id: str,
+        current_device: Device,
+        auth_snapshot: DeviceAuthSnapshot,
+        payload: DeviceSessionApprovalIn,
+        relay_access: RelayAccessService,
+    ) -> SessionRequest:
+        try:
+            validate_session_grant_policy(relay_access.current_policy)
+        except SessionGrantError as error:
+            raise DeviceSessionError(
+                error.code, error.status_code, str(error)
+            ) from None
+        async with session_grant_identity_lock(self._session, "session:" + session_id):
+            preview = await self._session.scalar(
+                select(SessionRequest).where(SessionRequest.id == session_id)
+            )
+            if preview is None or preview.requester_device_id is None:
+                _not_found()
+            devices = list(
+                await self._session.scalars(
+                    select(Device)
+                    .where(
+                        Device.id.in_(
+                            {
+                                preview.requester_device_id,
+                                preview.target_device_id,
+                                auth_snapshot.row_id,
+                            }
+                        )
+                    )
+                    .order_by(Device.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            by_device_id = {device.id: device for device in devices}
+            controller = by_device_id.get(preview.requester_device_id)
+            target = by_device_id.get(preview.target_device_id)
+            caller = by_device_id.get(auth_snapshot.row_id)
+            user_ids = sorted(
+                {
+                    user_id
+                    for user_id in (
+                        preview.requester_user_id,
+                        getattr(controller, "bound_user_id", None),
+                        getattr(target, "bound_user_id", None),
+                        getattr(caller, "bound_user_id", None),
+                    )
+                    if isinstance(user_id, str)
+                }
+            )
+            users = list(
+                await self._session.scalars(
+                    select(User)
+                    .where(User.id.in_(user_ids))
+                    .order_by(User.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            users_by_id = {user.id: user for user in users}
+            row = await self._session.scalar(
+                select(SessionRequest)
+                .where(SessionRequest.id == session_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            if (
+                row is None
+                or row.requester_device_id != getattr(controller, "id", None)
+                or row.target_device_id != getattr(target, "id", None)
+                or caller is None
+                or current_device.id != auth_snapshot.row_id
+                or not _matches_auth_snapshot(caller, auth_snapshot)
+                or not _is_authorized_participant(row, caller)
+                or controller is None
+                or target is None
+                or not _is_active_device(controller)
+                or not _is_active_device(target)
+                or controller.bound_user_id != row.requester_user_id
+                or users_by_id.get(controller.bound_user_id) is None
+                or users_by_id.get(target.bound_user_id) is None
+                or users_by_id[controller.bound_user_id].tenant_id != row.tenant_id
+                or users_by_id[target.bound_user_id].tenant_id != row.tenant_id
+            ):
+                _not_found()
+            request = device_session_out(row).request
+            if (
+                request.controller_device_id != controller.device_id
+                or request.target_device_id != target.device_id
+            ):
+                _not_found()
+            if row.target_device_id != caller.id:
+                _deny()
+            approved_scopes = list(payload.approved_scopes)
+            approved_profile = (
+                payload.approved_profile.model_dump(mode="json")
+                if payload.approved_profile is not None
+                else None
+            )
+            if (
+                not approved_scopes
+                or row.requested_scopes is None
+                or any(scope not in row.requested_scopes for scope in approved_scopes)
+                or not _profile_within(approved_profile, row.requested_profile)
+            ):
+                _deny()
+            now = _utc(self._now())
+            if row.status == "approved":
+                active_generation = row.active_relay_generation
+                policy = relay_access.current_policy
+                if (
+                    row.approved_scopes != approved_scopes
+                    or row.approved_profile != approved_profile
+                    or row.policy_revision != policy.revision
+                    or row.relay_allowed_regions != list(policy.allowed_regions)
+                    or row.relay_preferred_regions != list(policy.preferred_regions)
+                    or row.relay_accepted_transports != list(policy.accepted_transports)
+                    or row.intended_peer_id != target.id
+                    or not isinstance(row.grant_expires_at, datetime)
+                    or _utc(row.grant_expires_at) <= now
+                    or not isinstance(row.policy_expires_at, datetime)
+                    or _utc(row.policy_expires_at) <= now
+                    or not isinstance(active_generation, int)
+                    or isinstance(active_generation, bool)
+                    or active_generation < 0
+                ):
+                    _conflict()
+                await relay_access.validate_wan_generation_locked(
+                    grant=row,
+                    target_device=target,
+                    generation=active_generation,
+                )
+                return row
+            if row.status != "requested":
+                _conflict()
+
+            bind_session_grant_policy(
+                grant=row,
+                target_device_id=target.id,
+                policy=relay_access.current_policy,
+                now=now,
+                set_status=False,
+            )
+            row.approved_scopes = approved_scopes
+            row.approved_profile = approved_profile
+            await relay_access.create_wan_generation_locked(
+                grant=row,
+                target_device=target,
+                generation=0,
+            )
+            self._audit(
+                action="wan_session_approved",
+                row=row,
+                actor_device_id=caller.id,
+            )
+            await self._session.flush()
+            return row
 
     async def transition(
         self,
@@ -358,6 +528,65 @@ def _is_active_device(device: Device) -> bool:
         and device.bound_user_id is not None
         and device.auth_revoked_at is None
         and _valid_tenant(device.tenant_id)
+    )
+
+
+def _matches_auth_snapshot(
+    device: Device, snapshot: DeviceAuthSnapshot
+) -> bool:
+    return (
+        snapshot.auth_revoked_at is None
+        and snapshot.is_bound
+        and device.id == snapshot.row_id
+        and device.device_id == snapshot.device_id
+        and device.auth_version == snapshot.auth_version
+        and device.bound_user_id == snapshot.bound_user_id
+        and device.tenant_id == snapshot.tenant_id
+        and device.is_bound == snapshot.is_bound
+        and device.auth_revoked_at == snapshot.auth_revoked_at
+    )
+
+
+def _profile_within(
+    approved: dict[str, object] | None,
+    requested: dict[str, object] | None,
+) -> bool:
+    if approved is None:
+        return True
+    if requested is None:
+        return False
+    return (
+        approved.get("codec") == requested.get("codec")
+        and approved.get("codec_profile") == requested.get("codec_profile")
+        and _bounded_profile_value(approved, requested, "width")
+        and _bounded_profile_value(approved, requested, "height")
+        and _bounded_profile_value(approved, requested, "fps")
+        and _bounded_profile_value(approved, requested, "bitrate_mbps")
+        and all(
+            approved.get(field) == requested.get(field)
+            for field in (
+                "bit_depth",
+                "chroma_subsampling",
+                "pixel_format",
+                "hdr_enabled",
+                "color_mode",
+                "color_pipeline",
+            )
+        )
+    )
+
+
+def _bounded_profile_value(
+    approved: dict[str, object], requested: dict[str, object], field: str
+) -> bool:
+    approved_value = approved.get(field)
+    requested_value = requested.get(field)
+    return (
+        isinstance(approved_value, int)
+        and not isinstance(approved_value, bool)
+        and isinstance(requested_value, int)
+        and not isinstance(requested_value, bool)
+        and approved_value <= requested_value
     )
 
 

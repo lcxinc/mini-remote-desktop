@@ -21,11 +21,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from app.core.config import settings
 from app.core.response_security import no_store_sensitive_response
 from app.core.security import (
+    capture_device_auth_snapshot,
     get_current_device,
     get_verified_relay_node,
     get_verified_relay_renewal_node,
@@ -225,7 +226,7 @@ def _raise_domain(error: RelayRegistryError | RelayAuthError) -> None:
 
 
 class RelayAccessRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True)
 
     session_id: str = Field(
         min_length=1,
@@ -238,17 +239,29 @@ class RelayAccessRequest(BaseModel):
         max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
     )
+    generation: int | None = Field(default=None, ge=0, le=2**63 - 1)
+    refresh: bool = False
+
+    @model_validator(mode="after")
+    def validate_refresh_generation(self) -> "RelayAccessRequest":
+        if self.refresh and self.generation is None:
+            raise ValueError("relay generation is required for refresh")
+        return self
 
 
 class NodeTurnCredentialOut(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     node_id: str
     urls: list[str]
-    username: str
+    username: str = Field(repr=False)
     credential: str = Field(repr=False)
     expires_at_unix_seconds: int
 
 
 class RelayAccessResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     directory: SignedRelayDirectoryOut
     credentials: list[NodeTurnCredentialOut]
 
@@ -844,6 +857,7 @@ async def issue_relay_access(
     current_device: Device = Depends(get_current_device),
     service: RelayAccessService = Depends(get_relay_access_service),
 ) -> RelayAccessResponse:
+    auth_snapshot = capture_device_auth_snapshot(current_device)
     if not current_device.is_bound or current_device.bound_user_id is None:
         raise HTTPException(
             status_code=403,
@@ -853,27 +867,31 @@ async def issue_relay_access(
             },
         )
     try:
-        result = await service.issue_access(
-            current_user_id=current_device.bound_user_id,
+        result = await service.issue_authenticated_access(
+            current_device=current_device,
+            auth_snapshot=auth_snapshot,
             session_id=payload.session_id,
             policy_revision=payload.policy_revision,
             intended_peer_id=payload.intended_peer_id,
+            generation=payload.generation,
+            refresh=payload.refresh,
         )
     except RelayAccessError as error:
         raise HTTPException(
             status_code=error.status_code,
             detail={"code": error.code, "message": str(error)},
         ) from None
+    credentials = [
+        NodeTurnCredentialOut(
+            node_id=item.node_id,
+            urls=list(item.urls),
+            username=item.username,
+            credential=item.credential,
+            expires_at_unix_seconds=item.expires_at_unix_seconds,
+        )
+        for item in result.credentials
+    ]
     return RelayAccessResponse(
         directory=result.directory,
-        credentials=[
-            NodeTurnCredentialOut(
-                node_id=item.node_id,
-                urls=list(item.urls),
-                username=item.username,
-                credential=item.credential,
-                expires_at_unix_seconds=item.expires_at_unix_seconds,
-            )
-            for item in result.credentials
-        ],
+        credentials=credentials,
     )

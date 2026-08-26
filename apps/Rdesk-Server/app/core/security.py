@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import base64
 import hashlib
@@ -39,6 +40,31 @@ _DEVICE_AUTHORIZATION = re.compile(
     flags=re.ASCII,
 )
 _DEVICE_ENROLLMENT = re.compile(r"^[A-Za-z0-9_-]{43}$", flags=re.ASCII)
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceAuthSnapshot:
+    row_id: str
+    device_id: str
+    auth_version: int
+    bound_user_id: str | None
+    tenant_id: str | None
+    is_bound: bool
+    auth_revoked_at: datetime | None
+
+
+def capture_device_auth_snapshot(device: Device) -> DeviceAuthSnapshot:
+    """Freeze the device-auth decision before later database awaits can refresh it."""
+
+    return DeviceAuthSnapshot(
+        row_id=device.id,
+        device_id=device.device_id,
+        auth_version=device.auth_version,
+        bound_user_id=device.bound_user_id,
+        tenant_id=device.tenant_id,
+        is_bound=device.is_bound,
+        auth_revoked_at=device.auth_revoked_at,
+    )
 
 
 def hash_password(password: str) -> str:
