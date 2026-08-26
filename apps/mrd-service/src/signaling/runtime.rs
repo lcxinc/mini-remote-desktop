@@ -373,6 +373,54 @@ impl SignalingRuntimeCore {
                     candidate_fingerprint: message.payload.candidate_fingerprint.clone(),
                 },
             ),
+            AuthenticatedSignalMessage::RelayMigrationOffer(message) => (
+                message.verify_for(self.config.device_id(), now_ms, &mut self.replay)?,
+                message.signer_public_key.clone(),
+                AuthenticatedSessionSignal::RelayMigrationOffer {
+                    session_id: message.payload.session_id.clone(),
+                    migration_generation: message.payload.migration_generation,
+                    directory_id: message.payload.directory_id.clone(),
+                    node_id: message.payload.node_id.clone(),
+                    sdp: message.payload.sdp.clone(),
+                    candidate_fingerprints: message
+                        .payload
+                        .candidate_fingerprints
+                        .iter()
+                        .cloned()
+                        .collect(),
+                },
+            ),
+            AuthenticatedSignalMessage::RelayMigrationAnswer(message) => (
+                message.verify_for(self.config.device_id(), now_ms, &mut self.replay)?,
+                message.signer_public_key.clone(),
+                AuthenticatedSessionSignal::RelayMigrationAnswer {
+                    session_id: message.payload.session_id.clone(),
+                    migration_generation: message.payload.migration_generation,
+                    directory_id: message.payload.directory_id.clone(),
+                    node_id: message.payload.node_id.clone(),
+                    sdp: message.payload.sdp.clone(),
+                    candidate_fingerprints: message
+                        .payload
+                        .candidate_fingerprints
+                        .iter()
+                        .cloned()
+                        .collect(),
+                },
+            ),
+            AuthenticatedSignalMessage::RelayMigrationCandidate(message) => (
+                message.verify_for(self.config.device_id(), now_ms, &mut self.replay)?,
+                message.signer_public_key.clone(),
+                AuthenticatedSessionSignal::RelayMigrationCandidate {
+                    session_id: message.payload.session_id.clone(),
+                    migration_generation: message.payload.migration_generation,
+                    directory_id: message.payload.directory_id.clone(),
+                    node_id: message.payload.node_id.clone(),
+                    candidate: message.payload.candidate.clone(),
+                    sdp_mid: message.payload.sdp_mid.clone(),
+                    sdp_mline_index: message.payload.sdp_mline_index,
+                    candidate_fingerprint: message.payload.candidate_fingerprint.clone(),
+                },
+            ),
             AuthenticatedSignalMessage::SessionClose(message) => (
                 message.verify_for(self.config.device_id(), now_ms, &mut self.replay)?,
                 message.signer_public_key.clone(),
@@ -518,6 +566,9 @@ fn signed_claims(message: &AuthenticatedSignalMessage) -> Option<&AuthClaims> {
         AuthenticatedSignalMessage::WebrtcOffer(value) => Some(&value.payload.claims),
         AuthenticatedSignalMessage::WebrtcAnswer(value) => Some(&value.payload.claims),
         AuthenticatedSignalMessage::WebrtcCandidate(value) => Some(&value.payload.claims),
+        AuthenticatedSignalMessage::RelayMigrationOffer(value) => Some(&value.payload.claims),
+        AuthenticatedSignalMessage::RelayMigrationAnswer(value) => Some(&value.payload.claims),
+        AuthenticatedSignalMessage::RelayMigrationCandidate(value) => Some(&value.payload.claims),
         AuthenticatedSignalMessage::SessionClose(value) => Some(&value.payload.claims),
         AuthenticatedSignalMessage::ReconnectRequest(value) => Some(&value.payload.claims),
         AuthenticatedSignalMessage::ReconnectGrant(value) => Some(&value.payload.claims),

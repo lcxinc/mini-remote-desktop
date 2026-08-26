@@ -88,6 +88,55 @@ pub enum AuthenticatedSessionSignal {
         /// SHA-256 candidate fingerprint committed by a grant.
         candidate_fingerprint: String,
     },
+    /// Apply a relay-bound ICE migration offer.
+    RelayMigrationOffer {
+        /// Session identifier.
+        session_id: SessionId,
+        /// Strictly increasing migration generation.
+        migration_generation: u64,
+        /// Signed relay directory identifier used for selection.
+        directory_id: String,
+        /// Selected relay node identifier.
+        node_id: String,
+        /// Remote SDP migration offer.
+        sdp: String,
+        /// Candidate fingerprints committed by the migration offer.
+        candidate_fingerprints: Vec<String>,
+    },
+    /// Apply a relay-bound ICE migration answer.
+    RelayMigrationAnswer {
+        /// Session identifier.
+        session_id: SessionId,
+        /// Migration generation being answered.
+        migration_generation: u64,
+        /// Signed relay directory identifier used for selection.
+        directory_id: String,
+        /// Selected relay node identifier.
+        node_id: String,
+        /// Remote SDP migration answer.
+        sdp: String,
+        /// Candidate fingerprints committed by the migration answer.
+        candidate_fingerprints: Vec<String>,
+    },
+    /// Apply a relay-bound ICE migration candidate.
+    RelayMigrationCandidate {
+        /// Session identifier.
+        session_id: SessionId,
+        /// Migration generation receiving the candidate.
+        migration_generation: u64,
+        /// Signed relay directory identifier used for selection.
+        directory_id: String,
+        /// Selected relay node identifier.
+        node_id: String,
+        /// ICE candidate line.
+        candidate: String,
+        /// Optional SDP media identifier.
+        sdp_mid: Option<String>,
+        /// Optional SDP media-line index.
+        sdp_mline_index: Option<u16>,
+        /// SHA-256 candidate fingerprint committed by the grant.
+        candidate_fingerprint: String,
+    },
     /// The authenticated peer closed a session.
     Closed {
         /// Closed session identifier.

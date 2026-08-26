@@ -1,8 +1,10 @@
 use mrd_identity::DeviceIdentity;
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use mrd_signal_proto::{
-    AuthClaims, AuthenticatedRegister, AuthenticatedSignalMessage, RegisterPayload, SignalEnvelope,
-    SignalProtocolError, SignalReplayGuard, SIGNAL_PROTOCOL_VERSION,
+    AuthClaims, AuthenticatedRegister, AuthenticatedSignalMessage, RegisterPayload,
+    RelayMigrationCandidate, RelayMigrationCandidatePayload, RelayMigrationOffer,
+    RelayMigrationOfferPayload, SignalEnvelope, SignalProtocolError, SignalReplayGuard,
+    SIGNAL_PROTOCOL_VERSION,
 };
 use ring::rand::SystemRandom;
 
@@ -176,4 +178,109 @@ fn session_intent_rejects_target_that_disagrees_with_signed_peer_claim() {
     )
     .unwrap_err();
     assert_eq!(error, SignalProtocolError::WrongIntendedPeer);
+}
+
+#[test]
+fn relay_migration_payload_binds_generation_directory_node_and_fingerprints() {
+    use std::collections::BTreeSet;
+
+    let identity = identity();
+    let fingerprint = "a".repeat(64);
+    let offer = RelayMigrationOffer::sign(
+        &identity,
+        RelayMigrationOfferPayload {
+            claims: claims(&identity, [8; 16], 1),
+            session_id: SessionId("session-1".into()),
+            migration_generation: 1,
+            directory_id: "directory-20260822-0001".into(),
+            node_id: "relay-us-east-1a".into(),
+            sdp: "v=0".into(),
+            candidate_fingerprints: BTreeSet::from([fingerprint.clone()]),
+        },
+    )
+    .unwrap();
+    let envelope = SignalEnvelope::new(AuthenticatedSignalMessage::RelayMigrationOffer(
+        offer.clone(),
+    ));
+    let decoded: SignalEnvelope = serde_json::from_slice(&serde_json::to_vec(&envelope).unwrap())
+        .expect("migration envelope roundtrip");
+    assert_eq!(decoded, envelope);
+
+    let mut tampered = offer;
+    tampered.payload.node_id = "relay-attacker".into();
+    assert_eq!(
+        tampered.verify_for(
+            &DeviceId("signal-server".into()),
+            1_500,
+            &mut SignalReplayGuard::new(8, 64),
+        ),
+        Err(SignalProtocolError::InvalidSignature)
+    );
+
+    let candidate = RelayMigrationCandidate::sign(
+        &identity,
+        RelayMigrationCandidatePayload {
+            claims: claims(&identity, [9; 16], 2),
+            session_id: SessionId("session-1".into()),
+            migration_generation: 1,
+            directory_id: "directory-20260822-0001".into(),
+            node_id: "relay-us-east-1a".into(),
+            candidate: "candidate:1 1 UDP 1 192.0.2.10 5000 typ relay".into(),
+            sdp_mid: Some("0".into()),
+            sdp_mline_index: Some(0),
+            candidate_fingerprint: fingerprint,
+        },
+    )
+    .unwrap();
+    let mut replay = SignalReplayGuard::new(8, 64);
+    candidate
+        .verify_for(&DeviceId("signal-server".into()), 1_500, &mut replay)
+        .unwrap();
+    assert_eq!(
+        candidate.verify_for(&DeviceId("signal-server".into()), 1_500, &mut replay),
+        Err(SignalProtocolError::RepeatedNonce)
+    );
+}
+
+#[test]
+fn relay_migration_rejects_generation_zero_and_unbound_candidate_material() {
+    use std::collections::BTreeSet;
+
+    let identity = identity();
+    let base = RelayMigrationOfferPayload {
+        claims: claims(&identity, [10; 16], 1),
+        session_id: SessionId("session-1".into()),
+        migration_generation: 0,
+        directory_id: "directory-1".into(),
+        node_id: "relay-1".into(),
+        sdp: "v=0".into(),
+        candidate_fingerprints: BTreeSet::from(["a".repeat(64)]),
+    };
+    assert_eq!(
+        RelayMigrationOffer::sign(&identity, base.clone()),
+        Err(SignalProtocolError::Malformed)
+    );
+    for mut invalid in [
+        RelayMigrationOfferPayload {
+            migration_generation: 1,
+            directory_id: String::new(),
+            ..base.clone()
+        },
+        RelayMigrationOfferPayload {
+            migration_generation: 1,
+            node_id: String::new(),
+            ..base.clone()
+        },
+        RelayMigrationOfferPayload {
+            migration_generation: 1,
+            candidate_fingerprints: BTreeSet::new(),
+            ..base
+        },
+    ] {
+        invalid.claims.counter += 1;
+        assert_eq!(
+            RelayMigrationOffer::sign(&identity, invalid),
+            Err(SignalProtocolError::Malformed)
+        );
+    }
 }

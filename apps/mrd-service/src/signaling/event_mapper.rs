@@ -14,10 +14,27 @@ struct WebRtcGrantBinding {
     accepted_fingerprints: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct RelayMigrationBinding {
+    peer_key_id: String,
+    generation: u64,
+    directory_id: String,
+    node_id: String,
+    direction: RelayMigrationDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayMigrationDirection {
+    IncomingOffer,
+    OutboundOffer,
+}
+
 /// Applies verified WAN signaling to the service's authoritative aggregates.
 pub struct ServiceSignalingMapper {
     app_state: Arc<AppState>,
+    signaling_state_gate: Mutex<()>,
     webrtc_grants: Mutex<HashMap<mrd_proto::SessionId, WebRtcGrantBinding>>,
+    relay_migrations: Mutex<HashMap<mrd_proto::SessionId, RelayMigrationBinding>>,
 }
 
 impl ServiceSignalingMapper {
@@ -25,7 +42,9 @@ impl ServiceSignalingMapper {
     pub fn new(app_state: Arc<AppState>) -> Self {
         Self {
             app_state,
+            signaling_state_gate: Mutex::new(()),
             webrtc_grants: Mutex::new(HashMap::new()),
+            relay_migrations: Mutex::new(HashMap::new()),
         }
     }
 
@@ -205,11 +224,158 @@ impl ServiceSignalingMapper {
         }
         Ok(())
     }
+
+    async fn require_live_session(
+        &self,
+        event: &VerifiedSignalingEvent,
+        session_id: &mrd_proto::SessionId,
+    ) -> Result<()> {
+        self.update_session(event, session_id, |snapshot| {
+            if snapshot.lifecycle_state.is_terminal() {
+                bail!("terminal session cannot accept relay migration signaling");
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn apply_relay_migration_offer(
+        &self,
+        event: &VerifiedSignalingEvent,
+        session_id: &mrd_proto::SessionId,
+        generation: u64,
+        directory_id: &str,
+        node_id: &str,
+        candidate_fingerprints: &[String],
+    ) -> Result<()> {
+        self.require_live_session(event, session_id).await?;
+        self.require_webrtc_grant(event, session_id).await?;
+        for fingerprint in candidate_fingerprints {
+            self.require_webrtc_fingerprint(event, session_id, fingerprint)
+                .await?;
+        }
+        let mut migrations = self.relay_migrations.lock().await;
+        let expected = match migrations.get(session_id) {
+            Some(binding) => binding
+                .generation
+                .checked_add(1)
+                .context("relay migration generation is exhausted")?,
+            None => 1,
+        };
+        if generation == 0 || generation != expected {
+            bail!("relay migration generation is stale or skipped");
+        }
+        migrations.insert(
+            session_id.clone(),
+            RelayMigrationBinding {
+                peer_key_id: event.sender.key_id.clone(),
+                generation,
+                directory_id: directory_id.to_owned(),
+                node_id: node_id.to_owned(),
+                direction: RelayMigrationDirection::IncomingOffer,
+            },
+        );
+        Ok(())
+    }
+
+    async fn require_relay_migration_binding(
+        &self,
+        event: &VerifiedSignalingEvent,
+        session_id: &mrd_proto::SessionId,
+        generation: u64,
+        directory_id: &str,
+        node_id: &str,
+        required_direction: Option<RelayMigrationDirection>,
+    ) -> Result<()> {
+        self.require_live_session(event, session_id).await?;
+        let migrations = self.relay_migrations.lock().await;
+        let binding = migrations
+            .get(session_id)
+            .context("relay migration signaling arrived without an active generation")?;
+        if binding.peer_key_id != event.sender.key_id
+            || binding.generation != generation
+            || binding.directory_id != directory_id
+            || binding.node_id != node_id
+            || required_direction.is_some_and(|direction| binding.direction != direction)
+        {
+            bail!("relay migration signaling does not match the active generation");
+        }
+        Ok(())
+    }
+
+    /// Bind a locally initiated relay migration before its signed offer is sent.
+    pub async fn bind_outbound_relay_migration(
+        &self,
+        session_id: mrd_proto::SessionId,
+        peer_key_id: String,
+        generation: u64,
+        directory_id: String,
+        node_id: String,
+    ) -> Result<()> {
+        if generation == 0
+            || peer_key_id.is_empty()
+            || peer_key_id.len() > 256
+            || directory_id.is_empty()
+            || directory_id.len() > 256
+            || directory_id.chars().any(char::is_control)
+            || node_id.is_empty()
+            || node_id.len() > 256
+            || node_id.chars().any(char::is_control)
+        {
+            bail!("outbound relay migration binding is invalid");
+        }
+        let _signaling_state_guard = self.signaling_state_gate.lock().await;
+        let session = self
+            .app_state
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .context("outbound relay migration session does not exist")?;
+        if session.lifecycle_state.is_terminal() {
+            bail!("terminal session cannot start relay migration");
+        }
+        let grants = self.webrtc_grants.lock().await;
+        let grant = grants
+            .get(&session_id)
+            .context("outbound relay migration requires an authenticated grant")?;
+        if grant.peer_key_id != peer_key_id {
+            bail!("outbound relay migration peer does not match the authenticated grant");
+        }
+        drop(grants);
+        let mut migrations = self.relay_migrations.lock().await;
+        let expected = match migrations.get(&session_id) {
+            Some(binding) => binding
+                .generation
+                .checked_add(1)
+                .context("outbound relay migration generation is exhausted")?,
+            None => 1,
+        };
+        if generation != expected {
+            bail!("outbound relay migration generation is stale or skipped");
+        }
+        migrations.insert(
+            session_id,
+            RelayMigrationBinding {
+                peer_key_id,
+                generation,
+                directory_id,
+                node_id,
+                direction: RelayMigrationDirection::OutboundOffer,
+            },
+        );
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
 impl AuthenticatedSessionSignalPort for ServiceSignalingMapper {
     async fn apply_authenticated_signal(&self, event: VerifiedSignalingEvent) -> Result<()> {
+        // Grant replacement, terminalization, and migration generation changes form one
+        // security state machine. Serialize them so a migration cannot be installed from a
+        // grant that is concurrently being replaced or revoked.
+        let _signaling_state_guard = self.signaling_state_gate.lock().await;
         match event.signal.clone() {
             AuthenticatedSessionSignal::AuthorizationRequested {
                 session_id,
@@ -235,12 +401,13 @@ impl AuthenticatedSessionSignalPort for ServiceSignalingMapper {
                 })
                 .await?;
                 self.webrtc_grants.lock().await.insert(
-                    session_id,
+                    session_id.clone(),
                     WebRtcGrantBinding {
                         peer_key_id: event.sender.key_id,
                         accepted_fingerprints: accepted_candidate_fingerprints,
                     },
                 );
+                self.relay_migrations.lock().await.remove(&session_id);
                 Ok(())
             }
             AuthenticatedSessionSignal::Denied { session_id, reason } => {
@@ -256,6 +423,7 @@ impl AuthenticatedSessionSignalPort for ServiceSignalingMapper {
                 })
                 .await?;
                 self.webrtc_grants.lock().await.remove(&session_id);
+                self.relay_migrations.lock().await.remove(&session_id);
                 Ok(())
             }
             AuthenticatedSessionSignal::Closed { session_id, .. } => {
@@ -267,6 +435,7 @@ impl AuthenticatedSessionSignalPort for ServiceSignalingMapper {
                 })
                 .await?;
                 self.webrtc_grants.lock().await.remove(&session_id);
+                self.relay_migrations.lock().await.remove(&session_id);
                 Ok(())
             }
             AuthenticatedSessionSignal::WebRtcCandidate {
@@ -293,6 +462,68 @@ impl AuthenticatedSessionSignalPort for ServiceSignalingMapper {
                         .await?;
                 }
                 Ok(())
+            }
+            AuthenticatedSessionSignal::RelayMigrationOffer {
+                session_id,
+                migration_generation,
+                directory_id,
+                node_id,
+                candidate_fingerprints,
+                ..
+            } => {
+                self.apply_relay_migration_offer(
+                    &event,
+                    &session_id,
+                    migration_generation,
+                    &directory_id,
+                    &node_id,
+                    &candidate_fingerprints,
+                )
+                .await
+            }
+            AuthenticatedSessionSignal::RelayMigrationAnswer {
+                session_id,
+                migration_generation,
+                directory_id,
+                node_id,
+                candidate_fingerprints,
+                ..
+            } => {
+                self.require_relay_migration_binding(
+                    &event,
+                    &session_id,
+                    migration_generation,
+                    &directory_id,
+                    &node_id,
+                    Some(RelayMigrationDirection::OutboundOffer),
+                )
+                .await?;
+                self.require_webrtc_grant(&event, &session_id).await?;
+                for fingerprint in candidate_fingerprints {
+                    self.require_webrtc_fingerprint(&event, &session_id, &fingerprint)
+                        .await?;
+                }
+                Ok(())
+            }
+            AuthenticatedSessionSignal::RelayMigrationCandidate {
+                session_id,
+                migration_generation,
+                directory_id,
+                node_id,
+                candidate_fingerprint,
+                ..
+            } => {
+                self.require_relay_migration_binding(
+                    &event,
+                    &session_id,
+                    migration_generation,
+                    &directory_id,
+                    &node_id,
+                    None,
+                )
+                .await?;
+                self.require_webrtc_fingerprint(&event, &session_id, &candidate_fingerprint)
+                    .await
             }
         }
     }

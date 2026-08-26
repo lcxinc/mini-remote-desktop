@@ -295,6 +295,58 @@ impl RealtimeCore {
                 self.require_intended_peer(&metadata, &peer)?;
                 Ok(vec![delivery(self.connection_for(&peer)?, envelope)])
             }
+            AuthenticatedSignalMessage::RelayMigrationOffer(offer) => {
+                let metadata = offer.verify_for(
+                    &offer.payload.claims.intended_peer_device_id,
+                    now_ms,
+                    &mut self.replay,
+                )?;
+                self.bind_sender(&presence, &metadata)?;
+                let peer = self.routes.resolve_migration_offer(
+                    &presence.device_id,
+                    &offer.payload,
+                    now_ms,
+                )?;
+                self.require_intended_peer(&metadata, &peer)?;
+                tracing::info!(
+                    session_id = %offer.payload.session_id.0,
+                    migration_generation = offer.payload.migration_generation,
+                    directory_id = %offer.payload.directory_id,
+                    node_id = %offer.payload.node_id,
+                    "authenticated relay migration offer routed"
+                );
+                Ok(vec![delivery(self.connection_for(&peer)?, envelope)])
+            }
+            AuthenticatedSignalMessage::RelayMigrationAnswer(answer) => {
+                let metadata = answer.verify_for(
+                    &answer.payload.claims.intended_peer_device_id,
+                    now_ms,
+                    &mut self.replay,
+                )?;
+                self.bind_sender(&presence, &metadata)?;
+                let peer = self.routes.resolve_migration_answer(
+                    &presence.device_id,
+                    &answer.payload,
+                    now_ms,
+                )?;
+                self.require_intended_peer(&metadata, &peer)?;
+                Ok(vec![delivery(self.connection_for(&peer)?, envelope)])
+            }
+            AuthenticatedSignalMessage::RelayMigrationCandidate(candidate) => {
+                let metadata = candidate.verify_for(
+                    &candidate.payload.claims.intended_peer_device_id,
+                    now_ms,
+                    &mut self.replay,
+                )?;
+                self.bind_sender(&presence, &metadata)?;
+                let peer = self.routes.resolve_migration_candidate(
+                    &presence.device_id,
+                    &candidate.payload,
+                    now_ms,
+                )?;
+                self.require_intended_peer(&metadata, &peer)?;
+                Ok(vec![delivery(self.connection_for(&peer)?, envelope)])
+            }
             AuthenticatedSignalMessage::SessionClose(close) => {
                 let metadata = close.verify_for(
                     &close.payload.claims.intended_peer_device_id,
@@ -571,7 +623,9 @@ impl RealtimeError {
             Self::Presence(_) => ProtocolReasonCode::Conflict,
             Self::Route(error) => match error {
                 RouteError::UnknownSession => ProtocolReasonCode::UnknownSession,
-                RouteError::Conflict => ProtocolReasonCode::Conflict,
+                RouteError::Conflict | RouteError::MigrationConflict => {
+                    ProtocolReasonCode::Conflict
+                }
                 _ => ProtocolReasonCode::UnauthorizedRoute,
             },
         }

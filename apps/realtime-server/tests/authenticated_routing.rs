@@ -2,9 +2,11 @@ use mrd_identity::DeviceIdentity;
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use mrd_signal_proto::{
     AuthClaims, AuthenticatedRegister, AuthenticatedSignalMessage, PresenceHeartbeat,
-    PresenceHeartbeatPayload, ProtocolReasonCode, RegisterPayload, SessionClose,
-    SessionClosePayload, SessionGrant, SessionGrantPayload, SessionIntent, SessionIntentPayload,
-    SignalEnvelope, WebRtcCandidate, WebRtcCandidatePayload, WebRtcOffer, WebRtcOfferPayload,
+    PresenceHeartbeatPayload, ProtocolReasonCode, RegisterPayload, RelayMigrationAnswer,
+    RelayMigrationAnswerPayload, RelayMigrationCandidate, RelayMigrationCandidatePayload,
+    RelayMigrationOffer, RelayMigrationOfferPayload, SessionClose, SessionClosePayload,
+    SessionGrant, SessionGrantPayload, SessionIntent, SessionIntentPayload, SignalEnvelope,
+    WebRtcCandidate, WebRtcCandidatePayload, WebRtcOffer, WebRtcOfferPayload,
 };
 use realtime_server::{
     BackendTokenError, BackendTokenVerifier, ConnectionId, CoreConfig, DeliveryTarget,
@@ -354,6 +356,306 @@ fn authorize_route(core: &mut RealtimeCore, controller: &mut TestDevice, target:
         NOW + 3,
     )
     .unwrap();
+}
+
+#[test]
+fn relay_migration_enforces_generation_binding_grant_participants_and_close() {
+    let mut controller = TestDevice::new("controller-1", 1);
+    let mut target = TestDevice::new("target-1", 2);
+    let mut random = TestDevice::new("random-1", 3);
+    let mut core = core_with(&[
+        (&controller, BackendRole::Controller),
+        (&target, BackendRole::Agent),
+        (&random, BackendRole::Controller),
+    ]);
+    register(&mut core, &mut controller, BackendRole::Controller);
+    register(&mut core, &mut target, BackendRole::Agent);
+    register(&mut core, &mut random, BackendRole::Controller);
+    authorize_route(&mut core, &mut controller, &mut target);
+
+    let session_id = SessionId("session-1".into());
+    let fingerprint = "a".repeat(64);
+    let offer = |sender: &mut TestDevice,
+                 intended_peer: &DeviceId,
+                 generation: u64,
+                 directory_id: &str,
+                 node_id: &str,
+                 fingerprint: &str| {
+        let claims = sender.claims(intended_peer);
+        RelayMigrationOffer::sign(
+            &sender.identity,
+            RelayMigrationOfferPayload {
+                claims,
+                session_id: session_id.clone(),
+                migration_generation: generation,
+                directory_id: directory_id.into(),
+                node_id: node_id.into(),
+                sdp: "v=0".into(),
+                candidate_fingerprints: BTreeSet::from([fingerprint.to_owned()]),
+            },
+        )
+        .unwrap()
+    };
+
+    let first = offer(
+        &mut controller,
+        &target.device_id,
+        1,
+        "directory-1",
+        "relay-1",
+        &fingerprint,
+    );
+    let deliveries = core
+        .handle(
+            controller.connection_id,
+            SignalEnvelope::new(AuthenticatedSignalMessage::RelayMigrationOffer(first)),
+            NOW + 4,
+        )
+        .unwrap();
+    assert_eq!(
+        deliveries[0].target,
+        DeliveryTarget::Connection(target.connection_id)
+    );
+
+    let answer_claims = target.claims(&controller.device_id);
+    let answer = RelayMigrationAnswer::sign(
+        &target.identity,
+        RelayMigrationAnswerPayload {
+            claims: answer_claims,
+            session_id: session_id.clone(),
+            migration_generation: 1,
+            directory_id: "directory-1".into(),
+            node_id: "relay-1".into(),
+            sdp: "v=0".into(),
+            candidate_fingerprints: BTreeSet::from([fingerprint.clone()]),
+        },
+    )
+    .unwrap();
+    core.handle(
+        target.connection_id,
+        SignalEnvelope::new(AuthenticatedSignalMessage::RelayMigrationAnswer(answer)),
+        NOW + 5,
+    )
+    .unwrap();
+
+    let candidate_claims = target.claims(&controller.device_id);
+    let candidate = RelayMigrationCandidate::sign(
+        &target.identity,
+        RelayMigrationCandidatePayload {
+            claims: candidate_claims,
+            session_id: session_id.clone(),
+            migration_generation: 1,
+            directory_id: "directory-1".into(),
+            node_id: "relay-1".into(),
+            candidate: "candidate:relay".into(),
+            sdp_mid: Some("0".into()),
+            sdp_mline_index: Some(0),
+            candidate_fingerprint: fingerprint.clone(),
+        },
+    )
+    .unwrap();
+    core.handle(
+        target.connection_id,
+        SignalEnvelope::new(AuthenticatedSignalMessage::RelayMigrationCandidate(
+            candidate,
+        )),
+        NOW + 6,
+    )
+    .unwrap();
+
+    for generation in [1, 3] {
+        let invalid = offer(
+            &mut controller,
+            &target.device_id,
+            generation,
+            "directory-2",
+            "relay-2",
+            &fingerprint,
+        );
+        assert_eq!(
+            core.handle(
+                controller.connection_id,
+                SignalEnvelope::new(AuthenticatedSignalMessage::RelayMigrationOffer(invalid)),
+                NOW + 7,
+            )
+            .unwrap_err()
+            .reason_code(),
+            ProtocolReasonCode::Conflict
+        );
+    }
+
+    let ungranted = offer(
+        &mut controller,
+        &target.device_id,
+        2,
+        "directory-2",
+        "relay-2",
+        &"b".repeat(64),
+    );
+    assert_eq!(
+        core.handle(
+            controller.connection_id,
+            SignalEnvelope::new(AuthenticatedSignalMessage::RelayMigrationOffer(ungranted)),
+            NOW + 8,
+        )
+        .unwrap_err()
+        .reason_code(),
+        ProtocolReasonCode::UnauthorizedRoute
+    );
+
+    let second = offer(
+        &mut controller,
+        &target.device_id,
+        2,
+        "directory-2",
+        "relay-2",
+        &fingerprint,
+    );
+    core.handle(
+        controller.connection_id,
+        SignalEnvelope::new(AuthenticatedSignalMessage::RelayMigrationOffer(second)),
+        NOW + 9,
+    )
+    .unwrap();
+
+    let mismatched_claims = target.claims(&controller.device_id);
+    let mismatched = RelayMigrationAnswer::sign(
+        &target.identity,
+        RelayMigrationAnswerPayload {
+            claims: mismatched_claims,
+            session_id: session_id.clone(),
+            migration_generation: 2,
+            directory_id: "different-directory".into(),
+            node_id: "relay-2".into(),
+            sdp: "v=0".into(),
+            candidate_fingerprints: BTreeSet::from([fingerprint.clone()]),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        core.handle(
+            target.connection_id,
+            SignalEnvelope::new(AuthenticatedSignalMessage::RelayMigrationAnswer(mismatched)),
+            NOW + 10,
+        )
+        .unwrap_err()
+        .reason_code(),
+        ProtocolReasonCode::Conflict
+    );
+
+    let refreshed_grant_claims = target.claims(&controller.device_id);
+    let refreshed_grant = SessionGrant::sign(
+        &target.identity,
+        SessionGrantPayload {
+            claims: refreshed_grant_claims,
+            session_id: session_id.clone(),
+            controller_device_id: controller.device_id.clone(),
+            accepted_transport: "webrtc".into(),
+            accepted_candidate_fingerprints: BTreeSet::from([fingerprint.clone()]),
+        },
+    )
+    .unwrap();
+    core.handle(
+        target.connection_id,
+        SignalEnvelope::new(AuthenticatedSignalMessage::SessionGrant(refreshed_grant)),
+        NOW + 11,
+    )
+    .unwrap();
+
+    let stale_answer_claims = target.claims(&controller.device_id);
+    let stale_answer = RelayMigrationAnswer::sign(
+        &target.identity,
+        RelayMigrationAnswerPayload {
+            claims: stale_answer_claims,
+            session_id: session_id.clone(),
+            migration_generation: 2,
+            directory_id: "directory-2".into(),
+            node_id: "relay-2".into(),
+            sdp: "v=0".into(),
+            candidate_fingerprints: BTreeSet::from([fingerprint.clone()]),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        core.handle(
+            target.connection_id,
+            SignalEnvelope::new(AuthenticatedSignalMessage::RelayMigrationAnswer(
+                stale_answer,
+            )),
+            NOW + 12,
+        )
+        .unwrap_err()
+        .reason_code(),
+        ProtocolReasonCode::Conflict
+    );
+    let reset_offer = offer(
+        &mut controller,
+        &target.device_id,
+        1,
+        "directory-reset",
+        "relay-reset",
+        &fingerprint,
+    );
+    core.handle(
+        controller.connection_id,
+        SignalEnvelope::new(AuthenticatedSignalMessage::RelayMigrationOffer(reset_offer)),
+        NOW + 13,
+    )
+    .unwrap();
+
+    let injected = offer(
+        &mut random,
+        &target.device_id,
+        2,
+        "directory-3",
+        "relay-3",
+        &fingerprint,
+    );
+    assert_eq!(
+        core.handle(
+            random.connection_id,
+            SignalEnvelope::new(AuthenticatedSignalMessage::RelayMigrationOffer(injected)),
+            NOW + 14,
+        )
+        .unwrap_err()
+        .reason_code(),
+        ProtocolReasonCode::UnauthorizedRoute
+    );
+
+    let close_claims = controller.claims(&target.device_id);
+    let close = SessionClose::sign(
+        &controller.identity,
+        SessionClosePayload {
+            claims: close_claims,
+            session_id: session_id.clone(),
+            reason: ProtocolReasonCode::Conflict,
+        },
+    )
+    .unwrap();
+    core.handle(
+        controller.connection_id,
+        SignalEnvelope::new(AuthenticatedSignalMessage::SessionClose(close)),
+        NOW + 15,
+    )
+    .unwrap();
+    let post_close = offer(
+        &mut controller,
+        &target.device_id,
+        2,
+        "directory-3",
+        "relay-3",
+        &fingerprint,
+    );
+    assert_eq!(
+        core.handle(
+            controller.connection_id,
+            SignalEnvelope::new(AuthenticatedSignalMessage::RelayMigrationOffer(post_close)),
+            NOW + 16,
+        )
+        .unwrap_err()
+        .reason_code(),
+        ProtocolReasonCode::UnknownSession
+    );
 }
 
 #[test]

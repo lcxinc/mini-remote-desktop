@@ -13,10 +13,11 @@ use mrd_service::{
 };
 use mrd_signal_proto::{
     AuthClaims, AuthenticatedSignalMessage, ProtocolReasonCode, Registered, RegisteredPayload,
-    ServerChallenge, SessionIntent, SessionIntentPayload, SignalEnvelope,
+    RelayMigrationOffer, RelayMigrationOfferPayload, ServerChallenge, SessionIntent,
+    SessionIntentPayload, SignalEnvelope,
 };
 use ring::rand::SystemRandom;
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 const NOW: u64 = 1_000_000;
 
@@ -250,6 +251,49 @@ fn duplicate_signed_intent_is_idempotent_but_tampering_is_rejected() {
     assert!(runtime.handle_inbound(tampered, NOW + 3).is_err());
 }
 
+#[test]
+fn signed_relay_migration_is_mapped_without_becoming_reconnect() {
+    let server = identity();
+    let local = identity();
+    let controller = identity();
+    let mut runtime = SignalingRuntimeCore::new(config(&server), local);
+    runtime
+        .accept_registered(registered(&server, 1), NOW)
+        .unwrap();
+    let offer = RelayMigrationOffer::sign(
+        &controller,
+        RelayMigrationOfferPayload {
+            claims: claims(&controller, "controller-1", "local-device", 1, 42),
+            session_id: SessionId("migration-session".into()),
+            migration_generation: 1,
+            directory_id: "directory-1".into(),
+            node_id: "relay-1".into(),
+            sdp: "v=0".into(),
+            candidate_fingerprints: BTreeSet::from(["a".repeat(64)]),
+        },
+    )
+    .unwrap();
+    let envelope = SignalEnvelope::new(AuthenticatedSignalMessage::RelayMigrationOffer(offer));
+    let InboundDisposition::Applied(applied) =
+        runtime.handle_inbound(envelope.clone(), NOW + 1).unwrap()
+    else {
+        panic!("expected applied migration offer")
+    };
+    assert!(matches!(
+        applied.signal,
+        AuthenticatedSessionSignal::RelayMigrationOffer {
+            migration_generation: 1,
+            ref directory_id,
+            ref node_id,
+            ..
+        } if directory_id == "directory-1" && node_id == "relay-1"
+    ));
+    assert_eq!(
+        runtime.handle_inbound(envelope, NOW + 2).unwrap(),
+        InboundDisposition::Duplicate
+    );
+}
+
 fn verified_event(
     sender: &DeviceIdentity,
     signal: AuthenticatedSessionSignal,
@@ -432,6 +476,245 @@ async fn grant_deny_and_close_update_only_the_matching_session_aggregate() {
         SessionLifecycleState::Closed
     );
     assert!(!sessions.get(&close_id).unwrap().receiver_active);
+}
+
+#[tokio::test]
+async fn relay_migration_mapper_requires_the_bound_peer_grant_and_live_session() {
+    let app_state = Arc::new(AppState::new());
+    let mapper = ServiceSignalingMapper::new(Arc::clone(&app_state));
+    let peer = identity();
+    let session_id = SessionId("migration-grant-session".into());
+    app_state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), controller_snapshot(&session_id));
+
+    mapper
+        .apply_authenticated_signal(verified_event(
+            &peer,
+            AuthenticatedSessionSignal::Granted {
+                session_id: session_id.clone(),
+                accepted_transport: "webrtc".into(),
+                accepted_candidate_fingerprints: vec!["a".repeat(64)],
+            },
+        ))
+        .await
+        .unwrap();
+    mapper
+        .apply_authenticated_signal(verified_event(
+            &peer,
+            AuthenticatedSessionSignal::RelayMigrationOffer {
+                session_id: session_id.clone(),
+                migration_generation: 1,
+                directory_id: "directory-1".into(),
+                node_id: "relay-1".into(),
+                sdp: "v=0".into(),
+                candidate_fingerprints: vec!["a".repeat(64)],
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(mapper
+        .apply_authenticated_signal(verified_event(
+            &peer,
+            AuthenticatedSessionSignal::RelayMigrationAnswer {
+                session_id: session_id.clone(),
+                migration_generation: 1,
+                directory_id: "directory-1".into(),
+                node_id: "relay-1".into(),
+                sdp: "v=0".into(),
+                candidate_fingerprints: vec!["a".repeat(64)],
+            },
+        ))
+        .await
+        .is_err());
+    assert!(mapper
+        .apply_authenticated_signal(verified_event(
+            &peer,
+            AuthenticatedSessionSignal::RelayMigrationOffer {
+                session_id: session_id.clone(),
+                migration_generation: 2,
+                directory_id: "directory-2".into(),
+                node_id: "relay-2".into(),
+                sdp: "v=0".into(),
+                candidate_fingerprints: vec!["b".repeat(64)],
+            },
+        ))
+        .await
+        .is_err());
+
+    mapper
+        .apply_authenticated_signal(verified_event(
+            &peer,
+            AuthenticatedSessionSignal::Closed {
+                session_id: session_id.clone(),
+                reason: ProtocolReasonCode::Conflict,
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(mapper
+        .apply_authenticated_signal(verified_event(
+            &peer,
+            AuthenticatedSessionSignal::RelayMigrationOffer {
+                session_id,
+                migration_generation: 2,
+                directory_id: "directory-2".into(),
+                node_id: "relay-2".into(),
+                sdp: "v=0".into(),
+                candidate_fingerprints: vec!["a".repeat(64)],
+            },
+        ))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn outbound_relay_migration_binding_fences_answer_candidate_and_generation() {
+    let app_state = Arc::new(AppState::new());
+    let mapper = ServiceSignalingMapper::new(Arc::clone(&app_state));
+    let peer = identity();
+    let session_id = SessionId("outbound-migration-session".into());
+    app_state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), controller_snapshot(&session_id));
+    mapper
+        .apply_authenticated_signal(verified_event(
+            &peer,
+            AuthenticatedSessionSignal::Granted {
+                session_id: session_id.clone(),
+                accepted_transport: "webrtc".into(),
+                accepted_candidate_fingerprints: vec!["a".repeat(64)],
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(mapper
+        .bind_outbound_relay_migration(
+            session_id.clone(),
+            "wrong-peer-key".into(),
+            1,
+            "directory-1".into(),
+            "relay-1".into(),
+        )
+        .await
+        .is_err());
+    mapper
+        .bind_outbound_relay_migration(
+            session_id.clone(),
+            peer.key_id().into(),
+            1,
+            "directory-1".into(),
+            "relay-1".into(),
+        )
+        .await
+        .unwrap();
+
+    mapper
+        .apply_authenticated_signal(verified_event(
+            &peer,
+            AuthenticatedSessionSignal::RelayMigrationAnswer {
+                session_id: session_id.clone(),
+                migration_generation: 1,
+                directory_id: "directory-1".into(),
+                node_id: "relay-1".into(),
+                sdp: "v=0".into(),
+                candidate_fingerprints: vec!["a".repeat(64)],
+            },
+        ))
+        .await
+        .unwrap();
+    mapper
+        .apply_authenticated_signal(verified_event(
+            &peer,
+            AuthenticatedSessionSignal::RelayMigrationCandidate {
+                session_id: session_id.clone(),
+                migration_generation: 1,
+                directory_id: "directory-1".into(),
+                node_id: "relay-1".into(),
+                candidate: "candidate:relay".into(),
+                sdp_mid: Some("0".into()),
+                sdp_mline_index: Some(0),
+                candidate_fingerprint: "a".repeat(64),
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(mapper
+        .apply_authenticated_signal(verified_event(
+            &peer,
+            AuthenticatedSessionSignal::RelayMigrationCandidate {
+                session_id: session_id.clone(),
+                migration_generation: 1,
+                directory_id: "mismatched-directory".into(),
+                node_id: "relay-1".into(),
+                candidate: "candidate:relay".into(),
+                sdp_mid: Some("0".into()),
+                sdp_mline_index: Some(0),
+                candidate_fingerprint: "a".repeat(64),
+            },
+        ))
+        .await
+        .is_err());
+    assert!(mapper
+        .bind_outbound_relay_migration(
+            session_id.clone(),
+            peer.key_id().into(),
+            3,
+            "directory-3".into(),
+            "relay-3".into(),
+        )
+        .await
+        .is_err());
+    mapper
+        .bind_outbound_relay_migration(
+            session_id.clone(),
+            peer.key_id().into(),
+            2,
+            "directory-2".into(),
+            "relay-2".into(),
+        )
+        .await
+        .unwrap();
+
+    mapper
+        .apply_authenticated_signal(verified_event(
+            &peer,
+            AuthenticatedSessionSignal::Granted {
+                session_id: session_id.clone(),
+                accepted_transport: "webrtc".into(),
+                accepted_candidate_fingerprints: vec!["a".repeat(64)],
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(mapper
+        .apply_authenticated_signal(verified_event(
+            &peer,
+            AuthenticatedSessionSignal::RelayMigrationAnswer {
+                session_id: session_id.clone(),
+                migration_generation: 2,
+                directory_id: "directory-2".into(),
+                node_id: "relay-2".into(),
+                sdp: "v=0".into(),
+                candidate_fingerprints: vec!["a".repeat(64)],
+            },
+        ))
+        .await
+        .is_err());
+    mapper
+        .bind_outbound_relay_migration(
+            session_id,
+            peer.key_id().into(),
+            1,
+            "directory-reset".into(),
+            "relay-reset".into(),
+        )
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

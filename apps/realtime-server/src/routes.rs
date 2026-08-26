@@ -1,5 +1,6 @@
 use mrd_proto::{DeviceId, SessionId};
 use mrd_signal_proto::{
+    RelayMigrationAnswerPayload, RelayMigrationCandidatePayload, RelayMigrationOfferPayload,
     SessionGrantPayload, SessionIntentPayload, WebRtcAnswerPayload, WebRtcCandidatePayload,
     WebRtcOfferPayload,
 };
@@ -12,7 +13,17 @@ struct SessionRoute {
     target: DeviceId,
     idempotency_key: [u8; 16],
     granted_fingerprints: Option<HashSet<String>>,
+    latest_migration_generation: u64,
+    migration: Option<MigrationBinding>,
     last_activity_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct MigrationBinding {
+    generation: u64,
+    directory_id: String,
+    node_id: String,
+    offerer: DeviceId,
 }
 
 #[derive(Debug, Default)]
@@ -56,6 +67,8 @@ impl AuthorizedRoutes {
                 target: intent.target_device_id.clone(),
                 idempotency_key: intent.idempotency_key,
                 granted_fingerprints: None,
+                latest_migration_generation: 0,
+                migration: None,
                 last_activity_ms: now_ms,
             },
         );
@@ -83,6 +96,8 @@ impl AuthorizedRoutes {
                 .cloned()
                 .collect(),
         );
+        route.latest_migration_generation = 0;
+        route.migration = None;
         route.last_activity_ms = now_ms;
         Ok(route.controller.clone())
     }
@@ -179,6 +194,95 @@ impl AuthorizedRoutes {
         Ok(peer)
     }
 
+    pub fn resolve_migration_offer(
+        &mut self,
+        sender: &DeviceId,
+        offer: &RelayMigrationOfferPayload,
+        now_ms: u64,
+    ) -> Result<DeviceId, RouteError> {
+        let route = self
+            .routes
+            .get_mut(&offer.session_id)
+            .ok_or(RouteError::UnknownSession)?;
+        let peer = peer(route, sender)?;
+        require_granted_fingerprints(route, &offer.candidate_fingerprints)?;
+        let expected = route
+            .latest_migration_generation
+            .checked_add(1)
+            .ok_or(RouteError::MigrationConflict)?;
+        if offer.migration_generation != expected {
+            return Err(RouteError::MigrationConflict);
+        }
+        route.latest_migration_generation = offer.migration_generation;
+        route.migration = Some(MigrationBinding {
+            generation: offer.migration_generation,
+            directory_id: offer.directory_id.clone(),
+            node_id: offer.node_id.clone(),
+            offerer: sender.clone(),
+        });
+        route.last_activity_ms = now_ms;
+        Ok(peer)
+    }
+
+    pub fn resolve_migration_answer(
+        &mut self,
+        sender: &DeviceId,
+        answer: &RelayMigrationAnswerPayload,
+        now_ms: u64,
+    ) -> Result<DeviceId, RouteError> {
+        let route = self
+            .routes
+            .get_mut(&answer.session_id)
+            .ok_or(RouteError::UnknownSession)?;
+        let peer = peer(route, sender)?;
+        require_granted_fingerprints(route, &answer.candidate_fingerprints)?;
+        let binding = route
+            .migration
+            .as_ref()
+            .ok_or(RouteError::MigrationConflict)?;
+        if &binding.offerer == sender
+            || binding.generation != answer.migration_generation
+            || binding.directory_id != answer.directory_id
+            || binding.node_id != answer.node_id
+        {
+            return Err(RouteError::MigrationConflict);
+        }
+        route.last_activity_ms = now_ms;
+        Ok(peer)
+    }
+
+    pub fn resolve_migration_candidate(
+        &mut self,
+        sender: &DeviceId,
+        candidate: &RelayMigrationCandidatePayload,
+        now_ms: u64,
+    ) -> Result<DeviceId, RouteError> {
+        let route = self
+            .routes
+            .get_mut(&candidate.session_id)
+            .ok_or(RouteError::UnknownSession)?;
+        let peer = peer(route, sender)?;
+        if !route
+            .granted_fingerprints
+            .as_ref()
+            .is_some_and(|accepted| accepted.contains(&candidate.candidate_fingerprint))
+        {
+            return Err(RouteError::FingerprintNotGranted);
+        }
+        let binding = route
+            .migration
+            .as_ref()
+            .ok_or(RouteError::MigrationConflict)?;
+        if binding.generation != candidate.migration_generation
+            || binding.directory_id != candidate.directory_id
+            || binding.node_id != candidate.node_id
+        {
+            return Err(RouteError::MigrationConflict);
+        }
+        route.last_activity_ms = now_ms;
+        Ok(peer)
+    }
+
     pub fn close(
         &mut self,
         session_id: &SessionId,
@@ -260,6 +364,23 @@ fn peer(route: &SessionRoute, sender: &DeviceId) -> Result<DeviceId, RouteError>
     }
 }
 
+fn require_granted_fingerprints<'a>(
+    route: &SessionRoute,
+    fingerprints: impl IntoIterator<Item = &'a String>,
+) -> Result<(), RouteError> {
+    let accepted = route
+        .granted_fingerprints
+        .as_ref()
+        .ok_or(RouteError::NotGranted)?;
+    if !fingerprints
+        .into_iter()
+        .all(|fingerprint| accepted.contains(fingerprint))
+    {
+        return Err(RouteError::FingerprintNotGranted);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum RouteError {
     #[error("session route is unknown")]
@@ -272,4 +393,6 @@ pub enum RouteError {
     NotGranted,
     #[error("candidate fingerprint was not granted")]
     FingerprintNotGranted,
+    #[error("relay migration generation or binding conflicts with the session route")]
+    MigrationConflict,
 }

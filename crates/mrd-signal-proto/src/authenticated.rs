@@ -58,6 +58,9 @@ pub enum AuthenticatedSignalMessage {
     WebrtcOffer(WebRtcOffer),
     WebrtcAnswer(WebRtcAnswer),
     WebrtcCandidate(WebRtcCandidate),
+    RelayMigrationOffer(RelayMigrationOffer),
+    RelayMigrationAnswer(RelayMigrationAnswer),
+    RelayMigrationCandidate(RelayMigrationCandidate),
     SessionClose(SessionClose),
     ReconnectRequest(ReconnectRequest),
     ReconnectGrant(ReconnectGrant),
@@ -89,6 +92,9 @@ impl AuthenticatedSignalMessage {
             Self::WebrtcOffer(message) => verify!(message),
             Self::WebrtcAnswer(message) => verify!(message),
             Self::WebrtcCandidate(message) => verify!(message),
+            Self::RelayMigrationOffer(message) => verify!(message),
+            Self::RelayMigrationAnswer(message) => verify!(message),
+            Self::RelayMigrationCandidate(message) => verify!(message),
             Self::SessionClose(message) => verify!(message),
             Self::ReconnectRequest(message) => verify!(message),
             Self::ReconnectGrant(message) => verify!(message),
@@ -613,6 +619,135 @@ signed_payload!(
     }
 );
 pub type WebRtcCandidate = SignedSignal<WebRtcCandidatePayload>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RelayMigrationOfferPayload {
+    pub claims: AuthClaims,
+    pub session_id: SessionId,
+    pub migration_generation: u64,
+    pub directory_id: String,
+    pub node_id: String,
+    pub sdp: String,
+    pub candidate_fingerprints: BTreeSet<String>,
+}
+signed_payload!(
+    RelayMigrationOfferPayload,
+    "MRD_SIGNAL_RELAY_MIGRATION_OFFER_V2",
+    message,
+    {
+        {
+            validate_migration_description(
+                &message.session_id,
+                message.migration_generation,
+                &message.directory_id,
+                &message.node_id,
+                &message.sdp,
+                &message.candidate_fingerprints,
+            )
+        }
+    }
+);
+pub type RelayMigrationOffer = SignedSignal<RelayMigrationOfferPayload>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RelayMigrationAnswerPayload {
+    pub claims: AuthClaims,
+    pub session_id: SessionId,
+    pub migration_generation: u64,
+    pub directory_id: String,
+    pub node_id: String,
+    pub sdp: String,
+    pub candidate_fingerprints: BTreeSet<String>,
+}
+signed_payload!(
+    RelayMigrationAnswerPayload,
+    "MRD_SIGNAL_RELAY_MIGRATION_ANSWER_V2",
+    message,
+    {
+        {
+            validate_migration_description(
+                &message.session_id,
+                message.migration_generation,
+                &message.directory_id,
+                &message.node_id,
+                &message.sdp,
+                &message.candidate_fingerprints,
+            )
+        }
+    }
+);
+pub type RelayMigrationAnswer = SignedSignal<RelayMigrationAnswerPayload>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RelayMigrationCandidatePayload {
+    pub claims: AuthClaims,
+    pub session_id: SessionId,
+    pub migration_generation: u64,
+    pub directory_id: String,
+    pub node_id: String,
+    pub candidate: String,
+    pub sdp_mid: Option<String>,
+    pub sdp_mline_index: Option<u16>,
+    pub candidate_fingerprint: String,
+}
+signed_payload!(
+    RelayMigrationCandidatePayload,
+    "MRD_SIGNAL_RELAY_MIGRATION_CANDIDATE_V2",
+    message,
+    {
+        {
+            validate_migration_binding(
+                &message.session_id,
+                message.migration_generation,
+                &message.directory_id,
+                &message.node_id,
+            )?;
+            validate_text(&message.candidate, 1, 8_192)?;
+            if let Some(mid) = &message.sdp_mid {
+                validate_text(mid, 1, 128)?;
+            }
+            validate_fingerprint(&message.candidate_fingerprint)
+        }
+    }
+);
+pub type RelayMigrationCandidate = SignedSignal<RelayMigrationCandidatePayload>;
+
+fn validate_migration_description(
+    session_id: &SessionId,
+    migration_generation: u64,
+    directory_id: &str,
+    node_id: &str,
+    sdp: &str,
+    candidate_fingerprints: &BTreeSet<String>,
+) -> Result<(), SignalProtocolError> {
+    validate_migration_binding(session_id, migration_generation, directory_id, node_id)?;
+    validate_text(sdp, 1, 256 * 1_024)?;
+    if candidate_fingerprints.is_empty() || candidate_fingerprints.len() > 256 {
+        return Err(SignalProtocolError::Malformed);
+    }
+    for fingerprint in candidate_fingerprints {
+        validate_fingerprint(fingerprint)?;
+    }
+    Ok(())
+}
+
+fn validate_migration_binding(
+    session_id: &SessionId,
+    migration_generation: u64,
+    directory_id: &str,
+    node_id: &str,
+) -> Result<(), SignalProtocolError> {
+    validate_identifier(&session_id.0)?;
+    validate_identifier(directory_id)?;
+    validate_identifier(node_id)?;
+    if migration_generation == 0 {
+        return Err(SignalProtocolError::Malformed);
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
