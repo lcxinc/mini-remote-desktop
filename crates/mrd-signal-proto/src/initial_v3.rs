@@ -655,12 +655,17 @@ fn profile_within(
         (Some(_), None) => false,
         (Some(approved), Some(requested)) => {
             approved.codec == requested.codec
+                && approved.codec_profile == requested.codec_profile
                 && approved.width <= requested.width
                 && approved.height <= requested.height
                 && approved.fps <= requested.fps
                 && approved.bitrate_mbps <= requested.bitrate_mbps
                 && approved.bit_depth == requested.bit_depth
                 && approved.chroma_subsampling == requested.chroma_subsampling
+                && approved.pixel_format == requested.pixel_format
+                && approved.hdr_enabled == requested.hdr_enabled
+                && approved.color_mode == requested.color_mode
+                && approved.color_pipeline == requested.color_pipeline
         }
     }
 }

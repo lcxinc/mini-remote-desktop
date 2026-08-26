@@ -11,6 +11,7 @@ struct SessionRoute {
     controller: DeviceId,
     target: DeviceId,
     idempotency_key: [u8; 16],
+    request_commitment: String,
     granted: bool,
     latest_migration_generation: u64,
     migration: Option<MigrationBinding>,
@@ -54,6 +55,7 @@ impl AuthorizedRoutes {
             return if existing == &request.session_id
                 && &route.controller == controller
                 && route.target == request.target_device_id
+                && route.request_commitment == intent.request_commitment
             {
                 Ok(IntentDisposition::Duplicate)
             } else {
@@ -69,6 +71,7 @@ impl AuthorizedRoutes {
                 controller: controller.clone(),
                 target: request.target_device_id.clone(),
                 idempotency_key: request.idempotency_key,
+                request_commitment: intent.request_commitment.clone(),
                 granted: false,
                 latest_migration_generation: 0,
                 migration: None,
@@ -92,9 +95,10 @@ impl AuthorizedRoutes {
         if &route.target != target || route.controller != grant.controller_device_id {
             return Err(RouteError::Unauthorized);
         }
+        if route.granted {
+            return Err(RouteError::Conflict);
+        }
         route.granted = true;
-        route.latest_migration_generation = 0;
-        route.migration = None;
         route.last_activity_ms = now_ms;
         Ok(route.controller.clone())
     }

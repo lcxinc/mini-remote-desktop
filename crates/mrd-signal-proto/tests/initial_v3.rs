@@ -214,6 +214,84 @@ fn grant_carries_the_exact_intent_commitment_and_cannot_expand_scope() {
 }
 
 #[test]
+fn grant_profile_binding_rejects_every_non_numeric_mutation() {
+    let controller = identity();
+    let target = identity();
+    let profile = WanMediaProfileV3 {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        bitrate_mbps: 20,
+        codec: "h264".into(),
+        codec_profile: Some("high".into()),
+        bit_depth: Some(8),
+        chroma_subsampling: Some("4:2:0".into()),
+        pixel_format: Some("nv12".into()),
+        hdr_enabled: Some(false),
+        color_mode: Some("full".into()),
+        color_pipeline: Some("sdr8".into()),
+    };
+    let mut requested = request();
+    requested.requested_profile = Some(profile.clone());
+    let request_commitment = requested.commitment().unwrap();
+    let intent = SessionIntentV3::sign(
+        &controller,
+        SessionIntentV3Payload {
+            claims: claims(&controller, "controller-1", "target-1", 1),
+            request: requested,
+            request_commitment,
+        },
+    )
+    .unwrap();
+    let grant = SessionGrantV3::sign(
+        &target,
+        SessionGrantV3Payload {
+            claims: claims(&target, "target-1", "controller-1", 2),
+            session_id: SessionId("session-1".into()),
+            controller_device_id: DeviceId("controller-1".into()),
+            target_device_id: DeviceId("target-1".into()),
+            intent_commitment: intent.commitment().unwrap(),
+            approved_scopes: vec![WanPermissionScopeV3::ScreenView],
+            approved_profile: Some(profile.clone()),
+            backend_policy_revision: 7,
+            policy_expires_at_ms: 9_000,
+            relay_generation: 0,
+            relay_directory_id: "directory-1".into(),
+            primary_relay_node_id: "relay-1".into(),
+            route_policy: WanRoutePolicyV3::RelayOnly,
+        },
+    )
+    .unwrap();
+    grant.verify_intent(&intent).unwrap();
+
+    let mut mutations = Vec::new();
+    let mut changed = profile.clone();
+    changed.codec_profile = Some("main".into());
+    mutations.push(changed);
+    let mut changed = profile.clone();
+    changed.pixel_format = Some("p010".into());
+    mutations.push(changed);
+    let mut changed = profile.clone();
+    changed.hdr_enabled = Some(true);
+    mutations.push(changed);
+    let mut changed = profile.clone();
+    changed.color_mode = Some("limited".into());
+    mutations.push(changed);
+    let mut changed = profile;
+    changed.color_pipeline = Some("hdr10".into());
+    mutations.push(changed);
+
+    for approved_profile in mutations {
+        let mut mutated = grant.clone();
+        mutated.payload.approved_profile = Some(approved_profile);
+        assert_eq!(
+            mutated.verify_intent(&intent),
+            Err(SignalProtocolError::Malformed)
+        );
+    }
+}
+
+#[test]
 fn candidate_fingerprint_is_domain_separated_and_binds_optional_presence() {
     let session_id = SessionId("session-1".into());
     let grant_commitment = "b".repeat(64);

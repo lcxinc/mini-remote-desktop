@@ -163,6 +163,14 @@ fn signed_intent_v3(
     idempotency_key: [u8; 16],
 ) -> SessionIntentV3 {
     let request = wan_request(controller, target, session_id, idempotency_key);
+    signed_intent_request_v3(controller, target, request)
+}
+
+fn signed_intent_request_v3(
+    controller: &mut TestDevice,
+    target: &TestDevice,
+    request: WanSessionRequestV3,
+) -> SessionIntentV3 {
     let request_commitment = request.commitment().unwrap();
     let claims = controller.claims(&target.device_id);
     SessionIntentV3::sign(
@@ -419,6 +427,19 @@ fn v3_initial_all_five_messages_route_unchanged_only_to_the_signed_peer() {
         NOW + 2,
     );
     assert_eq!(core.route_count(), 1);
+    let mut conflicting_request = wan_request(&controller, &target, "session-1", [44; 16]);
+    conflicting_request.requested_scopes = vec![WanPermissionScopeV3::ScreenView];
+    let conflicting = signed_intent_request_v3(&mut controller, &target, conflicting_request);
+    assert_eq!(
+        core.handle(
+            controller.connection_id,
+            SignalEnvelope::new(AuthenticatedSignalMessage::SessionIntentV3(conflicting)),
+            NOW + 2,
+        )
+        .unwrap_err()
+        .reason_code(),
+        ProtocolReasonCode::Conflict
+    );
     let grant = signed_grant_v3(&mut target, &controller, &intent);
     assert_routes_to(
         &mut core,
@@ -833,12 +854,16 @@ fn relay_migration_enforces_generation_binding_grant_participants_and_close() {
     );
 
     let refreshed_grant = signed_grant_v3(&mut target, &controller, &intent);
-    core.handle(
-        target.connection_id,
-        SignalEnvelope::new(AuthenticatedSignalMessage::SessionGrantV3(refreshed_grant)),
-        NOW + 11,
-    )
-    .unwrap();
+    assert_eq!(
+        core.handle(
+            target.connection_id,
+            SignalEnvelope::new(AuthenticatedSignalMessage::SessionGrantV3(refreshed_grant)),
+            NOW + 11,
+        )
+        .unwrap_err()
+        .reason_code(),
+        ProtocolReasonCode::Conflict
+    );
 
     let stale_answer_claims = target.claims(&controller.device_id);
     let stale_answer = RelayMigrationAnswer::sign(
@@ -855,32 +880,19 @@ fn relay_migration_enforces_generation_binding_grant_participants_and_close() {
         },
     )
     .unwrap();
-    assert_eq!(
-        core.handle(
+    let deliveries = core
+        .handle(
             target.connection_id,
             SignalEnvelope::new(AuthenticatedSignalMessage::RelayMigrationAnswer(
                 stale_answer,
             )),
             NOW + 12,
         )
-        .unwrap_err()
-        .reason_code(),
-        ProtocolReasonCode::Conflict
+        .unwrap();
+    assert_eq!(
+        deliveries[0].target,
+        DeliveryTarget::Connection(controller.connection_id)
     );
-    let reset_offer = offer(
-        &mut controller,
-        &target.device_id,
-        1,
-        "directory-reset",
-        "relay-reset",
-        &fingerprint,
-    );
-    core.handle(
-        controller.connection_id,
-        SignalEnvelope::new(AuthenticatedSignalMessage::RelayMigrationOffer(reset_offer)),
-        NOW + 13,
-    )
-    .unwrap();
 
     let injected = offer(
         &mut random,

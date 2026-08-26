@@ -36,6 +36,40 @@ impl SignalEnvelope {
         }
         Ok(())
     }
+
+    /// Validate the mandatory envelope/message pairing before decoding a
+    /// potentially sensitive authenticated payload.
+    pub fn validate_wire_version(
+        version: u64,
+        message_type: &str,
+    ) -> Result<(), SignalProtocolError> {
+        let required = match message_type {
+            "session_intent" | "session_grant" | "webrtc_offer" | "webrtc_answer"
+            | "webrtc_candidate" => return Err(SignalProtocolError::UnsupportedVersion),
+            "session_intent_v3"
+            | "session_grant_v3"
+            | "webrtc_offer_v3"
+            | "webrtc_answer_v3"
+            | "webrtc_candidate_v3" => u64::from(SIGNAL_PROTOCOL_V3),
+            "server_challenge"
+            | "register"
+            | "registered"
+            | "presence_heartbeat"
+            | "session_deny"
+            | "relay_migration_offer"
+            | "relay_migration_answer"
+            | "relay_migration_candidate"
+            | "session_close"
+            | "reconnect_request"
+            | "reconnect_grant"
+            | "protocol_error" => u64::from(SIGNAL_PROTOCOL_V2),
+            _ => return Ok(()),
+        };
+        if version != required {
+            return Err(SignalProtocolError::UnsupportedVersion);
+        }
+        Ok(())
+    }
 }
 
 impl<'de> Deserialize<'de> for SignalEnvelope {
