@@ -2,7 +2,7 @@
 
 - Date: 2026-08-26
 - Branch: `codex/multi-region-turn-relay`
-- Implementation commits: `e3c39a23`, `af91b9e9`, `534577f9`
+- Implementation commits: `e3c39a23`, `af91b9e9`, `534577f9`, `1c44870a`
 Overall live verdict: **INFRA_FAIL**
 
 This record distinguishes deterministic implementation evidence from real
@@ -16,10 +16,11 @@ product pass is claimed.
 
 - Controller OS/toolchain: Windows x86_64 MSVC, Rust/Cargo 1.89.0,
   Windows PowerShell 5.1.26100.9032, Python 3.12.10.
-- Repository revision verified: `534577f90681` before this acceptance record.
-- `docker.exe` and `wsl.exe` were present locally, but neither was configured
-  as an MRD relay lab host and neither is acceptance evidence.
-- No local `turnserver` / `coturn` executable was discovered.
+- Repository revision verified: `1c44870a69b9` before this record update.
+- Docker Desktop client/server 29.2.1 was available. A temporary, single-host
+  coturn container was exercised for local transport evidence only; it was not
+  configured as an MRD relay agent, broker, or multi-region lab node.
+- No native local `turnserver` / `coturn` executable was discovered.
 - `MRD_TEST_DATABASE_URL` was not configured, so PostgreSQL-only FastAPI rows
   remained environment-gated locally. `.github/workflows/relay-control.yml`
   provisions PostgreSQL and makes those rows mandatory in CI.
@@ -31,7 +32,7 @@ product pass is claimed.
 | Relay selection / directory | PASS | `mrd-relay-control`: 27 tests including the compile-fail doc contract |
 | Cross-platform node agent | PASS | `mrd-relay-agent`: 209 tests across runtime, broker, platform, metrics, CLI, and secure stores |
 | Authenticated migration protocol | PASS | `mrd-signal-proto`: 10 tests; `realtime-server`: 6 tests |
-| WebRTC relay migration | PASS (live TURN rows not counted) | Package suite passed; 4 live/perf rows ignored, including 2 `MRD_TEST_TURN_*` rows |
+| WebRTC relay migration | PASS (multi-host rows not counted) | 86 unit, 18 integration, and 0 doc tests passed; 4 live/perf rows ignored in the ordinary package run. Local coturn UDP and TCP live rows were then invoked explicitly and passed. |
 | Session service | PASS | `mrd-service`: 778 tests passed, 4 environment/hardware rows ignored |
 | Backend | PASS for configured local rows | FastAPI: 348 passed, 78 PostgreSQL-gated rows skipped without `MRD_TEST_DATABASE_URL` |
 | Deployment contract | PASS | `deploy/turn/test_deploy_contract.ps1` |
@@ -39,6 +40,16 @@ product pass is claimed.
 | Quality and workflow gates | PASS | `mrd-quality-gate`: 48 tests; PowerShell orchestration contracts PASS |
 | Formatting | PASS | `cargo fmt --all -- --check`; `git diff --check` |
 | Strict focused Clippy | PASS | relay-control, relay-agent, signal, realtime, WebRTC, and quality-gate with `--no-deps -D warnings` |
+
+The WebRTC transport's upstream `webrtc-ice` 0.12 dependency does not gather
+TURN/TCP or TURN/TLS candidates. Commit `1c44870a` supplies a bounded,
+peer-owned stream bridge that preserves TURN allocation isolation, STUN and
+ChannelData framing, TCP, strict platform-certificate TLS, and cleanup across
+initial and restarted physical peers. Eight focused bridge tests passed,
+including trusted TLS framing and proof that TLS endpoints never downgrade to
+plaintext. `cargo clippy -p mrd-transport-webrtc --lib -- -D warnings` passed.
+The all-target variant remains blocked by pre-existing strict warnings in
+`vendor/nvenc`; no third-party source was changed.
 
 The first full FastAPI invocation hit a Windows ACL denial in pytest's default
 user temp root before affected tests were executed. Re-running the same suite
@@ -55,6 +66,36 @@ One WebRTC cleanup-capacity test failed once on an immediate scheduler-entry
 assertion. The exact test then passed five consecutive isolated runs and the
 entire WebRTC package passed on the immediate full rerun. No product change was
 made for the single non-reproducible scheduling event.
+
+## Single-host local coturn evidence
+
+This is transport smoke evidence, not multi-region or Windows node-mode
+acceptance. Docker ran the exact image manifest
+`coturn/coturn:4.17.2@sha256:aa68aab64a3b929d57fc2924c98ea447bf996cf8dade2508e7b71eaf23f1f14e`
+with local-only ephemeral credentials, UDP/TCP port 34789, and relay ports
+40000-40031. Loopback peers were allowed solely because both test WebRTC peers
+ran on this controller.
+
+| Local row | Result | Evidence |
+| --- | --- | --- |
+| Forced TURN/UDP | PASS | Selected pair was relay/relay and real media/control probes completed |
+| Direct to TURN/UDP restart | PASS | Restart validation, route commit, and post-switch media/control completed |
+| Forced TURN/TCP | PASS | Selected pair was relay/relay through the stream bridge and real media/control probes completed |
+| Direct to TURN/TCP restart | PASS | Restart validation, route commit, and post-switch media/control completed |
+| TURN/TLS framing and trust | PASS (deterministic) | Trusted IP certificate completed an encrypted bridge round trip; a plaintext endpoint was rejected with no downgrade |
+| Public-certificate coturn TLS | NOT RUN | Requires the external lab certificate and public endpoint |
+
+## Client mainline integration boundary
+
+The proxy/control-plane acceptance scope currently begins with an already
+authenticated, connected relay session. `mrd-service` can consume and emit
+authenticated migration messages and execute failover, but
+`install_connected_relay_session` has no production caller and the service
+does not yet orchestrate the initial WAN grant/offer/answer/candidate flow.
+The legacy Rdesk signaling path is not a substitute for that thin-shell
+architecture. Therefore a fresh end-user WAN session through the new local
+service is **not accepted** by this record; it needs a separate initial-session
+integration plan and security design for candidate commitments.
 
 ## Required live topology and host modes
 
