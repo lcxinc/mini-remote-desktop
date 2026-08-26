@@ -946,6 +946,7 @@ export type RemoteAuthorizationState =
   | "locked_out"
   | "policy_changed";
 export type RemoteRouteKind = "lan_quic" | "webrtc_direct" | "webrtc_relay";
+export type RemoteRoutePreference = "auto" | "lan" | "wan_relay";
 export type RemoteRouteState =
   | "idle"
   | "gathering"
@@ -979,6 +980,7 @@ export interface RemoteSessionRequest {
   session_id: string;
   target_device_id: string;
   access_mode: RemoteAccessMode;
+  route_preference?: RemoteRoutePreference;
   requested_scopes: RemotePermissionScope[];
   requested_profile?: MediaProfile | null;
 }

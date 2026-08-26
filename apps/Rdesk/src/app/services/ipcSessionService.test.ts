@@ -41,6 +41,7 @@ describe("startLanRemoteSession", () => {
       session_id: "session-1",
       target_device_id: "target-1",
       access_mode: "attended",
+      route_preference: "auto",
       requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
       requested_profile: profile,
     });

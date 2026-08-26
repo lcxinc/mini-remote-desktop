@@ -194,6 +194,7 @@ export const startLanRemoteSession = async (
     session_id: sessionId,
     target_device_id: targetDeviceId,
     access_mode: "attended",
+    route_preference: "auto",
     requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
     requested_profile: requestedProfile ?? null,
   });
