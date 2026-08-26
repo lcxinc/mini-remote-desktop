@@ -24,7 +24,7 @@ _CHECK_CAST = re.compile(
     flags=re.IGNORECASE,
 )
 _LOCK_CONTEXT = b"MRD_RELAY_ACCESS_SCHEMA_MIGRATION_V1\x00"
-_VERSIONS = (1, 2, 3, 4, 5)
+_VERSIONS = (1, 2, 3, 4, 5, 6)
 
 
 class RelayAccessMigrationError(RuntimeError):
@@ -81,8 +81,10 @@ async def _migrate_connection(
     users = _table(schema, "users")
     devices = _table(schema, "devices")
     sessions = _table(schema, "session_requests")
+    relay_nodes = _table(schema, "relay_nodes")
     device_enrollments = _table(schema, "device_enrollments")
     reservations = _table(schema, "relay_reservations")
+    generations = _table(schema, "relay_access_generations")
     versions = _table(schema, "relay_access_schema_migrations")
     ledger_exists = await connection.run_sync(
         lambda sync: inspect(sync).has_table(
@@ -118,6 +120,7 @@ async def _migrate_connection(
         set(),
         {1, 2, 3},
         {1, 2, 3, 4},
+        {1, 2, 3, 4, 5},
     )
     if applied_versions not in supported_upgrade_states:
         # Versions 1-3 shipped as one atomic legacy migration. A partial legacy
@@ -130,9 +133,10 @@ async def _migrate_connection(
     apply_legacy_access = not applied_versions
     apply_device_identity = 4 not in applied_versions
     apply_directory_lifecycle = 5 not in applied_versions
+    apply_wan_session = 6 not in applied_versions
     required_tables = (
         "users", "devices", "session_requests", "relay_nodes",
-        "relay_node_registrations", "relay_audit_events",
+        "relay_node_registrations", "relay_audit_events", "relay_reservations",
     )
     present = await connection.run_sync(
         lambda sync: {
@@ -211,12 +215,63 @@ async def _migrate_connection(
         f"ALTER TABLE {reservations} ADD COLUMN IF NOT EXISTS "
         "directory_generation VARCHAR(64)",
     )
+    wan_session_statements = (
+        f"ALTER TABLE {sessions} ADD COLUMN IF NOT EXISTS requester_device_id VARCHAR(36)",
+        f"ALTER TABLE {sessions} ADD COLUMN IF NOT EXISTS request_payload JSONB",
+        f"ALTER TABLE {sessions} ADD COLUMN IF NOT EXISTS "
+        "request_commitment VARCHAR(64)",
+        f"ALTER TABLE {sessions} ADD COLUMN IF NOT EXISTS access_mode VARCHAR(24)",
+        f"ALTER TABLE {sessions} ADD COLUMN IF NOT EXISTS route_policy VARCHAR(24)",
+        f"ALTER TABLE {sessions} ADD COLUMN IF NOT EXISTS requested_scopes JSONB",
+        f"ALTER TABLE {sessions} ADD COLUMN IF NOT EXISTS requested_profile JSONB",
+        f"ALTER TABLE {sessions} ADD COLUMN IF NOT EXISTS approved_scopes JSONB",
+        f"ALTER TABLE {sessions} ADD COLUMN IF NOT EXISTS approved_profile JSONB",
+        f"ALTER TABLE {sessions} ADD COLUMN IF NOT EXISTS active_relay_generation BIGINT",
+    )
     for statement in (
         (legacy_statements if apply_legacy_access else ())
         + (device_identity_statements if apply_device_identity else ())
         + (directory_lifecycle_statements if apply_directory_lifecycle else ())
+        + (wan_session_statements if apply_wan_session else ())
     ):
         await connection.execute(text(statement))
+
+    if apply_wan_session:
+        await connection.execute(
+            text(
+                f"""
+            CREATE TABLE IF NOT EXISTS {generations} (
+                session_id VARCHAR(36) NOT NULL,
+                generation BIGINT NOT NULL,
+                directory_id VARCHAR(64) NOT NULL,
+                signed_directory JSONB NOT NULL,
+                signing_key_id VARCHAR(64) NOT NULL,
+                signature_b64 VARCHAR(128) NOT NULL,
+                relay_url_digest VARCHAR(64) NOT NULL,
+                primary_node_id VARCHAR(128) NOT NULL,
+                reservation_ids JSONB NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                CONSTRAINT relay_access_generations_pkey
+                    PRIMARY KEY (session_id, generation),
+                CONSTRAINT relay_access_generations_directory_id_key
+                    UNIQUE (directory_id),
+                CONSTRAINT relay_access_generations_session_id_fkey
+                    FOREIGN KEY (session_id) REFERENCES {sessions}(id)
+                    ON DELETE CASCADE,
+                CONSTRAINT relay_access_generations_primary_node_id_fkey
+                    FOREIGN KEY (primary_node_id) REFERENCES {relay_nodes}(node_id)
+                    ON DELETE RESTRICT,
+                CONSTRAINT ck_relay_access_generations_generation
+                    CHECK (generation >= 0),
+                CONSTRAINT ck_relay_access_generations_url_digest
+                    CHECK (length(relay_url_digest) = 64),
+                CONSTRAINT ck_relay_access_generations_expiry
+                    CHECK (expires_at > created_at)
+            )
+                """
+            )
+        )
 
     # Reject wrong historical types before any backfill can coerce or partially
     # rewrite a malformed deployment.
@@ -333,10 +388,17 @@ async def _migrate_connection(
         (sessions, f"{effective_schema}.session_requests", "ck_session_requests_status", "status IN ('requested', 'approved', 'rejected', 'expired', 'closed', 'revoked')"),
         (sessions, f"{effective_schema}.session_requests", "ck_session_requests_policy_revision", "policy_revision IS NULL OR policy_revision > 0"),
         (sessions, f"{effective_schema}.session_requests", "ck_session_requests_approved_bundle", "status <> 'approved' OR (grant_expires_at IS NOT NULL AND policy_revision IS NOT NULL AND policy_expires_at IS NOT NULL AND intended_peer_id IS NOT NULL AND relay_allowed_regions IS NOT NULL AND relay_preferred_regions IS NOT NULL AND relay_accepted_transports IS NOT NULL)"),
+        (sessions, f"{effective_schema}.session_requests", "ck_session_requests_wan_request_bundle", "(requester_device_id IS NULL AND request_payload IS NULL AND request_commitment IS NULL AND access_mode IS NULL AND route_policy IS NULL AND requested_scopes IS NULL AND requested_profile IS NULL AND approved_scopes IS NULL AND approved_profile IS NULL AND active_relay_generation IS NULL) OR (requester_device_id IS NOT NULL AND request_payload IS NOT NULL AND request_commitment IS NOT NULL AND length(request_commitment) = 64 AND access_mode IS NOT NULL AND route_policy IS NOT NULL AND requested_scopes IS NOT NULL)"),
+        (sessions, f"{effective_schema}.session_requests", "ck_session_requests_wan_values", "requester_device_id IS NULL OR (requester_device_id <> target_device_id AND access_mode = 'attended' AND route_policy = 'relay_only')"),
+        (sessions, f"{effective_schema}.session_requests", "ck_session_requests_wan_approval_bundle", "requester_device_id IS NULL OR status <> 'approved' OR (approved_scopes IS NOT NULL AND policy_expires_at IS NOT NULL AND active_relay_generation IS NOT NULL AND active_relay_generation >= 0)"),
+        (sessions, f"{effective_schema}.session_requests", "ck_session_requests_active_relay_generation", "active_relay_generation IS NULL OR (requester_device_id IS NOT NULL AND active_relay_generation >= 0)"),
     )
     for table_name, regclass, name, expression in checks:
         should_apply = (
-            (name == "ck_session_requests_status" and (
+            ((name.startswith("ck_session_requests_wan_")
+              or name == "ck_session_requests_active_relay_generation")
+             and apply_wan_session)
+            or (name == "ck_session_requests_status" and (
                 apply_legacy_access or apply_directory_lifecycle
             ))
             or (name in {
@@ -349,6 +411,10 @@ async def _migrate_connection(
                 "ck_devices_auth_version",
                 "ck_devices_serial_digest",
                 "ck_devices_plaintext_serial_cleared",
+                "ck_session_requests_wan_request_bundle",
+                "ck_session_requests_wan_values",
+                "ck_session_requests_wan_approval_bundle",
+                "ck_session_requests_active_relay_generation",
             } and apply_legacy_access)
         )
         if not should_apply:
@@ -373,6 +439,17 @@ async def _migrate_connection(
                 "ON DELETE RESTRICT"
             ),
         )
+    if apply_wan_session:
+        await _add_constraint(
+            connection,
+            table=sessions,
+            regclass=f"{effective_schema}.session_requests",
+            name="session_requests_requester_device_id_fkey",
+            expression=(
+                f"FOREIGN KEY (requester_device_id) REFERENCES {devices}(id) "
+                "ON DELETE CASCADE"
+            ),
+        )
         await _add_constraint(
             connection,
             table=sessions,
@@ -393,9 +470,20 @@ async def _migrate_connection(
         f"CREATE UNIQUE INDEX IF NOT EXISTS ix_devices_motherboard_serial_digest "
         f"ON {devices} (motherboard_serial_digest)",
     )
+    wan_session_indexes = (
+        f"CREATE INDEX IF NOT EXISTS ix_session_requests_requester_device_id "
+        f"ON {sessions} (requester_device_id)",
+        f"CREATE INDEX IF NOT EXISTS ix_session_requests_active_relay_generation "
+        f"ON {sessions} (active_relay_generation)",
+        f"CREATE INDEX IF NOT EXISTS ix_relay_access_generations_expiry "
+        f"ON {generations} (expires_at)",
+        f"CREATE INDEX IF NOT EXISTS ix_relay_access_generations_primary_node "
+        f"ON {generations} (primary_node_id)",
+    )
     for statement in (
         (legacy_indexes if apply_legacy_access else ())
         + (identity_indexes if apply_device_identity else ())
+        + (wan_session_indexes if apply_wan_session else ())
     ):
         await connection.execute(text(statement))
 
@@ -551,6 +639,7 @@ def _auth_specs() -> dict[str, dict[str, tuple[type[object], int | None, bool]]]
         "session_requests": {
             "id": (String, 36, False),
             "requester_user_id": (String, 36, False),
+            "requester_device_id": (String, 36, True),
             "target_device_id": (String, 36, False),
             "signaling_room": (String, 128, False),
             "tenant_id": (String, 64, False),
@@ -562,6 +651,15 @@ def _auth_specs() -> dict[str, dict[str, tuple[type[object], int | None, bool]]]
             "relay_allowed_regions": (JSONB, None, True),
             "relay_preferred_regions": (JSONB, None, True),
             "relay_accepted_transports": (JSONB, None, True),
+            "request_payload": (JSONB, None, True),
+            "request_commitment": (String, 64, True),
+            "access_mode": (String, 24, True),
+            "route_policy": (String, 24, True),
+            "requested_scopes": (JSONB, None, True),
+            "requested_profile": (JSONB, None, True),
+            "approved_scopes": (JSONB, None, True),
+            "approved_profile": (JSONB, None, True),
+            "active_relay_generation": (BigInteger, None, True),
         },
     }
 
@@ -1019,6 +1117,169 @@ def _verify_device_enrollment_table(
     )
 
 
+def _verify_relay_access_generation_table(
+    connection: object, schema: str | None, *, current_schema: str
+) -> None:
+    inspector = inspect(connection)
+    table_name = "relay_access_generations"
+    if not inspector.has_table(table_name, schema=schema):
+        raise RelayAccessMigrationError(
+            "relay access generation table is unavailable"
+        )
+    expected_columns = {
+        "session_id": (String, 36, False),
+        "generation": (BigInteger, None, False),
+        "directory_id": (String, 64, False),
+        "signed_directory": (JSONB, None, False),
+        "signing_key_id": (String, 64, False),
+        "signature_b64": (String, 128, False),
+        "relay_url_digest": (String, 64, False),
+        "primary_node_id": (String, 128, False),
+        "reservation_ids": (JSONB, None, False),
+        "expires_at": (DateTime, None, False),
+        "created_at": (DateTime, None, False),
+    }
+    columns = {
+        column["name"]: column
+        for column in inspector.get_columns(table_name, schema=schema)
+    }
+    if set(columns) != set(expected_columns):
+        raise RelayAccessMigrationError(
+            "relay access generation columns differ"
+        )
+    for name, (expected_type, length, nullable) in expected_columns.items():
+        column = columns[name]
+        if (
+            column["nullable"] is not nullable
+            or not _type_matches(column["type"], expected_type, length)
+        ):
+            raise RelayAccessMigrationError(
+                f"relay access generation differs for {name}"
+            )
+        expected_default = "now()" if name == "created_at" else None
+        actual_default = column["default"]
+        if (
+            actual_default is not None
+            if expected_default is None
+            else _normalize_server_default(actual_default) != expected_default
+        ):
+            raise RelayAccessMigrationError(
+                f"relay access generation default differs for {name}"
+            )
+
+    if not _primary_key_matches(
+        inspector.get_pk_constraint(table_name, schema=schema),
+        name="relay_access_generations_pkey",
+        columns=("session_id", "generation"),
+    ):
+        raise RelayAccessMigrationError(
+            "relay access generation primary key differs"
+        )
+
+    actual_unique = {
+        _unique_constraint_signature(constraint)
+        for constraint in inspector.get_unique_constraints(
+            table_name, schema=schema
+        )
+    }
+    expected_unique = {
+        (
+            "relay_access_generations_directory_id_key",
+            ("directory_id",),
+            False,
+            (),
+            (),
+        )
+    }
+    if actual_unique != expected_unique:
+        raise RelayAccessMigrationError(
+            "relay access generation unique constraints differ"
+        )
+
+    expected_checks = {
+        "ck_relay_access_generations_generation": "generation >= 0",
+        "ck_relay_access_generations_url_digest": (
+            "length(relay_url_digest) = 64"
+        ),
+        "ck_relay_access_generations_expiry": "expires_at > created_at",
+    }
+    actual_checks = {
+        constraint["name"]: _normalize_check_expression(constraint["sqltext"])
+        for constraint in inspector.get_check_constraints(
+            table_name, schema=schema
+        )
+    }
+    if actual_checks != {
+        name: _normalize_check_expression(expression)
+        for name, expression in expected_checks.items()
+    }:
+        raise RelayAccessMigrationError(
+            "relay access generation checks differ"
+        )
+
+    expected_foreign_keys = {
+        (
+            "relay_access_generations_session_id_fkey",
+            ("session_id",),
+            current_schema,
+            "session_requests",
+            ("id",),
+            "CASCADE",
+            "NO ACTION",
+            False,
+            None,
+            "SIMPLE",
+        ),
+        (
+            "relay_access_generations_primary_node_id_fkey",
+            ("primary_node_id",),
+            current_schema,
+            "relay_nodes",
+            ("node_id",),
+            "RESTRICT",
+            "NO ACTION",
+            False,
+            None,
+            "SIMPLE",
+        ),
+    }
+    actual_foreign_keys = {
+        _foreign_key_signature(key, current_schema=current_schema)
+        for key in inspector.get_foreign_keys(table_name, schema=schema)
+    }
+    if actual_foreign_keys != expected_foreign_keys:
+        raise RelayAccessMigrationError(
+            "relay access generation foreign keys differ"
+        )
+
+    _assert_constraint_states(
+        connection,
+        schema=current_schema,
+        table_name=table_name,
+        expected_types={
+            "relay_access_generations_pkey": "p",
+            "relay_access_generations_directory_id_key": "u",
+            **{name: "c" for name in expected_checks},
+            **{str(signature[0]): "f" for signature in expected_foreign_keys},
+        },
+        exact=True,
+    )
+    _verify_exact_indexes(
+        connection,
+        inspector,
+        schema=schema,
+        current_schema=current_schema,
+        table_name=table_name,
+        expected={
+            "ix_relay_access_generations_expiry": (("expires_at",), False),
+            "ix_relay_access_generations_primary_node": (
+                ("primary_node_id",),
+                False,
+            ),
+        },
+    )
+
+
 def _verify(connection: object, schema: str | None) -> None:
     inspector = inspect(connection)
     effective_schema = schema or connection.scalar(text("SELECT current_schema()"))
@@ -1031,6 +1292,9 @@ def _verify(connection: object, schema: str | None) -> None:
             "relay access control schema differs"
         ) from error
     _verify_device_enrollment_table(
+        connection, schema, current_schema=effective_schema
+    )
+    _verify_relay_access_generation_table(
         connection, schema, current_schema=effective_schema
     )
     for table_name, expected in _auth_specs().items():
@@ -1061,6 +1325,16 @@ def _verify(connection: object, schema: str | None) -> None:
                 "relay_allowed_regions",
                 "relay_preferred_regions",
                 "relay_accepted_transports",
+                "requester_device_id",
+                "request_payload",
+                "request_commitment",
+                "access_mode",
+                "route_policy",
+                "requested_scopes",
+                "requested_profile",
+                "approved_scopes",
+                "approved_profile",
+                "active_relay_generation",
             }
         }.get(table_name, set())
         if any(columns[name]["default"] is not None for name in no_default_columns):
@@ -1114,6 +1388,31 @@ def _verify(connection: object, schema: str | None) -> None:
             ),
             "ck_session_requests_policy_revision": "policy_revision IS NULL OR policy_revision > 0",
             "ck_session_requests_approved_bundle": "status <> 'approved' OR grant_expires_at IS NOT NULL AND policy_revision IS NOT NULL AND policy_expires_at IS NOT NULL AND intended_peer_id IS NOT NULL AND relay_allowed_regions IS NOT NULL AND relay_preferred_regions IS NOT NULL AND relay_accepted_transports IS NOT NULL",
+            "ck_session_requests_wan_request_bundle": (
+                "requester_device_id IS NULL AND request_payload IS NULL AND "
+                "request_commitment IS NULL AND access_mode IS NULL AND "
+                "route_policy IS NULL AND requested_scopes IS NULL AND "
+                "requested_profile IS NULL AND approved_scopes IS NULL AND "
+                "approved_profile IS NULL AND active_relay_generation IS NULL OR "
+                "requester_device_id IS NOT NULL AND request_payload IS NOT NULL AND "
+                "request_commitment IS NOT NULL AND length(request_commitment) = 64 AND "
+                "access_mode IS NOT NULL AND route_policy IS NOT NULL AND "
+                "requested_scopes IS NOT NULL"
+            ),
+            "ck_session_requests_wan_values": (
+                "requester_device_id IS NULL OR "
+                "requester_device_id <> target_device_id AND "
+                "access_mode = 'attended' AND route_policy = 'relay_only'"
+            ),
+            "ck_session_requests_wan_approval_bundle": (
+                "requester_device_id IS NULL OR status <> 'approved' OR "
+                "approved_scopes IS NOT NULL AND policy_expires_at IS NOT NULL AND "
+                "active_relay_generation IS NOT NULL AND active_relay_generation >= 0"
+            ),
+            "ck_session_requests_active_relay_generation": (
+                "active_relay_generation IS NULL OR requester_device_id IS NOT NULL "
+                "AND active_relay_generation >= 0"
+            ),
         },
     }
     for table_name, expected in required_checks.items():
@@ -1199,6 +1498,18 @@ def _verify(connection: object, schema: str | None) -> None:
                 "SIMPLE",
             ),
             (
+                "session_requests_requester_device_id_fkey",
+                ("requester_device_id",),
+                effective_schema,
+                "devices",
+                ("id",),
+                "CASCADE",
+                "NO ACTION",
+                False,
+                None,
+                "SIMPLE",
+            ),
+            (
                 "session_requests_intended_peer_id_fkey",
                 ("intended_peer_id",),
                 effective_schema,
@@ -1238,6 +1549,7 @@ def _verify(connection: object, schema: str | None) -> None:
             "session_requests_requester_user_id_fkey": "f",
             "session_requests_target_device_id_fkey": "f",
             "session_requests_intended_peer_id_fkey": "f",
+            "session_requests_requester_device_id_fkey": "f",
         },
     }
     for table_name, expected_types in required_constraint_types.items():
@@ -1267,6 +1579,12 @@ def _verify(connection: object, schema: str | None) -> None:
         "session_requests": {
             "ix_session_requests_requester_user_id": (
                 ("requester_user_id",), False
+            ),
+            "ix_session_requests_requester_device_id": (
+                ("requester_device_id",), False
+            ),
+            "ix_session_requests_active_relay_generation": (
+                ("active_relay_generation",), False
             ),
             "ix_session_requests_signaling_room": (("signaling_room",), False),
             "ix_session_requests_target_device_id": (

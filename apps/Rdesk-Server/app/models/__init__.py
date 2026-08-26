@@ -7,6 +7,7 @@ from app.models.relay_audit_event import RelayAuditEvent
 from app.models.relay_node import RelayNode
 from app.models.relay_node_registration import RelayNodeRegistration
 from app.models.relay_reservation import RelayReservation
+from app.models.relay_access_generation import RelayAccessGeneration
 from app.models.session_request import SessionRequest
 from app.models.user import User
 
@@ -23,4 +24,5 @@ __all__ = [
     "RelayNodeRegistration",
     "RelayAuditEvent",
     "RelayReservation",
+    "RelayAccessGeneration",
 ]

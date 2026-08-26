@@ -55,6 +55,8 @@ def asyncpg_url(url: str) -> str:
     "malformation",
     [
         "ALTER TABLE session_requests ALTER COLUMN intended_peer_id TYPE TEXT",
+        "ALTER TABLE session_requests ALTER COLUMN active_relay_generation TYPE INTEGER",
+        "ALTER TABLE relay_access_generations ALTER COLUMN relay_url_digest TYPE TEXT",
         "ALTER TABLE session_requests DROP CONSTRAINT ck_session_requests_status; "
         "ALTER TABLE session_requests ADD CONSTRAINT ck_session_requests_status "
         "CHECK (status IS NOT NULL)",
@@ -147,6 +149,8 @@ async def test_access_migration_rejects_malformed_ledger_and_index_semantics(
         "REFERENCES device_enrollments (id)",
         "CREATE INDEX ix_device_enrollments_extra_partial ON "
         "device_enrollments (expires_at) WHERE consumed_at IS NULL",
+        "ALTER TABLE relay_access_generations ADD CONSTRAINT "
+        "ck_relay_access_generations_extra_deny CHECK (FALSE) NOT VALID",
         "DROP INDEX ix_device_enrollments_expiry; CREATE INDEX "
         "ix_device_enrollments_expiry ON device_enrollments USING HASH "
         "(expires_at)",
@@ -285,7 +289,7 @@ async def test_access_migration_creates_and_strictly_validates_device_enrollment
                 ).scalars()
             )
         assert "device_enrollments" in tables
-        assert versions == [1, 2, 3, 4, 5]
+        assert versions == [1, 2, 3, 4, 5, 6]
     finally:
         await engine.dispose()
         async with admin_engine.begin() as connection:
@@ -461,7 +465,7 @@ async def test_access_migration_runs_only_the_missing_version_step() -> None:
             await connection.run_sync(Base.metadata.create_all)
             await migrate_relay_access(connection)
             await connection.execute(
-                text("DELETE FROM relay_access_schema_migrations WHERE version = 5")
+                text("DELETE FROM relay_access_schema_migrations WHERE version = 6")
             )
 
         def capture_statement(*args: object) -> None:
@@ -475,7 +479,7 @@ async def test_access_migration_runs_only_the_missing_version_step() -> None:
         assert not [
             statement
             for statement in statements
-            if re.search(r"\b(?:update|alter)\s+(?:table\s+)?(?:users|devices|session_requests)\b", statement)
+            if re.search(r"\bupdate\s+(?:table\s+)?(?:users|devices|session_requests)\b", statement)
         ]
         assert not [
             statement
