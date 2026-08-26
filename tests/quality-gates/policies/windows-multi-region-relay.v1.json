@@ -1,0 +1,34 @@
+{
+  "id": "windows-multi-region-relay.v1",
+  "required_scenarios": [
+    "windows.multi_region.relay_failover",
+    "linux_primary_linux_backup",
+    "linux_primary_windows_backup",
+    "failure_before_allocation",
+    "regional_outage",
+    "planned_drain",
+    "soft_capacity",
+    "hard_capacity",
+    "udp_block_tls_fallback",
+    "certificate_revocation",
+    "backend_outage_existing_allocation",
+    "backend_outage_expired_cache"
+  ],
+  "allow_skips": [],
+  "thresholds": [],
+  "multi_region_relay_requirements": {
+    "route_selected": "relay",
+    "max_node_removal_ms": 10000,
+    "max_media_recovery_ms": 20000,
+    "min_video_frames_after_recovery": 1,
+    "min_audio_packets_after_recovery": 1,
+    "min_control_events_after_recovery": 1,
+    "require_signed_directory": true,
+    "require_distinct_regions": true,
+    "require_distinct_failure_domains": true,
+    "require_relay_candidate_pair": true,
+    "require_permissions_unchanged": true,
+    "require_release_all": true,
+    "require_cleanup": true
+  }
+}

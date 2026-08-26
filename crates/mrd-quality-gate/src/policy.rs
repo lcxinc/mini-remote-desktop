@@ -19,6 +19,8 @@ pub struct GatePolicy {
     pub secure_lan_requirements: Option<SecureLanRequirements>,
     #[serde(default)]
     pub security_negative_requirements: Option<SecurityNegativeRequirements>,
+    #[serde(default)]
+    pub multi_region_relay_requirements: Option<MultiRegionRelayRequirements>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -78,6 +80,24 @@ pub struct SecurityNegativeAttemptRule {
     pub rejection_reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MultiRegionRelayRequirements {
+    pub route_selected: String,
+    pub max_node_removal_ms: u64,
+    pub max_media_recovery_ms: u64,
+    pub min_video_frames_after_recovery: u64,
+    pub min_audio_packets_after_recovery: u64,
+    pub min_control_events_after_recovery: u64,
+    pub require_signed_directory: bool,
+    pub require_distinct_regions: bool,
+    pub require_distinct_failure_domains: bool,
+    pub require_relay_candidate_pair: bool,
+    pub require_permissions_unchanged: bool,
+    pub require_release_all: bool,
+    pub require_cleanup: bool,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PolicyError {
     #[error("policy id is empty")]
@@ -86,7 +106,7 @@ pub enum PolicyError {
     EmptyRequiredScenario,
     #[error("policy has no effective threshold, allowed-skip, or security rule")]
     NoEffectiveRule,
-    #[error("policy cannot combine secure-LAN positive and security-negative profiles")]
+    #[error("policy cannot combine specialized validation profiles")]
     AmbiguousSecurityProfile,
     #[error("invalid threshold rule: {0}")]
     InvalidThreshold(String),
@@ -96,6 +116,8 @@ pub enum PolicyError {
     InvalidSecureLanRequirement(String),
     #[error("invalid security-negative requirement: {0}")]
     InvalidSecurityNegativeRequirement(String),
+    #[error("invalid multi-region relay requirement: {0}")]
+    InvalidMultiRegionRelayRequirement(String),
 }
 
 pub fn validate_policy(policy: &GatePolicy) -> Result<(), PolicyError> {
@@ -109,7 +131,10 @@ pub fn validate_policy(policy: &GatePolicy) -> Result<(), PolicyError> {
     {
         return Err(PolicyError::EmptyRequiredScenario);
     }
-    if policy.secure_lan_requirements.is_some() && policy.security_negative_requirements.is_some() {
+    let validation_profiles = usize::from(policy.secure_lan_requirements.is_some())
+        + usize::from(policy.security_negative_requirements.is_some())
+        + usize::from(policy.multi_region_relay_requirements.is_some());
+    if validation_profiles > 1 {
         return Err(PolicyError::AmbiguousSecurityProfile);
     }
 
@@ -181,10 +206,29 @@ pub fn validate_policy(policy: &GatePolicy) -> Result<(), PolicyError> {
         validate_negative_attempt_rules(policy, requirements)?;
     }
 
+    if let Some(requirements) = &policy.multi_region_relay_requirements {
+        if requirements.route_selected != "relay" {
+            return Err(PolicyError::InvalidMultiRegionRelayRequirement(
+                "route_selected must be relay".to_owned(),
+            ));
+        }
+        if requirements.max_node_removal_ms == 0
+            || requirements.max_media_recovery_ms == 0
+            || requirements.min_video_frames_after_recovery == 0
+            || requirements.min_audio_packets_after_recovery == 0
+            || requirements.min_control_events_after_recovery == 0
+        {
+            return Err(PolicyError::InvalidMultiRegionRelayRequirement(
+                "timing bounds and restored media minima must be positive".to_owned(),
+            ));
+        }
+    }
+
     if policy.thresholds.is_empty()
         && policy.allow_skips.is_empty()
         && policy.secure_lan_requirements.is_none()
         && policy.security_negative_requirements.is_none()
+        && policy.multi_region_relay_requirements.is_none()
     {
         return Err(PolicyError::NoEffectiveRule);
     }

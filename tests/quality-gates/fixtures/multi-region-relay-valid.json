@@ -1,0 +1,25 @@
+{
+  "schema_version": "remote-experience-run.v2",
+  "run_id": "multi-region-relay-001",
+  "scenario": {"id": "windows.multi_region.relay_failover", "required": true},
+  "route": {"requested": "relay", "selected": "relay", "candidate_pair": "relay/relay"},
+  "media": {"requested_profile": "1080p60-h264", "selected_profile": "1080p60-h264", "profile_downgraded": false},
+  "present": {"visible_first_frame_ms": 240.0, "input_to_photon_ms": [72.0], "fps_windows": [59.0, 60.0], "freeze_count": 1, "stall_ms": [2000.0]},
+  "resources": {"cpu_percent": [18.0], "gpu_percent": [30.0], "rss_bytes": [1200000], "vram_bytes": [2200000]},
+  "producer_status": "completed",
+  "gate_status": "PASS",
+  "audit_event_ids": ["relay-directory-001", "relay-failure-001", "relay-migrated-001", "relay-cleanup-001"],
+  "relay": {
+    "directory": {"directory_id": "directory-001", "session_id": "relay-session-001", "signing_key_id": "relay-key-v1", "signature_verified": true, "policy_revision": 7, "expires_at_ms": 60000},
+    "primary": {"node_id": "relay-linux-a", "region": "ap-east", "failure_domain": "rack-a"},
+    "backup": {"node_id": "relay-windows-b", "region": "eu-west", "failure_domain": "rack-b"},
+    "reservation": {"primary_reservation_id": "reservation-primary", "primary_node_id": "relay-linux-a", "backup_reservation_id": "reservation-backup", "backup_node_id": "relay-windows-b", "committed": true, "expires_at_ms": 30000},
+    "selected_pair": {"relay_node_id": "relay-windows-b", "local_candidate_type": "relay", "remote_candidate_type": "relay", "transport": "tls", "nominated": true, "runtime_verified": true},
+    "allocation": {"primary_allocation_id": "allocation-primary", "primary_node_id": "relay-linux-a", "backup_allocation_id": "allocation-backup", "backup_node_id": "relay-windows-b", "primary_established": true, "backup_established": true, "relayed_bytes_before_failure": 1048576},
+    "injected_failure": {"kind": "process_kill", "target_node_id": "relay-linux-a", "injected_at_ms": 10000},
+    "detection": {"source": "webrtc_ice_failed", "detected_at_ms": 10500, "removed_at_ms": 11000},
+    "generation": {"before": 0, "after": 1},
+    "restored_media": {"backup_node_id": "relay-windows-b", "media_resumed": true, "resumed_at_ms": 12000, "video_frames_after_recovery": 120, "audio_packets_after_recovery": 240, "control_events_after_recovery": 2, "permissions_unchanged": true, "release_all_recorded": true},
+    "cleanup": {"reservation_released": true, "old_allocation_closed": true, "replacement_allocation_closed": true, "input_thawed": true, "lab_reset": true}
+  }
+}

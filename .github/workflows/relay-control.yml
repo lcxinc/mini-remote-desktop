@@ -1,0 +1,145 @@
+name: Relay Control
+
+on:
+  pull_request:
+    paths:
+      - "apps/Rdesk-Server/**"
+      - "apps/mrd-relay-agent/**"
+      - "crates/mrd-relay-control/**"
+      - "crates/mrd-quality-gate/**"
+      - "tests/benchmarks/scripts/*multi_region_relay*"
+      - "tests/quality-gates/**"
+      - ".github/workflows/relay-control.yml"
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+
+jobs:
+  relay-backend-postgres:
+    name: Relay backend PostgreSQL contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: mrd_relay_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d mrd_relay_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      MRD_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/mrd_relay_test
+      PYTHONPATH: ${{ github.workspace }}/apps/Rdesk-Server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: apps/Rdesk-Server/requirements-dev.txt
+      - name: Install backend test dependencies
+        working-directory: apps/Rdesk-Server
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run in-memory and PostgreSQL relay repository tests
+        working-directory: apps/Rdesk-Server
+        run: >-
+          python -m pytest -q
+          tests/test_relay_repository.py
+          tests/test_relay_repository_postgres.py
+          tests/test_relay_directory_postgres.py
+
+  relay-control-rust:
+    name: Relay control Rust contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test relay selection and signed directory
+        run: cargo test -p mrd-relay-control
+
+  relay-agent-linux:
+    name: Linux relay agent build
+    needs: relay-control-rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Linux relay agent
+        run: cargo build -p mrd-relay-agent
+      - name: Test Linux relay agent
+        run: cargo test -p mrd-relay-agent
+
+  relay-agent-windows:
+    name: Windows relay agent build
+    needs: relay-control-rust
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Windows relay agent
+        run: cargo build -p mrd-relay-agent
+      - name: Test Windows relay agent
+        run: cargo test -p mrd-relay-agent
+
+  relay-control-gate:
+    name: Deterministic relay control gate
+    needs: [relay-backend-postgres, relay-control-rust, relay-agent-linux, relay-agent-windows]
+    if: always()
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run deterministic multi-region orchestration contracts
+        id: relay-contracts
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass `
+            -File tests/benchmarks/scripts/test_multi_region_relay.ps1 2>&1 `
+            | Tee-Object -FilePath multi-region-relay-contracts.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p mrd-quality-gate 2>&1 | Tee-Object -FilePath multi-region-relay-quality-gate.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload deterministic relay gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-control-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            multi-region-relay-contracts.log
+            multi-region-relay-quality-gate.log
+          if-no-files-found: warn
+      - name: Enforce relay control gate
+        if: always()
+        shell: powershell
+        run: |
+          $dependencyResults = @(
+            "${{ needs.relay-backend-postgres.result }}",
+            "${{ needs.relay-control-rust.result }}",
+            "${{ needs.relay-agent-linux.result }}",
+            "${{ needs.relay-agent-windows.result }}"
+          )
+          if ($dependencyResults -contains "failure" -or $dependencyResults -contains "cancelled") {
+            [Console]::Error.WriteLine("A required relay control dependency failed")
+            exit 3
+          }
+          if ("${{ steps.relay-contracts.outcome }}" -ne "success") {
+            [Console]::Error.WriteLine("Deterministic relay control contracts failed")
+            exit 2
+          }
