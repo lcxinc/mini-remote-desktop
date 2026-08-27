@@ -50,6 +50,9 @@ pub struct AppState {
     /// Optional device-authenticated WAN session backend configured at process startup.
     wan_session_backend:
         Arc<RwLock<Option<Arc<dyn crate::wan_session::backend::WanSessionBackend>>>>,
+    /// Process-wide authoritative attended WAN session state coordinator.
+    wan_session_coordinator:
+        Arc<RwLock<Option<Arc<crate::wan_session::coordinator::WanSessionCoordinator>>>>,
     /// Optional production relay failover coordinator configured after signaling starts.
     relay_failover_coordinator: Arc<RwLock<Option<Arc<crate::relay::RelayFailoverCoordinator>>>>,
     /// Service-owned security and operations audit events.
@@ -477,6 +480,7 @@ impl AppState {
             webrtc_host: Arc::new(crate::transports::webrtc::ServiceWebRtcTransportHost::new()),
             relay_directory_client: Arc::new(RwLock::new(None)),
             wan_session_backend: Arc::new(RwLock::new(None)),
+            wan_session_coordinator: Arc::new(RwLock::new(None)),
             relay_failover_coordinator: Arc::new(RwLock::new(None)),
             audit_log: Arc::new(audit_log),
             device_identities: Arc::new(device_identities),
@@ -584,6 +588,32 @@ impl AppState {
         &self,
     ) -> Option<Arc<dyn crate::wan_session::backend::WanSessionBackend>> {
         self.wan_session_backend
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    /// Install the process-wide WAN session coordinator exactly once.
+    pub fn bind_wan_session_coordinator(
+        &self,
+        coordinator: Arc<crate::wan_session::coordinator::WanSessionCoordinator>,
+    ) -> Result<(), &'static str> {
+        let mut slot = self
+            .wan_session_coordinator
+            .write()
+            .map_err(|_| "WAN session coordinator lock poisoned")?;
+        if slot.is_some() {
+            return Err("WAN session coordinator is already bound");
+        }
+        *slot = Some(coordinator);
+        Ok(())
+    }
+
+    /// Return the authoritative WAN session coordinator, if initial WAN is enabled.
+    pub fn wan_session_coordinator(
+        &self,
+    ) -> Option<Arc<crate::wan_session::coordinator::WanSessionCoordinator>> {
+        self.wan_session_coordinator
             .read()
             .ok()
             .and_then(|slot| slot.clone())
