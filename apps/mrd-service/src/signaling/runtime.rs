@@ -10,8 +10,11 @@ use mrd_signal_proto::{
     AuthClaims, AuthenticatedSignalMessage, PresenceHeartbeat, PresenceHeartbeatPayload,
     RegisterPayload, Registered, RelayMigrationAnswer, RelayMigrationAnswerPayload,
     RelayMigrationCandidate, RelayMigrationCandidatePayload, RelayMigrationOffer,
-    RelayMigrationOfferPayload, ServerChallenge, SignalEnvelope, SignalProtocolError,
-    SignalReplayGuard,
+    RelayMigrationOfferPayload, ServerChallenge, SessionGrantV3, SessionGrantV3Payload,
+    SessionIntentV3, SessionIntentV3Payload, SignalEnvelope, SignalProtocolError,
+    SignalReplayGuard, WanMediaProfileV3, WanPermissionScopeV3, WanRoutePolicyV3,
+    WanSessionRequestV3, WebRtcAnswerV3, WebRtcAnswerV3Payload, WebRtcCandidateV3,
+    WebRtcCandidateV3Payload, WebRtcDescriptionRoleV3, WebRtcOfferV3, WebRtcOfferV3Payload,
 };
 use ring::{digest, rand::SecureRandom, rand::SystemRandom};
 use std::{
@@ -28,6 +31,138 @@ const MIN_HEARTBEAT_INTERVAL_MS: u64 = 250;
 const MAX_HEARTBEAT_INTERVAL_MS: u64 = 300_000;
 const RELAY_SIGNAL_QUEUE_CAPACITY: usize = 128;
 const RELAY_EVENT_QUEUE_CAPACITY: usize = 256;
+
+pub const AUTHENTICATED_SESSION_SIGNAL_QUEUE_CAPACITY: usize = RELAY_SIGNAL_QUEUE_CAPACITY;
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum OutboundAuthenticatedSessionSignal {
+    SessionIntent {
+        request: WanSessionRequestV3,
+    },
+    SessionGrant {
+        session_id: mrd_proto::SessionId,
+        controller_device_id: mrd_proto::DeviceId,
+        target_device_id: mrd_proto::DeviceId,
+        intent_commitment: String,
+        approved_scopes: Vec<WanPermissionScopeV3>,
+        approved_profile: Option<WanMediaProfileV3>,
+        backend_policy_revision: u64,
+        policy_expires_at_ms: u64,
+        relay_generation: u64,
+        relay_directory_id: String,
+        primary_relay_node_id: String,
+        route_policy: WanRoutePolicyV3,
+    },
+    WebRtcOffer {
+        session_id: mrd_proto::SessionId,
+        controller_device_id: mrd_proto::DeviceId,
+        target_device_id: mrd_proto::DeviceId,
+        grant_commitment: String,
+        sdp: String,
+        candidate_fingerprints: Vec<String>,
+    },
+    WebRtcAnswer {
+        session_id: mrd_proto::SessionId,
+        controller_device_id: mrd_proto::DeviceId,
+        target_device_id: mrd_proto::DeviceId,
+        grant_commitment: String,
+        sdp: String,
+        candidate_fingerprints: Vec<String>,
+    },
+    WebRtcCandidate {
+        session_id: mrd_proto::SessionId,
+        controller_device_id: mrd_proto::DeviceId,
+        target_device_id: mrd_proto::DeviceId,
+        grant_commitment: String,
+        description_role: WebRtcDescriptionRoleV3,
+        candidate: String,
+        sdp_mid: Option<String>,
+        sdp_mline_index: Option<u16>,
+        username_fragment: Option<String>,
+        candidate_fingerprint: String,
+    },
+}
+
+impl OutboundAuthenticatedSessionSignal {
+    pub fn session_id(&self) -> &mrd_proto::SessionId {
+        match self {
+            Self::SessionIntent { request } => &request.session_id,
+            Self::SessionGrant { session_id, .. }
+            | Self::WebRtcOffer { session_id, .. }
+            | Self::WebRtcAnswer { session_id, .. }
+            | Self::WebRtcCandidate { session_id, .. } => session_id,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::SessionIntent { .. } => "session_intent_v3",
+            Self::SessionGrant { .. } => "session_grant_v3",
+            Self::WebRtcOffer { .. } => "webrtc_offer_v3",
+            Self::WebRtcAnswer { .. } => "webrtc_answer_v3",
+            Self::WebRtcCandidate { .. } => "webrtc_candidate_v3",
+        }
+    }
+}
+
+impl std::fmt::Debug for OutboundAuthenticatedSessionSignal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OutboundAuthenticatedSessionSignal")
+            .field("kind", &self.kind())
+            .field("session_id", self.session_id())
+            .field("body", &"REDACTED")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedSessionSignalingCommand {
+    pub peer_device_id: mrd_proto::DeviceId,
+    pub signal: OutboundAuthenticatedSessionSignal,
+}
+
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum AuthenticatedSessionSignalingSendError {
+    #[error("authenticated signaling is unavailable")]
+    Unavailable,
+    #[error("authenticated signaling queue is full")]
+    Backpressure,
+    #[error("authenticated session signaling command is invalid")]
+    Invalid,
+    #[error("authenticated session signaling is closed")]
+    SessionClosed,
+}
+
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum AuthenticatedSessionSignalingReceiveError {
+    #[error("authenticated session signaling is closed")]
+    SessionClosed,
+    #[error("authenticated session signaling stream closed")]
+    Closed,
+    #[error("authenticated session signaling stream overflowed")]
+    Lagged,
+}
+
+pub struct AuthenticatedSessionSignalingReceipt {
+    completed: tokio::sync::oneshot::Receiver<Result<(), AuthenticatedSessionSignalingSendError>>,
+}
+
+impl std::fmt::Debug for AuthenticatedSessionSignalingReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedSessionSignalingReceipt")
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthenticatedSessionSignalingReceipt {
+    pub async fn wait(self) -> Result<(), AuthenticatedSessionSignalingSendError> {
+        self.completed
+            .await
+            .map_err(|_| AuthenticatedSessionSignalingSendError::Unavailable)?
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum OutboundRelayMigrationSignal {
@@ -65,55 +200,26 @@ pub enum OutboundRelayMigrationSignal {
 
 impl std::fmt::Debug for OutboundRelayMigrationSignal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (kind, session_id, generation, directory_id, node_id) = match self {
+        let (kind, generation) = match self {
             Self::Offer {
-                session_id,
                 migration_generation,
-                directory_id,
-                node_id,
                 ..
-            } => (
-                "offer",
-                session_id,
-                migration_generation,
-                directory_id,
-                node_id,
-            ),
+            } => ("offer", migration_generation),
             Self::Answer {
-                session_id,
                 migration_generation,
-                directory_id,
-                node_id,
                 ..
-            } => (
-                "answer",
-                session_id,
-                migration_generation,
-                directory_id,
-                node_id,
-            ),
+            } => ("answer", migration_generation),
             Self::Candidate {
-                session_id,
                 migration_generation,
-                directory_id,
-                node_id,
                 ..
-            } => (
-                "candidate",
-                session_id,
-                migration_generation,
-                directory_id,
-                node_id,
-            ),
+            } => ("candidate", migration_generation),
         };
         formatter
             .debug_struct("OutboundRelayMigrationSignal")
             .field("kind", &kind)
-            .field("session_id", session_id)
             .field("migration_generation", generation)
-            .field("directory_id", directory_id)
-            .field("node_id", node_id)
-            .finish_non_exhaustive()
+            .field("body", &"REDACTED")
+            .finish()
     }
 }
 
@@ -144,11 +250,33 @@ struct OutboundRelaySignalingRequest {
     completion: tokio::sync::oneshot::Sender<Result<(), RelaySignalingSendError>>,
 }
 
+struct OutboundAuthenticatedSessionSignalingRequest {
+    request_id: u64,
+    command: AuthenticatedSessionSignalingCommand,
+}
+
+struct PendingAuthenticatedSessionSignalingRequest {
+    session_id: mrd_proto::SessionId,
+    completion: tokio::sync::oneshot::Sender<Result<(), AuthenticatedSessionSignalingSendError>>,
+}
+
+#[derive(Default)]
+struct AuthenticatedSessionBusState {
+    closed: HashSet<mrd_proto::SessionId>,
+    pending: HashMap<u64, PendingAuthenticatedSessionSignalingRequest>,
+    queued: VecDeque<OutboundAuthenticatedSessionSignalingRequest>,
+}
+
 pub struct RelaySignalingBus {
     outbound: tokio::sync::mpsc::Sender<OutboundRelaySignalingRequest>,
     receiver: Mutex<Option<tokio::sync::mpsc::Receiver<OutboundRelaySignalingRequest>>>,
     inbound: tokio::sync::broadcast::Sender<VerifiedSignalingEvent>,
+    closed_signal: tokio::sync::watch::Sender<u64>,
     history: Mutex<VecDeque<VerifiedSignalingEvent>>,
+    authenticated: Mutex<AuthenticatedSessionBusState>,
+    authenticated_lifecycle: tokio::sync::RwLock<()>,
+    authenticated_ready: tokio::sync::Notify,
+    next_authenticated_request_id: std::sync::atomic::AtomicU64,
     active: std::sync::atomic::AtomicBool,
 }
 
@@ -168,11 +296,17 @@ impl Default for RelaySignalingBus {
     fn default() -> Self {
         let (outbound, receiver) = tokio::sync::mpsc::channel(RELAY_SIGNAL_QUEUE_CAPACITY);
         let (inbound, _) = tokio::sync::broadcast::channel(RELAY_EVENT_QUEUE_CAPACITY);
+        let (closed_signal, _) = tokio::sync::watch::channel(0);
         Self {
             outbound,
             receiver: Mutex::new(Some(receiver)),
             inbound,
+            closed_signal,
             history: Mutex::new(VecDeque::with_capacity(RELAY_EVENT_QUEUE_CAPACITY)),
+            authenticated: Mutex::new(AuthenticatedSessionBusState::default()),
+            authenticated_lifecycle: tokio::sync::RwLock::new(()),
+            authenticated_ready: tokio::sync::Notify::new(),
+            next_authenticated_request_id: std::sync::atomic::AtomicU64::new(1),
             active: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -199,7 +333,7 @@ impl RelaySignalingBus {
             .map_err(|_| RelaySignalingSendError::Unavailable)?
     }
 
-    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<VerifiedSignalingEvent> {
+    pub(crate) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<VerifiedSignalingEvent> {
         self.inbound.subscribe()
     }
 
@@ -208,11 +342,12 @@ impl RelaySignalingBus {
         session_id: mrd_proto::SessionId,
         generation: u64,
     ) -> RelaySignalingSubscription {
-        let live = self.inbound.subscribe();
-        let replay = self
+        let history = self
             .history
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let live = self.inbound.subscribe();
+        let replay = history
             .iter()
             .filter(|event| relay_event_matches(event, &session_id, generation))
             .cloned()
@@ -225,17 +360,139 @@ impl RelaySignalingBus {
         }
     }
 
-    pub(crate) fn publish(&self, event: VerifiedSignalingEvent) {
+    pub fn try_send_authenticated(
+        &self,
+        command: AuthenticatedSessionSignalingCommand,
+    ) -> Result<AuthenticatedSessionSignalingReceipt, AuthenticatedSessionSignalingSendError> {
+        let session_id = command.signal.session_id().clone();
+        let request_id = self
+            .next_authenticated_request_id
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |current| current.checked_add(1),
+            )
+            .map_err(|_| AuthenticatedSessionSignalingSendError::Invalid)?;
+        let (completion, completed) = tokio::sync::oneshot::channel();
         {
-            let mut history = self
-                .history
+            let mut authenticated = self
+                .authenticated
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if history.len() == RELAY_EVENT_QUEUE_CAPACITY {
-                history.pop_front();
+            if authenticated.closed.contains(&session_id) {
+                return Err(AuthenticatedSessionSignalingSendError::SessionClosed);
             }
-            history.push_back(event.clone());
+            if !self.active.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(AuthenticatedSessionSignalingSendError::Unavailable);
+            }
+            if authenticated.pending.len() >= AUTHENTICATED_SESSION_SIGNAL_QUEUE_CAPACITY {
+                return Err(AuthenticatedSessionSignalingSendError::Backpressure);
+            }
+            authenticated.pending.insert(
+                request_id,
+                PendingAuthenticatedSessionSignalingRequest {
+                    session_id,
+                    completion,
+                },
+            );
+            authenticated
+                .queued
+                .push_back(OutboundAuthenticatedSessionSignalingRequest {
+                    request_id,
+                    command,
+                });
         }
+        self.authenticated_ready.notify_one();
+        Ok(AuthenticatedSessionSignalingReceipt { completed })
+    }
+
+    pub fn subscribe_authenticated_session(
+        self: &Arc<Self>,
+        session_id: mrd_proto::SessionId,
+        peer_device_id: mrd_proto::DeviceId,
+    ) -> AuthenticatedSessionSignalingSubscription {
+        let history = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let live = self.inbound.subscribe();
+        let replay = history
+            .iter()
+            .filter(|event| {
+                authenticated_session_event_matches(event, &session_id, &peer_device_id)
+            })
+            .cloned()
+            .collect();
+        AuthenticatedSessionSignalingSubscription {
+            bus: Arc::clone(self),
+            session_id,
+            peer_device_id,
+            replay,
+            live,
+            closed_signal: self.closed_signal.subscribe(),
+        }
+    }
+
+    pub async fn close_authenticated_session(
+        &self,
+        session_id: &mrd_proto::SessionId,
+    ) -> Result<(), AuthenticatedSessionSignalingSendError> {
+        let _lifecycle = self.authenticated_lifecycle.write().await;
+        let completions = {
+            let mut authenticated = self
+                .authenticated
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            authenticated.closed.insert(session_id.clone());
+            authenticated
+                .queued
+                .retain(|request| request.command.signal.session_id() != session_id);
+            let request_ids = authenticated
+                .pending
+                .iter()
+                .filter_map(|(request_id, pending)| {
+                    (pending.session_id == *session_id).then_some(*request_id)
+                })
+                .collect::<Vec<_>>();
+            request_ids
+                .into_iter()
+                .filter_map(|request_id| {
+                    authenticated
+                        .pending
+                        .remove(&request_id)
+                        .map(|pending| pending.completion)
+                })
+                .collect::<Vec<_>>()
+        };
+        self.history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|event| event.signal.session_id() != session_id);
+        for completion in completions {
+            let _ = completion.send(Err(AuthenticatedSessionSignalingSendError::SessionClosed));
+        }
+        self.closed_signal
+            .send_modify(|version| *version = version.wrapping_add(1));
+        Ok(())
+    }
+
+    pub(crate) async fn publish(&self, event: VerifiedSignalingEvent) {
+        let _lifecycle = self.authenticated_lifecycle.read().await;
+        let authenticated = self
+            .authenticated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if authenticated.closed.contains(event.signal.session_id()) {
+            return;
+        }
+        let mut history = self
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if history.len() == RELAY_EVENT_QUEUE_CAPACITY {
+            history.pop_front();
+        }
+        history.push_back(event.clone());
         let _ = self.inbound.send(event);
     }
 
@@ -250,9 +507,106 @@ impl RelaySignalingBus {
             .ok_or(SignalingRuntimeError::AlreadyStarted)
     }
 
+    async fn recv_authenticated(&self) -> Option<OutboundAuthenticatedSessionSignalingRequest> {
+        loop {
+            let notified = self.authenticated_ready.notified();
+            if let Some(request) = self
+                .authenticated
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .queued
+                .pop_front()
+            {
+                return Some(request);
+            }
+            if !self.active.load(std::sync::atomic::Ordering::Acquire) {
+                return None;
+            }
+            notified.await;
+        }
+    }
+
     fn set_active(&self, active: bool) {
         self.active
             .store(active, std::sync::atomic::Ordering::Release);
+        if !active {
+            self.authenticated_ready.notify_waiters();
+        }
+    }
+
+    fn is_authenticated_session_closed(&self, session_id: &mrd_proto::SessionId) -> bool {
+        self.authenticated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed
+            .contains(session_id)
+    }
+
+    fn authenticated_request_is_live(&self, request_id: u64) -> bool {
+        let mut authenticated = self
+            .authenticated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stale = authenticated
+            .pending
+            .get(&request_id)
+            .map(|pending| {
+                pending.completion.is_closed() || authenticated.closed.contains(&pending.session_id)
+            })
+            .unwrap_or(true);
+        if stale {
+            authenticated.pending.remove(&request_id);
+            false
+        } else {
+            true
+        }
+    }
+
+    async fn admit_authenticated_request(
+        &self,
+        request_id: u64,
+    ) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
+        let lifecycle = self.authenticated_lifecycle.read().await;
+        if self.authenticated_request_is_live(request_id) {
+            Some(lifecycle)
+        } else {
+            None
+        }
+    }
+
+    fn complete_authenticated(
+        &self,
+        request_id: u64,
+        result: Result<(), AuthenticatedSessionSignalingSendError>,
+    ) {
+        let completion = self
+            .authenticated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending
+            .remove(&request_id)
+            .map(|pending| pending.completion);
+        if let Some(completion) = completion {
+            let _ = completion.send(result);
+        }
+    }
+
+    fn fail_all_authenticated(&self) {
+        let completions = {
+            let mut authenticated = self
+                .authenticated
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            authenticated.queued.clear();
+            authenticated
+                .pending
+                .drain()
+                .map(|(_, pending)| pending.completion)
+                .collect::<Vec<_>>()
+        };
+        for completion in completions {
+            let _ = completion.send(Err(AuthenticatedSessionSignalingSendError::Unavailable));
+        }
     }
 }
 
@@ -285,6 +639,73 @@ impl RelaySignalingSubscription {
     }
 }
 
+pub struct AuthenticatedSessionSignalingSubscription {
+    bus: Arc<RelaySignalingBus>,
+    session_id: mrd_proto::SessionId,
+    peer_device_id: mrd_proto::DeviceId,
+    replay: VecDeque<VerifiedSignalingEvent>,
+    live: tokio::sync::broadcast::Receiver<VerifiedSignalingEvent>,
+    closed_signal: tokio::sync::watch::Receiver<u64>,
+}
+
+impl std::fmt::Debug for AuthenticatedSessionSignalingSubscription {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedSessionSignalingSubscription")
+            .field("session_id", &self.session_id)
+            .field("peer_device_id", &self.peer_device_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthenticatedSessionSignalingSubscription {
+    pub async fn recv(
+        &mut self,
+    ) -> Result<VerifiedSignalingEvent, AuthenticatedSessionSignalingReceiveError> {
+        loop {
+            let lifecycle = self.bus.authenticated_lifecycle.read().await;
+            if self.bus.is_authenticated_session_closed(&self.session_id) {
+                self.replay.clear();
+                return Err(AuthenticatedSessionSignalingReceiveError::SessionClosed);
+            }
+            if let Some(event) = self.replay.pop_front() {
+                return Ok(event);
+            }
+            drop(lifecycle);
+            tokio::select! {
+                event = self.live.recv() => match event {
+                    Ok(event)
+                        if authenticated_session_event_matches(
+                            &event,
+                            &self.session_id,
+                            &self.peer_device_id,
+                        ) =>
+                    {
+                        let _lifecycle = self.bus.authenticated_lifecycle.read().await;
+                        if self.bus.is_authenticated_session_closed(&self.session_id) {
+                            self.replay.clear();
+                            return Err(AuthenticatedSessionSignalingReceiveError::SessionClosed);
+                        }
+                        return Ok(event);
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err(AuthenticatedSessionSignalingReceiveError::Closed);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        return Err(AuthenticatedSessionSignalingReceiveError::Lagged);
+                    }
+                },
+                changed = self.closed_signal.changed() => {
+                    if changed.is_err() {
+                        return Err(AuthenticatedSessionSignalingReceiveError::Closed);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn relay_event_matches(
     event: &VerifiedSignalingEvent,
     session_id: &mrd_proto::SessionId,
@@ -308,6 +729,25 @@ fn relay_event_matches(
         } => current == session_id && *migration_generation == generation,
         _ => false,
     }
+}
+
+fn authenticated_session_event_matches(
+    event: &VerifiedSignalingEvent,
+    session_id: &mrd_proto::SessionId,
+    peer_device_id: &mrd_proto::DeviceId,
+) -> bool {
+    event.sender.device_id == *peer_device_id
+        && event.signal.session_id() == session_id
+        && matches!(
+            &event.signal,
+            AuthenticatedSessionSignal::SessionIntentV3 { .. }
+                | AuthenticatedSessionSignal::SessionGrantV3 { .. }
+                | AuthenticatedSessionSignal::WebRtcOfferV3 { .. }
+                | AuthenticatedSessionSignal::WebRtcAnswerV3 { .. }
+                | AuthenticatedSessionSignal::WebRtcCandidateV3 { .. }
+                | AuthenticatedSessionSignal::Denied { .. }
+                | AuthenticatedSessionSignal::Closed { .. }
+        )
 }
 
 /// Observable connection phase for service health projections.
@@ -385,7 +825,7 @@ impl SignalingStatus {
         now_ms: u64,
         reconnect_attempt: u32,
         retry_after: Duration,
-        error: &str,
+        error: &SignalingRuntimeError,
     ) {
         let mut status = self
             .0
@@ -395,7 +835,7 @@ impl SignalingStatus {
         status.reconnect_attempt = reconnect_attempt;
         status.next_retry_at_ms =
             Some(now_ms.saturating_add(retry_after.as_millis().min(u128::from(u64::MAX)) as u64));
-        status.last_error = Some(sanitize_error(error));
+        status.last_error = Some(error.code().into());
     }
 
     pub(crate) fn note_stopped(&self) {
@@ -567,6 +1007,175 @@ impl SignalingRuntimeCore {
         )))
     }
 
+    pub fn build_authenticated_session_signal(
+        &mut self,
+        command: AuthenticatedSessionSignalingCommand,
+        now_ms: u64,
+    ) -> Result<SignalEnvelope, SignalingRuntimeError> {
+        let peer_device_id = command.peer_device_id;
+        let message = match command.signal {
+            OutboundAuthenticatedSessionSignal::SessionIntent { request } => {
+                self.require_role(BackendRole::Controller)?;
+                if request.controller_device_id != *self.config.device_id()
+                    || request.target_device_id != peer_device_id
+                {
+                    return Err(SignalingRuntimeError::RoleMismatch);
+                }
+                let request_commitment = request.commitment()?;
+                let claims = self.next_claims(peer_device_id, now_ms)?;
+                AuthenticatedSignalMessage::SessionIntentV3(SessionIntentV3::sign(
+                    &self.identity,
+                    SessionIntentV3Payload {
+                        claims,
+                        request,
+                        request_commitment,
+                    },
+                )?)
+            }
+            OutboundAuthenticatedSessionSignal::SessionGrant {
+                session_id,
+                controller_device_id,
+                target_device_id,
+                intent_commitment,
+                approved_scopes,
+                approved_profile,
+                backend_policy_revision,
+                policy_expires_at_ms,
+                relay_generation,
+                relay_directory_id,
+                primary_relay_node_id,
+                route_policy,
+            } => {
+                self.require_role(BackendRole::Agent)?;
+                if controller_device_id != peer_device_id
+                    || target_device_id != *self.config.device_id()
+                {
+                    return Err(SignalingRuntimeError::RoleMismatch);
+                }
+                let claims = self.next_claims(peer_device_id, now_ms)?;
+                AuthenticatedSignalMessage::SessionGrantV3(SessionGrantV3::sign(
+                    &self.identity,
+                    SessionGrantV3Payload {
+                        claims,
+                        session_id,
+                        controller_device_id,
+                        target_device_id,
+                        intent_commitment,
+                        approved_scopes,
+                        approved_profile,
+                        backend_policy_revision,
+                        policy_expires_at_ms,
+                        relay_generation,
+                        relay_directory_id,
+                        primary_relay_node_id,
+                        route_policy,
+                    },
+                )?)
+            }
+            OutboundAuthenticatedSessionSignal::WebRtcOffer {
+                session_id,
+                controller_device_id,
+                target_device_id,
+                grant_commitment,
+                sdp,
+                candidate_fingerprints,
+            } => {
+                self.require_role(BackendRole::Controller)?;
+                if controller_device_id != *self.config.device_id()
+                    || target_device_id != peer_device_id
+                {
+                    return Err(SignalingRuntimeError::RoleMismatch);
+                }
+                let claims = self.next_claims(peer_device_id, now_ms)?;
+                AuthenticatedSignalMessage::WebrtcOfferV3(WebRtcOfferV3::sign(
+                    &self.identity,
+                    WebRtcOfferV3Payload {
+                        claims,
+                        session_id,
+                        controller_device_id,
+                        target_device_id,
+                        grant_commitment,
+                        sdp,
+                        candidate_fingerprints,
+                    },
+                )?)
+            }
+            OutboundAuthenticatedSessionSignal::WebRtcAnswer {
+                session_id,
+                controller_device_id,
+                target_device_id,
+                grant_commitment,
+                sdp,
+                candidate_fingerprints,
+            } => {
+                self.require_role(BackendRole::Agent)?;
+                if controller_device_id != peer_device_id
+                    || target_device_id != *self.config.device_id()
+                {
+                    return Err(SignalingRuntimeError::RoleMismatch);
+                }
+                let claims = self.next_claims(peer_device_id, now_ms)?;
+                AuthenticatedSignalMessage::WebrtcAnswerV3(WebRtcAnswerV3::sign(
+                    &self.identity,
+                    WebRtcAnswerV3Payload {
+                        claims,
+                        session_id,
+                        controller_device_id,
+                        target_device_id,
+                        grant_commitment,
+                        sdp,
+                        candidate_fingerprints,
+                    },
+                )?)
+            }
+            OutboundAuthenticatedSessionSignal::WebRtcCandidate {
+                session_id,
+                controller_device_id,
+                target_device_id,
+                grant_commitment,
+                description_role,
+                candidate,
+                sdp_mid,
+                sdp_mline_index,
+                username_fragment,
+                candidate_fingerprint,
+            } => {
+                let (required_role, expected_local, expected_peer) = match description_role {
+                    WebRtcDescriptionRoleV3::Offer => (
+                        BackendRole::Controller,
+                        &controller_device_id,
+                        &target_device_id,
+                    ),
+                    WebRtcDescriptionRoleV3::Answer => {
+                        (BackendRole::Agent, &target_device_id, &controller_device_id)
+                    }
+                };
+                self.require_role(required_role)?;
+                if expected_local != self.config.device_id() || expected_peer != &peer_device_id {
+                    return Err(SignalingRuntimeError::RoleMismatch);
+                }
+                let claims = self.next_claims(peer_device_id, now_ms)?;
+                AuthenticatedSignalMessage::WebrtcCandidateV3(WebRtcCandidateV3::sign(
+                    &self.identity,
+                    WebRtcCandidateV3Payload {
+                        claims,
+                        session_id,
+                        controller_device_id,
+                        target_device_id,
+                        grant_commitment,
+                        description_role,
+                        candidate,
+                        sdp_mid,
+                        sdp_mline_index,
+                        username_fragment,
+                        candidate_fingerprint,
+                    },
+                )?)
+            }
+        };
+        Ok(SignalEnvelope::new(message))
+    }
+
     pub fn build_relay_migration_signal(
         &mut self,
         command: RelaySignalingCommand,
@@ -661,33 +1270,64 @@ impl SignalingRuntimeCore {
             return Ok(InboundDisposition::Duplicate);
         }
         let (metadata, public_key, signal) = match &envelope.message {
-            AuthenticatedSignalMessage::SessionIntent(message) => (
+            AuthenticatedSignalMessage::SessionIntent(_)
+            | AuthenticatedSignalMessage::SessionGrant(_)
+            | AuthenticatedSignalMessage::WebrtcOffer(_)
+            | AuthenticatedSignalMessage::WebrtcAnswer(_)
+            | AuthenticatedSignalMessage::WebrtcCandidate(_) => {
+                return Err(SignalProtocolError::UnsupportedVersion.into());
+            }
+            AuthenticatedSignalMessage::SessionIntentV3(message) => (
                 {
                     self.require_role(BackendRole::Agent)?;
                     message.verify_for(self.config.device_id(), now_ms, &mut self.replay)?
                 },
                 message.signer_public_key.clone(),
-                AuthenticatedSessionSignal::AuthorizationRequested {
-                    session_id: message.payload.session_id.clone(),
-                    idempotency_key: message.payload.idempotency_key,
-                    requested_transport: message.payload.requested_transport.clone(),
+                AuthenticatedSessionSignal::SessionIntentV3 {
+                    message: message.clone(),
                 },
             ),
-            AuthenticatedSignalMessage::SessionGrant(message) => (
+            AuthenticatedSignalMessage::SessionGrantV3(message) => (
                 {
                     self.require_role(BackendRole::Controller)?;
                     message.verify_for(self.config.device_id(), now_ms, &mut self.replay)?
                 },
                 message.signer_public_key.clone(),
-                AuthenticatedSessionSignal::Granted {
-                    session_id: message.payload.session_id.clone(),
-                    accepted_transport: message.payload.accepted_transport.clone(),
-                    accepted_candidate_fingerprints: message
-                        .payload
-                        .accepted_candidate_fingerprints
-                        .iter()
-                        .cloned()
-                        .collect(),
+                AuthenticatedSessionSignal::SessionGrantV3 {
+                    message: message.clone(),
+                },
+            ),
+            AuthenticatedSignalMessage::WebrtcOfferV3(message) => (
+                {
+                    self.require_role(BackendRole::Agent)?;
+                    message.verify_for(self.config.device_id(), now_ms, &mut self.replay)?
+                },
+                message.signer_public_key.clone(),
+                AuthenticatedSessionSignal::WebRtcOfferV3 {
+                    message: message.clone(),
+                },
+            ),
+            AuthenticatedSignalMessage::WebrtcAnswerV3(message) => (
+                {
+                    self.require_role(BackendRole::Controller)?;
+                    message.verify_for(self.config.device_id(), now_ms, &mut self.replay)?
+                },
+                message.signer_public_key.clone(),
+                AuthenticatedSessionSignal::WebRtcAnswerV3 {
+                    message: message.clone(),
+                },
+            ),
+            AuthenticatedSignalMessage::WebrtcCandidateV3(message) => (
+                {
+                    self.require_role(match message.payload.description_role {
+                        WebRtcDescriptionRoleV3::Offer => BackendRole::Agent,
+                        WebRtcDescriptionRoleV3::Answer => BackendRole::Controller,
+                    })?;
+                    message.verify_for(self.config.device_id(), now_ms, &mut self.replay)?
+                },
+                message.signer_public_key.clone(),
+                AuthenticatedSessionSignal::WebRtcCandidateV3 {
+                    message: message.clone(),
                 },
             ),
             AuthenticatedSignalMessage::SessionDeny(message) => (
@@ -699,45 +1339,6 @@ impl SignalingRuntimeCore {
                 AuthenticatedSessionSignal::Denied {
                     session_id: message.payload.session_id.clone(),
                     reason: message.payload.reason,
-                },
-            ),
-            AuthenticatedSignalMessage::WebrtcOffer(message) => (
-                message.verify_for(self.config.device_id(), now_ms, &mut self.replay)?,
-                message.signer_public_key.clone(),
-                AuthenticatedSessionSignal::WebRtcOffer {
-                    session_id: message.payload.session_id.clone(),
-                    sdp: message.payload.sdp.clone(),
-                    candidate_fingerprints: message
-                        .payload
-                        .candidate_fingerprints
-                        .iter()
-                        .cloned()
-                        .collect(),
-                },
-            ),
-            AuthenticatedSignalMessage::WebrtcAnswer(message) => (
-                message.verify_for(self.config.device_id(), now_ms, &mut self.replay)?,
-                message.signer_public_key.clone(),
-                AuthenticatedSessionSignal::WebRtcAnswer {
-                    session_id: message.payload.session_id.clone(),
-                    sdp: message.payload.sdp.clone(),
-                    candidate_fingerprints: message
-                        .payload
-                        .candidate_fingerprints
-                        .iter()
-                        .cloned()
-                        .collect(),
-                },
-            ),
-            AuthenticatedSignalMessage::WebrtcCandidate(message) => (
-                message.verify_for(self.config.device_id(), now_ms, &mut self.replay)?,
-                message.signer_public_key.clone(),
-                AuthenticatedSessionSignal::WebRtcCandidate {
-                    session_id: message.payload.session_id.clone(),
-                    candidate: message.payload.candidate.clone(),
-                    sdp_mid: message.payload.sdp_mid.clone(),
-                    sdp_mline_index: message.payload.sdp_mline_index,
-                    candidate_fingerprint: message.payload.candidate_fingerprint.clone(),
                 },
             ),
             AuthenticatedSignalMessage::RelayMigrationOffer(message) => (
@@ -801,25 +1402,23 @@ impl SignalingRuntimeCore {
                 },
             ),
             AuthenticatedSignalMessage::ProtocolError(error) => {
-                return Err(SignalingRuntimeError::ServerProtocol(format!(
-                    "{:?}",
-                    error.reason
-                )))
+                let _ = error;
+                return Err(SignalingRuntimeError::ServerProtocol);
             }
             AuthenticatedSignalMessage::ReconnectGrant(_)
             | AuthenticatedSignalMessage::PresenceHeartbeat(_) => {
-                return Err(SignalingRuntimeError::UnexpectedMessage)
+                return Err(SignalingRuntimeError::UnexpectedMessage);
             }
             AuthenticatedSignalMessage::ServerChallenge(_)
             | AuthenticatedSignalMessage::Register(_)
             | AuthenticatedSignalMessage::Registered(_)
             | AuthenticatedSignalMessage::ReconnectRequest(_) => {
-                return Err(SignalingRuntimeError::UnexpectedMessage)
+                return Err(SignalingRuntimeError::UnexpectedMessage);
             }
         };
         match self.peer_keys.get(&metadata.issuer_device_id) {
             Some(existing) if existing != &metadata.issuer_key_id => {
-                return Err(SignalingRuntimeError::PeerIdentityChanged)
+                return Err(SignalingRuntimeError::PeerIdentityChanged);
             }
             None => {
                 if self.peer_keys.len() >= PEER_KEY_LIMIT {
@@ -869,7 +1468,7 @@ impl SignalingRuntimeCore {
     }
 
     /// Record one failed connection attempt and advance the reconnect schedule.
-    pub fn note_connection_failure(&mut self, now_ms: u64, error: &str) {
+    pub fn note_connection_failure(&mut self, now_ms: u64, error: &SignalingRuntimeError) {
         self.reconnect_attempt = self.reconnect_attempt.saturating_add(1);
         let delay = self.reconnect_delay();
         self.connection_id = None;
@@ -877,6 +1476,11 @@ impl SignalingRuntimeCore {
         self.next_heartbeat_at_ms = None;
         self.status
             .note_disconnected(now_ms, self.reconnect_attempt, delay, error);
+        tracing::warn!(
+            reconnect_attempt = self.reconnect_attempt,
+            error_code = error.code(),
+            "authenticated signaling connection unavailable"
+        );
     }
 
     pub(crate) fn config(&self) -> &SignalingConfig {
@@ -937,6 +1541,11 @@ fn signed_claims(message: &AuthenticatedSignalMessage) -> Option<&AuthClaims> {
         AuthenticatedSignalMessage::WebrtcOffer(value) => Some(&value.payload.claims),
         AuthenticatedSignalMessage::WebrtcAnswer(value) => Some(&value.payload.claims),
         AuthenticatedSignalMessage::WebrtcCandidate(value) => Some(&value.payload.claims),
+        AuthenticatedSignalMessage::SessionIntentV3(value) => Some(&value.payload.claims),
+        AuthenticatedSignalMessage::SessionGrantV3(value) => Some(&value.payload.claims),
+        AuthenticatedSignalMessage::WebrtcOfferV3(value) => Some(&value.payload.claims),
+        AuthenticatedSignalMessage::WebrtcAnswerV3(value) => Some(&value.payload.claims),
+        AuthenticatedSignalMessage::WebrtcCandidateV3(value) => Some(&value.payload.claims),
         AuthenticatedSignalMessage::RelayMigrationOffer(value) => Some(&value.payload.claims),
         AuthenticatedSignalMessage::RelayMigrationAnswer(value) => Some(&value.payload.claims),
         AuthenticatedSignalMessage::RelayMigrationCandidate(value) => Some(&value.payload.claims),
@@ -949,7 +1558,7 @@ fn signed_claims(message: &AuthenticatedSignalMessage) -> Option<&AuthClaims> {
 }
 
 fn envelope_digest(envelope: &SignalEnvelope) -> Result<[u8; 32], SignalingRuntimeError> {
-    let bytes = serde_json::to_vec(envelope).map_err(SignalingRuntimeError::Serialize)?;
+    let bytes = serde_json::to_vec(envelope).map_err(|_| SignalingRuntimeError::Serialize)?;
     digest::digest(&digest::SHA256, &bytes)
         .as_ref()
         .try_into()
@@ -959,21 +1568,6 @@ fn envelope_digest(envelope: &SignalEnvelope) -> Result<[u8; 32], SignalingRunti
 fn exponential_delay(initial: Duration, maximum: Duration, attempt: u32) -> Duration {
     let factor = 1_u32.checked_shl(attempt.min(31)).unwrap_or(u32::MAX);
     initial.saturating_mul(factor).min(maximum)
-}
-
-fn sanitize_error(error: &str) -> String {
-    let mut value: String = error
-        .chars()
-        .filter(|character| !character.is_control())
-        .take(256)
-        .collect();
-    for marker in ["token=", "authorization:", "bearer "] {
-        if value.to_ascii_lowercase().contains(marker) {
-            value = "signaling connection failed (secret-bearing detail redacted)".into();
-            break;
-        }
-    }
-    value
 }
 
 #[derive(Default)]
@@ -1077,17 +1671,19 @@ async fn run_reconnect_loop(
     let mut core = SignalingRuntimeCore::with_status(config, identity, Arc::clone(&status));
     loop {
         status.note_connecting();
-        let connection = run_connection(&mut core, &mapper, &mut outbound, &mut shutdown).await;
+        let connection = run_connection(
+            &mut core,
+            &mapper,
+            &relay_signaling,
+            &mut outbound,
+            &mut shutdown,
+        )
+        .await;
         match connection {
             ConnectionExit::Shutdown => break,
             ConnectionExit::Failed(error) => {
                 let now_ms = unix_time_ms();
-                core.note_connection_failure(now_ms, &error.to_string());
-                tracing::warn!(
-                    reconnect_attempt = core.snapshot().reconnect_attempt,
-                    error = %error,
-                    "authenticated signaling connection unavailable"
-                );
+                core.note_connection_failure(now_ms, &error);
                 let delay = core.reconnect_delay();
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
@@ -1102,6 +1698,7 @@ async fn run_reconnect_loop(
             .completion
             .send(Err(RelaySignalingSendError::Unavailable));
     }
+    relay_signaling.fail_all_authenticated();
     status.note_stopped();
 }
 
@@ -1113,6 +1710,7 @@ enum ConnectionExit {
 async fn run_connection(
     core: &mut SignalingRuntimeCore,
     mapper: &Arc<ServiceSignalingMapper>,
+    relay_signaling: &Arc<RelaySignalingBus>,
     outbound: &mut tokio::sync::mpsc::Receiver<OutboundRelaySignalingRequest>,
     shutdown: &mut tokio::sync::oneshot::Receiver<()>,
 ) -> ConnectionExit {
@@ -1185,7 +1783,7 @@ async fn run_connection(
                     return ConnectionExit::Failed(SignalingRuntimeError::OutboundClosed);
                 };
                 // A migration deadline may expire while signaling is reconnecting. Never emit
-                // that now-ownerless command after the caller dropped its completion receiver.
+                // that now-ownerless command after its caller has stopped waiting.
                 if request.completion.is_closed() {
                     continue;
                 }
@@ -1205,6 +1803,41 @@ async fn run_connection(
                 }
                 let _ = request.completion.send(Ok(()));
             }
+            request = relay_signaling.recv_authenticated() => {
+                let Some(request) = request else {
+                    return ConnectionExit::Failed(SignalingRuntimeError::OutboundClosed);
+                };
+                let Some(_send_admission) = relay_signaling
+                    .admit_authenticated_request(request.request_id)
+                    .await
+                else {
+                    continue;
+                };
+                let envelope = match core.build_authenticated_session_signal(
+                    request.command,
+                    unix_time_ms(),
+                ) {
+                    Ok(envelope) => envelope,
+                    Err(_) => {
+                        relay_signaling.complete_authenticated(
+                            request.request_id,
+                            Err(AuthenticatedSessionSignalingSendError::Invalid),
+                        );
+                        continue;
+                    }
+                };
+                if !relay_signaling.authenticated_request_is_live(request.request_id) {
+                    continue;
+                }
+                if let Err(error) = send_envelope(&mut writer, envelope).await {
+                    relay_signaling.complete_authenticated(
+                        request.request_id,
+                        Err(AuthenticatedSessionSignalingSendError::Unavailable),
+                    );
+                    return ConnectionExit::Failed(error);
+                }
+                relay_signaling.complete_authenticated(request.request_id, Ok(()));
+            }
             message = reader.next() => {
                 let envelope = match decode_socket_message(message) {
                     Ok(Some(value)) => value,
@@ -1215,7 +1848,8 @@ async fn run_connection(
                     Ok(InboundDisposition::Applied(event)) => {
                         inbox.push(*event);
                         if let Err(error) = apply_authenticated_realtime_events(&inbox, mapper.as_ref()).await {
-                            return ConnectionExit::Failed(SignalingRuntimeError::Apply(error));
+                            let _ = error;
+                            return ConnectionExit::Failed(SignalingRuntimeError::Apply);
                         }
                     }
                     Ok(InboundDisposition::Duplicate | InboundDisposition::Control) => {}
@@ -1310,12 +1944,12 @@ pub enum SignalingRuntimeError {
     Config(#[from] SignalingConfigError),
     #[error(transparent)]
     Protocol(#[from] SignalProtocolError),
-    #[error(transparent)]
-    Client(#[from] mrd_signal_client::SignalClientError),
-    #[error("signaling transport failed: {0}")]
-    Transport(String),
-    #[error("signaling payload serialization failed: {0}")]
-    Serialize(serde_json::Error),
+    #[error("signaling codec failed")]
+    Client,
+    #[error("signaling transport failed")]
+    Transport,
+    #[error("signaling payload serialization failed")]
+    Serialize,
     #[error("signaling challenge is invalid or expired")]
     InvalidChallenge,
     #[error("signaling server identity does not match configuration")]
@@ -1336,8 +1970,8 @@ pub enum SignalingRuntimeError {
     CounterExhausted,
     #[error("signaling entropy is unavailable")]
     EntropyUnavailable,
-    #[error("signaling server rejected the protocol message: {0}")]
-    ServerProtocol(String),
+    #[error("signaling server rejected the protocol message")]
+    ServerProtocol,
     #[error("signaling connect timed out")]
     ConnectTimeout,
     #[error("signaling authentication handshake timed out")]
@@ -1348,12 +1982,132 @@ pub enum SignalingRuntimeError {
     InvalidUtf8,
     #[error("local device registration is unavailable")]
     LocalDeviceMissing,
-    #[error("applying an authenticated signaling event failed: {0}")]
-    Apply(#[source] anyhow::Error),
+    #[error("applying an authenticated signaling event failed")]
+    Apply,
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for SignalingRuntimeError {
-    fn from(error: tokio_tungstenite::tungstenite::Error) -> Self {
-        Self::Transport(error.to_string())
+    fn from(_: tokio_tungstenite::tungstenite::Error) -> Self {
+        Self::Transport
+    }
+}
+
+impl From<mrd_signal_client::SignalClientError> for SignalingRuntimeError {
+    fn from(_: mrd_signal_client::SignalClientError) -> Self {
+        Self::Client
+    }
+}
+
+impl SignalingRuntimeError {
+    /// Return the closed, body-free code used by traces and health projections.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::AlreadyStarted => "signaling_already_started",
+            Self::OutboundClosed => "signaling_outbound_closed",
+            Self::Config(_) => "signaling_config",
+            Self::Protocol(error) => match error.reason_code() {
+                mrd_signal_proto::ProtocolReasonCode::UnsupportedVersion => {
+                    "signaling_protocol_unsupported_version"
+                }
+                mrd_signal_proto::ProtocolReasonCode::Malformed => "signaling_protocol_malformed",
+                mrd_signal_proto::ProtocolReasonCode::AuthenticationFailed => {
+                    "signaling_protocol_authentication_failed"
+                }
+                mrd_signal_proto::ProtocolReasonCode::WrongPeer => "signaling_protocol_wrong_peer",
+                mrd_signal_proto::ProtocolReasonCode::Expired => "signaling_protocol_expired",
+                mrd_signal_proto::ProtocolReasonCode::ReplayRejected => {
+                    "signaling_protocol_replay_rejected"
+                }
+                _ => "signaling_protocol_rejected",
+            },
+            Self::Client => "signaling_codec",
+            Self::Transport => "signaling_transport",
+            Self::Serialize => "signaling_serialize",
+            Self::InvalidChallenge => "signaling_invalid_challenge",
+            Self::ServerIdentityMismatch => "signaling_server_identity_mismatch",
+            Self::PeerIdentityChanged => "signaling_peer_identity_changed",
+            Self::PeerCapacity => "signaling_peer_capacity",
+            Self::RoleMismatch => "signaling_role_mismatch",
+            Self::UnexpectedMessage => "signaling_unexpected_message",
+            Self::NotAuthenticated => "signaling_not_authenticated",
+            Self::InvalidHeartbeatInterval => "signaling_invalid_heartbeat_interval",
+            Self::CounterExhausted => "signaling_counter_exhausted",
+            Self::EntropyUnavailable => "signaling_entropy_unavailable",
+            Self::ServerProtocol => "signaling_server_protocol",
+            Self::ConnectTimeout => "signaling_connect_timeout",
+            Self::HandshakeTimeout => "signaling_handshake_timeout",
+            Self::Disconnected => "signaling_disconnected",
+            Self::InvalidUtf8 => "signaling_invalid_utf8",
+            Self::LocalDeviceMissing => "signaling_local_device_missing",
+            Self::Apply => "signaling_apply",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn authenticated_command(session_id: &str) -> AuthenticatedSessionSignalingCommand {
+        AuthenticatedSessionSignalingCommand {
+            peer_device_id: mrd_proto::DeviceId("peer-device".into()),
+            signal: OutboundAuthenticatedSessionSignal::SessionIntent {
+                request: WanSessionRequestV3 {
+                    session_id: mrd_proto::SessionId(session_id.into()),
+                    idempotency_key: [1; 16],
+                    controller_device_id: mrd_proto::DeviceId("local-device".into()),
+                    target_device_id: mrd_proto::DeviceId("peer-device".into()),
+                    access_mode: mrd_signal_proto::WanAccessModeV3::Attended,
+                    requested_scopes: vec![WanPermissionScopeV3::ScreenView],
+                    requested_profile: None,
+                    route_policy: WanRoutePolicyV3::RelayOnly,
+                },
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_send_admission_linearizes_session_close() {
+        let bus = Arc::new(RelaySignalingBus::default());
+        bus.set_active(true);
+        let session_id = mrd_proto::SessionId("send-fence-session".into());
+        let receipt = bus
+            .try_send_authenticated(authenticated_command(&session_id.0))
+            .unwrap();
+        let request = bus.recv_authenticated().await.unwrap();
+        let admission = bus
+            .admit_authenticated_request(request.request_id)
+            .await
+            .expect("live request admitted");
+
+        let closing_bus = Arc::clone(&bus);
+        let closing_session = session_id.clone();
+        let closing = tokio::spawn(async move {
+            closing_bus
+                .close_authenticated_session(&closing_session)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if bus.authenticated_lifecycle.try_read().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("close acquired write-fence priority");
+        assert!(!closing.is_finished(), "close bypassed an admitted send");
+
+        drop(admission);
+        closing.await.unwrap().unwrap();
+        assert!(bus
+            .admit_authenticated_request(request.request_id)
+            .await
+            .is_none());
+        assert_eq!(
+            receipt.wait().await,
+            Err(AuthenticatedSessionSignalingSendError::SessionClosed)
+        );
     }
 }

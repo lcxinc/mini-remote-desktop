@@ -17,7 +17,7 @@ struct WebRtcGrantBinding {
     accepted_fingerprints: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct RelayMigrationBinding {
     peer_key_id: String,
     generation: u64,
@@ -26,6 +26,17 @@ struct RelayMigrationBinding {
     restart_route_token: String,
     peer_candidate_fingerprints: HashSet<String>,
     direction: RelayMigrationDirection,
+}
+
+impl std::fmt::Debug for RelayMigrationBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RelayMigrationBinding")
+            .field("generation", &self.generation)
+            .field("direction", &self.direction)
+            .field("body", &"REDACTED")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,6 +420,14 @@ impl AuthenticatedSessionSignalPort for ServiceSignalingMapper {
         // grant that is concurrently being replaced or revoked.
         let _signaling_state_guard = self.signaling_state_gate.lock().await;
         match event.signal.clone() {
+            AuthenticatedSessionSignal::SessionIntentV3 { .. }
+            | AuthenticatedSessionSignal::SessionGrantV3 { .. }
+            | AuthenticatedSessionSignal::WebRtcOfferV3 { .. }
+            | AuthenticatedSessionSignal::WebRtcAnswerV3 { .. }
+            | AuthenticatedSessionSignal::WebRtcCandidateV3 { .. } => {
+                self.relay_signaling.publish(event).await;
+                Ok(())
+            }
             AuthenticatedSessionSignal::AuthorizationRequested {
                 session_id,
                 idempotency_key,
@@ -483,6 +502,10 @@ impl AuthenticatedSessionSignalPort for ServiceSignalingMapper {
                     crate::relay::RelayTerminalSecurityReason::RelayRevoked,
                 )
                 .await?;
+                self.relay_signaling
+                    .close_authenticated_session(&session_id)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
                 Ok(())
             }
             AuthenticatedSessionSignal::WebRtcCandidate {
@@ -529,7 +552,7 @@ impl AuthenticatedSessionSignalPort for ServiceSignalingMapper {
                     &candidate_fingerprints,
                 )
                 .await?;
-                self.relay_signaling.publish(event);
+                self.relay_signaling.publish(event).await;
                 Ok(())
             }
             AuthenticatedSessionSignal::RelayMigrationAnswer {
@@ -558,7 +581,7 @@ impl AuthenticatedSessionSignalPort for ServiceSignalingMapper {
                     .context("relay migration answer has no active binding")?;
                 binding.peer_candidate_fingerprints = candidate_fingerprints.into_iter().collect();
                 drop(migrations);
-                self.relay_signaling.publish(event);
+                self.relay_signaling.publish(event).await;
                 Ok(())
             }
             AuthenticatedSessionSignal::RelayMigrationCandidate {
@@ -606,7 +629,7 @@ impl AuthenticatedSessionSignalPort for ServiceSignalingMapper {
                     bail!("relay migration candidate was not committed by its description");
                 }
                 drop(migrations);
-                self.relay_signaling.publish(event);
+                self.relay_signaling.publish(event).await;
                 Ok(())
             }
         }
@@ -618,4 +641,27 @@ fn valid_restart_route_token(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RelayMigrationBinding, RelayMigrationDirection};
+    use std::collections::HashSet;
+
+    #[test]
+    fn relay_migration_binding_debug_redacts_route_token() {
+        let binding = RelayMigrationBinding {
+            peer_key_id: "peer-key".into(),
+            generation: 1,
+            directory_id: "directory-1".into(),
+            node_id: "relay-1".into(),
+            restart_route_token: "TEST_ONLY_RESTART_ROUTE_TOKEN_SENTINEL".into(),
+            peer_candidate_fingerprints: HashSet::new(),
+            direction: RelayMigrationDirection::IncomingOffer,
+        };
+
+        let rendered = format!("{binding:?}");
+        assert!(!rendered.contains("TEST_ONLY_RESTART_ROUTE_TOKEN_SENTINEL"));
+        assert!(rendered.contains("REDACTED"));
+    }
 }
