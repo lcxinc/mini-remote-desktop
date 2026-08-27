@@ -10,6 +10,7 @@ from dataclasses import dataclass, field as dataclass_field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Callable, Iterable, NoReturn, Protocol
 
+from pydantic import ValidationError
 from sqlalchemy import func, select
 
 from app.core.security import DeviceAuthSnapshot
@@ -21,6 +22,7 @@ from app.models.relay_node_registration import RelayNodeRegistration
 from app.models.relay_reservation import RelayReservation
 from app.models.session_request import SessionRequest
 from app.models.user import User
+from app.schemas.session import DeviceSessionCanonicalRequest
 from app.services.relay_repository import RelayRepository, RelayRepositoryError
 from app.services.relay_signing import (
     RelayDirectoryCandidateOut,
@@ -1658,25 +1660,27 @@ def _wan_request_binding_valid(
     if not isinstance(payload, dict):
         return False
     try:
+        request = DeviceSessionCanonicalRequest.model_validate(payload)
+        normalized = request.model_dump(mode="json")
         canonical = json.dumps(
-            payload,
+            normalized,
             ensure_ascii=False,
             allow_nan=False,
             separators=(",", ":"),
         ).encode("utf-8")
-    except (TypeError, ValueError):
+    except (ValidationError, TypeError, ValueError):
         return False
     commitment = hashlib.sha256(
         b"MRD_WAN_SESSION_REQUEST_V3\x00" + canonical
     ).hexdigest()
     return (
-        payload.get("session_id") == grant.id
-        and payload.get("controller_device_id") == controller.device_id
-        and payload.get("target_device_id") == target.device_id
-        and payload.get("access_mode") == "attended"
-        and payload.get("route_policy") == "relay_only"
-        and payload.get("requested_scopes") == grant.requested_scopes
-        and payload.get("requested_profile") == grant.requested_profile
+        request.session_id == grant.id
+        and request.controller_device_id == controller.device_id
+        and request.target_device_id == target.device_id
+        and request.access_mode == "attended"
+        and request.route_policy == "relay_only"
+        and normalized["requested_scopes"] == grant.requested_scopes
+        and normalized["requested_profile"] == grant.requested_profile
         and grant.request_commitment == commitment
     )
 
