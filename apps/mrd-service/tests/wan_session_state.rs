@@ -37,6 +37,7 @@ const TARGET_KEY: &str = "222222222222222222222222222222222222222222222222222222
 const REQUEST_COMMITMENT: &str = "3333333333333333333333333333333333333333333333333333333333333333";
 const RELAY_URL_DIGEST: &str = "4444444444444444444444444444444444444444444444444444444444444444";
 const INTENT_COMMITMENT: &str = "5555555555555555555555555555555555555555555555555555555555555555";
+const GRANT_COMMITMENT: &str = "6666666666666666666666666666666666666666666666666666666666666666";
 
 fn identity(suffix: &str) -> WanSessionIdentity {
     WanSessionIdentity::new(
@@ -100,9 +101,7 @@ fn full_path() -> Vec<WanSessionEvent> {
         WanSessionEvent::Granted(grant(7)),
         WanSessionEvent::AccessBound(access(7)),
         WanSessionEvent::Negotiating,
-        WanSessionEvent::RelayVerified(
-            RelayRouteProof::from_access(&access(7), true, true).unwrap(),
-        ),
+        WanSessionEvent::RelayVerified(RelayRouteProof::for_test(&access(7), true, true).unwrap()),
         WanSessionEvent::Streaming,
         WanSessionEvent::Closed,
     ]
@@ -232,7 +231,7 @@ fn deadline_generation_and_route_proof_are_fail_closed() {
         RELAY_URL_DIGEST.to_owned(),
     )
     .unwrap();
-    let wrong_proof = RelayRouteProof::from_access(&wrong_access, true, true).unwrap();
+    let wrong_proof = RelayRouteProof::for_test(&wrong_access, true, true).unwrap();
     assert!(state
         .apply(WanSessionEvent::RelayVerified(wrong_proof), 2)
         .is_err());
@@ -684,17 +683,17 @@ impl WanSessionWorkflowSignaling for FakeSignaling {
         Ok(INTENT_COMMITMENT.to_owned())
     }
 
-    async fn send_grant(
+    async fn send_grant_with_commitment(
         &self,
         _: &WanSessionIdentity,
         _: &str,
         _: &GrantBinding,
         _: &RelayAccessBinding,
         deadline: u64,
-    ) -> Result<(), WanSessionPortError> {
+    ) -> Result<String, WanSessionPortError> {
         self.grants.fetch_add(1, Ordering::SeqCst);
         self.deadlines.lock().unwrap().push(deadline);
-        Ok(())
+        Ok(GRANT_COMMITMENT.to_owned())
     }
 }
 

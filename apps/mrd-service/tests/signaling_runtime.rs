@@ -883,6 +883,95 @@ fn v3_initial_inbound_preserves_typed_signed_payloads_and_redacts_bodies() {
     }
 }
 
+#[test]
+fn v3_webrtc_messages_allow_signed_counter_reordering_per_session() {
+    let server = identity();
+    let peer = identity();
+    let mut runtime = SignalingRuntimeCore::new(
+        config_with_role_at(&server, BackendRole::Agent, "ws://127.0.0.1:9532/realtime"),
+        identity(),
+    );
+    runtime
+        .accept_registered(registered(&server, 1), NOW)
+        .unwrap();
+
+    let session_id = "reordered-webrtc-session";
+    let mut offer_payload = inbound_v3_offer(&peer, session_id).payload;
+    offer_payload.claims.counter = 1;
+    offer_payload.claims.nonce = [91; 16];
+    let offer = WebRtcOfferV3::sign(&peer, offer_payload).unwrap();
+    let candidate = inbound_v3_candidate(&peer, session_id, WebRtcDescriptionRoleV3::Offer, 2, 92);
+
+    // ICE candidates may be delivered before the SDP description.  Their
+    // authenticated counters are consequently not a globally ordered stream.
+    assert!(matches!(
+        runtime
+            .handle_inbound(
+                SignalEnvelope::new(AuthenticatedSignalMessage::WebrtcCandidateV3(
+                    candidate.clone(),
+                )),
+                NOW + 1,
+            )
+            .unwrap(),
+        InboundDisposition::Applied(_)
+    ));
+    assert!(matches!(
+        runtime
+            .handle_inbound(
+                SignalEnvelope::new(AuthenticatedSignalMessage::WebrtcOfferV3(offer)),
+                NOW + 1,
+            )
+            .unwrap(),
+        InboundDisposition::Applied(_)
+    ));
+
+    // The exact signed envelope remains idempotent even after an out-of-order
+    // message has been accepted.
+    assert_eq!(
+        runtime
+            .handle_inbound(
+                SignalEnvelope::new(AuthenticatedSignalMessage::WebrtcCandidateV3(candidate)),
+                NOW + 1,
+            )
+            .unwrap(),
+        InboundDisposition::Duplicate
+    );
+
+    // A fresh envelope with the same authenticated tuple is still a replay,
+    // even if an attacker changes the signed description body.
+    let mut altered_offer_payload = inbound_v3_offer(&peer, session_id).payload;
+    altered_offer_payload.claims.counter = 1;
+    altered_offer_payload.claims.nonce = [91; 16];
+    altered_offer_payload.sdp = "v=0\r\n".into();
+    let altered_offer = WebRtcOfferV3::sign(&peer, altered_offer_payload).unwrap();
+    assert!(matches!(
+        runtime.handle_inbound(
+            SignalEnvelope::new(AuthenticatedSignalMessage::WebrtcOfferV3(altered_offer)),
+            NOW + 1,
+        ),
+        Err(SignalingRuntimeError::Protocol(
+            mrd_signal_proto::SignalProtocolError::RepeatedNonce
+        ))
+    ));
+
+    // The same issuer/counter/nonce can be used by a separate session without
+    // poisoning that session's independently tracked replay window.
+    let second_session = "reordered-webrtc-session-2";
+    let mut second_offer_payload = inbound_v3_offer(&peer, second_session).payload;
+    second_offer_payload.claims.counter = 1;
+    second_offer_payload.claims.nonce = [91; 16];
+    let second_offer = WebRtcOfferV3::sign(&peer, second_offer_payload).unwrap();
+    assert!(matches!(
+        runtime
+            .handle_inbound(
+                SignalEnvelope::new(AuthenticatedSignalMessage::WebrtcOfferV3(second_offer)),
+                NOW + 1,
+            )
+            .unwrap(),
+        InboundDisposition::Applied(_)
+    ));
+}
+
 #[tokio::test]
 async fn v3_initial_invalid_runtime_messages_never_reach_scoped_bus() {
     struct InvalidCase {

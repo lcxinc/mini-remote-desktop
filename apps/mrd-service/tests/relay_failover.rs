@@ -24,6 +24,7 @@ use mrd_service::{
     },
     transports::{memory::MemoryTransportMux, TransportMuxConfig},
 };
+use ring::digest::{digest, SHA256};
 use serde_json::json;
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -52,6 +53,7 @@ fn production_migration_executor_rejects_unbounded_negotiation_deadlines() {
 struct FakeBackend {
     responses: Mutex<VecDeque<Result<Vec<u8>, RelayBackendError>>>,
     gate: Mutex<Option<Arc<Semaphore>>>,
+    contexts: Mutex<Vec<RelayAccessContext>>,
     fetches: AtomicU64,
 }
 
@@ -65,9 +67,10 @@ impl FakeBackend {
 impl RelayAccessBackend for FakeBackend {
     async fn fetch(
         &self,
-        _context: &RelayAccessContext,
+        context: &RelayAccessContext,
     ) -> Result<Zeroizing<Vec<u8>>, RelayBackendError> {
         self.fetches.fetch_add(1, Ordering::AcqRel);
+        self.contexts.lock().unwrap().push(context.clone());
         let gate = self.gate.lock().unwrap().take();
         if let Some(gate) = gate {
             gate.acquire().await.unwrap().forget();
@@ -222,10 +225,26 @@ fn relay_config() -> RelayClientConfig {
 }
 
 fn access_response(expires_at_ms: u64) -> Vec<u8> {
-    access_response_with_backup_domain(expires_at_ms, "domain-c")
+    access_response_with_generation(None, expires_at_ms, "domain-c")
 }
 
-fn access_response_with_backup_domain(expires_at_ms: u64, backup_domain: &str) -> Vec<u8> {
+fn refresh_access_response(generation: u64, expires_at_ms: u64) -> Vec<u8> {
+    access_response_with_generation(Some(generation), expires_at_ms, "domain-c")
+}
+
+fn refresh_access_response_with_backup_domain(
+    generation: u64,
+    expires_at_ms: u64,
+    backup_domain: &str,
+) -> Vec<u8> {
+    access_response_with_generation(Some(generation), expires_at_ms, backup_domain)
+}
+
+fn access_response_with_generation(
+    generation: Option<u64>,
+    expires_at_ms: u64,
+    backup_domain: &str,
+) -> Vec<u8> {
     let endpoints = [
         ("relay-a", "domain-a", "relay-a.example.test"),
         ("relay-b", "domain-a", "relay-b.example.test"),
@@ -256,7 +275,12 @@ fn access_response_with_backup_domain(expires_at_ms: u64, backup_domain: &str) -
                 }],
                 capabilities: 1,
                 load_class: 1,
-                selection_reason: "eligible".into(),
+                selection_reason: if generation.is_some() && *node_id == "relay-a" {
+                    "preferred-region"
+                } else {
+                    "eligible"
+                }
+                .into(),
                 reservation: RelayReservation {
                     reservation_id: format!("reservation-{node_id}"),
                     expires_at_ms,
@@ -282,11 +306,27 @@ fn access_response_with_backup_domain(expires_at_ms: u64, backup_domain: &str) -
             })
         })
         .collect::<Vec<_>>();
+    let primary_url = "turn:relay-a.example.test:3478?transport=udp";
     serde_json::to_vec(&json!({
+        "generation": generation,
+        "directory_id": "directory-failover",
+        "relay_url_digest": generation.map(|_| relay_url_digest(primary_url)),
         "directory": directory,
         "credentials": credentials
     }))
     .unwrap()
+}
+
+fn relay_url_digest(url: &str) -> String {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"MRD_RELAY_URLS_V1\0");
+    bytes.extend_from_slice(&(url.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(url.as_bytes());
+    digest(&SHA256, &bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 struct Fixture {
@@ -400,7 +440,9 @@ async fn wait_for_phase(
 #[tokio::test]
 async fn authenticated_remote_offer_refreshes_exact_node_and_commits_answer_side_generation() {
     let fixture = make_fixture(None, false).await;
-    fixture.backend.push(Ok(access_response(NOW + 30_000)));
+    fixture
+        .backend
+        .push(Ok(refresh_access_response(1, NOW + 30_000)));
     let event = VerifiedSignalingEvent {
         sender: VerifiedSignalingIdentity {
             device_id: mrd_proto::DeviceId("peer-device".into()),
@@ -430,6 +472,10 @@ async fn authenticated_remote_offer_refreshes_exact_node_and_commits_answer_side
         .expect("answer-side migration");
 
     assert!(matches!(outcome, RelayRecoveryOutcome::Migrated { .. }));
+    let contexts = fixture.backend.contexts.lock().unwrap();
+    let refresh_context = contexts.last().expect("refresh access context");
+    assert!(refresh_context.is_refresh());
+    assert_eq!(refresh_context.generation(), Some(0));
     let snapshot = fixture
         .coordinator
         .snapshot(&fixture.session_id)
@@ -485,7 +531,9 @@ async fn cancelling_directory_refresh_returns_planning_session_to_idle() {
     let fixture = make_fixture(None, false).await;
     let backend_gate = Arc::new(Semaphore::new(0));
     *fixture.backend.gate.lock().unwrap() = Some(Arc::clone(&backend_gate));
-    fixture.backend.push(Ok(access_response(NOW + 30_000)));
+    fixture
+        .backend
+        .push(Ok(refresh_access_response(1, NOW + 30_000)));
     let coordinator = Arc::clone(&fixture.coordinator);
     let session_id = fixture.session_id.clone();
     let recovery = tokio::spawn(async move {
@@ -510,7 +558,9 @@ async fn cancelling_directory_refresh_returns_planning_session_to_idle() {
 async fn cancelling_frozen_migration_discards_attempt_and_thaws_input() {
     let executor_gate = Arc::new(Semaphore::new(0));
     let fixture = make_fixture(Some(Arc::clone(&executor_gate)), false).await;
-    fixture.backend.push(Ok(access_response(NOW + 30_000)));
+    fixture
+        .backend
+        .push(Ok(refresh_access_response(1, NOW + 30_000)));
     let coordinator = Arc::clone(&fixture.coordinator);
     let session_id = fixture.session_id.clone();
     let recovery = tokio::spawn(async move {
@@ -608,7 +658,9 @@ async fn retry_after_started_migration_uses_the_next_generation() {
     *fixture.executor.failure.lock().unwrap() = Some(RelayMigrationFailure::retryable(
         RelayMigrationFailureCode::SignalingUnavailable,
     ));
-    fixture.backend.push(Ok(access_response(NOW + 30_000)));
+    fixture
+        .backend
+        .push(Ok(refresh_access_response(1, NOW + 30_000)));
 
     assert_eq!(
         fixture
@@ -621,7 +673,9 @@ async fn retry_after_started_migration_uses_the_next_generation() {
         }
     );
 
-    fixture.backend.push(Ok(access_response(NOW + 30_000)));
+    fixture
+        .backend
+        .push(Ok(refresh_access_response(2, NOW + 30_000)));
     assert!(matches!(
         fixture
             .coordinator
@@ -651,7 +705,9 @@ async fn retry_after_started_migration_uses_the_next_generation() {
 #[tokio::test]
 async fn disconnected_uses_grace_failed_is_immediate_and_backup_crosses_failure_domain() {
     let fixture = make_fixture(None, false).await;
-    fixture.backend.push(Ok(access_response(NOW + 30_000)));
+    fixture
+        .backend
+        .push(Ok(refresh_access_response(1, NOW + 30_000)));
     assert_eq!(
         fixture
             .coordinator
@@ -692,7 +748,9 @@ async fn disconnected_uses_grace_failed_is_immediate_and_backup_crosses_failure_
         ]
     );
 
-    fixture.backend.push(Ok(access_response(NOW + 30_000)));
+    fixture
+        .backend
+        .push(Ok(refresh_access_response(2, NOW + 30_000)));
     assert!(matches!(
         fixture
             .coordinator
@@ -715,7 +773,9 @@ async fn disconnected_uses_grace_failed_is_immediate_and_backup_crosses_failure_
 #[tokio::test]
 async fn stale_health_from_the_replaced_generation_is_suppressed() {
     let fixture = make_fixture(None, false).await;
-    fixture.backend.push(Ok(access_response(NOW + 30_000)));
+    fixture
+        .backend
+        .push(Ok(refresh_access_response(1, NOW + 30_000)));
     assert!(matches!(
         fixture
             .coordinator
@@ -747,7 +807,9 @@ async fn stale_health_from_the_replaced_generation_is_suppressed() {
 async fn replacement_is_atomic_and_terminal_event_suppresses_the_late_loser() {
     let gate = Arc::new(Semaphore::new(0));
     let fixture = make_fixture(Some(Arc::clone(&gate)), false).await;
-    fixture.backend.push(Ok(access_response(NOW + 30_000)));
+    fixture
+        .backend
+        .push(Ok(refresh_access_response(1, NOW + 30_000)));
     let coordinator = Arc::clone(&fixture.coordinator);
     let session_id = fixture.session_id.clone();
     let recovery = tokio::spawn(async move {
@@ -849,7 +911,9 @@ async fn terminal_event_during_input_freeze_prevents_migration_from_starting() {
     let fixture = make_fixture(None, false).await;
     let input_gate = Arc::new(Semaphore::new(0));
     *fixture.input.gate.lock().unwrap() = Some(Arc::clone(&input_gate));
-    fixture.backend.push(Ok(access_response(NOW + 30_000)));
+    fixture
+        .backend
+        .push(Ok(refresh_access_response(1, NOW + 30_000)));
     let coordinator = Arc::clone(&fixture.coordinator);
     let session_id = fixture.session_id.clone();
     let recovery = tokio::spawn(async move {
@@ -905,7 +969,9 @@ async fn transport_error_after_terminal_close_is_suppressed_not_retried() {
     *fixture.executor.failure.lock().unwrap() = Some(RelayMigrationFailure::retryable(
         RelayMigrationFailureCode::TransportUnavailable,
     ));
-    fixture.backend.push(Ok(access_response(NOW + 30_000)));
+    fixture
+        .backend
+        .push(Ok(refresh_access_response(1, NOW + 30_000)));
     let coordinator = Arc::clone(&fixture.coordinator);
     let session_id = fixture.session_id.clone();
     let recovery = tokio::spawn(async move {
@@ -950,10 +1016,13 @@ async fn terminal_event_during_directory_refresh_suppresses_retryable_planning_r
     let fixture = make_fixture(None, false).await;
     let backend_gate = Arc::new(Semaphore::new(0));
     *fixture.backend.gate.lock().unwrap() = Some(Arc::clone(&backend_gate));
-    fixture.backend.push(Ok(access_response_with_backup_domain(
-        NOW + 30_000,
-        "domain-a",
-    )));
+    fixture
+        .backend
+        .push(Ok(refresh_access_response_with_backup_domain(
+            1,
+            NOW + 30_000,
+            "domain-a",
+        )));
     let coordinator = Arc::clone(&fixture.coordinator);
     let session_id = fixture.session_id.clone();
     let recovery = tokio::spawn(async move {
@@ -1048,7 +1117,7 @@ async fn backend_revocation_is_reported_as_grant_expiry_not_signature_failure() 
 async fn invalid_signed_refresh_and_explicit_security_events_close_active_and_pending_paths() {
     let fixture = make_fixture(None, false).await;
     let mut tampered: serde_json::Value =
-        serde_json::from_slice(&access_response(NOW + 30_000)).unwrap();
+        serde_json::from_slice(&refresh_access_response(1, NOW + 30_000)).unwrap();
     tampered["directory"]["payload"]["directory_id"] = json!("directory-attacker");
     fixture
         .backend
@@ -1108,7 +1177,9 @@ async fn stable_mux_preserves_all_lane_continuity_across_atomic_relay_commit() {
             .unwrap()
             .expect("first envelope");
     }
-    fixture.backend.push(Ok(access_response(NOW + 30_000)));
+    fixture
+        .backend
+        .push(Ok(refresh_access_response(1, NOW + 30_000)));
     assert!(matches!(
         fixture
             .coordinator

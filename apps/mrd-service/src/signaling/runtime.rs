@@ -7,14 +7,15 @@ use mrd_application::{
 use mrd_identity::DeviceIdentity;
 use mrd_proto::BackendRole;
 use mrd_signal_proto::{
-    AuthClaims, AuthenticatedSignalMessage, PresenceHeartbeat, PresenceHeartbeatPayload,
-    RegisterPayload, Registered, RelayMigrationAnswer, RelayMigrationAnswerPayload,
-    RelayMigrationCandidate, RelayMigrationCandidatePayload, RelayMigrationOffer,
-    RelayMigrationOfferPayload, ServerChallenge, SessionGrantV3, SessionGrantV3Payload,
-    SessionIntentV3, SessionIntentV3Payload, SignalEnvelope, SignalProtocolError,
-    SignalReplayGuard, WanMediaProfileV3, WanPermissionScopeV3, WanRoutePolicyV3,
-    WanSessionRequestV3, WebRtcAnswerV3, WebRtcAnswerV3Payload, WebRtcCandidateV3,
-    WebRtcCandidateV3Payload, WebRtcDescriptionRoleV3, WebRtcOfferV3, WebRtcOfferV3Payload,
+    AuthClaims, AuthenticatedPayload, AuthenticatedSignalMessage, PresenceHeartbeat,
+    PresenceHeartbeatPayload, RegisterPayload, Registered, RelayMigrationAnswer,
+    RelayMigrationAnswerPayload, RelayMigrationCandidate, RelayMigrationCandidatePayload,
+    RelayMigrationOffer, RelayMigrationOfferPayload, ServerChallenge, SessionGrantV3,
+    SessionGrantV3Payload, SessionIntentV3, SessionIntentV3Payload, SignalEnvelope,
+    SignalProtocolError, SignalReplayGuard, SignedSignal, VerifiedSignalMetadata,
+    WanMediaProfileV3, WanPermissionScopeV3, WanRoutePolicyV3, WanSessionRequestV3, WebRtcAnswerV3,
+    WebRtcAnswerV3Payload, WebRtcCandidateV3, WebRtcCandidateV3Payload, WebRtcDescriptionRoleV3,
+    WebRtcOfferV3, WebRtcOfferV3Payload,
 };
 use ring::{digest, rand::SecureRandom, rand::SystemRandom};
 use std::{
@@ -31,8 +32,148 @@ const MIN_HEARTBEAT_INTERVAL_MS: u64 = 250;
 const MAX_HEARTBEAT_INTERVAL_MS: u64 = 300_000;
 const RELAY_SIGNAL_QUEUE_CAPACITY: usize = 128;
 const RELAY_EVENT_QUEUE_CAPACITY: usize = 256;
+const GENERATION_ZERO_REPLAY_WINDOW_CAPACITY: usize = 512;
+const GENERATION_ZERO_REPLAY_MAX_WINDOWS: usize = 1_024;
+const GENERATION_ZERO_REPLAY_MAX_ENTRIES: usize = 4_096;
 
 pub const AUTHENTICATED_SESSION_SIGNAL_QUEUE_CAPACITY: usize = RELAY_SIGNAL_QUEUE_CAPACITY;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GenerationZeroReplayLaneKey {
+    session_id: mrd_proto::SessionId,
+    issuer_key_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GenerationZeroReplayTuple {
+    counter: u64,
+    nonce: [u8; 16],
+}
+
+#[derive(Debug, Clone)]
+struct GenerationZeroReplayEntry {
+    tuple: GenerationZeroReplayTuple,
+    expires_at_ms: u64,
+}
+
+/// Bounded replay tracking for generation-zero WebRTC messages.
+///
+/// Description and ICE messages are independently signed and may cross in
+/// flight, so their counters are not an ordered stream. Each
+/// `(session, issuer)` lane rejects the same authenticated `(counter, nonce)`
+/// tuple without allowing traffic from another session to evict its recent
+/// replay entries. Both the number of lanes and the total number of entries
+/// remain bounded. Only expired entries are removed; capacity exhaustion
+/// fails closed instead of making an unexpired replay acceptable again.
+#[derive(Debug, Default)]
+struct GenerationZeroReplayLane {
+    order: VecDeque<GenerationZeroReplayEntry>,
+    seen: HashSet<GenerationZeroReplayTuple>,
+}
+
+#[derive(Debug)]
+struct GenerationZeroReplayWindow {
+    lane_capacity: usize,
+    max_windows: usize,
+    max_entries: usize,
+    total_entries: usize,
+    windows: HashMap<GenerationZeroReplayLaneKey, GenerationZeroReplayLane>,
+}
+
+impl GenerationZeroReplayWindow {
+    fn new(lane_capacity: usize) -> Self {
+        Self::with_limits(
+            lane_capacity,
+            GENERATION_ZERO_REPLAY_MAX_WINDOWS,
+            GENERATION_ZERO_REPLAY_MAX_ENTRIES,
+        )
+    }
+
+    fn with_limits(lane_capacity: usize, max_windows: usize, max_entries: usize) -> Self {
+        Self {
+            lane_capacity: lane_capacity.max(1),
+            max_windows: max_windows.max(1),
+            max_entries: max_entries.max(1),
+            total_entries: 0,
+            windows: HashMap::new(),
+        }
+    }
+
+    fn accept(
+        &mut self,
+        session_id: &mrd_proto::SessionId,
+        issuer_key_id: &str,
+        counter: u64,
+        nonce: [u8; 16],
+        now_ms: u64,
+        expires_at_ms: u64,
+    ) -> Result<(), SignalProtocolError> {
+        self.prune_expired(now_ms);
+        let lane_key = GenerationZeroReplayLaneKey {
+            session_id: session_id.clone(),
+            issuer_key_id: issuer_key_id.to_owned(),
+        };
+        let tuple = GenerationZeroReplayTuple { counter, nonce };
+        if self
+            .windows
+            .get(&lane_key)
+            .is_some_and(|lane| lane.seen.contains(&tuple))
+        {
+            return Err(SignalProtocolError::RepeatedNonce);
+        }
+
+        if !self.windows.contains_key(&lane_key) {
+            if self.windows.len() >= self.max_windows || self.total_entries >= self.max_entries {
+                return Err(SignalProtocolError::ReplayCapacity);
+            }
+            self.windows
+                .insert(lane_key.clone(), GenerationZeroReplayLane::default());
+        }
+
+        if self.total_entries >= self.max_entries
+            || self
+                .windows
+                .get(&lane_key)
+                .is_some_and(|lane| lane.order.len() >= self.lane_capacity)
+        {
+            return Err(SignalProtocolError::ReplayCapacity);
+        }
+
+        let lane = self
+            .windows
+            .get_mut(&lane_key)
+            .expect("replay lane exists before insertion");
+        lane.seen.insert(tuple.clone());
+        lane.order.push_back(GenerationZeroReplayEntry {
+            tuple,
+            expires_at_ms,
+        });
+        self.total_entries += 1;
+        Ok(())
+    }
+
+    fn prune_expired(&mut self, now_ms: u64) {
+        let mut empty = Vec::new();
+        for (lane_key, lane) in &mut self.windows {
+            let mut retained = VecDeque::with_capacity(lane.order.len());
+            while let Some(entry) = lane.order.pop_front() {
+                if entry.expires_at_ms <= now_ms {
+                    lane.seen.remove(&entry.tuple);
+                    self.total_entries = self.total_entries.saturating_sub(1);
+                } else {
+                    retained.push_back(entry);
+                }
+            }
+            lane.order = retained;
+            if lane.order.is_empty() {
+                empty.push(lane_key.clone());
+            }
+        }
+        for lane_key in empty {
+            self.windows.remove(&lane_key);
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum OutboundAuthenticatedSessionSignal {
@@ -144,8 +285,11 @@ pub enum AuthenticatedSessionSignalingReceiveError {
     Lagged,
 }
 
+pub type AuthenticatedSessionSignalingOutcome =
+    Result<Option<String>, AuthenticatedSessionSignalingSendError>;
+
 pub struct AuthenticatedSessionSignalingReceipt {
-    completed: tokio::sync::oneshot::Receiver<Result<(), AuthenticatedSessionSignalingSendError>>,
+    completed: tokio::sync::oneshot::Receiver<AuthenticatedSessionSignalingOutcome>,
 }
 
 impl std::fmt::Debug for AuthenticatedSessionSignalingReceipt {
@@ -158,6 +302,14 @@ impl std::fmt::Debug for AuthenticatedSessionSignalingReceipt {
 
 impl AuthenticatedSessionSignalingReceipt {
     pub async fn wait(self) -> Result<(), AuthenticatedSessionSignalingSendError> {
+        self.outcome().await.map(|_| ())
+    }
+
+    pub async fn wait_with_commitment(self) -> AuthenticatedSessionSignalingOutcome {
+        self.outcome().await
+    }
+
+    pub async fn outcome(self) -> AuthenticatedSessionSignalingOutcome {
         self.completed
             .await
             .map_err(|_| AuthenticatedSessionSignalingSendError::Unavailable)?
@@ -257,7 +409,7 @@ struct OutboundAuthenticatedSessionSignalingRequest {
 
 struct PendingAuthenticatedSessionSignalingRequest {
     session_id: mrd_proto::SessionId,
-    completion: tokio::sync::oneshot::Sender<Result<(), AuthenticatedSessionSignalingSendError>>,
+    completion: tokio::sync::oneshot::Sender<AuthenticatedSessionSignalingOutcome>,
 }
 
 #[derive(Default)]
@@ -577,7 +729,7 @@ impl RelaySignalingBus {
     fn complete_authenticated(
         &self,
         request_id: u64,
-        result: Result<(), AuthenticatedSessionSignalingSendError>,
+        result: AuthenticatedSessionSignalingOutcome,
     ) {
         let completion = self
             .authenticated
@@ -659,6 +811,43 @@ impl std::fmt::Debug for AuthenticatedSessionSignalingSubscription {
 }
 
 impl AuthenticatedSessionSignalingSubscription {
+    /// Poll one already-buffered event without waiting. Generation-zero
+    /// negotiation uses this after an exact candidate set to reject trailing
+    /// extra/duplicate candidates while preserving the scoped subscription.
+    pub async fn try_recv(
+        &mut self,
+    ) -> Result<Option<VerifiedSignalingEvent>, AuthenticatedSessionSignalingReceiveError> {
+        let _lifecycle = self.bus.authenticated_lifecycle.read().await;
+        if self.bus.is_authenticated_session_closed(&self.session_id) {
+            self.replay.clear();
+            return Err(AuthenticatedSessionSignalingReceiveError::SessionClosed);
+        }
+        if let Some(event) = self.replay.pop_front() {
+            return Ok(Some(event));
+        }
+        loop {
+            match self.live.try_recv() {
+                Ok(event)
+                    if authenticated_session_event_matches(
+                        &event,
+                        &self.session_id,
+                        &self.peer_device_id,
+                    ) =>
+                {
+                    return Ok(Some(event));
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => return Ok(None),
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                    return Err(AuthenticatedSessionSignalingReceiveError::Closed)
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                    return Err(AuthenticatedSessionSignalingReceiveError::Lagged)
+                }
+            }
+        }
+    }
+
     pub async fn recv(
         &mut self,
     ) -> Result<VerifiedSignalingEvent, AuthenticatedSessionSignalingReceiveError> {
@@ -871,6 +1060,7 @@ pub struct SignalingRuntimeCore {
     reconnect_attempt: u32,
     observed_server_key_id: Option<String>,
     replay: SignalReplayGuard,
+    generation_zero_replay: GenerationZeroReplayWindow,
     accepted_order: VecDeque<[u8; 32]>,
     accepted: HashSet<[u8; 32]>,
     peer_keys: HashMap<mrd_proto::DeviceId, String>,
@@ -900,6 +1090,9 @@ impl SignalingRuntimeCore {
             reconnect_attempt: 0,
             observed_server_key_id: None,
             replay: SignalReplayGuard::new(4_096, 2_048),
+            generation_zero_replay: GenerationZeroReplayWindow::new(
+                GENERATION_ZERO_REPLAY_WINDOW_CAPACITY,
+            ),
             accepted_order: VecDeque::new(),
             accepted: HashSet::new(),
             peer_keys: HashMap::new(),
@@ -1176,6 +1369,16 @@ impl SignalingRuntimeCore {
         Ok(SignalEnvelope::new(message))
     }
 
+    fn authenticated_session_commitment(
+        envelope: &SignalEnvelope,
+    ) -> Result<Option<String>, SignalingRuntimeError> {
+        match &envelope.message {
+            AuthenticatedSignalMessage::SessionIntentV3(message) => Ok(Some(message.commitment()?)),
+            AuthenticatedSignalMessage::SessionGrantV3(message) => Ok(Some(message.commitment()?)),
+            _ => Ok(None),
+        }
+    }
+
     pub fn build_relay_migration_signal(
         &mut self,
         command: RelaySignalingCommand,
@@ -1258,6 +1461,30 @@ impl SignalingRuntimeCore {
         Ok(SignalEnvelope::new(message))
     }
 
+    fn verify_generation_zero<T: AuthenticatedPayload>(
+        &mut self,
+        message: &SignedSignal<T>,
+        session_id: &mrd_proto::SessionId,
+        now_ms: u64,
+    ) -> Result<VerifiedSignalMetadata, SignalingRuntimeError> {
+        // The protocol-level guard enforces signature, claims, time and peer
+        // validation, but its monotonic counter rule is intentionally scoped
+        // out for independently delivered generation-zero WebRTC messages.
+        let metadata = {
+            let mut single_message_replay = SignalReplayGuard::new(1, 1);
+            message.verify_for(self.config.device_id(), now_ms, &mut single_message_replay)?
+        };
+        self.generation_zero_replay.accept(
+            session_id,
+            &metadata.issuer_key_id,
+            metadata.counter,
+            metadata.nonce,
+            now_ms,
+            message.payload.claims().expires_at_ms,
+        )?;
+        Ok(metadata)
+    }
+
     /// Verify, bind and map one inbound session envelope.
     pub fn handle_inbound(
         &mut self,
@@ -1300,7 +1527,7 @@ impl SignalingRuntimeCore {
             AuthenticatedSignalMessage::WebrtcOfferV3(message) => (
                 {
                     self.require_role(BackendRole::Agent)?;
-                    message.verify_for(self.config.device_id(), now_ms, &mut self.replay)?
+                    self.verify_generation_zero(message, &message.payload.session_id, now_ms)?
                 },
                 message.signer_public_key.clone(),
                 AuthenticatedSessionSignal::WebRtcOfferV3 {
@@ -1310,7 +1537,7 @@ impl SignalingRuntimeCore {
             AuthenticatedSignalMessage::WebrtcAnswerV3(message) => (
                 {
                     self.require_role(BackendRole::Controller)?;
-                    message.verify_for(self.config.device_id(), now_ms, &mut self.replay)?
+                    self.verify_generation_zero(message, &message.payload.session_id, now_ms)?
                 },
                 message.signer_public_key.clone(),
                 AuthenticatedSessionSignal::WebRtcAnswerV3 {
@@ -1323,7 +1550,7 @@ impl SignalingRuntimeCore {
                         WebRtcDescriptionRoleV3::Offer => BackendRole::Agent,
                         WebRtcDescriptionRoleV3::Answer => BackendRole::Controller,
                     })?;
-                    message.verify_for(self.config.device_id(), now_ms, &mut self.replay)?
+                    self.verify_generation_zero(message, &message.payload.session_id, now_ms)?
                 },
                 message.signer_public_key.clone(),
                 AuthenticatedSessionSignal::WebRtcCandidateV3 {
@@ -1826,6 +2053,17 @@ async fn run_connection(
                         continue;
                     }
                 };
+                let commitment = match SignalingRuntimeCore::authenticated_session_commitment(&envelope)
+                {
+                    Ok(value) => value,
+                    Err(_) => {
+                        relay_signaling.complete_authenticated(
+                            request.request_id,
+                            Err(AuthenticatedSessionSignalingSendError::Invalid),
+                        );
+                        continue;
+                    }
+                };
                 if !relay_signaling.authenticated_request_is_live(request.request_id) {
                     continue;
                 }
@@ -1836,7 +2074,7 @@ async fn run_connection(
                     );
                     return ConnectionExit::Failed(error);
                 }
-                relay_signaling.complete_authenticated(request.request_id, Ok(()));
+                relay_signaling.complete_authenticated(request.request_id, Ok(commitment));
             }
             message = reader.next() => {
                 let envelope = match decode_socket_message(message) {
@@ -2048,6 +2286,39 @@ impl SignalingRuntimeError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn generation_zero_replay_lanes_fail_closed_until_entries_expire() {
+        let active = mrd_proto::SessionId("active-session".into());
+        let noisy = mrd_proto::SessionId("noisy-session".into());
+        let churned = mrd_proto::SessionId("churned-session".into());
+        let mut replay = GenerationZeroReplayWindow::with_limits(4, 2, 4);
+
+        replay
+            .accept(&active, "peer-key", 1, [1; 16], 1, 100)
+            .unwrap();
+        replay
+            .accept(&noisy, "peer-key", 1, [2; 16], 1, 100)
+            .unwrap();
+        replay
+            .accept(&active, "peer-key", 2, [3; 16], 1, 100)
+            .unwrap();
+        assert_eq!(
+            replay.accept(&churned, "peer-key", 1, [4; 16], 1, 100),
+            Err(SignalProtocolError::ReplayCapacity)
+        );
+
+        assert_eq!(
+            replay.accept(&active, "peer-key", 1, [1; 16], 1, 100),
+            Err(SignalProtocolError::RepeatedNonce)
+        );
+        assert!(replay.total_entries <= 4);
+        assert!(replay.windows.len() <= 2);
+
+        replay
+            .accept(&churned, "peer-key", 1, [4; 16], 100, 200)
+            .unwrap();
+    }
+
     fn authenticated_command(session_id: &str) -> AuthenticatedSessionSignalingCommand {
         AuthenticatedSessionSignalingCommand {
             peer_device_id: mrd_proto::DeviceId("peer-device".into()),
@@ -2108,6 +2379,111 @@ mod tests {
         assert_eq!(
             receipt.wait().await,
             Err(AuthenticatedSessionSignalingSendError::SessionClosed)
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_receipt_exposes_commitment_outcome() {
+        let (_completion, completed) = tokio::sync::oneshot::channel();
+        let receipt = AuthenticatedSessionSignalingReceipt { completed };
+
+        assert_eq!(
+            receipt.wait_with_commitment().await,
+            Err(AuthenticatedSessionSignalingSendError::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_receipt_outcome_alias_is_available() {
+        let (_completion, completed) = tokio::sync::oneshot::channel();
+        let receipt = AuthenticatedSessionSignalingReceipt { completed };
+
+        assert_eq!(
+            receipt.outcome().await,
+            Err(AuthenticatedSessionSignalingSendError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn authenticated_session_commitment_is_exact_for_intent_and_grant_only() {
+        let signer = DeviceIdentity::generate(&SystemRandom::new()).unwrap();
+        let request = match authenticated_command("commitment-session").signal {
+            OutboundAuthenticatedSessionSignal::SessionIntent { request } => request,
+            _ => unreachable!(),
+        };
+        let intent = SessionIntentV3::sign(
+            &signer,
+            SessionIntentV3Payload {
+                claims: AuthClaims {
+                    issuer_device_id: mrd_proto::DeviceId("local-device".into()),
+                    issuer_key_id: signer.key_id().into(),
+                    intended_peer_device_id: mrd_proto::DeviceId("peer-device".into()),
+                    issued_at_ms: 1,
+                    expires_at_ms: 100,
+                    counter: 1,
+                    nonce: [1; 16],
+                },
+                request: request.clone(),
+                request_commitment: request.commitment().unwrap(),
+            },
+        )
+        .unwrap();
+        let intent_commitment = intent.commitment().unwrap();
+        assert_eq!(
+            SignalingRuntimeCore::authenticated_session_commitment(&SignalEnvelope::new(
+                AuthenticatedSignalMessage::SessionIntentV3(intent),
+            ))
+            .unwrap(),
+            Some(intent_commitment)
+        );
+
+        let grant = SessionGrantV3::sign(
+            &signer,
+            SessionGrantV3Payload {
+                claims: AuthClaims {
+                    issuer_device_id: mrd_proto::DeviceId("peer-device".into()),
+                    issuer_key_id: signer.key_id().into(),
+                    intended_peer_device_id: mrd_proto::DeviceId("local-device".into()),
+                    issued_at_ms: 1,
+                    expires_at_ms: 100,
+                    counter: 2,
+                    nonce: [2; 16],
+                },
+                session_id: mrd_proto::SessionId("commitment-session".into()),
+                controller_device_id: mrd_proto::DeviceId("local-device".into()),
+                target_device_id: mrd_proto::DeviceId("peer-device".into()),
+                intent_commitment: "a".repeat(64),
+                approved_scopes: vec![WanPermissionScopeV3::ScreenView],
+                approved_profile: None,
+                backend_policy_revision: 1,
+                policy_expires_at_ms: 90,
+                relay_generation: 0,
+                relay_directory_id: "directory-0".into(),
+                primary_relay_node_id: "relay-primary".into(),
+                route_policy: mrd_signal_proto::WanRoutePolicyV3::RelayOnly,
+            },
+        )
+        .unwrap();
+        let grant_commitment = grant.commitment().unwrap();
+        assert_eq!(
+            SignalingRuntimeCore::authenticated_session_commitment(&SignalEnvelope::new(
+                AuthenticatedSignalMessage::SessionGrantV3(grant),
+            ))
+            .unwrap(),
+            Some(grant_commitment)
+        );
+
+        assert_eq!(
+            SignalingRuntimeCore::authenticated_session_commitment(&SignalEnvelope::new(
+                AuthenticatedSignalMessage::ServerChallenge(ServerChallenge {
+                    challenge_id: [3; 16],
+                    challenge_nonce: [4; 32],
+                    issued_at_ms: 1,
+                    expires_at_ms: 100,
+                }),
+            ))
+            .unwrap(),
+            None
         );
     }
 }

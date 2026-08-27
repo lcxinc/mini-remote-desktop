@@ -161,6 +161,9 @@ impl WanSessionIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantBinding {
     request_commitment: String,
+    /// Commitment of the verified signed SessionGrantV3.  Backend policy
+    /// records do not have this value until a signed grant is installed.
+    grant_commitment: Option<String>,
     approved_scopes: Vec<WanPermissionScopeV3>,
     approved_profile: Option<WanMediaProfileV3>,
     policy_revision: u64,
@@ -210,6 +213,7 @@ impl GrantBinding {
         }
         Ok(Self {
             request_commitment,
+            grant_commitment: None,
             approved_scopes,
             approved_profile,
             policy_revision,
@@ -221,6 +225,24 @@ impl GrantBinding {
 
     pub fn request_commitment(&self) -> &str {
         &self.request_commitment
+    }
+
+    pub fn grant_commitment(&self) -> Option<&str> {
+        self.grant_commitment.as_deref()
+    }
+
+    /// Bind the exact commitment of the signed grant that authorized this
+    /// policy.  The value is intentionally not accepted by `new`, so a
+    /// backend-only policy cannot be used to authenticate WebRTC messages.
+    pub fn with_grant_commitment(
+        mut self,
+        grant_commitment: String,
+    ) -> Result<Self, WanSessionModelError> {
+        if !is_digest(&grant_commitment) {
+            return Err(WanSessionModelError::InvalidPolicy);
+        }
+        self.grant_commitment = Some(grant_commitment);
+        Ok(self)
     }
 
     pub fn approved_scopes(&self) -> &[WanPermissionScopeV3] {
@@ -326,7 +348,7 @@ pub struct RelayRouteProof {
 }
 
 impl RelayRouteProof {
-    pub fn from_access(
+    pub(crate) fn from_verified_access(
         access: &RelayAccessBinding,
         local_candidate_relayed: bool,
         remote_candidate_relayed: bool,
@@ -339,6 +361,18 @@ impl RelayRouteProof {
             local_candidate_relayed,
             remote_candidate_relayed,
         })
+    }
+
+    /// Test-only constructor. Production callers must obtain route evidence
+    /// through the generation-zero host verification and coordinator commit.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn for_test(
+        access: &RelayAccessBinding,
+        local_candidate_relayed: bool,
+        remote_candidate_relayed: bool,
+    ) -> Result<Self, WanSessionModelError> {
+        Self::from_verified_access(access, local_candidate_relayed, remote_candidate_relayed)
     }
 
     pub fn access(&self) -> &RelayAccessBinding {

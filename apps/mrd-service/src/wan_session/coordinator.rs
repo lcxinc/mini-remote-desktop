@@ -419,6 +419,26 @@ impl WanSessionCoordinator {
             )
             .await
             .map_err(WanSessionCoordinatorError::Backend)?;
+            // The signaling adapter must sign and publish the grant before
+            // this state becomes authoritative.  The returned commitment is
+            // the exact bytes that peers will bind their WebRTC messages to;
+            // a backend-only grant remains deliberately unbound.
+            let signed_grant_commitment = run_port_before_deadline(
+                workflow.clock.as_ref(),
+                deadline,
+                workflow.signaling.send_grant_with_commitment(
+                    &identity,
+                    &intent_commitment,
+                    &grant,
+                    &access,
+                    deadline,
+                ),
+            )
+            .await
+            .map_err(WanSessionCoordinatorError::Signaling)?;
+            let grant = grant
+                .with_grant_commitment(signed_grant_commitment)
+                .map_err(|_| WanSessionCoordinatorError::BackendBindingMismatch)?;
             self.apply(
                 session_id,
                 WanSessionEvent::Granted(grant.clone()),
@@ -431,19 +451,6 @@ impl WanSessionCoordinator {
                 workflow.clock.now_unix_ms(),
             )
             .await?;
-            run_port_before_deadline(
-                workflow.clock.as_ref(),
-                deadline,
-                workflow.signaling.send_grant(
-                    &identity,
-                    &intent_commitment,
-                    &grant,
-                    &access,
-                    deadline,
-                ),
-            )
-            .await
-            .map_err(WanSessionCoordinatorError::Signaling)?;
             Ok(TransitionResult::Applied)
         }
         .await;
@@ -476,6 +483,7 @@ impl WanSessionCoordinator {
             && state.grant().is_some_and(|grant| {
                 grant.approved_scopes() == verified.approved_scopes
                     && grant.approved_profile() == verified.approved_profile.as_ref()
+                    && grant.grant_commitment() == Some(verified.grant_commitment.as_str())
                     && grant.policy_revision() == verified.policy_revision
                     && grant.policy_expires_at_ms() == verified.policy_expires_at_ms
                     && grant.route_policy() == verified.route_policy
@@ -542,6 +550,10 @@ impl WanSessionCoordinator {
             {
                 return Err(WanSessionCoordinatorError::BackendBindingMismatch);
             }
+            let backend_grant = backend_grant
+                .clone()
+                .with_grant_commitment(verified.grant_commitment.clone())
+                .map_err(|_| WanSessionCoordinatorError::BackendBindingMismatch)?;
             self.apply(
                 session_id,
                 WanSessionEvent::Granted(backend_grant.clone()),
@@ -603,13 +615,121 @@ impl WanSessionCoordinator {
             .await
     }
 
-    pub async fn record_relay_verified(
+    /// Atomically install a verified generation-zero transport and advance
+    /// the authoritative state.  The per-session operation lock remains held
+    /// across the revalidation, installer call, and state transition so a
+    /// concurrent close/fail cannot publish a stale media route.
+    pub async fn commit_generation_zero<F, Fut>(
         &self,
         session_id: &SessionId,
+        role: WanSessionRole,
+        identity: &WanSessionIdentity,
+        grant: &GrantBinding,
+        access: &RelayAccessBinding,
         proof: RelayRouteProof,
-    ) -> Result<TransitionResult, WanSessionCoordinatorError> {
-        self.apply_with_operation(session_id, WanSessionEvent::RelayVerified(proof))
-            .await
+        install: F,
+    ) -> Result<TransitionResult, WanSessionCoordinatorError>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = Result<(), WanSessionCoordinatorError>> + Send,
+    {
+        let entry = self.entry(session_id).await?;
+        let _operation = entry.operation.lock().await;
+        let now = self.clock.now_unix_ms();
+        {
+            let state = entry.state.lock().await;
+            if state.phase() != WanSessionPhase::Negotiating || state.role() != role {
+                return Err(WanSessionCoordinatorError::RoleOrPhaseMismatch);
+            }
+            if now >= identity.deadline_unix_ms()
+                || now >= grant.grant_expires_at_ms()
+                || now >= grant.policy_expires_at_ms()
+            {
+                return Err(WanSessionCoordinatorError::DeadlineExceeded);
+            }
+            if grant.grant_commitment().is_none()
+                || state.identity() != identity
+                || state.grant() != Some(grant)
+                || state.access() != Some(access)
+                || !proof.is_relay_to_relay()
+                || proof.access() != access
+            {
+                return Err(WanSessionCoordinatorError::BackendBindingMismatch);
+            }
+        }
+
+        if install().await.is_err() {
+            let failure = {
+                let mut state = entry.state.lock().await;
+                let transition = state.apply(
+                    WanSessionEvent::Failed(WanSessionFailure::Transport),
+                    self.clock.now_unix_ms(),
+                );
+                (transition, state.phase().is_terminal())
+            };
+            if failure.1 {
+                self.finalize(
+                    session_id,
+                    &entry,
+                    matches!(
+                        failure.0,
+                        Ok(TransitionResult::Applied | TransitionResult::Duplicate)
+                    ),
+                )
+                .await?;
+            }
+            return Err(WanSessionCoordinatorError::CleanupFailed);
+        }
+
+        let (transition, terminal, failed, invalidated_error) = {
+            let mut state = entry.state.lock().await;
+            let now = self.clock.now_unix_ms();
+            let deadline_invalidated = now >= identity.deadline_unix_ms()
+                || now >= grant.grant_expires_at_ms()
+                || now >= grant.policy_expires_at_ms();
+            let binding_invalidated = state.phase() != WanSessionPhase::Negotiating
+                || state.role() != role
+                || grant.grant_commitment().is_none()
+                || state.identity() != identity
+                || state.grant() != Some(grant)
+                || state.access() != Some(access);
+            let invalidated = deadline_invalidated || binding_invalidated;
+            let transition = if invalidated {
+                state.apply(
+                    WanSessionEvent::Failed(if deadline_invalidated {
+                        WanSessionFailure::DeadlineExceeded
+                    } else {
+                        WanSessionFailure::RouteMismatch
+                    }),
+                    now,
+                )
+            } else {
+                state.apply(WanSessionEvent::RelayVerified(proof), now)
+            };
+            (
+                transition,
+                state.phase().is_terminal(),
+                state.phase() == WanSessionPhase::Failed,
+                if deadline_invalidated {
+                    Some(WanSessionCoordinatorError::DeadlineExceeded)
+                } else if binding_invalidated {
+                    Some(WanSessionCoordinatorError::BackendBindingMismatch)
+                } else {
+                    None
+                },
+            )
+        };
+        if terminal {
+            self.finalize(session_id, &entry, failed).await?;
+        }
+        if let Some(error) = invalidated_error {
+            // `WanSessionState::apply` deliberately rejects every event at
+            // the exact deadline, while still recording the terminal failure.
+            // Do not let that internal transition result turn an
+            // invalidated install into a false successful commit.
+            return Err(error);
+        }
+        transition.map_err(WanSessionCoordinatorError::Transition)
     }
 
     pub async fn record_streaming(
@@ -951,6 +1071,7 @@ pub struct VerifiedWanSessionGrant {
     target_key_fingerprint: String,
     controller_key_fingerprint: String,
     intent_commitment: String,
+    grant_commitment: String,
     approved_scopes: Vec<mrd_signal_proto::WanPermissionScopeV3>,
     approved_profile: Option<mrd_signal_proto::WanMediaProfileV3>,
     policy_revision: u64,
@@ -1001,21 +1122,26 @@ impl VerifiedWanSessionGrant {
         {
             return Err(WanSessionCoordinatorError::VerifiedGrantRequired);
         }
+        let grant_commitment = message
+            .commitment()
+            .map_err(|_| WanSessionCoordinatorError::VerifiedGrantRequired)?;
+        let payload = message.payload;
         Ok(Self {
-            session_id: message.payload.session_id,
-            controller_device_id: message.payload.controller_device_id,
-            target_device_id: message.payload.target_device_id,
+            session_id: payload.session_id,
+            controller_device_id: payload.controller_device_id,
+            target_device_id: payload.target_device_id,
             target_key_fingerprint: event.sender.key_id,
             controller_key_fingerprint: local_controller_identity.key_id().to_owned(),
-            intent_commitment: message.payload.intent_commitment,
-            approved_scopes: message.payload.approved_scopes,
-            approved_profile: message.payload.approved_profile,
-            policy_revision: message.payload.backend_policy_revision,
-            policy_expires_at_ms: message.payload.policy_expires_at_ms,
-            generation: message.payload.relay_generation,
-            directory_id: message.payload.relay_directory_id,
-            primary_node_id: message.payload.primary_relay_node_id,
-            route_policy: message.payload.route_policy,
+            intent_commitment: payload.intent_commitment,
+            grant_commitment,
+            approved_scopes: payload.approved_scopes,
+            approved_profile: payload.approved_profile,
+            policy_revision: payload.backend_policy_revision,
+            policy_expires_at_ms: payload.policy_expires_at_ms,
+            generation: payload.relay_generation,
+            directory_id: payload.relay_directory_id,
+            primary_node_id: payload.primary_relay_node_id,
+            route_policy: payload.route_policy,
         })
     }
 }
@@ -1029,6 +1155,12 @@ impl std::fmt::Debug for VerifiedWanSessionIntent {
             .field("request_commitment", &self.request_commitment)
             .field("intent_commitment", &self.intent_commitment)
             .finish()
+    }
+}
+
+impl VerifiedWanSessionGrant {
+    pub fn grant_commitment(&self) -> &str {
+        &self.grant_commitment
     }
 }
 
@@ -1306,14 +1438,16 @@ pub trait WanSessionWorkflowSignaling: Send + Sync {
         request_commitment: &str,
         absolute_deadline_unix_ms: u64,
     ) -> Result<String, WanSessionPortError>;
-    async fn send_grant(
+    /// Sign and publish a grant, returning the exact commitment of the
+    /// signed message. Implementations must not report success without it.
+    async fn send_grant_with_commitment(
         &self,
         identity: &WanSessionIdentity,
         intent_commitment: &str,
         grant: &GrantBinding,
         access: &RelayAccessBinding,
         absolute_deadline_unix_ms: u64,
-    ) -> Result<(), WanSessionPortError>;
+    ) -> Result<String, WanSessionPortError>;
 }
 
 #[async_trait]

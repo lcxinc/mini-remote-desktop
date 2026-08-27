@@ -683,7 +683,16 @@ impl RelayFailoverCoordinator {
         };
         let _cancellation_guard =
             RelayRecoveryCancellationGuard::new(self, &session_id, generation);
-        let access = match self.provider.refresh_access(&context).await {
+        let refresh_context = RelayAccessContext::for_refresh(
+            context.session_id.clone(),
+            context.policy_revision,
+            context.intended_peer_id.clone(),
+            generation
+                .checked_sub(1)
+                .ok_or(RelayFailoverConfigError::ContextMismatch)?,
+        )
+        .map_err(|_| RelayFailoverConfigError::ContextMismatch)?;
+        let access = match self.provider.refresh_access(&refresh_context).await {
             Ok(access) => access,
             Err(RelayClientError::BackendUnavailable)
                 if cached_access.is_fresh(self.clock.now_ms()) =>
@@ -856,7 +865,16 @@ impl RelayFailoverCoordinator {
         active_failure_domain: String,
     ) -> Result<RelayRecoveryOutcome, RelayFailoverConfigError> {
         let _cancellation_guard = RelayRecoveryCancellationGuard::new(self, session_id, generation);
-        let access = match self.provider.refresh_access(&context).await {
+        let refresh_context = RelayAccessContext::for_refresh(
+            context.session_id.clone(),
+            context.policy_revision,
+            context.intended_peer_id.clone(),
+            generation
+                .checked_sub(1)
+                .ok_or(RelayFailoverConfigError::ContextMismatch)?,
+        )
+        .map_err(|_| RelayFailoverConfigError::ContextMismatch)?;
+        let access = match self.provider.refresh_access(&refresh_context).await {
             Ok(access) => access,
             Err(RelayClientError::BackendUnavailable) => {
                 if cached_access.is_fresh(self.clock.now_ms()) {
