@@ -410,13 +410,19 @@ impl HttpWanSessionBackend {
         method: Method,
         endpoint: Url,
         body: Option<&B>,
+        allow_retry: bool,
     ) -> Result<Zeroizing<Vec<u8>>, WanSessionBackendError> {
         let body = body
             .map(serde_json::to_vec)
             .transpose()
             .map_err(|_| WanSessionBackendError::InvalidRequest)?;
         let deadline = Instant::now() + self.config.operation_deadline();
-        for attempt in 1..=self.config.max_attempts() {
+        let max_attempts = if allow_retry {
+            self.config.max_attempts()
+        } else {
+            1
+        };
+        for attempt in 1..=max_attempts {
             let mut authorization =
                 Zeroizing::new(format!("Bearer {}", self.config.device_token()));
             let mut authorization_header = HeaderValue::from_str(&authorization)
@@ -434,7 +440,7 @@ impl HttpWanSessionBackend {
             }
             let response = match timeout_at(deadline, request.send()).await {
                 Err(_) => return Err(WanSessionBackendError::DeadlineExceeded),
-                Ok(Err(_)) if attempt < self.config.max_attempts() => {
+                Ok(Err(_)) if attempt < max_attempts => {
                     tokio::task::yield_now().await;
                     continue;
                 }
@@ -442,7 +448,7 @@ impl HttpWanSessionBackend {
                 Ok(Ok(response)) => response,
             };
             let status = response.status();
-            if is_retryable_status(status) && attempt < self.config.max_attempts() {
+            if is_retryable_status(status) && attempt < max_attempts {
                 tokio::task::yield_now().await;
                 continue;
             }
@@ -486,9 +492,10 @@ impl HttpWanSessionBackend {
         body: Option<&B>,
         binding: &WanSessionBinding,
         expected_status: Option<WanSessionStatus>,
+        allow_retry: bool,
     ) -> Result<WanSessionRecord, WanSessionBackendError> {
         let bytes = self
-            .execute_json(method, self.endpoint(relative)?, body)
+            .execute_json(method, self.endpoint(relative)?, body, allow_retry)
             .await?;
         let record = parse_record(&bytes, binding)?;
         if expected_status.is_some_and(|expected| record.status != expected) {
@@ -514,7 +521,14 @@ impl WanSessionBackend for HttpWanSessionBackend {
         )?;
         let body = DeviceSessionCreateBody::from(request);
         let record = self
-            .session_operation(Method::POST, "device-sessions", Some(&body), &binding, None)
+            .session_operation(
+                Method::POST,
+                "device-sessions",
+                Some(&body),
+                &binding,
+                None,
+                true,
+            )
             .await?;
         if &record.request != request {
             return Err(WanSessionBackendError::BindingMismatch);
@@ -532,6 +546,7 @@ impl WanSessionBackend for HttpWanSessionBackend {
             None,
             binding,
             None,
+            true,
         )
         .await
     }
@@ -551,6 +566,7 @@ impl WanSessionBackend for HttpWanSessionBackend {
             Some(&body),
             binding,
             Some(WanSessionStatus::Approved),
+            false,
         )
         .await
     }
@@ -604,6 +620,7 @@ impl WanSessionBackend for HttpWanSessionBackend {
                 Method::POST,
                 self.endpoint("relays/access")?,
                 Some(&context),
+                false,
             )
             .await?;
         let verified = verify_relay_access_response(
@@ -615,7 +632,9 @@ impl WanSessionBackend for HttpWanSessionBackend {
         .map_err(map_relay_error)?;
         Ok(WanRelayAccess {
             binding: request.binding.clone(),
-            generation: request.generation,
+            generation: verified
+                .generation()
+                .ok_or(WanSessionBackendError::BindingMismatch)?,
             verified: Arc::new(verified),
         })
     }
@@ -634,6 +653,7 @@ impl HttpWanSessionBackend {
             Some(&EmptyBody {}),
             binding,
             Some(expected_status),
+            false,
         )
         .await
     }

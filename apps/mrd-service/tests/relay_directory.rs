@@ -121,8 +121,39 @@ fn generation_context(session_id: &str, generation: u64) -> RelayAccessContext {
     RelayAccessContext::for_generation(session_id, 7, "peer-device-1", generation).unwrap()
 }
 
+fn refresh_context(session_id: &str, generation: u64) -> RelayAccessContext {
+    RelayAccessContext::for_refresh(session_id, 7, "peer-device-1", generation).unwrap()
+}
+
 fn signed_response(session_id: &str, expires_at_ms: u64) -> Vec<u8> {
     signed_response_at(session_id, NOW - 1_000, expires_at_ms)
+}
+
+fn signed_generation_response(session_id: &str, generation: u64, expires_at_ms: u64) -> Vec<u8> {
+    let mut response: serde_json::Value =
+        serde_json::from_slice(&signed_response(session_id, expires_at_ms)).unwrap();
+    response["generation"] = json!(generation);
+    response["directory_id"] = json!(format!("directory-{session_id}"));
+    response["relay_url_digest"] = json!(relay_urls_digest(&[
+        "turn:relay-a.example.test:3478?transport=udp",
+    ]));
+    serde_json::to_vec(&response).unwrap()
+}
+
+fn relay_urls_digest(urls: &[&str]) -> String {
+    let mut urls = urls.to_vec();
+    urls.sort_unstable();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"MRD_RELAY_URLS_V1\0");
+    for url in urls {
+        bytes.extend_from_slice(&(url.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(url.as_bytes());
+    }
+    ring::digest::digest(&ring::digest::SHA256, &bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn signed_response_at(session_id: &str, issued_at_ms: u64, expires_at_ms: u64) -> Vec<u8> {
@@ -147,7 +178,7 @@ fn signed_response_at(session_id: &str, issued_at_ms: u64, expires_at_ms: u64) -
                 }],
                 capabilities: 1,
                 load_class: 1,
-                selection_reason: "preferred_region".into(),
+                selection_reason: "preferred-region".into(),
                 reservation: RelayReservation {
                     reservation_id: format!("reservation-a-{session_id}"),
                     expires_at_ms,
@@ -164,7 +195,7 @@ fn signed_response_at(session_id: &str, issued_at_ms: u64, expires_at_ms: u64) -
                 }],
                 capabilities: 1,
                 load_class: 2,
-                selection_reason: "failure_domain_backup".into(),
+                selection_reason: "failure-domain-backup".into(),
                 reservation: RelayReservation {
                     reservation_id: format!("reservation-b-{session_id}"),
                     expires_at_ms,
@@ -179,6 +210,9 @@ fn signed_response_at(session_id: &str, issued_at_ms: u64, expires_at_ms: u64) -
         signature_b64: STANDARD.encode(signature.to_bytes()),
     };
     serde_json::to_vec(&json!({
+        "generation": null,
+        "directory_id": format!("directory-{session_id}"),
+        "relay_url_digest": null,
         "directory": directory,
         "credentials": [
             {
@@ -270,8 +304,8 @@ fn relay_access_context_preserves_v2_json_and_binds_v3_generation() {
 #[tokio::test]
 async fn relay_cache_keys_include_the_exact_wan_generation() {
     let backend = Arc::new(FakeBackend::default());
-    backend.push(Ok(signed_response("wan-cache", NOW + 30_000)));
-    backend.push(Ok(signed_response("wan-cache", NOW + 30_000)));
+    backend.push(Ok(signed_generation_response("wan-cache", 0, NOW + 30_000)));
+    backend.push(Ok(signed_generation_response("wan-cache", 1, NOW + 30_000)));
     let client = make_client(4, backend.clone(), Arc::new(FakeClock::new(NOW)));
 
     client
@@ -285,6 +319,48 @@ async fn relay_cache_keys_include_the_exact_wan_generation() {
 
     assert_eq!(backend.call_count(), 2);
     assert_eq!(client.cache_len().await, 2);
+}
+
+#[tokio::test]
+async fn refresh_is_cached_only_under_the_authoritative_next_generation() {
+    let backend = Arc::new(FakeBackend::default());
+    backend.push(Ok(signed_generation_response(
+        "wan-refresh-cache",
+        1,
+        NOW + 30_000,
+    )));
+    let client = make_client(4, backend.clone(), Arc::new(FakeClock::new(NOW)));
+
+    let refreshed = client
+        .refresh(refresh_context("wan-refresh-cache", 0))
+        .await
+        .expect("generation refresh");
+    assert_eq!(refreshed.generation(), Some(1));
+    client
+        .access(generation_context("wan-refresh-cache", 1))
+        .await
+        .expect("authoritative generation cached");
+
+    assert_eq!(backend.call_count(), 1);
+    assert_eq!(client.cache_len().await, 1);
+}
+
+#[tokio::test]
+async fn generation_metadata_mismatch_is_terminal_and_never_cached() {
+    let backend = Arc::new(FakeBackend::default());
+    backend.push(Ok(signed_generation_response(
+        "wan-generation-mismatch",
+        2,
+        NOW + 30_000,
+    )));
+    let client = make_client(2, backend, Arc::new(FakeClock::new(NOW)));
+
+    assert!(client
+        .refresh(refresh_context("wan-generation-mismatch", 0))
+        .await
+        .unwrap_err()
+        .is_terminal_security());
+    assert_eq!(client.cache_len().await, 0);
 }
 
 #[tokio::test]

@@ -28,6 +28,7 @@ use mrd_service::{
 use mrd_signal_proto::{
     WanAccessModeV3, WanPermissionScopeV3, WanRoutePolicyV3, WanSessionRequestV3,
 };
+use ring::digest::{digest, SHA256};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -206,7 +207,7 @@ async fn fake_backend(State(state): State<FakeState>, request: Request) -> Respo
             method: parts.method.clone(),
             path: parts.uri.path().to_owned(),
             headers: parts.headers,
-            body,
+            body: body.clone(),
         });
         captured.len()
     };
@@ -246,7 +247,21 @@ async fn fake_backend(State(state): State<FakeState>, request: Request) -> Respo
         "requested"
     };
     let mut response = if parts.uri.path() == "/api/v1/relays/access" {
-        relay_access_response(&state)
+        let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        let requested_generation = request
+            .get("generation")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let authoritative_generation = if request
+            .get("refresh")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            requested_generation.saturating_add(1)
+        } else {
+            requested_generation
+        };
+        relay_access_response(&state, authoritative_generation)
     } else {
         session_response(&state, status)
     };
@@ -278,7 +293,7 @@ fn session_response(state: &FakeState, status: &str) -> Value {
     })
 }
 
-fn relay_access_response(state: &FakeState) -> Value {
+fn relay_access_response(state: &FakeState, generation: u64) -> Value {
     let issued_at_ms = now_ms().saturating_sub(1_000);
     let expires_at_ms = issued_at_ms.saturating_add(120_000);
     let payload = RelayDirectoryPayload {
@@ -300,7 +315,7 @@ fn relay_access_response(state: &FakeState) -> Value {
             }],
             capabilities: 1,
             load_class: 1,
-            selection_reason: "preferred_region".into(),
+            selection_reason: "preferred-region".into(),
             reservation: RelayReservation {
                 reservation_id: "reservation-wan-session-1-a".into(),
                 expires_at_ms,
@@ -314,6 +329,9 @@ fn relay_access_response(state: &FakeState) -> Value {
         signature_b64: STANDARD.encode(signature.to_bytes()),
     };
     json!({
+        "generation": generation,
+        "directory_id": "directory-wan-session-1",
+        "relay_url_digest": relay_url_digest(&["turn:relay-a.example.test:3478?transport=udp"]),
         "directory": directory,
         "credentials": [{
             "node_id": "relay-a",
@@ -323,6 +341,22 @@ fn relay_access_response(state: &FakeState) -> Value {
             "expires_at_unix_seconds": (expires_at_ms / 1000) + 60
         }]
     })
+}
+
+fn relay_url_digest(urls: &[&str]) -> String {
+    let mut urls = urls.to_vec();
+    urls.sort_unstable();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"MRD_RELAY_URLS_V1\0");
+    for url in urls {
+        bytes.extend_from_slice(&(url.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(url.as_bytes());
+    }
+    digest(&SHA256, &bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn client_config(base_url: &str, token: &str) -> WanSessionBackendConfig {
@@ -535,6 +569,74 @@ async fn idempotent_requests_retry_with_the_exact_same_body() {
     assert!(captured[0].method == Method::POST);
     assert!(captured[0].path == "/api/v1/device-sessions");
     assert!(captured[0].body == captured[1].body);
+}
+
+#[tokio::test]
+async fn state_changes_and_generation_refresh_are_never_automatically_retried() {
+    let canonical_request = request();
+    let expected_binding = binding(&canonical_request);
+    let token = private_material("device-auth");
+
+    let transition_server = FakeBackend::spawn_with_mode(
+        canonical_request.clone(),
+        FakeMode::FailFirst(StatusCode::SERVICE_UNAVAILABLE),
+    )
+    .await;
+    let transition_backend = HttpWanSessionBackend::new(client_config_with(
+        &transition_server.base_url,
+        &token,
+        Duration::from_secs(2),
+        64 * 1024,
+        3,
+    ))
+    .expect("WAN client");
+    let approval =
+        WanSessionApproval::new(vec![WanPermissionScopeV3::ScreenView], None).expect("approval");
+    assert!(
+        transition_backend
+            .approve(&expected_binding, &approval)
+            .await
+            == Err(WanSessionBackendError::Unavailable)
+    );
+    assert!(transition_server.requests().len() == 1);
+
+    let refresh_server = FakeBackend::spawn_with_mode(
+        canonical_request,
+        FakeMode::FailFirst(StatusCode::SERVICE_UNAVAILABLE),
+    )
+    .await;
+    let refresh_backend = HttpWanSessionBackend::new(client_config_with(
+        &refresh_server.base_url,
+        &token,
+        Duration::from_secs(2),
+        64 * 1024,
+        3,
+    ))
+    .expect("WAN client");
+    let refresh = WanRelayAccessRequest::exact_generation(expected_binding, 29, 0, true)
+        .expect("refresh request");
+    assert!(matches!(
+        refresh_backend.access(&refresh).await,
+        Err(WanSessionBackendError::Unavailable)
+    ));
+    assert!(refresh_server.requests().len() == 1);
+}
+
+#[tokio::test]
+async fn refresh_uses_the_authoritative_next_generation_from_the_backend() {
+    let canonical_request = request();
+    let expected_binding = binding(&canonical_request);
+    let server = FakeBackend::spawn(canonical_request).await;
+    let token = private_material("device-auth");
+    let backend =
+        HttpWanSessionBackend::new(client_config(&server.base_url, &token)).expect("WAN client");
+    let refresh = WanRelayAccessRequest::exact_generation(expected_binding, 29, 0, true)
+        .expect("refresh request");
+
+    let access = backend.access(&refresh).await.expect("refresh access");
+
+    assert!(access.generation() == 1);
+    assert!(access.directory_id() == "directory-wan-session-1");
 }
 
 #[tokio::test]

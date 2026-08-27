@@ -295,7 +295,21 @@ impl RelayDirectoryClient {
             Ok(body) => match self.verify_response(&context, &body, self.clock.now_ms()) {
                 Ok(access) => {
                     let access = Arc::new(access);
-                    self.cache.lock().await.insert(context, Arc::clone(&access));
+                    let cache_context = if context.is_refresh() {
+                        RelayAccessContext::for_generation(
+                            context.session_id.clone(),
+                            context.policy_revision,
+                            context.intended_peer_id.clone(),
+                            access
+                                .generation()
+                                .ok_or(RelayClientError::InvalidResponse)?,
+                        )?
+                    } else {
+                        context.clone()
+                    };
+                    let mut cache = self.cache.lock().await;
+                    cache.remove(&context);
+                    cache.insert(cache_context, Arc::clone(&access));
                     Ok(access)
                 }
                 Err(error) => {
@@ -345,6 +359,13 @@ pub(crate) fn verify_relay_access_response(
     }
     let raw: RawRelayAccessResponse =
         serde_json::from_slice(body).map_err(|_| RelayClientError::InvalidResponse)?;
+    let expected_generation = match context.generation() {
+        Some(generation) if context.is_refresh() => generation.checked_add(1),
+        generation => generation,
+    };
+    if raw.generation != expected_generation {
+        return Err(RelayClientError::CredentialBinding);
+    }
     if raw.credentials.is_empty() || raw.credentials.len() > MAX_CREDENTIALS {
         return Err(RelayClientError::CredentialBinding);
     }
@@ -358,20 +379,48 @@ pub(crate) fn verify_relay_access_response(
         context.intended_peer_digest(),
         now_ms,
     )?;
+    if raw.directory_id != directory.payload().directory_id {
+        return Err(RelayClientError::CredentialBinding);
+    }
     let credentials = verify_credentials(
         directory.payload().candidates.as_slice(),
         raw.credentials,
         now_ms,
     )?;
+    let relay_url_digest = match (expected_generation, raw.relay_url_digest) {
+        (None, None) => None,
+        (Some(_), Some(expected)) => {
+            let primary = directory
+                .payload()
+                .candidates
+                .iter()
+                .find(|candidate| candidate.selection_reason == "preferred-region")
+                .ok_or(RelayClientError::CredentialBinding)?;
+            let credential = credentials
+                .get(&primary.node_id)
+                .ok_or(RelayClientError::CredentialBinding)?;
+            let actual = urls_digest(&credential.urls);
+            if expected != sha256_hex(&actual) {
+                return Err(RelayClientError::CredentialBinding);
+            }
+            Some(actual)
+        }
+        _ => return Err(RelayClientError::CredentialBinding),
+    };
     Ok(VerifiedRelayAccess {
         directory,
         credentials,
+        generation: raw.generation,
+        relay_url_digest,
     })
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRelayAccessResponse {
+    generation: Option<u64>,
+    directory_id: String,
+    relay_url_digest: Option<String>,
     directory: serde_json::Value,
     credentials: Vec<RawRelayCredential>,
 }
@@ -389,6 +438,8 @@ struct RawRelayCredential {
 pub struct VerifiedRelayAccess {
     directory: ContextVerifiedRelayDirectory,
     credentials: BTreeMap<String, ServiceTurnRelayCredentials>,
+    generation: Option<u64>,
+    relay_url_digest: Option<[u8; 32]>,
 }
 
 impl fmt::Debug for VerifiedRelayAccess {
@@ -397,6 +448,11 @@ impl fmt::Debug for VerifiedRelayAccess {
             .debug_struct("VerifiedRelayAccess")
             .field("directory_id", &self.directory.payload().directory_id)
             .field("session_id", &self.directory.payload().session_id)
+            .field("generation", &self.generation)
+            .field(
+                "relay_url_digest",
+                &self.relay_url_digest.as_ref().map(|_| "[REDACTED]"),
+            )
             .field(
                 "candidate_node_ids",
                 &self.credentials.keys().collect::<Vec<_>>(),
@@ -412,6 +468,10 @@ impl VerifiedRelayAccess {
 
     pub fn credentials_for(&self, node_id: &str) -> Option<&ServiceTurnRelayCredentials> {
         self.credentials.get(node_id)
+    }
+
+    pub fn generation(&self) -> Option<u64> {
+        self.generation
     }
 
     pub fn route_evidence(
@@ -603,6 +663,10 @@ pub(crate) fn urls_digest(urls: &[String]) -> [u8; 32] {
         .as_ref()
         .try_into()
         .expect("SHA-256 output is 32 bytes")
+}
+
+fn sha256_hex(value: &[u8; 32]) -> String {
+    value.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn validate_identifier(value: &str) -> Result<(), RelayClientError> {

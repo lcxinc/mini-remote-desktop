@@ -664,7 +664,16 @@ def test_both_devices_fetch_identical_public_generation_but_scoped_credentials(
     assert target.status_code == controller.status_code == 200
     target_body = target.json()
     controller_body = controller.json()
-    assert set(target_body) == set(controller_body) == {"directory", "credentials"}
+    assert set(target_body) == set(controller_body) == {
+        "generation",
+        "directory_id",
+        "relay_url_digest",
+        "directory",
+        "credentials",
+    }
+    assert target_body["generation"] == controller_body["generation"] == 0
+    assert target_body["directory_id"] == controller_body["directory_id"]
+    assert target_body["relay_url_digest"] == controller_body["relay_url_digest"]
     assert _safe_access_projection(target_body) == _safe_access_projection(
         controller_body
     )
@@ -1007,7 +1016,15 @@ def test_refresh_serializes_next_generation_without_mutating_old_directory(
         refresh=True,
     )
     assert refreshed.status_code == 200
-    assert set(refreshed.json()) == {"directory", "credentials"}
+    assert set(refreshed.json()) == {
+        "generation",
+        "directory_id",
+        "relay_url_digest",
+        "directory",
+        "credentials",
+    }
+    assert refreshed.json()["generation"] == 1
+    assert refreshed.json()["directory_id"] == refreshed.json()["directory"]["payload"]["directory_id"]
     api.session.expire_all()
     old_after = api.session.get(RelayAccessGeneration, ("wan-session-1", 0))
     current = api.session.get(RelayAccessGeneration, ("wan-session-1", 1))

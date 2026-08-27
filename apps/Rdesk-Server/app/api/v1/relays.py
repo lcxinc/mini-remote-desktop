@@ -262,6 +262,9 @@ class NodeTurnCredentialOut(BaseModel):
 class RelayAccessResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
+    generation: int | None = Field(default=None, ge=0, le=2**63 - 1)
+    directory_id: str
+    relay_url_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     directory: SignedRelayDirectoryOut
     credentials: list[NodeTurnCredentialOut]
 
@@ -892,6 +895,9 @@ async def issue_relay_access(
         for item in result.credentials
     ]
     return RelayAccessResponse(
+        generation=result.generation,
+        directory_id=result.directory.payload.directory_id,
+        relay_url_digest=result.relay_url_digest,
         directory=result.directory,
         credentials=credentials,
     )

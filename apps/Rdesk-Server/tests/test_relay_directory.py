@@ -445,7 +445,13 @@ def test_score_uses_rust_compatible_u64_saturation():
 
 def test_public_access_response_and_openapi_expose_no_secret_configuration_fields():
     response_fields = RelayAccessResponse.model_fields
-    assert set(response_fields) == {"directory", "credentials"}
+    assert set(response_fields) == {
+        "generation",
+        "directory_id",
+        "relay_url_digest",
+        "directory",
+        "credentials",
+    }
     credential_model = response_fields["credentials"].annotation.__args__[0]
     assert set(credential_model.model_fields) == {
         "node_id", "urls", "username", "credential", "expires_at_unix_seconds",
@@ -1288,7 +1294,16 @@ def test_access_api_requires_auth_and_returns_only_signed_directory_and_credenti
         assert response.headers["cache-control"] == "no-store, private"
         assert response.headers["pragma"] == "no-cache"
         body = response.json()
-        assert set(body) == {"directory", "credentials"}
+        assert set(body) == {
+            "generation",
+            "directory_id",
+            "relay_url_digest",
+            "directory",
+            "credentials",
+        }
+        assert body["generation"] is None
+        assert body["relay_url_digest"] is None
+        assert body["directory_id"] == body["directory"]["payload"]["directory_id"]
         candidates = body["directory"]["payload"]["candidates"]
         assert [item["node_id"] for item in candidates] == [
             item["node_id"] for item in body["credentials"]
