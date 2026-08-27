@@ -29,6 +29,10 @@ pub struct RelayAccessContext {
     pub session_id: String,
     pub policy_revision: u64,
     pub intended_peer_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh: Option<bool>,
     #[serde(skip)]
     peer_digest: String,
 }
@@ -51,8 +55,64 @@ impl RelayAccessContext {
             session_id,
             policy_revision,
             intended_peer_id,
+            generation: None,
+            refresh: None,
             peer_digest,
         })
+    }
+
+    pub fn for_generation(
+        session_id: impl Into<String>,
+        policy_revision: u64,
+        intended_peer_id: impl Into<String>,
+        generation: u64,
+    ) -> Result<Self, RelayClientError> {
+        Self::with_generation(
+            session_id,
+            policy_revision,
+            intended_peer_id,
+            generation,
+            None,
+        )
+    }
+
+    pub fn for_refresh(
+        session_id: impl Into<String>,
+        policy_revision: u64,
+        intended_peer_id: impl Into<String>,
+        generation: u64,
+    ) -> Result<Self, RelayClientError> {
+        Self::with_generation(
+            session_id,
+            policy_revision,
+            intended_peer_id,
+            generation,
+            Some(true),
+        )
+    }
+
+    fn with_generation(
+        session_id: impl Into<String>,
+        policy_revision: u64,
+        intended_peer_id: impl Into<String>,
+        generation: u64,
+        refresh: Option<bool>,
+    ) -> Result<Self, RelayClientError> {
+        if generation > i64::MAX as u64 {
+            return Err(RelayClientError::InvalidContext);
+        }
+        let mut context = Self::new(session_id, policy_revision, intended_peer_id)?;
+        context.generation = Some(generation);
+        context.refresh = refresh;
+        Ok(context)
+    }
+
+    pub fn generation(&self) -> Option<u64> {
+        self.generation
+    }
+
+    pub fn is_refresh(&self) -> bool {
+        self.refresh.unwrap_or(false)
     }
 
     pub fn intended_peer_digest(&self) -> &str {
@@ -270,34 +330,43 @@ impl RelayDirectoryClient {
         body: &[u8],
         now_ms: u64,
     ) -> Result<VerifiedRelayAccess, RelayClientError> {
-        if body.len() > MAX_RELAY_ACCESS_JSON_BYTES {
-            return Err(RelayClientError::InvalidResponse);
-        }
-        let raw: RawRelayAccessResponse =
-            serde_json::from_slice(body).map_err(|_| RelayClientError::InvalidResponse)?;
-        if raw.credentials.is_empty() || raw.credentials.len() > MAX_CREDENTIALS {
-            return Err(RelayClientError::CredentialBinding);
-        }
-        let directory_json =
-            serde_json::to_vec(&raw.directory).map_err(|_| RelayClientError::InvalidResponse)?;
-        let signed = SignedRelayDirectory::from_json(&directory_json)?;
-        let directory = signed.verify_for_context(
-            self.config.trusted_keys(),
-            &context.session_id,
-            context.policy_revision,
-            context.intended_peer_digest(),
-            now_ms,
-        )?;
-        let credentials = verify_credentials(
-            directory.payload().candidates.as_slice(),
-            raw.credentials,
-            now_ms,
-        )?;
-        Ok(VerifiedRelayAccess {
-            directory,
-            credentials,
-        })
+        verify_relay_access_response(context, self.config.trusted_keys(), body, now_ms)
     }
+}
+
+pub(crate) fn verify_relay_access_response(
+    context: &RelayAccessContext,
+    trusted_keys: &BTreeMap<String, Vec<u8>>,
+    body: &[u8],
+    now_ms: u64,
+) -> Result<VerifiedRelayAccess, RelayClientError> {
+    if body.len() > MAX_RELAY_ACCESS_JSON_BYTES {
+        return Err(RelayClientError::InvalidResponse);
+    }
+    let raw: RawRelayAccessResponse =
+        serde_json::from_slice(body).map_err(|_| RelayClientError::InvalidResponse)?;
+    if raw.credentials.is_empty() || raw.credentials.len() > MAX_CREDENTIALS {
+        return Err(RelayClientError::CredentialBinding);
+    }
+    let directory_json =
+        serde_json::to_vec(&raw.directory).map_err(|_| RelayClientError::InvalidResponse)?;
+    let signed = SignedRelayDirectory::from_json(&directory_json)?;
+    let directory = signed.verify_for_context(
+        trusted_keys,
+        &context.session_id,
+        context.policy_revision,
+        context.intended_peer_digest(),
+        now_ms,
+    )?;
+    let credentials = verify_credentials(
+        directory.payload().candidates.as_slice(),
+        raw.credentials,
+        now_ms,
+    )?;
+    Ok(VerifiedRelayAccess {
+        directory,
+        credentials,
+    })
 }
 
 #[derive(Deserialize)]

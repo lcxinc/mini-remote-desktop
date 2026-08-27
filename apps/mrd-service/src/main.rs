@@ -11,7 +11,7 @@ use mrd_service::agent_runtime::{
 use mrd_service::{
     app_state::{self, AppState},
     ipc_server::IpcServer,
-    lan_discovery, relay, security, shell, signaling, web_bridge,
+    lan_discovery, relay, security, shell, signaling, wan_session, web_bridge,
     windows_service::{
         ServiceControl as LifecycleControl, ServiceLifecycle,
         SessionChange as LifecycleSessionChange, MRD_WINDOWS_SERVICE_SID,
@@ -124,6 +124,21 @@ async fn run_service(
         if let Err(error) = tray.lock().unwrap().install(initial_model) {
             warn!("Tray not available: {error}");
         }
+    }
+
+    if let Some(config) = wan_session::config::WanSessionBackendConfig::from_env()
+        .context("WAN session backend configuration failed")?
+    {
+        let backend: Arc<dyn wan_session::backend::WanSessionBackend> = Arc::new(
+            wan_session::backend::HttpWanSessionBackend::new(config)
+                .context("WAN session backend startup failed")?,
+        );
+        app_state
+            .bind_wan_session_backend(backend)
+            .map_err(anyhow::Error::msg)?;
+        info!("Device-authenticated WAN session backend configured");
+    } else {
+        info!("Initial WAN sessions disabled (MRD_WAN_SESSION_API_URL is unset)");
     }
 
     let relay_client = if let Some(config) =

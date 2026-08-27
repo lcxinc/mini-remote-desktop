@@ -21,6 +21,7 @@ common-control-proto = { path = "../../common-control-proto" }
 mrd-application = { path = "../../crates/mrd-application" }
 mrd-agent-ipc = { path = "../../crates/mrd-agent-ipc" }
 thiserror.workspace = true
+time = { version = "0.3", features = ["parsing"] }
 mrd-decode = { path = "../../crates/mrd-decode" }
 mrd-encode-openh264 = { path = "../../crates/mrd-encode-openh264" }
 mrd-encode-vvenc = { path = "../../crates/mrd-encode-vvenc", optional = true }

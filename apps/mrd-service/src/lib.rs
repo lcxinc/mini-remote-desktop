@@ -24,6 +24,7 @@ pub mod shell;
 pub mod signaling;
 pub mod transports;
 pub mod wake_on_lan;
+pub mod wan_session;
 pub mod web_bridge;
 pub mod windows_service;
 

@@ -8,11 +8,11 @@ mod migration;
 mod responder;
 mod runtime;
 
-pub(crate) use client::urls_digest;
 pub use client::{
     relay_peer_digest, RelayAccessBackend, RelayAccessContext, RelayBackendError, RelayClientError,
     RelayClock, RelayDirectoryClient, RelayRouteEvidence, SystemRelayClock, VerifiedRelayAccess,
 };
+pub(crate) use client::{urls_digest, verify_relay_access_response};
 pub use config::{RelayClientConfig, RelayClientConfigError};
 pub use executor::{ServiceRelayMigrationConfigError, ServiceRelayMigrationExecutor};
 pub use migration::*;

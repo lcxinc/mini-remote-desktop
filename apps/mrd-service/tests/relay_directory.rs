@@ -117,6 +117,10 @@ fn context(session_id: &str) -> RelayAccessContext {
     RelayAccessContext::new(session_id, 7, "peer-device-1").unwrap()
 }
 
+fn generation_context(session_id: &str, generation: u64) -> RelayAccessContext {
+    RelayAccessContext::for_generation(session_id, 7, "peer-device-1", generation).unwrap()
+}
+
 fn signed_response(session_id: &str, expires_at_ms: u64) -> Vec<u8> {
     signed_response_at(session_id, NOW - 1_000, expires_at_ms)
 }
@@ -225,6 +229,62 @@ fn relay_client_configuration_requires_https_pinned_keys_and_credential_free_url
     assert!(!debug.contains("device-token-secret"));
     assert!(!debug.contains("control.example.test"));
     assert!(!debug.contains("/api/v1/relays/access"));
+}
+
+#[test]
+fn relay_access_context_preserves_v2_json_and_binds_v3_generation() {
+    let legacy = serde_json::to_value(context("legacy-session")).unwrap();
+    assert_eq!(
+        legacy,
+        json!({
+            "session_id": "legacy-session",
+            "policy_revision": 7,
+            "intended_peer_id": "peer-device-1"
+        })
+    );
+
+    let generation_zero = serde_json::to_value(generation_context("wan-session", 0)).unwrap();
+    assert_eq!(
+        generation_zero,
+        json!({
+            "session_id": "wan-session",
+            "policy_revision": 7,
+            "intended_peer_id": "peer-device-1",
+            "generation": 0
+        })
+    );
+    let refresh = RelayAccessContext::for_refresh("wan-session", 7, "peer-device-1", 0)
+        .expect("valid refresh context");
+    assert_eq!(
+        serde_json::to_value(refresh).unwrap(),
+        json!({
+            "session_id": "wan-session",
+            "policy_revision": 7,
+            "intended_peer_id": "peer-device-1",
+            "generation": 0,
+            "refresh": true
+        })
+    );
+}
+
+#[tokio::test]
+async fn relay_cache_keys_include_the_exact_wan_generation() {
+    let backend = Arc::new(FakeBackend::default());
+    backend.push(Ok(signed_response("wan-cache", NOW + 30_000)));
+    backend.push(Ok(signed_response("wan-cache", NOW + 30_000)));
+    let client = make_client(4, backend.clone(), Arc::new(FakeClock::new(NOW)));
+
+    client
+        .access(generation_context("wan-cache", 0))
+        .await
+        .unwrap();
+    client
+        .access(generation_context("wan-cache", 1))
+        .await
+        .unwrap();
+
+    assert_eq!(backend.call_count(), 2);
+    assert_eq!(client.cache_len().await, 2);
 }
 
 #[tokio::test]

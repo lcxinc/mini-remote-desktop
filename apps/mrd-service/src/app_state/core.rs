@@ -47,6 +47,9 @@ pub struct AppState {
     pub webrtc_host: Arc<crate::transports::webrtc::ServiceWebRtcTransportHost>,
     /// Optional verified relay-directory client configured at process startup.
     relay_directory_client: Arc<RwLock<Option<Arc<crate::relay::RelayDirectoryClient>>>>,
+    /// Optional device-authenticated WAN session backend configured at process startup.
+    wan_session_backend:
+        Arc<RwLock<Option<Arc<dyn crate::wan_session::backend::WanSessionBackend>>>>,
     /// Optional production relay failover coordinator configured after signaling starts.
     relay_failover_coordinator: Arc<RwLock<Option<Arc<crate::relay::RelayFailoverCoordinator>>>>,
     /// Service-owned security and operations audit events.
@@ -473,6 +476,7 @@ impl AppState {
             signaling_mapper: Arc::new(RwLock::new(None)),
             webrtc_host: Arc::new(crate::transports::webrtc::ServiceWebRtcTransportHost::new()),
             relay_directory_client: Arc::new(RwLock::new(None)),
+            wan_session_backend: Arc::new(RwLock::new(None)),
             relay_failover_coordinator: Arc::new(RwLock::new(None)),
             audit_log: Arc::new(audit_log),
             device_identities: Arc::new(device_identities),
@@ -554,6 +558,32 @@ impl AppState {
     /// Return the configured verified relay-directory client, if WAN relay is enabled.
     pub fn relay_directory_client(&self) -> Option<Arc<crate::relay::RelayDirectoryClient>> {
         self.relay_directory_client
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    /// Install the process-wide device-authenticated WAN session backend exactly once.
+    pub fn bind_wan_session_backend(
+        &self,
+        backend: Arc<dyn crate::wan_session::backend::WanSessionBackend>,
+    ) -> Result<(), &'static str> {
+        let mut slot = self
+            .wan_session_backend
+            .write()
+            .map_err(|_| "WAN session backend lock poisoned")?;
+        if slot.is_some() {
+            return Err("WAN session backend is already bound");
+        }
+        *slot = Some(backend);
+        Ok(())
+    }
+
+    /// Return the configured WAN session backend, if initial WAN sessions are enabled.
+    pub fn wan_session_backend(
+        &self,
+    ) -> Option<Arc<dyn crate::wan_session::backend::WanSessionBackend>> {
+        self.wan_session_backend
             .read()
             .ok()
             .and_then(|slot| slot.clone())
