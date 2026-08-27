@@ -446,12 +446,23 @@ pub enum ProtocolReasonCode {
     Internal,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SignalErrorMessage {
     pub reason: ProtocolReasonCode,
     pub correlation_id: Option<[u8; 16]>,
     pub detail: String,
+}
+
+impl std::fmt::Debug for SignalErrorMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SignalErrorMessage")
+            .field("reason", &self.reason)
+            .field("correlation_id", &self.correlation_id)
+            .field("detail", &"REDACTED")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

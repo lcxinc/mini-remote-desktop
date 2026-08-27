@@ -898,7 +898,7 @@ async fn v3_initial_invalid_runtime_messages_never_reach_scoped_bus() {
     invalid_intent.signature[0] ^= 1;
 
     let mut tampered_grant = inbound_v3_grant(&peer, "tampered-grant");
-    tampered_grant.payload.relay_directory_id = TEST_ONLY_SIGNAL_TURN_USERINFO_SENTINEL.into();
+    tampered_grant.payload.relay_directory_id = "directory-mutated-after-signing".into();
 
     let mut wrong_peer_offer_payload = inbound_v3_offer(&peer, "wrong-peer-offer").payload;
     wrong_peer_offer_payload.claims.intended_peer_device_id = DeviceId("other-device".into());

@@ -571,6 +571,38 @@ fn all_v3_initial_messages_require_v3_and_cross_version_pairs_are_rejected() {
 }
 
 #[test]
+fn v3_identifiers_reject_userinfo_and_non_backend_safe_characters() {
+    for invalid in [
+        "turn:user:pass@relay.example",
+        "session/with/path",
+        "session?query=secret",
+        "session#fragment",
+        "-leading-separator",
+    ] {
+        let mut invalid_request = request();
+        invalid_request.session_id = SessionId(invalid.into());
+        assert_eq!(
+            invalid_request.validate(),
+            Err(SignalProtocolError::Malformed)
+        );
+    }
+
+    let mut too_long = request();
+    too_long.target_device_id = DeviceId("a".repeat(129));
+    assert_eq!(too_long.validate(), Err(SignalProtocolError::Malformed));
+
+    let controller = identity();
+    let target = identity();
+    let intent = signed_intent(&controller);
+    let mut grant = signed_grant(&target, &intent).payload;
+    grant.relay_directory_id = "turn:user:pass@relay.example".into();
+    assert_eq!(
+        SessionGrantV3::sign(&target, grant),
+        Err(SignalProtocolError::Malformed)
+    );
+}
+
+#[test]
 fn debug_output_redacts_signed_descriptions_candidates_and_grant_bodies() {
     let controller = identity();
     let target = identity();

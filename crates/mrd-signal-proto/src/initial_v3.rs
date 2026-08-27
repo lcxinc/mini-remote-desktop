@@ -735,8 +735,13 @@ fn validate_normalized_token(value: &str, maximum: usize) -> Result<(), SignalPr
 }
 
 fn validate_identifier(value: &str) -> Result<(), SignalProtocolError> {
-    validate_text(value, 1, 256)?;
-    if value.chars().any(char::is_control) {
+    if value.is_empty()
+        || value.len() > 128
+        || !value.as_bytes()[0].is_ascii_alphanumeric()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
         return Err(SignalProtocolError::Malformed);
     }
     Ok(())

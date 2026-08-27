@@ -2,11 +2,12 @@ use mrd_identity::DeviceIdentity;
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use mrd_signal_proto::{
     relay_candidate_fingerprint, AuthClaims, AuthenticatedRegister, AuthenticatedSignalMessage,
-    ReconnectGrant, ReconnectGrantPayload, ReconnectRequest, ReconnectRequestPayload,
-    RegisterPayload, RelayMigrationCandidate, RelayMigrationCandidatePayload, RelayMigrationOffer,
-    RelayMigrationOfferPayload, SessionClose, SessionClosePayload, SessionGrantPayload,
-    SessionIntentPayload, SignalEnvelope, SignalProtocolError, SignalReplayGuard, SignedSignal,
-    WebRtcAnswerPayload, WebRtcCandidatePayload, WebRtcOfferPayload, SIGNAL_PROTOCOL_VERSION,
+    ProtocolReasonCode, ReconnectGrant, ReconnectGrantPayload, ReconnectRequest,
+    ReconnectRequestPayload, RegisterPayload, RelayMigrationCandidate,
+    RelayMigrationCandidatePayload, RelayMigrationOffer, RelayMigrationOfferPayload, SessionClose,
+    SessionClosePayload, SessionGrantPayload, SessionIntentPayload, SignalEnvelope,
+    SignalErrorMessage, SignalProtocolError, SignalReplayGuard, SignedSignal, WebRtcAnswerPayload,
+    WebRtcCandidatePayload, WebRtcOfferPayload, SIGNAL_PROTOCOL_VERSION,
 };
 use ring::rand::SystemRandom;
 
@@ -61,6 +62,21 @@ fn authenticated_envelope_requires_explicit_supported_version() {
     let mut wrong = encoded;
     wrong["version"] = serde_json::json!(SIGNAL_PROTOCOL_VERSION + 1);
     assert!(serde_json::from_value::<SignalEnvelope>(wrong).is_err());
+}
+
+#[test]
+fn protocol_error_debug_never_exposes_server_detail() {
+    let sentinel = "TEST_ONLY_PROTOCOL_DETAIL_SDP_AND_TURN_SECRET";
+    let message = SignalErrorMessage {
+        reason: ProtocolReasonCode::Internal,
+        correlation_id: Some([9; 16]),
+        detail: sentinel.into(),
+    };
+    let envelope = SignalEnvelope::new(AuthenticatedSignalMessage::ProtocolError(message.clone()));
+
+    let rendered = format!("{message:?} {envelope:?}");
+    assert!(!rendered.contains(sentinel));
+    assert!(rendered.contains("REDACTED"));
 }
 
 #[test]
