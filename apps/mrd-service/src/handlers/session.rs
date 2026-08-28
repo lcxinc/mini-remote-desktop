@@ -1098,10 +1098,11 @@ pub async fn send_control_input(
             },
         };
     }
-    let route_to_peer = match {
+    let session_snapshot = {
         let sessions = app_state.sessions.lock().await;
         sessions.get(&session_id).cloned()
-    } {
+    };
+    let route_to_peer = match session_snapshot {
         Some(snapshot) if snapshot.lifecycle_state.is_terminal() => {
             return IpcResponse::Error {
                 code: "E_CONTROL_INPUT".to_string(),

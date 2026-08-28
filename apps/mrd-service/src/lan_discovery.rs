@@ -4258,6 +4258,7 @@ async fn send_packet(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_lan_media_receiver(
     app_state: Arc<AppState>,
     session_id: SessionId,
@@ -5663,8 +5664,8 @@ async fn send_quic_media_loop(
                 let mut reliable_fragments_sent = 0_u64;
                 for reliable_fragment in reliable_fragments.unwrap_or_default() {
                     let delay = test_impairment.next_delay();
-                    if !delay.is_zero() {
-                        if run_lan_media_operation_while_authorized(
+                    if !delay.is_zero()
+                        && run_lan_media_operation_while_authorized(
                             &app_state,
                             &session_id,
                             &endpoint,
@@ -5672,9 +5673,8 @@ async fn send_quic_media_loop(
                         )
                         .await
                         .is_none()
-                        {
-                            return Ok(());
-                        }
+                    {
+                        return Ok(());
                     }
                     if !session_allows_media(&app_state, &session_id).await {
                         return Ok(());

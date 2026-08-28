@@ -614,7 +614,7 @@ impl GenerationZeroSessionInstaller for ServiceGenerationZeroSessionInstaller {
             || proof.generation() != 0
             || proof.directory_id() != route.directory_id()
             || proof.primary_node_id() != route.node_id()
-            || proof.relay_url_digest() != &hex_digest(route.urls_digest())
+            || proof.relay_url_digest() != hex_digest(route.urls_digest())
             || !proof.is_relay_to_relay()
         {
             return Err(GenerationZeroNegotiationError::RouteEvidenceMismatch);
@@ -1599,6 +1599,7 @@ impl GenerationZeroNegotiator {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn receive_candidates(
         &self,
         context: &GenerationZeroNegotiationContext,

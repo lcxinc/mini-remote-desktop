@@ -243,6 +243,7 @@ impl LanSenderStatsTracker {
         metrics
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn take_payload(
         &mut self,
         now: Instant,

@@ -52,9 +52,9 @@ fn parse_mac_address(value: &str) -> Result<[u8; 6]> {
     }
 
     let mut mac = [0_u8; 6];
-    for index in 0..6 {
+    for (index, octet) in mac.iter_mut().enumerate() {
         let start = index * 2;
-        mac[index] = u8::from_str_radix(&hex[start..start + 2], 16)
+        *octet = u8::from_str_radix(&hex[start..start + 2], 16)
             .context("parse Wake-on-LAN MAC address octet")?;
     }
     Ok(mac)

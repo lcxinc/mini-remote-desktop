@@ -2384,7 +2384,8 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_receipt_exposes_commitment_outcome() {
-        let (_completion, completed) = tokio::sync::oneshot::channel();
+        let (completion, completed) = tokio::sync::oneshot::channel();
+        drop(completion);
         let receipt = AuthenticatedSessionSignalingReceipt { completed };
 
         assert_eq!(
@@ -2395,7 +2396,8 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_receipt_outcome_alias_is_available() {
-        let (_completion, completed) = tokio::sync::oneshot::channel();
+        let (completion, completed) = tokio::sync::oneshot::channel();
+        drop(completion);
         let receipt = AuthenticatedSessionSignalingReceipt { completed };
 
         assert_eq!(

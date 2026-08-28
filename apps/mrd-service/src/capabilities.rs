@@ -1545,11 +1545,11 @@ fn software_vvc_encode_status(probe_mode: CapabilityProbeMode) -> (CapabilitySta
     #[cfg(not(feature = "production-vvc-software-codec"))]
     {
         let _ = probe_mode;
-        return (
+        (
             CapabilityStatus::Unimplemented,
             "H.266/VVC software encode requires mrd-service feature production-vvc-software-codec, mrd-encode-vvenc feature software-vvenc, and libvvenc >= 1.13.0."
                 .to_string(),
-        );
+        )
     }
 
     #[cfg(feature = "production-vvc-software-codec")]

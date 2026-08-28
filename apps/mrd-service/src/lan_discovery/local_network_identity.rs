@@ -10,9 +10,7 @@ pub(super) fn local_lan_announcement_mac_address() -> Option<String> {
 
     let networks = sysinfo::Networks::new_with_refreshed_list();
     select_lan_announcement_mac_address(
-        networks
-            .iter()
-            .map(|(_interface_name, data)| data.mac_address().to_string()),
+        networks.values().map(|data| data.mac_address().to_string()),
     )
 }
 

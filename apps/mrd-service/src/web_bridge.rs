@@ -725,12 +725,9 @@ fn origin_host(origin: &HeaderValue) -> Option<&str> {
     let Ok(origin) = origin.to_str() else {
         return None;
     };
-    let Some(rest) = origin
+    let rest = origin
         .strip_prefix("http://")
-        .or_else(|| origin.strip_prefix("https://"))
-    else {
-        return None;
-    };
+        .or_else(|| origin.strip_prefix("https://"))?;
     let host = rest.split('/').next().unwrap_or(rest);
     Some(host.rsplit_once(':').map(|(host, _)| host).unwrap_or(host))
 }

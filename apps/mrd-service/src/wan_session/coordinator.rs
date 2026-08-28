@@ -637,6 +637,7 @@ impl WanSessionCoordinator {
     /// the authoritative state.  The per-session operation lock remains held
     /// across the revalidation, installer call, and state transition so a
     /// concurrent close/fail cannot publish a stale media route.
+    #[allow(clippy::too_many_arguments)]
     pub async fn commit_generation_zero<F, Fut>(
         &self,
         session_id: &SessionId,
