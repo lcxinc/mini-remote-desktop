@@ -654,7 +654,13 @@ If all-target clippy remains blocked only by the documented pre-existing `vendor
 **Step 2: Run backend and frontend verification**
 
 ```powershell
-python -m pytest apps/Rdesk-Server/tests --basetemp .pytest_tmp/wan-session -q
+Push-Location apps/Rdesk-Server
+try {
+  New-Item -ItemType Directory -Force .pytest_tmp | Out-Null
+  python -m pytest tests --basetemp .pytest_tmp/wan-session -q
+} finally {
+  Pop-Location
+}
 pnpm --dir apps/Rdesk test -- --run
 pnpm --dir apps/Rdesk type-check
 pnpm --dir apps/Rdesk build

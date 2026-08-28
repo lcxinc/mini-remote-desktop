@@ -2,8 +2,8 @@
 
 - Date: 2026-08-28
 - Branch: `codex/initial-wan-relay-session`
-- Initial-WAN implementation base: `682bf3a4` (Task 12 gate changes were
-  verified from the working tree before their commit)
+- Initial-WAN implementation base: `682bf3a4`; evidence gate: `ce594a8a`;
+  verification-blocker fixes: `bacf1165`
 Overall live verdict: **INFRA_FAIL**
 
 This record distinguishes deterministic implementation evidence from real
@@ -17,14 +17,13 @@ product pass is claimed.
 
 - Controller OS/toolchain: Windows x86_64 MSVC, Rust/Cargo 1.89.0,
   Windows PowerShell 5.1.26100.9032, Python 3.12.10.
-- Repository revision verified: `1c44870a69b9` before this record update.
+- Repository revision verified: `bacf1165` before this record update.
 - Docker Desktop client/server 29.2.1 was available. A temporary, single-host
   coturn container was exercised for local transport evidence only; it was not
   configured as an MRD relay agent, broker, or multi-region lab node.
 - No native local `turnserver` / `coturn` executable was discovered.
-- `MRD_TEST_DATABASE_URL` was not configured, so PostgreSQL-only FastAPI rows
-  remained environment-gated locally. `.github/workflows/relay-control.yml`
-  provisions PostgreSQL and makes those rows mandatory in CI.
+- `MRD_TEST_DATABASE_URL` was configured. The FastAPI suite exercised its
+  PostgreSQL paths rather than skipping them.
 
 ## Deterministic and local results
 
@@ -32,15 +31,16 @@ product pass is claimed.
 | --- | --- | --- |
 | Relay selection / directory | PASS | `mrd-relay-control`: 27 tests including the compile-fail doc contract |
 | Cross-platform node agent | PASS | `mrd-relay-agent`: 209 tests across runtime, broker, platform, metrics, CLI, and secure stores |
-| Authenticated migration protocol | PASS | `mrd-signal-proto`: 10 tests; `realtime-server`: 6 tests |
+| Authenticated migration protocol | PASS | `mrd-signal-proto`: 21 tests; `realtime-server`: 7 tests; doc tests also passed |
 | WebRTC relay migration | PASS (multi-host rows not counted) | 86 unit, 18 integration, and 0 doc tests passed; 4 live/perf rows ignored in the ordinary package run. Local coturn UDP and TCP live rows were then invoked explicitly and passed. |
-| Session service | PASS | `mrd-service`: 778 tests passed, 4 environment/hardware rows ignored |
-| Backend | PASS for configured local rows | FastAPI: 348 passed, 78 PostgreSQL-gated rows skipped without `MRD_TEST_DATABASE_URL` |
+| Session service | PASS | `mrd-service`: 865 tests passed, 16 ignored; 12 ignored rows are the explicit initial-WAN live-lab matrix |
+| Backend | PASS | FastAPI/PostgreSQL: 467 passed with `MRD_TEST_DATABASE_URL` configured |
+| Desktop client | PASS | Rdesk: 46 Vitest files / 644 tests; TypeScript check and Vite production build passed |
 | Deployment contract | PASS | `deploy/turn/test_deploy_contract.ps1` |
 | Multi-region integration | PASS | 3 tests: explicit generation-zero peer binding, three-node/two-region capacity lifecycle, and real failover coordinator/security cleanup |
 | Quality and workflow gates | PASS | `mrd-quality-gate`: 48 tests; PowerShell orchestration contracts PASS |
 | Formatting | PASS | `cargo fmt --all -- --check`; `git diff --check` |
-| Strict focused Clippy | PASS | relay-control, relay-agent, signal, realtime, WebRTC, and quality-gate with `--no-deps -D warnings` |
+| Strict focused Clippy | PASS | `mrd-signal-proto`, `realtime-server`, and `mrd-service` libs/bins passed with `--no-deps -D warnings`; dependency-aware run remains blocked only by 7 `vendor/nvenc` findings |
 
 The WebRTC transport's upstream `webrtc-ice` 0.12 dependency does not gather
 TURN/TCP or TURN/TLS candidates. Commit `1c44870a` supplies a bounded,
@@ -52,16 +52,24 @@ plaintext. `cargo clippy -p mrd-transport-webrtc --lib -- -D warnings` passed.
 The all-target variant remains blocked by pre-existing strict warnings in
 `vendor/nvenc`; no third-party source was changed.
 
-The first full FastAPI invocation hit a Windows ACL denial in pytest's default
-user temp root before affected tests were executed. Re-running the same suite
-with a new workspace-local `--basetemp` completed with the result above. This
-was an executor filesystem issue, not a product assertion failure.
+The first Task 13 FastAPI commands exposed two harness issues before product
+assertions: the repository-root invocation did not put `apps/Rdesk-Server` on
+the Python import path, and pytest does not create a missing parent directory
+for a nested `--basetemp`. Running from the backend import root after creating
+the exact workspace-local parent completed 467/467. The temporary tree was
+then removed by its exact repository path.
 
-`mrd-service --lib --no-deps -D warnings` remains blocked by 12 pre-existing,
-non-relay Clippy findings in agent runtime, capabilities, generic session/LAN
-handlers, wake-on-LAN, and web bridge code. The relay modules introduced by
-this work produced no strict Clippy finding. The complete `mrd-service` test
-package nevertheless passed.
+The focused no-dependency Clippy run initially identified 15 service findings.
+Mechanical, behavior-preserving fixes plus local exceptions for functions whose
+arguments deliberately express exact security bindings reduced that command to
+zero findings. The dependency-aware command still stops at 7 pre-existing
+`vendor/nvenc` findings (redundant field names, argument count, and a missing
+`# Safety` section); vendor source was not changed.
+
+The Task 13 secret-negative scan found only synthetic test credentials and ICE
+candidate fixtures, explicit redaction assertions, and typed `candidate`
+fields. No raw SDP/candidate, authorization header, TURN secret, or endpoint
+userinfo was found in committed evidence, runtime logs, or error snapshots.
 
 ### Initial attended WAN session gate
 
