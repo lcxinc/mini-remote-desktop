@@ -999,6 +999,7 @@ mod tests {
                 request: mrd_ipc::RemoteSessionRequest {
                     session_id: session_id.clone(),
                     target_device_id: DeviceId("missing-target".to_string()),
+                    route_preference: mrd_ipc::RemoteRoutePreference::Auto,
                     access_mode: RemoteAccessMode::Unattended,
                     requested_scopes: vec![RemotePermissionScope::ScreenView],
                     requested_profile: None,
@@ -1046,6 +1047,7 @@ mod tests {
                 request: mrd_ipc::RemoteSessionRequest {
                     session_id: session_id.clone(),
                     target_device_id: target_device_id.clone(),
+                    route_preference: mrd_ipc::RemoteRoutePreference::Lan,
                     access_mode: RemoteAccessMode::Attended,
                     requested_scopes: vec![
                         RemotePermissionScope::ScreenView,

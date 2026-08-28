@@ -2,12 +2,22 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import create_access_token, hash_password, verify_password
+from app.core.security import (
+    create_access_token,
+    hash_password,
+    password_needs_rehash,
+    verify_password,
+)
+from app.core.response_security import no_store_sensitive_response
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.auth import LoginRequest, LoginResponse, RegisterRequest
 
-router = APIRouter(prefix="/auth", tags=["auth"])
+router = APIRouter(
+    prefix="/auth",
+    tags=["auth"],
+    dependencies=[Depends(no_store_sensitive_response)],
+)
 
 
 @router.post("/register", response_model=LoginResponse)
@@ -72,6 +82,9 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)) -> Lo
             detail="Invalid username or password",
         )
     token = create_access_token(user.id, user.username, user.role)
+    if password_needs_rehash(user.password_hash):
+        user.password_hash = hash_password(payload.password)
+        await db.commit()
     return LoginResponse(
         access_token=token,
         user_id=user.id,

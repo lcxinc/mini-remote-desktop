@@ -16,6 +16,9 @@ fn policy(name: &str) -> GatePolicy {
         "windows-security-negative.v1.json" => {
             include_str!("../../../tests/quality-gates/policies/windows-security-negative.v1.json")
         }
+        "windows-multi-region-relay.v1.json" => {
+            include_str!("../../../tests/quality-gates/policies/windows-multi-region-relay.v1.json")
+        }
         _ => panic!("unknown fixture"),
     };
     serde_json::from_str(raw).unwrap()
@@ -44,6 +47,9 @@ fn fixture(name: &str) -> mrd_quality_gate::RemoteExperienceRun {
         "security-certificate-substitution.json" => include_str!(
             "../../../tests/quality-gates/fixtures/security-certificate-substitution.json"
         ),
+        "multi-region-relay-valid.json" => {
+            include_str!("../../../tests/quality-gates/fixtures/multi-region-relay-valid.json")
+        }
         _ => panic!("unknown fixture"),
     };
     serde_json::from_str(raw).unwrap()
@@ -359,4 +365,100 @@ fn unsupported_secure_lan_route_is_an_invalid_policy() {
         evaluate(&secure_positive_run(), &policy).verdict,
         Verdict::InfraFail
     );
+}
+
+#[test]
+fn complete_multi_region_runtime_evidence_passes() {
+    let result = evaluate(
+        &fixture("multi-region-relay-valid.json"),
+        &policy("windows-multi-region-relay.v1.json"),
+    );
+    assert_eq!(result.verdict, Verdict::Pass, "{:?}", result.failures);
+}
+
+#[test]
+fn metadata_only_or_non_relay_selected_pair_cannot_pass() {
+    let policy = policy("windows-multi-region-relay.v1.json");
+    let run = fixture("multi-region-relay-valid.json");
+    let mut value = serde_json::to_value(run).unwrap();
+    value["relay"]["selected_pair"]["runtime_verified"] = serde_json::json!(false);
+    let run = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(evaluate(&run, &policy).verdict, Verdict::ProductFail);
+
+    value["relay"]["selected_pair"]["runtime_verified"] = serde_json::json!(true);
+    value["relay"]["selected_pair"]["remote_candidate_type"] = serde_json::json!("host");
+    let run = serde_json::from_value(value).unwrap();
+    assert_eq!(evaluate(&run, &policy).verdict, Verdict::ProductFail);
+}
+
+#[test]
+fn relay_gate_enforces_failure_domain_generation_recovery_and_cleanup() {
+    let policy = policy("windows-multi-region-relay.v1.json");
+    let run = fixture("multi-region-relay-valid.json");
+    let original = serde_json::to_value(run).unwrap();
+    for mutation in [
+        ("backup", "failure_domain", serde_json::json!("rack-a")),
+        ("generation", "after", serde_json::json!(0)),
+        ("restored_media", "media_resumed", serde_json::json!(false)),
+        ("cleanup", "lab_reset", serde_json::json!(false)),
+    ] {
+        let mut value = original.clone();
+        value["relay"][mutation.0][mutation.1] = mutation.2;
+        let run = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            evaluate(&run, &policy).verdict,
+            Verdict::ProductFail,
+            "relay.{}.{} must be enforced",
+            mutation.0,
+            mutation.1
+        );
+    }
+}
+
+#[test]
+fn relay_gate_binds_reservations_and_allocations_to_selected_nodes() {
+    let policy = policy("windows-multi-region-relay.v1.json");
+    let run = fixture("multi-region-relay-valid.json");
+    let original = serde_json::to_value(run).unwrap();
+    for (section, field) in [
+        ("reservation", "primary_node_id"),
+        ("reservation", "backup_node_id"),
+        ("allocation", "primary_node_id"),
+        ("allocation", "backup_node_id"),
+    ] {
+        let mut value = original.clone();
+        value["relay"][section][field] = serde_json::json!("relay-unrelated");
+        let run = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            evaluate(&run, &policy).verdict,
+            Verdict::ProductFail,
+            "relay.{section}.{field} must be bound"
+        );
+    }
+}
+
+#[test]
+fn relay_gate_enforces_ten_second_removal_and_twenty_second_recovery() {
+    let policy = policy("windows-multi-region-relay.v1.json");
+    let run = fixture("multi-region-relay-valid.json");
+    let original = serde_json::to_value(run).unwrap();
+
+    let mut slow_removal = original.clone();
+    slow_removal["relay"]["detection"]["removed_at_ms"] = serde_json::json!(20_001);
+    let run = serde_json::from_value(slow_removal).unwrap();
+    assert_eq!(evaluate(&run, &policy).verdict, Verdict::ProductFail);
+
+    let mut slow_recovery = original;
+    slow_recovery["relay"]["restored_media"]["resumed_at_ms"] = serde_json::json!(30_001);
+    let run = serde_json::from_value(slow_recovery).unwrap();
+    assert_eq!(evaluate(&run, &policy).verdict, Verdict::ProductFail);
+}
+
+#[test]
+fn missing_live_infrastructure_is_infra_fail_never_product_pass() {
+    let mut run = fixture("multi-region-relay-valid.json");
+    run.producer_status = "infra_failed".to_owned();
+    run.gate_status = Verdict::InfraFail;
+    let result = evaluate(&run, &policy("windows-multi-region-relay.v1.json"));
+    assert_eq!(result.verdict, Verdict::InfraFail);
 }

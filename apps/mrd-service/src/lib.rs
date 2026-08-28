@@ -16,6 +16,7 @@ pub mod handlers;
 pub mod ipc_server;
 pub mod lan_discovery;
 pub mod media_adaptation;
+pub mod relay;
 pub mod resource_monitor;
 pub mod security;
 pub mod session_authorization;
@@ -23,6 +24,7 @@ pub mod shell;
 pub mod signaling;
 pub mod transports;
 pub mod wake_on_lan;
+pub mod wan_session;
 pub mod web_bridge;
 pub mod windows_service;
 

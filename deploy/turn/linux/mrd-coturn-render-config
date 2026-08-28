@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
+
+readonly base_config=/etc/mrd-relay-agent/coturn/turnserver.conf.base
+readonly rendered_config=/etc/mrd-relay-agent/secrets/turnserver.generated.conf
+readonly turn_cert=/run/credentials/mrd-coturn.service/turn-cert
+readonly turn_key=/run/credentials/mrd-coturn.service/turn-key
+
+fail() {
+  printf '%s\n' "${1:-relay_coturn_render_failed}" >&2
+  exit 1
+}
+
+assert_trusted_ancestors() {
+  local current=$1
+  while [[ "$current" != / ]]; do
+    if [[ -e "$current" ]]; then
+      [[ ! -L "$current" ]] || fail relay_coturn_render_symlink_rejected
+      [[ "$(/usr/bin/stat -c '%u' -- "$current")" == 0 ]] \
+        || fail relay_coturn_render_owner_invalid
+      local mode
+      mode="$(/usr/bin/stat -c '%a' -- "$current")"
+      (( (8#$mode & 0022) == 0 )) || fail relay_coturn_render_mode_invalid
+    fi
+    current="${current%/*}"
+    [[ -n "$current" ]] || current=/
+  done
+}
+
+[[ "${EUID}" -eq 0 ]] || fail relay_coturn_render_requires_root
+[[ "$#" -eq 1 ]] || fail relay_coturn_render_invalid_arguments
+[[ "$1" == /etc/mrd-relay-agent/secrets/turn-rest-secret ]] || fail relay_coturn_render_invalid_secret_path
+assert_trusted_ancestors "$1"
+assert_trusted_ancestors "$base_config"
+assert_trusted_ancestors "${rendered_config%/*}"
+[[ -f "$1" && ! -L "$1" ]] || fail relay_coturn_render_invalid_secret_source
+[[ -f "$base_config" && ! -L "$base_config" ]] || fail relay_coturn_render_invalid_base_config
+[[ -d "${rendered_config%/*}" && ! -L "${rendered_config%/*}" ]] || fail relay_coturn_render_invalid_output_directory
+
+[[ "$(/usr/bin/stat -c '%s' -- "$1")" == 43 ]] || fail relay_coturn_render_secret_size_invalid
+secret="$(/usr/bin/head -c 513 -- "$1")"
+[[ "$secret" =~ ^[A-Za-z0-9_-]{43}$ ]] || fail relay_coturn_render_invalid_secret
+
+temporary="$(/usr/bin/mktemp --tmpdir="${rendered_config%/*}" .turnserver.generated.XXXXXX)"
+cleanup() {
+  if [[ -n "${temporary:-}" && -e "$temporary" ]]; then
+    /usr/bin/rm -f -- "$temporary"
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+
+placeholder_count=0
+while IFS= read -r line || [[ -n "$line" ]]; do
+  case "$line" in
+    'static-auth-secret=__MRD_BROKER_SECRET_V1__')
+      printf 'static-auth-secret=%s\n' "$secret" >> "$temporary"
+      placeholder_count=$((placeholder_count + 1))
+      ;;
+    'cert=/etc/mrd-relay-agent/tls/fullchain.pem')
+      printf 'cert=%s\n' "$turn_cert" >> "$temporary"
+      ;;
+    'pkey=/etc/mrd-relay-agent/tls/privkey.pem')
+      printf 'pkey=%s\n' "$turn_key" >> "$temporary"
+      ;;
+    *)
+      printf '%s\n' "$line" >> "$temporary"
+      ;;
+  esac
+done < "$base_config"
+unset secret
+
+[[ "$placeholder_count" -eq 1 ]] || fail relay_coturn_render_placeholder_count_invalid
+/usr/bin/chown root:root "$temporary"
+/usr/bin/chmod 0600 "$temporary"
+/usr/bin/mv -fT -- "$temporary" "$rendered_config"
+temporary=
+trap - EXIT HUP INT TERM

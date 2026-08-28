@@ -2,8 +2,10 @@ use mrd_proto::{BackendRole, DeviceId, SessionId};
 use serde::{Deserialize, Serialize};
 
 mod authenticated;
+mod initial_v3;
 
 pub use authenticated::*;
+pub use initial_v3::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "payload")]

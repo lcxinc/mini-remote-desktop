@@ -1,0 +1,757 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
+
+readonly config_path=/etc/mrd-relay-agent/firewall.conf
+readonly nft_policy=/etc/nftables.d/mrd-relay.nft
+readonly state_dir=/var/lib/mrd-coturn
+readonly firewalld_state=/var/lib/mrd-coturn/firewalld-added.rules
+readonly ufw_state=/var/lib/mrd-coturn/ufw-added.rule
+readonly ufw_profile=/etc/ufw/applications.d/mrd-relay
+
+fail() {
+  printf '%s\n' "${1:-relay_firewall_failed}" >&2
+  exit 1
+}
+
+assert_trusted_ancestors() {
+  local current=$1
+  while [[ "$current" != / ]]; do
+    if [[ -e "$current" ]]; then
+      [[ ! -L "$current" ]] || fail relay_firewall_symlink_ancestor_rejected
+      [[ "$(/usr/bin/stat -c '%u' -- "$current")" == 0 ]] \
+        || fail relay_firewall_owner_invalid
+      local mode
+      mode="$(/usr/bin/stat -c '%a' -- "$current")"
+      (( (8#$mode & 0022) == 0 )) || fail relay_firewall_mode_invalid
+    fi
+    current="${current%/*}"
+    [[ -n "$current" ]] || current=/
+  done
+}
+
+durable_write_lines() {
+  local destination=$1
+  shift
+  /usr/bin/python3 - "$destination" "$@" <<'PY'
+import os
+import pathlib
+import sys
+import tempfile
+
+destination = pathlib.Path(sys.argv[1])
+payload = ("\n".join(sys.argv[2:]) + "\n").encode("utf-8")
+descriptor, temporary = tempfile.mkstemp(
+    prefix=f".{destination.name}.", dir=destination.parent
+)
+try:
+    os.fchmod(descriptor, 0o600)
+    os.fchown(descriptor, 0, 0)
+    with os.fdopen(descriptor, "wb") as output:
+        descriptor = -1
+        output.write(payload)
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, destination)
+    directory = os.open(
+        destination.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    )
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+except BaseException:
+    if descriptor >= 0:
+        os.close(descriptor)
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+}
+
+durable_remove_file() {
+  local destination=$1
+  /usr/bin/python3 - "$destination" <<'PY'
+import os
+import pathlib
+import sys
+
+destination = pathlib.Path(sys.argv[1])
+try:
+    os.unlink(destination)
+except FileNotFoundError:
+    raise SystemExit(0)
+directory = os.open(
+    destination.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+PY
+}
+
+self_test_parse_config() {
+  local input=$1
+  local -A fixture_values=()
+  local key value
+  while IFS='=' read -r key value || [[ -n "$key" ]]; do
+    [[ "$key" =~ ^(backend|tls_port|min_port|max_port|firewalld_zone)$ ]] || return 1
+    [[ -z "${fixture_values[$key]+present}" ]] || return 1
+    fixture_values[$key]=$value
+  done <<< "$input"
+  [[ "${#fixture_values[@]}" -eq 5 ]] || return 1
+  [[ "${fixture_values[backend]}" =~ ^(nftables|firewalld|ufw)$ ]] || return 1
+  [[ "${fixture_values[tls_port]}" == 5349 || "${fixture_values[tls_port]}" == 443 ]] || return 1
+  [[ "${fixture_values[min_port]}" == 49160 && "${fixture_values[max_port]}" == 49260 ]] || return 1
+  [[ "${fixture_values[firewalld_zone]}" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || return 1
+}
+
+nft_snapshot_valid() {
+  local tls=$1
+  local snapshot=$2
+  local normalized
+  normalized="$(printf '%s\n' "$snapshot" | /usr/bin/sed -E \
+    's/^[[:space:]]+//;s/[[:space:]]+$//;s/[[:space:]]+/ /g')"
+  [[ "$(printf '%s\n' "$normalized" | /usr/bin/grep -Evc '^$')" == 14 ]] || return 1
+  [[ "$(printf '%s\n' "$normalized" | /usr/bin/grep -Ec '^}$')" == 3 ]] || return 1
+  [[ "$(printf '%s\n' "$normalized" | /usr/bin/grep -Fxc 'table inet mrd_relay {')" == 1 ]] || return 1
+  [[ "$(printf '%s\n' "$normalized" | /usr/bin/grep -Fxc 'chain mrd_relay_owner_v1 {')" == 1 ]] || return 1
+  [[ "$(printf '%s\n' "$normalized" | /usr/bin/grep -Fxc 'comment "mrd-relay-owner-v1"')" == 1 ]] || return 1
+  [[ "$(printf '%s\n' "$normalized" | /usr/bin/grep -Fxc 'chain input {')" == 1 ]] || return 1
+  [[ "$(printf '%s\n' "$normalized" | /usr/bin/grep -Ec '^type filter hook input .* policy accept;$')" == 1 ]] || return 1
+  local rule
+  for rule in \
+    'udp dport 3478 accept' \
+    "tcp dport { 3478, $tls } accept" \
+    'meta l4proto { tcp, udp } th dport 49160-49260 accept' \
+    'iifname "lo" ip saddr 127.0.0.0/8 tcp dport 9641 accept' \
+    'iifname "lo" ip6 saddr ::1 tcp dport 9641 accept' \
+    'tcp dport 9641 drop'; do
+    [[ "$(printf '%s\n' "$normalized" | /usr/bin/grep -Fxc -- "$rule")" == 1 ]] || return 1
+  done
+  [[ "$(printf '%s\n' "$normalized" | /usr/bin/grep -Ec ' (accept|drop)$')" == 6 ]] || return 1
+}
+
+ufw_rule_count_from_text() {
+  local status=$1
+  /usr/bin/awk '
+    /MRD-Relay/ {
+      if ($0 ~ /^MRD-Relay[[:space:]]+ALLOW[[:space:]]+Anywhere[[:space:]]*$/) {
+        kind = "v4"
+      } else if ($0 ~ /^MRD-Relay \(v6\)[[:space:]]+ALLOW[[:space:]]+Anywhere \(v6\)[[:space:]]*$/) {
+        kind = "v6"
+      } else {
+        exit 2
+      }
+      if (seen[kind]++) exit 3
+      count++
+    }
+    END { if (count > 2) exit 3; print count + 0 }
+  ' <<< "$status"
+}
+
+firewalld_classify_mutation_result() {
+  local status=$1 output=$2 operation=$3 normalized
+  normalized="$(printf '%s\n' "$output" | /usr/bin/tr -d '\r' | /usr/bin/sed \
+    -e '/^[[:space:]]*$/d' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  if [[ "$operation" == add ]]; then
+    if [[ "$status" -eq 11 || "$normalized" == *ALREADY_ENABLED* ]]; then
+      printf '%s\n' collision
+    elif [[ "$status" -eq 0 && ( -z "$normalized" || "$normalized" == success ) ]]; then
+      printf '%s\n' owned
+    else
+      printf '%s\n' ambiguous
+    fi
+    return
+  fi
+  if [[ "$operation" == remove ]]; then
+    if [[ "$status" -eq 12 || "$normalized" == *NOT_ENABLED* ]]; then
+      printf '%s\n' absent
+    elif [[ "$status" -eq 0 && ( -z "$normalized" || "$normalized" == success ) ]]; then
+      printf '%s\n' removed
+    else
+      printf '%s\n' ambiguous
+    fi
+    return
+  fi
+  printf '%s\n' ambiguous
+}
+
+ufw_classify_add_result() {
+  local status=$1 output=$2 line family kind
+  [[ "$status" -eq 0 ]] || { printf '%s\n' ambiguous; return; }
+  local added=0 skipped=0 invalid=0
+  local -A seen=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line%$'\r'}
+    [[ -n "$line" ]] || continue
+    case "$line" in
+      'Rule added') family=v4; kind=added ;;
+      'Rule added (v6)') family=v6; kind=added ;;
+      'Skipping adding existing rule') family=v4; kind=skipped ;;
+      'Skipping adding existing rule (v6)') family=v6; kind=skipped ;;
+      *) invalid=1; continue ;;
+    esac
+    if [[ -n "${seen[$family]+present}" ]]; then
+      invalid=1
+      continue
+    fi
+    seen[$family]=$kind
+    if [[ "$kind" == added ]]; then ((added += 1)); else ((skipped += 1)); fi
+  done <<< "$output"
+  if [[ "$invalid" -ne 0 || $((added + skipped)) -eq 0 || ( "$added" -gt 0 && "$skipped" -gt 0 ) ]]; then
+    printf '%s\n' ambiguous
+  elif [[ "$added" -gt 0 ]]; then
+    printf '%s\n' owned
+  else
+    printf '%s\n' collision
+  fi
+}
+
+if [[ "${1:-}" == --self-test && "$#" -eq 1 ]]; then
+  valid=$'backend=nftables\ntls_port=5349\nmin_port=49160\nmax_port=49260\nfirewalld_zone=public'
+  unknown=$'backend=iptables\ntls_port=5349\nmin_port=49160\nmax_port=49260\nfirewalld_zone=public'
+  duplicate=$'backend=nftables\nbackend=ufw\ntls_port=5349\nmin_port=49160\nmax_port=49260\nfirewalld_zone=public'
+  malformed=$'backend=ufw\ntls_port=5349\nmin_port=1\nmax_port=65535\nfirewalld_zone=public'
+  self_test_parse_config "$valid" || fail relay_firewall_self_test_valid_rejected
+  if self_test_parse_config "$unknown"; then fail relay_firewall_self_test_unknown_accepted; fi
+  if self_test_parse_config "$duplicate"; then fail relay_firewall_self_test_duplicate_accepted; fi
+  if self_test_parse_config "$malformed"; then fail relay_firewall_self_test_range_accepted; fi
+  good_snapshot=$'table inet mrd_relay {\n chain mrd_relay_owner_v1 {\n comment "mrd-relay-owner-v1"\n }\n chain input {\n type filter hook input priority -5; policy accept;\n udp dport 3478 accept\n tcp dport { 3478, 5349 } accept\n meta l4proto { tcp, udp } th dport 49160-49260 accept\n iifname "lo" ip saddr 127.0.0.0/8 tcp dport 9641 accept\n iifname "lo" ip6 saddr ::1 tcp dport 9641 accept\n tcp dport 9641 drop\n }\n}'
+  nft_snapshot_valid 5349 "$good_snapshot" || fail relay_firewall_self_test_live_rules_rejected
+  tampered_snapshot="${good_snapshot/udp dport 3478 accept/udp dport 3478 drop}"
+  if nft_snapshot_valid 5349 "$tampered_snapshot"; then
+    fail relay_firewall_self_test_tampered_live_rules_accepted
+  fi
+  extra_snapshot="${good_snapshot/tcp dport 9641 drop/tcp dport 9641 drop$'\n' counter}"
+  if nft_snapshot_valid 5349 "$extra_snapshot"; then
+    fail relay_firewall_self_test_extra_live_rule_accepted
+  fi
+  [[ "$(ufw_rule_count_from_text $'Status: active\nMRD-Relay  ALLOW  Anywhere\nMRD-Relay (v6)  ALLOW  Anywhere (v6)')" == 2 ]] \
+    || fail relay_firewall_self_test_ufw_pair_rejected
+  if ufw_rule_count_from_text $'Status: active\nMRD-Relay  DENY  Anywhere' >/dev/null; then
+    fail relay_firewall_self_test_ufw_deny_accepted
+  fi
+  if ufw_rule_count_from_text $'Status: active\nMRD-Relay  ALLOW OUT  Anywhere' >/dev/null; then
+    fail relay_firewall_self_test_ufw_outbound_accepted
+  fi
+  if ufw_rule_count_from_text $'Status: active\nMRD-Relay  ALLOW  203.0.113.0/24' >/dev/null; then
+    fail relay_firewall_self_test_ufw_restricted_source_accepted
+  fi
+  if ufw_rule_count_from_text $'MRD-Relay ALLOW Anywhere\nMRD-Relay ALLOW Anywhere\nMRD-Relay ALLOW Anywhere' >/dev/null; then
+    fail relay_firewall_self_test_ufw_duplicate_accepted
+  fi
+  [[ "$(firewalld_classify_mutation_result 0 success add)" == owned ]] \
+    || fail relay_firewall_self_test_firewalld_success_rejected
+  [[ "$(firewalld_classify_mutation_result 0 'Warning: ALREADY_ENABLED: 3478:udp' add)" == collision ]] \
+    || fail relay_firewall_self_test_firewalld_collision_rejected
+  [[ "$(firewalld_classify_mutation_result 11 'ALREADY_ENABLED' add)" == collision ]] \
+    || fail relay_firewall_self_test_firewalld_code_11_rejected
+  [[ "$(firewalld_classify_mutation_result 13 'COMMAND_FAILED' add)" == ambiguous ]] \
+    || fail relay_firewall_self_test_firewalld_failure_accepted
+  [[ "$(ufw_classify_add_result 0 $'Rule added\nRule added (v6)')" == owned ]] \
+    || fail relay_firewall_self_test_ufw_add_rejected
+  [[ "$(ufw_classify_add_result 0 $'Skipping adding existing rule\nSkipping adding existing rule (v6)')" == collision ]] \
+    || fail relay_firewall_self_test_ufw_collision_rejected
+  [[ "$(ufw_classify_add_result 0 $'Rule added\nSkipping adding existing rule (v6)')" == ambiguous ]] \
+    || fail relay_firewall_self_test_ufw_partial_add_accepted
+  [[ "$(ufw_classify_add_result 1 'Rule added')" == ambiguous ]] \
+    || fail relay_firewall_self_test_ufw_failed_add_accepted
+  script_source="$(/usr/bin/cat -- "${BASH_SOURCE[0]}")"
+  for required in \
+    'load_firewalld_provenance' 'store_firewalld_provenance' \
+    'owned_port=' 'pending_add_port=' 'pending_remove_port=' \
+    'store_ufw_provenance pending_add' 'store_ufw_provenance pending_remove' \
+    'store_ufw_provenance ambiguous' \
+    'store_ufw_provenance' 'validate_ufw_provenance' \
+    'durable_write_lines' 'os.replace' 'os.fsync' \
+    'relay_firewall_firewalld_concurrent_rule' 'relay_firewall_ufw_concurrent_rule' \
+    'relay_firewall_firewalld_remove_failed' 'relay_firewall_ufw_remove_failed'; do
+    /usr/bin/grep -Fq -- "$required" <<< "$script_source" \
+      || fail relay_firewall_self_test_provenance_contract_missing
+  done
+  swallow_pattern='||'' true'
+  if /usr/bin/grep -Fq -- "$swallow_pattern" <<< "$script_source"; then
+    fail relay_firewall_self_test_rollback_error_swallowed
+  fi
+  printf '%s\n' relay_firewall_self_test_passed
+  exit 0
+fi
+
+[[ "${EUID}" -eq 0 ]] || fail relay_firewall_requires_root
+[[ "$#" -eq 1 ]] || fail relay_firewall_invalid_arguments
+action=$1
+[[ "$action" == apply || "$action" == remove || "$action" == verify ]] \
+  || fail relay_firewall_invalid_action
+[[ -f "$config_path" && ! -L "$config_path" ]] || fail relay_firewall_config_invalid
+[[ "$(/usr/bin/stat -c '%U:%G:%a' -- "$config_path")" == root:root:600 ]] \
+  || fail relay_firewall_config_mode_invalid
+[[ -d "$state_dir" && ! -L "$state_dir" ]] || fail relay_firewall_state_invalid
+assert_trusted_ancestors "$config_path"
+assert_trusted_ancestors "$state_dir"
+
+declare -A values=()
+while IFS='=' read -r key value || [[ -n "$key" ]]; do
+  [[ "$key" =~ ^(backend|tls_port|min_port|max_port|firewalld_zone)$ ]] \
+    || fail relay_firewall_config_key_invalid
+  [[ -z "${values[$key]+present}" ]] || fail relay_firewall_config_duplicate
+  values[$key]=$value
+done < "$config_path"
+[[ "${#values[@]}" -eq 5 ]] || fail relay_firewall_config_missing
+
+backend=${values[backend]}
+tls_port=${values[tls_port]}
+min_port=${values[min_port]}
+max_port=${values[max_port]}
+firewalld_zone=${values[firewalld_zone]}
+[[ "$backend" =~ ^(nftables|firewalld|ufw)$ ]] || fail relay_firewall_backend_unknown
+[[ "$tls_port" == 5349 || "$tls_port" == 443 ]] || fail relay_firewall_config_invalid
+[[ "$min_port" == 49160 && "$max_port" == 49260 ]] || fail relay_firewall_config_invalid
+[[ "$firewalld_zone" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || fail relay_firewall_config_invalid
+
+case "$backend" in
+  nftables)
+    [[ -f "$nft_policy" && ! -L "$nft_policy" ]] || fail relay_firewall_nftables_policy_invalid
+    assert_trusted_ancestors "$nft_policy"
+    [[ "$(/usr/bin/stat -c '%U:%G:%a' -- "$nft_policy")" == root:root:644 ]] \
+      || fail relay_firewall_nftables_policy_mode_invalid
+    ;;
+  ufw)
+    [[ -f "$ufw_profile" && ! -L "$ufw_profile" ]] || fail relay_firewall_ufw_profile_invalid
+    assert_trusted_ancestors "$ufw_profile"
+    [[ "$(/usr/bin/stat -c '%U:%G:%a' -- "$ufw_profile")" == root:root:644 ]] \
+      || fail relay_firewall_ufw_profile_mode_invalid
+    ;;
+  firewalld) : ;;
+esac
+
+exec 9> /var/lib/mrd-coturn/firewall.lock
+/usr/bin/flock --exclusive --timeout 10 9 || fail relay_firewall_lock_timeout
+
+nftables_apply() {
+  [[ -x /usr/sbin/nft && -f "$nft_policy" && ! -L "$nft_policy" ]] \
+    || fail relay_firewall_nftables_unavailable
+  local existing_file existing_snapshot
+  existing_file="$(/usr/bin/mktemp --tmpdir="$state_dir" .nft-existing.XXXXXX)"
+  /usr/bin/chown root:root "$existing_file"
+  /usr/bin/chmod 0600 "$existing_file"
+  if /usr/sbin/nft --numeric list table inet mrd_relay > "$existing_file" 2>/dev/null; then
+    [[ "$(/usr/bin/stat -c '%s' -- "$existing_file")" -le 65536 ]] \
+      || fail relay_firewall_nftables_unknown_table
+    existing_snapshot="$(/usr/bin/head -c 65537 -- "$existing_file")"
+    nft_snapshot_valid "$tls_port" "$existing_snapshot" \
+      || fail relay_firewall_nftables_unknown_table
+    /usr/sbin/nft delete table inet mrd_relay \
+      || fail relay_firewall_nftables_delete_owned_failed
+  fi
+  /usr/bin/rm -f -- "$existing_file"
+  if ! /usr/sbin/nft --file "$nft_policy"; then
+    fail relay_firewall_nftables_apply_failed
+  fi
+}
+
+nftables_remove() {
+  local existing_file existing_snapshot
+  existing_file="$(/usr/bin/mktemp --tmpdir="$state_dir" .nft-remove.XXXXXX)"
+  /usr/bin/chown root:root "$existing_file"
+  /usr/bin/chmod 0600 "$existing_file"
+  if /usr/sbin/nft --numeric list table inet mrd_relay > "$existing_file" 2>/dev/null; then
+    [[ "$(/usr/bin/stat -c '%s' -- "$existing_file")" -le 65536 ]] \
+      || fail relay_firewall_nftables_unknown_table
+    existing_snapshot="$(/usr/bin/head -c 65537 -- "$existing_file")"
+    nft_snapshot_valid "$tls_port" "$existing_snapshot" \
+      || fail relay_firewall_nftables_unknown_table
+    /usr/sbin/nft delete table inet mrd_relay \
+      || fail relay_firewall_nftables_delete_owned_failed
+  fi
+  /usr/bin/rm -f -- "$existing_file"
+}
+
+nftables_verify() {
+  local snapshot_file
+  snapshot_file="$(/usr/bin/mktemp --tmpdir="$state_dir" .nft-live.XXXXXX)"
+  /usr/bin/chown root:root "$snapshot_file"
+  /usr/bin/chmod 0600 "$snapshot_file"
+  if ! /usr/sbin/nft --numeric list table inet mrd_relay > "$snapshot_file" 2>/dev/null; then
+    /usr/bin/rm -f -- "$snapshot_file"
+    fail relay_firewall_nftables_verify_failed
+  fi
+  [[ "$(/usr/bin/stat -c '%s' -- "$snapshot_file")" -le 65536 ]] || {
+    /usr/bin/rm -f -- "$snapshot_file"
+    fail relay_firewall_nftables_snapshot_oversized
+  }
+  local snapshot
+  snapshot="$(/usr/bin/head -c 65537 -- "$snapshot_file")"
+  /usr/bin/rm -f -- "$snapshot_file"
+  nft_snapshot_valid "$tls_port" "$snapshot" || fail relay_firewall_nftables_live_rules_invalid
+}
+
+firewalld_ports() {
+  printf '%s\n' 3478/udp 3478/tcp "$tls_port/tcp" "$min_port-$max_port/udp" "$min_port-$max_port/tcp"
+}
+
+firewalld_owned_zone=
+declare -a firewalld_owned_ports=()
+declare -a firewalld_pending_add_ports=()
+declare -a firewalld_pending_remove_ports=()
+
+firewalld_port_expected() {
+  local candidate=$1 expected
+  while IFS= read -r expected; do
+    [[ "$candidate" == "$expected" ]] && return 0
+  done < <(firewalld_ports)
+  return 1
+}
+
+load_firewalld_provenance() {
+  firewalld_owned_zone=
+  firewalld_owned_ports=()
+  firewalld_pending_add_ports=()
+  firewalld_pending_remove_ports=()
+  [[ -e "$firewalld_state" ]] || return 0
+  [[ -f "$firewalld_state" && ! -L "$firewalld_state" ]] \
+    || fail relay_firewall_firewalld_provenance_invalid
+  assert_trusted_ancestors "$firewalld_state"
+  [[ "$(/usr/bin/stat -c '%U:%G:%a' -- "$firewalld_state")" == root:root:600 ]] \
+    || fail relay_firewall_firewalld_provenance_invalid
+  local -a lines=()
+  mapfile -t lines < "$firewalld_state"
+  [[ "${#lines[@]}" -ge 3 && "${#lines[@]}" -le 7 \
+    && "${lines[0]}" == schema_version=2 \
+    && "${lines[1]}" =~ ^zone=([A-Za-z0-9_-]{1,32})$ ]] \
+    || fail relay_firewall_firewalld_provenance_invalid
+  firewalld_owned_zone=${BASH_REMATCH[1]}
+  local line kind port
+  local -A seen=()
+  for line in "${lines[@]:2}"; do
+    [[ "$line" =~ ^(owned_port|pending_add_port|pending_remove_port)=(([0-9]+|[0-9]+-[0-9]+)/(tcp|udp))$ ]] \
+      || fail relay_firewall_firewalld_provenance_invalid
+    kind=${BASH_REMATCH[1]}
+    port=${BASH_REMATCH[2]}
+    firewalld_port_expected "$port" || fail relay_firewall_firewalld_provenance_invalid
+    [[ -z "${seen[$port]+present}" ]] || fail relay_firewall_firewalld_provenance_invalid
+    seen[$port]=$kind
+    case "$kind" in
+      owned_port) firewalld_owned_ports+=("$port") ;;
+      pending_add_port) firewalld_pending_add_ports+=("$port") ;;
+      pending_remove_port) firewalld_pending_remove_ports+=("$port") ;;
+    esac
+  done
+}
+
+store_firewalld_provenance() {
+  if [[ "${#firewalld_owned_ports[@]}" -eq 0 \
+    && "${#firewalld_pending_add_ports[@]}" -eq 0 \
+    && "${#firewalld_pending_remove_ports[@]}" -eq 0 ]]; then
+    durable_remove_file "$firewalld_state"
+    return
+  fi
+  local port
+  local -a lines=(schema_version=2 "zone=$firewalld_owned_zone")
+  for port in "${firewalld_owned_ports[@]}"; do
+    lines+=("owned_port=$port")
+  done
+  for port in "${firewalld_pending_add_ports[@]}"; do
+    lines+=("pending_add_port=$port")
+  done
+  for port in "${firewalld_pending_remove_ports[@]}"; do
+    lines+=("pending_remove_port=$port")
+  done
+  durable_write_lines "$firewalld_state" "${lines[@]}"
+}
+
+firewalld_port_state() {
+  local candidate=$1 value owned
+  for owned in "${firewalld_owned_ports[@]}"; do
+    [[ "$owned" == "$candidate" ]] && { printf '%s\n' owned; return; }
+  done
+  for value in "${firewalld_pending_add_ports[@]}"; do
+    [[ "$value" == "$candidate" ]] && { printf '%s\n' pending_add; return; }
+  done
+  for value in "${firewalld_pending_remove_ports[@]}"; do
+    [[ "$value" == "$candidate" ]] && { printf '%s\n' pending_remove; return; }
+  done
+  printf '%s\n' absent
+}
+
+firewalld_set_port_state() {
+  local candidate=$1 desired=$2 value
+  local -a remaining=()
+  for value in "${firewalld_owned_ports[@]}"; do
+    [[ "$value" == "$candidate" ]] || remaining+=("$value")
+  done
+  firewalld_owned_ports=("${remaining[@]}")
+  remaining=()
+  for value in "${firewalld_pending_add_ports[@]}"; do
+    [[ "$value" == "$candidate" ]] || remaining+=("$value")
+  done
+  firewalld_pending_add_ports=("${remaining[@]}")
+  remaining=()
+  for value in "${firewalld_pending_remove_ports[@]}"; do
+    [[ "$value" == "$candidate" ]] || remaining+=("$value")
+  done
+  firewalld_pending_remove_ports=("${remaining[@]}")
+  case "$desired" in
+    owned) firewalld_owned_ports+=("$candidate") ;;
+    pending_add) firewalld_pending_add_ports+=("$candidate") ;;
+    pending_remove) firewalld_pending_remove_ports+=("$candidate") ;;
+    absent) ;;
+    *) fail relay_firewall_firewalld_provenance_invalid ;;
+  esac
+  store_firewalld_provenance
+}
+
+firewalld_has_pending() {
+  [[ "${#firewalld_pending_add_ports[@]}" -gt 0 \
+    || "${#firewalld_pending_remove_ports[@]}" -gt 0 ]]
+}
+
+run_firewalld_mutation() {
+  local operation=$1 port=$2 output status
+  if output="$(LC_ALL=C /usr/bin/firewall-cmd --permanent \
+      --zone="$firewalld_owned_zone" "--${operation}-port=$port" 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+  [[ "${#output}" -le 16384 ]] \
+    || { printf '%s\n' ambiguous; return; }
+  firewalld_classify_mutation_result "$status" "$output" "$operation"
+}
+
+firewalld_apply() {
+  [[ -x /usr/bin/firewall-cmd ]] || fail relay_firewall_firewalld_unavailable
+  [[ "$(/usr/bin/firewall-cmd --state)" == running ]] || fail relay_firewall_firewalld_inactive
+  load_firewalld_provenance
+  if [[ -n "$firewalld_owned_zone" && "$firewalld_owned_zone" != "$firewalld_zone" ]]; then
+    fail relay_firewall_firewalld_provenance_zone_mismatch
+  fi
+  firewalld_has_pending && fail relay_firewall_firewalld_ownership_ambiguous
+  firewalld_owned_zone=$firewalld_zone
+  local port query_status state result
+  while IFS= read -r port; do
+    state="$(firewalld_port_state "$port")"
+    if /usr/bin/firewall-cmd --permanent --zone="$firewalld_zone" --query-port="$port" >/dev/null; then
+      [[ "$state" == owned ]] || fail relay_firewall_firewalld_unowned_rule
+      continue
+    else
+      query_status=$?
+      [[ "$query_status" -eq 1 ]] || fail relay_firewall_firewalld_query_failed
+    fi
+    [[ "$state" == absent ]] || fail relay_firewall_firewalld_owned_rule_missing
+    # The pending state is durable before mutation.  A crash or an
+    # unclassifiable manager result therefore blocks all future auto-removal.
+    firewalld_set_port_state "$port" pending_add
+    if /usr/bin/firewall-cmd --permanent --zone="$firewalld_zone" --query-port="$port" >/dev/null; then
+      firewalld_set_port_state "$port" absent
+      fail relay_firewall_firewalld_concurrent_rule
+    else
+      query_status=$?
+      [[ "$query_status" -eq 1 ]] || fail relay_firewall_firewalld_query_failed
+    fi
+    result="$(run_firewalld_mutation add "$port")"
+    case "$result" in
+      collision)
+        firewalld_set_port_state "$port" absent
+        fail relay_firewall_firewalld_concurrent_rule
+        ;;
+      owned)
+        /usr/bin/firewall-cmd --permanent --zone="$firewalld_zone" --query-port="$port" >/dev/null \
+          || fail relay_firewall_firewalld_apply_readback_failed
+        firewalld_set_port_state "$port" owned
+        ;;
+      *) fail relay_firewall_firewalld_ownership_ambiguous ;;
+    esac
+  done < <(firewalld_ports)
+  /usr/bin/firewall-cmd --reload >/dev/null || fail relay_firewall_firewalld_reload_failed
+}
+
+firewalld_remove() {
+  [[ -x /usr/bin/firewall-cmd ]] || fail relay_firewall_firewalld_unavailable
+  load_firewalld_provenance
+  firewalld_has_pending && fail relay_firewall_firewalld_ownership_ambiguous
+  [[ "${#firewalld_owned_ports[@]}" -gt 0 ]] || return
+  local port query_status result
+  local -a ports=("${firewalld_owned_ports[@]}")
+  # Mark the entire removal set before the first mutation.  Until readback and
+  # reload both succeed, no retry is allowed to delete a replacement rule.
+  for port in "${ports[@]}"; do
+    firewalld_set_port_state "$port" pending_remove
+  done
+  for port in "${ports[@]}"; do
+    if /usr/bin/firewall-cmd --permanent --zone="$firewalld_owned_zone" --query-port="$port" >/dev/null; then
+      result="$(run_firewalld_mutation remove "$port")"
+      [[ "$result" == removed || "$result" == absent ]] \
+        || fail relay_firewall_firewalld_remove_failed
+    else
+      query_status=$?
+      [[ "$query_status" -eq 1 ]] || fail relay_firewall_firewalld_query_failed
+    fi
+  done
+  /usr/bin/firewall-cmd --reload >/dev/null || fail relay_firewall_firewalld_reload_failed
+  for port in "${ports[@]}"; do
+    if /usr/bin/firewall-cmd --permanent --zone="$firewalld_owned_zone" --query-port="$port" >/dev/null; then
+      fail relay_firewall_firewalld_remove_readback_failed
+    else
+      query_status=$?
+      [[ "$query_status" -eq 1 ]] || fail relay_firewall_firewalld_query_failed
+    fi
+    if /usr/bin/firewall-cmd --zone="$firewalld_owned_zone" --query-port="$port" >/dev/null; then
+      fail relay_firewall_firewalld_remove_readback_failed
+    else
+      query_status=$?
+      [[ "$query_status" -eq 1 ]] || fail relay_firewall_firewalld_query_failed
+    fi
+  done
+  durable_remove_file "$firewalld_state"
+}
+
+firewalld_verify() {
+  load_firewalld_provenance
+  firewalld_has_pending && fail relay_firewall_firewalld_ownership_ambiguous
+  [[ "$firewalld_owned_zone" == "$firewalld_zone" ]] \
+    || fail relay_firewall_firewalld_provenance_zone_mismatch
+  local port
+  while IFS= read -r port; do
+    [[ "$(firewalld_port_state "$port")" == owned ]] \
+      || fail relay_firewall_firewalld_provenance_incomplete
+    /usr/bin/firewall-cmd --permanent --zone="$firewalld_zone" --query-port="$port" >/dev/null \
+      || fail relay_firewall_firewalld_verify_failed
+    /usr/bin/firewall-cmd --zone="$firewalld_zone" --query-port="$port" >/dev/null \
+      || fail relay_firewall_firewalld_live_verify_failed
+  done < <(firewalld_ports)
+}
+
+ufw_ownership_state=
+validate_ufw_provenance() {
+  [[ -f "$ufw_state" && ! -L "$ufw_state" ]] \
+    || fail relay_firewall_ufw_provenance_invalid
+  assert_trusted_ancestors "$ufw_state"
+  [[ "$(/usr/bin/stat -c '%U:%G:%a' -- "$ufw_state")" == root:root:600 ]] \
+    || fail relay_firewall_ufw_provenance_invalid
+  local -a lines=()
+  mapfile -t lines < "$ufw_state"
+  [[ "${#lines[@]}" -eq 3 && "${lines[0]}" == schema_version=2 \
+    && "${lines[1]}" == rule=MRD-Relay \
+    && "${lines[2]}" =~ ^state=(owned|pending_add|pending_remove|ambiguous)$ ]] \
+    || fail relay_firewall_ufw_provenance_invalid
+  ufw_ownership_state=${BASH_REMATCH[1]}
+}
+
+store_ufw_provenance() {
+  local state=$1
+  [[ "$state" =~ ^(owned|pending_add|pending_remove|ambiguous)$ ]] \
+    || fail relay_firewall_ufw_provenance_invalid
+  durable_write_lines "$ufw_state" schema_version=2 rule=MRD-Relay "state=$state"
+  ufw_ownership_state=$state
+}
+
+ufw_rule_count() {
+  local status
+  status="$(/usr/sbin/ufw status)" || fail relay_firewall_ufw_status_failed
+  ufw_rule_count_from_text "$status" || fail relay_firewall_ufw_rule_shape_invalid
+}
+
+ufw_apply() {
+  [[ -x /usr/sbin/ufw && -f "$ufw_profile" && ! -L "$ufw_profile" ]] \
+    || fail relay_firewall_ufw_unavailable
+  /usr/sbin/ufw status | /usr/bin/grep -q '^Status: active$' || fail relay_firewall_ufw_inactive
+  local count created_provenance=0 output status result
+  count="$(ufw_rule_count)"
+  [[ "$count" =~ ^[0-2]$ ]] || fail relay_firewall_ufw_rule_shape_invalid
+  if [[ -e "$ufw_state" ]]; then
+    validate_ufw_provenance
+    [[ "$ufw_ownership_state" == owned ]] || fail relay_firewall_ufw_ownership_ambiguous
+    [[ "$count" -gt 0 ]] || fail relay_firewall_ufw_owned_rule_missing
+  elif [[ "$count" -ne 0 ]]; then
+    # Never adopt or rewrite a same-name administrator rule.
+    fail relay_firewall_ufw_unowned_rule
+  else
+    # Persist intent before either the profile update or rule mutation.  A
+    # crash is intentionally non-removable until an operator resolves it.
+    store_ufw_provenance pending_add
+    created_provenance=1
+  fi
+  if [[ "$created_provenance" -eq 0 ]]; then
+    /usr/sbin/ufw app update MRD-Relay >/dev/null \
+      || fail relay_firewall_ufw_profile_update_failed
+    count="$(ufw_rule_count)"
+    [[ "$count" -ge 1 && "$count" -le 2 ]] \
+      || fail relay_firewall_ufw_apply_readback_failed
+    return
+  fi
+  # On a fresh claim, do not run `ufw app update`: a same-name rule could be
+  # created after the first query and must not be rewritten before collision
+  # classification.  The installed profile is already the exact desired one.
+  count="$(ufw_rule_count)"
+  if [[ "$count" -ne 0 ]]; then
+    durable_remove_file "$ufw_state"
+    fail relay_firewall_ufw_concurrent_rule
+  fi
+  if output="$(LC_ALL=C /usr/sbin/ufw allow MRD-Relay 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [[ "${#output}" -gt 16384 ]]; then
+    store_ufw_provenance ambiguous
+    fail relay_firewall_ufw_ownership_ambiguous
+  fi
+  result="$(ufw_classify_add_result "$status" "$output")"
+  case "$result" in
+    collision)
+      durable_remove_file "$ufw_state"
+      fail relay_firewall_ufw_concurrent_rule
+      ;;
+    owned) ;;
+    *)
+      store_ufw_provenance ambiguous
+      fail relay_firewall_ufw_ownership_ambiguous
+      ;;
+  esac
+  count="$(ufw_rule_count)"
+  [[ "$count" -ge 1 && "$count" -le 2 ]] || fail relay_firewall_ufw_apply_readback_failed
+  store_ufw_provenance owned
+}
+
+ufw_remove() {
+  [[ -x /usr/sbin/ufw ]] || fail relay_firewall_ufw_unavailable
+  [[ -e "$ufw_state" ]] || return
+  validate_ufw_provenance
+  [[ "$ufw_ownership_state" == owned ]] || fail relay_firewall_ufw_ownership_ambiguous
+  store_ufw_provenance pending_remove
+  local count
+  count="$(ufw_rule_count)"
+  if [[ "$count" -gt 0 ]]; then
+    /usr/sbin/ufw --force delete allow MRD-Relay >/dev/null 2>&1 \
+      || fail relay_firewall_ufw_remove_failed
+  fi
+  [[ "$(ufw_rule_count)" -eq 0 ]] || fail relay_firewall_ufw_remove_readback_failed
+  durable_remove_file "$ufw_state"
+}
+
+ufw_verify() {
+  [[ -e "$ufw_state" ]] || fail relay_firewall_ufw_provenance_missing
+  validate_ufw_provenance
+  [[ "$ufw_ownership_state" == owned ]] || fail relay_firewall_ufw_ownership_ambiguous
+  local count
+  count="$(ufw_rule_count)"
+  [[ "$count" -ge 1 && "$count" -le 2 ]] || fail relay_firewall_ufw_verify_failed
+}
+
+case "$backend:$action" in
+  nftables:apply) nftables_apply ;;
+  nftables:remove) nftables_remove ;;
+  nftables:verify) nftables_verify ;;
+  firewalld:apply) firewalld_apply ;;
+  firewalld:remove) firewalld_remove ;;
+  firewalld:verify) firewalld_verify ;;
+  ufw:apply) ufw_apply ;;
+  ufw:remove) ufw_remove ;;
+  ufw:verify) ufw_verify ;;
+  *) fail relay_firewall_backend_unknown ;;
+esac

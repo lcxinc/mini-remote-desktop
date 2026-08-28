@@ -1,6 +1,7 @@
-from typing import Optional
+from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from typing import Optional
 
 
 class DeviceOut(BaseModel):
@@ -23,41 +24,81 @@ class DeviceOut(BaseModel):
 
 
 class DeviceRegisterRequest(BaseModel):
-    """Device registration request."""
+    """设备注册请求"""
+    model_config = ConfigDict(extra="forbid")
 
-    motherboard_serial: str = Field(..., min_length=1, max_length=128)
-    hostname: str = Field(..., min_length=1, max_length=128)
-    os_version: str = Field(..., min_length=1, max_length=256)
-    device_name: Optional[str] = Field(None, min_length=1, max_length=128)
-    cpu_info: Optional[str] = None
-    total_memory_mb: Optional[int] = None
-    gpu_info: Optional[str] = None
+    motherboard_serial: str = Field(
+        ..., min_length=1, max_length=128, description="主板序列号", repr=False
+    )
+    hostname: str = Field(..., min_length=1, max_length=128, description="主机名")
+    os_version: str = Field(..., min_length=1, max_length=256, description="操作系统版本")
+    device_name: Optional[str] = Field(None, min_length=1, max_length=128, description="设备显示名称")
+    cpu_info: Optional[str] = Field(None, description="CPU 信息")
+    total_memory_mb: Optional[int] = Field(None, description="内存总量(MB)")
+    gpu_info: Optional[str] = Field(None, description="GPU 信息")
 
 
 class DeviceRegisterResponse(BaseModel):
+    """设备注册响应"""
+    device_id: str = Field(..., description="分配的设备ID")
+    device_name: str = Field(..., description="设备名称")
+    access_token: str = Field(..., description="访问令牌", repr=False)
+
+
+class DeviceEnrollmentTokenOut(BaseModel):
+    enrollment_id: str
+    token: str = Field(repr=False)
+    expires_at: datetime
+
+
+class DeviceInventoryCheckRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    motherboard_serial: SecretStr = Field(repr=False)
+
+
+class DeviceInventoryCheckResponse(BaseModel):
+    registered: bool
+    device_id: str | None = None
+    device_name: str | None = None
+    is_bound: bool | None = None
+
+
+class DeviceCredentialResponse(BaseModel):
     device_id: str
-    device_name: str
-    access_token: str
+    auth_version: int
+    access_token: str = Field(repr=False)
+
+
+class DeviceCredentialRevocationResponse(BaseModel):
+    device_id: str
+    auth_version: int
+    revoked: bool
 
 
 class DeviceBindRequest(BaseModel):
-    device_id: str
-    # Kept temporarily for client compatibility. The API never uses it as the
-    # ownership principal and rejects it when it differs from the bearer user.
-    user_id: str | None = None
+    """设备绑定请求"""
+    model_config = ConfigDict(extra="forbid")
+
+    device_id: str = Field(..., description="设备ID")
 
 
 class DeviceAutoBindRequest(BaseModel):
-    device_id: str
-    user_id: str | None = None
+    """设备自动绑定请求（登录时使用）"""
+    model_config = ConfigDict(extra="forbid")
+
+    device_id: str = Field(..., description="设备ID")
 
 
 class DeviceUnbindRequest(BaseModel):
-    device_id: str
-    user_id: str | None = None
+    """设备解绑请求（登出时使用）"""
+    model_config = ConfigDict(extra="forbid")
+
+    device_id: str = Field(..., description="设备ID")
 
 
 class DeviceBindingStatus(BaseModel):
+    """设备绑定状态响应"""
     is_bound: bool
     bound_user_id: str | None = None
     bound_username: str | None = None
@@ -65,17 +106,20 @@ class DeviceBindingStatus(BaseModel):
 
 
 class DeviceAutoBindResponse(BaseModel):
+    """设备自动绑定响应"""
     success: bool
     message: str
-    kicked_user: dict | None = None
-    is_new_binding: bool = False
+    kicked_user: dict | None = None  # 被踢出的用户信息（如有）
+    is_new_binding: bool = False  # 是否是新绑定（从其他用户迁移过来）
 
 
 class DeviceRenameRequest(BaseModel):
-    name: str = Field(..., min_length=1, max_length=128)
+    """设备重命名请求"""
+    name: str = Field(..., min_length=1, max_length=128, description="新设备名称")
 
 
 class DeviceRenameResponse(BaseModel):
+    """设备重命名响应"""
     success: bool
     message: str
     device_id: str

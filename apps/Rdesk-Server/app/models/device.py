@@ -1,8 +1,17 @@
 from datetime import datetime
 from uuid import uuid4
-import hashlib
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
@@ -10,6 +19,32 @@ from app.db.session import Base
 
 class Device(Base):
     __tablename__ = "devices"
+    __table_args__ = (
+        CheckConstraint(
+            "length(tenant_id) BETWEEN 1 AND 64",
+            name="ck_devices_tenant_id",
+        ),
+        CheckConstraint(
+            "(is_bound = FALSE AND bound_user_id IS NULL) OR "
+            "(is_bound = TRUE AND bound_user_id IS NOT NULL)",
+            name="ck_devices_bound_owner",
+        ),
+        CheckConstraint(
+            "auth_version >= 1",
+            name="ck_devices_auth_version",
+        ),
+        CheckConstraint(
+            "motherboard_serial_digest IS NULL OR "
+            "length(motherboard_serial_digest) = 64",
+            name="ck_devices_serial_digest",
+        ),
+        CheckConstraint(
+            "motherboard_serial IS NULL",
+            name="ck_devices_plaintext_serial_cleared",
+        ),
+        Index("ix_devices_tenant_id", "tenant_id"),
+        Index("ix_devices_bound_user_id", "bound_user_id"),
+    )
 
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid4())
@@ -22,10 +57,17 @@ class Device(Base):
     ip: Mapped[str] = mapped_column(String(64), default="")
     group: Mapped[str] = mapped_column(String(64), default="默认")
     favorite: Mapped[bool] = mapped_column(Boolean, default=False)
+    tenant_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="default", server_default=text("'default'")
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     # 设备绑定相关字段
-    motherboard_serial: Mapped[str | None] = mapped_column(String(128), nullable=True, unique=True, index=True)
+    # Upgrade-only bridge. New writes must leave plaintext serials NULL.
+    motherboard_serial: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    motherboard_serial_digest: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, unique=True, index=True
+    )
     hostname: Mapped[str | None] = mapped_column(String(128), nullable=True)
     os_version: Mapped[str | None] = mapped_column(Text, nullable=True)
     cpu_info: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -33,7 +75,17 @@ class Device(Base):
     gpu_info: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_bound: Mapped[bool] = mapped_column(Boolean, default=False)
     bound_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    bound_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    bound_user_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    auth_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
+    auth_revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     status: Mapped["DeviceStatus"] = relationship(
         "DeviceStatus",
@@ -50,45 +102,12 @@ class Device(Base):
     )
 
 
-def generate_device_id_from_serial(motherboard_serial: str) -> str:
-    """
-    根据主板序列号生成纯数字设备ID（保证唯一性）
+def generate_device_id_from_digest(serial_digest: str) -> str:
+    """Derive the stable public numeric ID from the non-reversible HMAC digest."""
 
-    使用 SHA256 哈希主板序列号，将完整哈希值转换为数字格式
-    同一主板序列号始终生成相同的设备ID
-
-    Args:
-        motherboard_serial: 主板序列号（完整传输到服务端）
-
-    Returns:
-        12位纯数字设备ID字符串
-
-    唯一性保证：
-    - SHA256 输出 256 位，提供 2^256 种可能
-    - 转换为数字后范围约 10^77，远超实际需求
-    - 使用模 10^12 确保结果在 12 位数字内
-    - 碰撞概率极低（约 1/10^12）
-
-    示例:
-        "BASEBOARD-12345" -> "123456789012"
-        "TEST-SERIAL-001"  -> "987654321098"
-    """
-    # SHA256 哈希（256位 = 32字节）
-    hash_bytes = hashlib.sha256(motherboard_serial.encode('utf-8')).digest()
-
-    # 将完整 256 位哈希转换为大整数
-    # 范围: 0 到 2^256-1 (约 1.16 * 10^77)
-    hash_int = int.from_bytes(hash_bytes, byteorder='big')
-
-    # 取模 10^12，得到 12 位数字范围（000000000001 - 999999999999）
-    # 碰撞概率: 1/10^12（对于实际设备数量可忽略）
-    mod = 10 ** 12
-    device_num = hash_int % mod
-
-    # 格式化为 12 位数字（不足补零）
-    device_id = str(device_num).zfill(12)
-
-    return device_id
+    if len(serial_digest) != 64:
+        raise ValueError("device serial digest is invalid")
+    return str(int(serial_digest, 16) % 10**12).zfill(12)
 
 
 class DeviceStatus(Base):

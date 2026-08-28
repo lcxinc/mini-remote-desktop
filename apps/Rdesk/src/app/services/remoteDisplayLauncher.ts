@@ -1,4 +1,5 @@
 import { openRemoteDisplayWindow } from "../adapters/tauri";
+import type { RemoteRoutePreference } from "../adapters/tauri/types";
 import { isTauriRuntime } from "../utils/runtime";
 import { deviceService } from "./deviceService";
 import {
@@ -80,7 +81,7 @@ function isMacOsTarget(targetOs?: string): boolean {
   );
 }
 
-type RemoteDisplayLaunchOptions = {
+export type RemoteDisplayLaunchOptions = {
   transportKind?: TransportKind;
   sessionId?: string;
   openWindow?: boolean;
@@ -89,6 +90,7 @@ type RemoteDisplayLaunchOptions = {
   targetIp?: string;
   localTest?: boolean;
   lanP2P?: boolean;
+  routePreference?: RemoteRoutePreference;
   requestedProfile?: MediaProfile;
   captureSourceId?: string;
 };
@@ -151,15 +153,27 @@ export async function launchRemoteDisplayForDevice(
     return { sessionId, windowLabel: null, mode: "route" };
   }
 
+  const hasExplicitRoutePreference = options?.routePreference !== undefined;
+  const shouldUseAuthorizedRemoteRequest = Boolean(
+    !targetIsLocal && (options?.lanP2P || hasExplicitRoutePreference),
+  );
   const startedSessionId = targetIsLocal
     ? sessionId
-    : options?.lanP2P
-      ? await startLanRemoteSession(
-          sessionId,
-          targetDeviceId,
-          transportKind,
-          lanRequestedProfile
-        )
+    : shouldUseAuthorizedRemoteRequest
+      ? hasExplicitRoutePreference
+        ? await startLanRemoteSession(
+            sessionId,
+            targetDeviceId,
+            transportKind,
+            lanRequestedProfile,
+            options.routePreference,
+          )
+        : await startLanRemoteSession(
+            sessionId,
+            targetDeviceId,
+            transportKind,
+            lanRequestedProfile,
+          )
       : await startSession(sessionId, targetDeviceId, transportKind);
 
   let captureSourceSelection: CaptureSourceSelection | null = null;

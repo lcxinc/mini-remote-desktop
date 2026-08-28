@@ -51,6 +51,7 @@ pub struct ControlInputRegistry {
     realtime: ControlLaneCounters,
     last_realtime_mouse_move_by_session: HashMap<SessionId, (i32, i32)>,
     pressed_by_session: HashMap<SessionId, SessionPressedInput>,
+    migration_frozen_sessions: HashSet<SessionId>,
     button_holder_counts: HashMap<InputButton, usize>,
     key_holder_counts: HashMap<InputKey, usize>,
 }
@@ -79,6 +80,7 @@ impl ControlInputRegistry {
             realtime: ControlLaneCounters::default(),
             last_realtime_mouse_move_by_session: HashMap::new(),
             pressed_by_session: HashMap::new(),
+            migration_frozen_sessions: HashSet::new(),
             button_holder_counts: HashMap::new(),
             key_holder_counts: HashMap::new(),
         }
@@ -121,6 +123,17 @@ impl ControlInputRegistry {
     ) -> Result<ControlInputResult, InputError> {
         let lane = input_lane(event);
         counter_for_lane_mut(&mut self.reliable, &mut self.realtime, lane).accepted_messages += 1;
+
+        if session_id.is_some_and(|session_id| {
+            self.migration_frozen_sessions.contains(session_id)
+                && !matches!(event, ControlInputEvent::ReleaseAll)
+        }) {
+            counter_for_lane_mut(&mut self.reliable, &mut self.realtime, lane).dropped_messages +=
+                1;
+            return Err(InputError::InvalidEvent(
+                "control input is frozen during relay migration".into(),
+            ));
+        }
 
         if self.should_coalesce_realtime_event(session_id, event) {
             counter_for_lane_mut(&mut self.reliable, &mut self.realtime, lane)
@@ -307,12 +320,16 @@ impl ControlInputRegistry {
         let Some(state) = self.pressed_by_session.get(session_id) else {
             return Ok(0);
         };
-        let buttons = (scope == ControlInputScope::Pointer)
-            .then(|| state.buttons.iter().copied().collect::<Vec<_>>())
-            .unwrap_or_default();
-        let keys = (scope == ControlInputScope::Keyboard)
-            .then(|| state.keys.iter().copied().collect::<Vec<_>>())
-            .unwrap_or_default();
+        let buttons = if scope == ControlInputScope::Pointer {
+            state.buttons.iter().copied().collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let keys = if scope == ControlInputScope::Keyboard {
+            state.keys.iter().copied().collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let mut released = 0_u32;
         for button in buttons {
             released =
@@ -366,6 +383,25 @@ impl ControlInputRegistry {
             Some(error) => Err(error),
             None => Ok(released),
         }
+    }
+
+    /// Release every held input state and atomically reject new input for one migration.
+    pub(crate) fn freeze_session_for_migration(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Result<u32, InputError> {
+        let released = self.release_session_all(session_id);
+        self.migration_frozen_sessions.insert(session_id.clone());
+        released
+    }
+
+    /// Resume authenticated input after an exact migration generation commits or aborts safely.
+    pub(crate) fn thaw_session_after_migration(&mut self, session_id: &SessionId) -> bool {
+        self.migration_frozen_sessions.remove(session_id)
+    }
+
+    pub(crate) fn session_is_migration_frozen(&self, session_id: &SessionId) -> bool {
+        self.migration_frozen_sessions.contains(session_id)
     }
 
     fn remove_empty_session_state(&mut self, session_id: &SessionId) {
@@ -567,6 +603,21 @@ mod tests {
         should_fail: bool,
     }
 
+    struct FailsKeyReleaseInputInjector;
+
+    impl InputInjector for FailsKeyReleaseInputInjector {
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
+            if matches!(event, InputEvent::Key { pressed: false, .. }) {
+                return Err(InputError::Platform("key release failed".into()));
+            }
+            Ok(())
+        }
+    }
+
     impl FailsOnceInputInjector {
         fn new(error_message: impl Into<String>) -> Self {
             Self {
@@ -702,6 +753,34 @@ mod tests {
             .expect("same coordinate after session reuse");
 
         assert_eq!(reused.event_count, 1);
+    }
+
+    #[test]
+    fn migration_freeze_rejects_new_input_even_when_release_all_fails() {
+        let mut registry = ControlInputRegistry::with_injector(FailsKeyReleaseInputInjector);
+        let session_id = SessionId("migration-input-safety".into());
+        registry
+            .handle_session_event(
+                &session_id,
+                &ControlInputEvent::Key {
+                    key: ControlInputKey::VirtualKey { code: 0x41 },
+                    pressed: true,
+                },
+            )
+            .expect("key down before migration");
+
+        assert_eq!(
+            registry
+                .freeze_session_for_migration(&session_id)
+                .expect_err("failed ReleaseAll must surface"),
+            InputError::Platform("key release failed".into())
+        );
+        assert!(registry.session_is_migration_frozen(&session_id));
+        assert!(matches!(
+            registry
+                .handle_session_event(&session_id, &ControlInputEvent::MouseMove { x: 1, y: 2 },),
+            Err(InputError::InvalidEvent(_))
+        ));
     }
 
     #[test]

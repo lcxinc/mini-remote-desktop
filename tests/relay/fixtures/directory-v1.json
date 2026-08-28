@@ -1,0 +1,61 @@
+{
+  "test_only_public_key_b64": "IVL40Zt5HSRFMkLhXy6rbLfP+ntqXtMAl5YOBpiB2xI=",
+  "directory": {
+    "payload": {
+      "format_version": 1,
+      "policy_revision": 17,
+      "directory_id": "directory-20260822-0001",
+      "issued_at_ms": 1777000000000,
+      "expires_at_ms": 1777000030000,
+      "session_id": "session-alpha",
+      "intended_peer_digest": "peer-sha256-0123456789abcdef",
+      "candidates": [
+        {
+          "node_id": "relay-ap-sg-a",
+          "region": "ap-southeast-1",
+          "failure_domain": "ap-southeast-1a",
+          "endpoints": [
+            {
+              "transport": "udp",
+              "host": "turn-a.example.test",
+              "port": 3478
+            },
+            {
+              "transport": "tls",
+              "host": "turn-a.example.test",
+              "port": 5349
+            }
+          ],
+          "capabilities": 7,
+          "load_class": 1,
+          "selection_reason": "preferred-region",
+          "reservation": {
+            "reservation_id": "reservation-a",
+            "expires_at_ms": 1777000020000
+          }
+        },
+        {
+          "node_id": "relay-eu-de-b",
+          "region": "eu-central-1",
+          "failure_domain": "eu-central-1b",
+          "endpoints": [
+            {
+              "transport": "tcp",
+              "host": "turn-b.example.test",
+              "port": 3478
+            }
+          ],
+          "capabilities": 3,
+          "load_class": 2,
+          "selection_reason": "failure-domain-backup",
+          "reservation": {
+            "reservation_id": "reservation-b",
+            "expires_at_ms": 1777000025000
+          }
+        }
+      ]
+    },
+    "signing_key_id": "directory-test-key-v1",
+    "signature_b64": "fcl/7IoMHEYef8sMbbIDpIZaP94zvLqK7PXO7baEmL4cEqQN+y8KxjRHo3TxLAZWXzaxSYXfY/sMQMnEjr2HBQ=="
+  }
+}

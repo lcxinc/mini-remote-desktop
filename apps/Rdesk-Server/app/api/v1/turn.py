@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+from pydantic import SecretStr
 
 from app.core.config import settings
 from app.core.security import get_current_user
@@ -12,6 +13,11 @@ from app.services.turn_credentials import (
 
 
 router = APIRouter(prefix="/turn", tags=["turn"])
+
+
+def require_legacy_turn_credentials_enabled() -> None:
+    if not settings.legacy_turn_credentials_enabled:
+        raise HTTPException(status_code=404, detail="Not found")
 
 
 class TurnCredentialRequest(BaseModel):
@@ -29,13 +35,24 @@ class TurnCredentialResponse(BaseModel):
 
 
 def get_turn_credential_service() -> TurnCredentialService:
+    configured_secret = settings.turn_auth_secret
+    auth_secret = (
+        configured_secret.get_secret_value()
+        if isinstance(configured_secret, SecretStr)
+        else configured_secret
+    )
     return TurnCredentialService(
-        auth_secret=settings.turn_auth_secret,
+        auth_secret=auth_secret,
         urls=[item.strip() for item in settings.turn_urls.split(",") if item.strip()],
         ttl_seconds=settings.turn_credential_ttl_seconds,
     )
 
-@router.post("/credentials", response_model=TurnCredentialResponse)
+@router.post(
+    "/credentials",
+    response_model=TurnCredentialResponse,
+    deprecated=True,
+    dependencies=[Depends(require_legacy_turn_credentials_enabled)],
+)
 async def create_turn_credentials(
     payload: TurnCredentialRequest,
     current_user: User = Depends(get_current_user),

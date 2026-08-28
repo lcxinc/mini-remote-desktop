@@ -1,0 +1,1 @@
+"""ASGI trust-boundary middleware."""

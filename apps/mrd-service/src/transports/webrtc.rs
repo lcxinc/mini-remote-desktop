@@ -2,11 +2,12 @@ use std::{
     collections::HashMap,
     fmt,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
 
+use crate::relay::{urls_digest, RelayRouteEvidence};
 use anyhow::{bail, Result};
 use bytes::Bytes;
 use mrd_application::ports::{
@@ -16,11 +17,13 @@ use mrd_application::ports::{
 use mrd_pipeline_core::{EncodedAccessUnit, VideoCodec};
 use mrd_proto::SessionId;
 use mrd_transport_webrtc::{
-    ControlLane, IceCandidate, IceServerConfig, IceTransportPolicy, PeerConnectionConfig,
-    SelectedCandidatePairStats, SessionDescription, WebRtcPeerConnection,
+    CandidateKind, ControlLane, IceCandidate, IceServerConfig, IceTransportPolicy,
+    PeerConnectionConfig, RestartRouteEvidence, SelectedCandidatePairStats, SessionDescription,
+    WebRtcPeerConnection,
 };
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{watch, Mutex, RwLock};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::{quic, SessionMuxCore, TransportMuxConfig};
 
@@ -39,6 +42,10 @@ pub enum ServiceWebRtcTransportError {
     SessionNotFound(SessionId),
     #[error("WebRTC transport failed: {0}")]
     Transport(String),
+    #[error("WebRTC replacement plan is invalid")]
+    InvalidReplacement,
+    #[error("WebRTC replacement evidence does not match the planned relay")]
+    ReplacementEvidenceMismatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +56,7 @@ pub enum RelayUrlClass {
     Unknown,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct ServiceTurnRelayCredentials {
     pub urls: Vec<String>,
     pub username: String,
@@ -103,10 +110,124 @@ pub struct ServiceWebRtcTransportHost {
     sessions: RwLock<HashMap<SessionId, ServiceWebRtcSession>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ServiceWebRtcSession {
     peer: Arc<WebRtcPeerConnection>,
     mux: Arc<WebRtcTransportMux>,
+    replacement_gate: Arc<Mutex<()>>,
+    initial_relay_urls_digest: Option<[u8; 32]>,
+    relay_failure: Arc<RelayFailureGate>,
+}
+
+#[derive(Debug)]
+struct RelayFailureGate {
+    enabled: AtomicBool,
+    generation: watch::Sender<Option<u64>>,
+}
+
+impl RelayFailureGate {
+    fn disabled() -> Arc<Self> {
+        let (generation, _) = watch::channel(None);
+        Arc::new(Self {
+            enabled: AtomicBool::new(false),
+            generation,
+        })
+    }
+}
+
+/// One unpublished WebRTC replacement generation.
+pub struct PendingWebRtcReplacement {
+    session_id: SessionId,
+    generation: u64,
+    local_description: SessionDescription,
+    planned_urls_digest: [u8; 32],
+    peer: Arc<WebRtcPeerConnection>,
+}
+
+impl fmt::Debug for PendingWebRtcReplacement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingWebRtcReplacement")
+            .field("session_id", &self.session_id)
+            .field("generation", &self.generation)
+            .field("local_description", &"[REDACTED]")
+            .field("planned_urls_digest", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl PendingWebRtcReplacement {
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn local_description(&self) -> SessionDescription {
+        self.local_description.clone()
+    }
+}
+
+impl Drop for PendingWebRtcReplacement {
+    fn drop(&mut self) {
+        if let Some(route_token) = self.local_description.restart_route_token() {
+            let _ = self.peer.abort_restart(self.generation, route_token);
+        }
+    }
+}
+
+/// Real selected-pair and lane-probe evidence bound to one verified directory candidate.
+pub struct VerifiedRelayEvidence {
+    session_id: SessionId,
+    generation: u64,
+    planned_urls_digest: [u8; 32],
+    route: RelayRouteEvidence,
+    transport: RestartRouteEvidence,
+}
+
+impl fmt::Debug for VerifiedRelayEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedRelayEvidence")
+            .field("session_id", &self.session_id)
+            .field("generation", &self.generation)
+            .field("route", &self.route)
+            .field("planned_urls_digest", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl VerifiedRelayEvidence {
+    pub fn route(&self) -> &RelayRouteEvidence {
+        &self.route
+    }
+
+    pub fn selected_pair(&self) -> &SelectedCandidatePairStats {
+        self.transport.selected_pair()
+    }
+}
+
+/// Opaque proof that generation zero is a nominated relay/relay route matching the signed
+/// directory node and the exact TURN URL set used to create the peer.
+pub(crate) struct VerifiedActiveRelayEvidence {
+    route: RelayRouteEvidence,
+}
+
+impl VerifiedActiveRelayEvidence {
+    pub(crate) fn route(&self) -> &RelayRouteEvidence {
+        &self.route
+    }
+}
+
+impl fmt::Debug for VerifiedActiveRelayEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedActiveRelayEvidence")
+            .field("route", &self.route)
+            .finish()
+    }
 }
 
 impl ServiceWebRtcTransportHost {
@@ -125,6 +246,10 @@ impl ServiceWebRtcTransportHost {
                 return Err(ServiceWebRtcTransportError::DuplicateSession(session_id));
             }
         }
+        let initial_relay_urls_digest = match config.ice_transport_policy {
+            IceTransportPolicy::Relay => Some(replacement_urls_digest(&config)?),
+            IceTransportPolicy::All => None,
+        };
         let mux_config = TransportMuxConfig::default();
         config.max_h264_access_unit_bytes = config
             .max_h264_access_unit_bytes
@@ -148,10 +273,18 @@ impl ServiceWebRtcTransportHost {
                 .await
                 .map_err(transport_error)?,
         );
+        let replacement_gate = Arc::new(Mutex::new(()));
+        let relay_failure = RelayFailureGate::disabled();
         let mux = Arc::new(
-            WebRtcTransportMux::new(session_id.clone(), mux_config, Arc::clone(&peer))
-                .await
-                .map_err(|error| ServiceWebRtcTransportError::Transport(error.to_string()))?,
+            WebRtcTransportMux::new_with_replacement_gate(
+                session_id.clone(),
+                mux_config,
+                Arc::clone(&peer),
+                Arc::clone(&replacement_gate),
+                Arc::clone(&relay_failure),
+            )
+            .await
+            .map_err(|error| ServiceWebRtcTransportError::Transport(error.to_string()))?,
         );
         let mut sessions = self.sessions.write().await;
         if sessions.contains_key(&session_id) {
@@ -159,7 +292,58 @@ impl ServiceWebRtcTransportHost {
             let _ = mux.close().await;
             return Err(ServiceWebRtcTransportError::DuplicateSession(session_id));
         }
-        sessions.insert(session_id, ServiceWebRtcSession { peer, mux });
+        sessions.insert(
+            session_id,
+            ServiceWebRtcSession {
+                peer,
+                mux,
+                replacement_gate,
+                initial_relay_urls_digest,
+                relay_failure,
+            },
+        );
+        Ok(())
+    }
+
+    /// Verify the already connected generation-zero path before registering it for failover.
+    pub(crate) async fn verify_active_relay(
+        &self,
+        session_id: &SessionId,
+        route: RelayRouteEvidence,
+    ) -> Result<VerifiedActiveRelayEvidence, ServiceWebRtcTransportError> {
+        let session = self.session_entry(session_id).await?;
+        let _replacement_guard = session.replacement_gate.lock().await;
+        if route.session_id() != session_id.0
+            || route.generation() != 0
+            || session.initial_relay_urls_digest.as_ref() != Some(route.urls_digest())
+            || session.peer.current_generation().await != 0
+        {
+            return Err(ServiceWebRtcTransportError::ReplacementEvidenceMismatch);
+        }
+        let pair = session
+            .peer
+            .selected_candidate_pair_stats()
+            .await
+            .ok_or(ServiceWebRtcTransportError::ReplacementEvidenceMismatch)?;
+        let mux_route = session.mux.route_snapshot().await;
+        if !pair.nominated
+            || pair.local_candidate_kind != CandidateKind::Relay
+            || pair.remote_candidate_kind != CandidateKind::Relay
+            || mux_route.session_id != *session_id
+            || mux_route.closed
+        {
+            return Err(ServiceWebRtcTransportError::ReplacementEvidenceMismatch);
+        }
+        Ok(VerifiedActiveRelayEvidence { route })
+    }
+
+    pub(crate) async fn enable_relay_failover(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), ServiceWebRtcTransportError> {
+        let session = self.session_entry(session_id).await?;
+        session.relay_failure.enabled.store(true, Ordering::Release);
+        let _ = session.relay_failure.generation.send(None);
         Ok(())
     }
 
@@ -239,6 +423,214 @@ impl ServiceWebRtcTransportHost {
             .await)
     }
 
+    /// Build an offerer replacement on an independent relay-only peer.
+    pub async fn begin_replacement(
+        &self,
+        session_id: &SessionId,
+        generation: u64,
+        config: PeerConnectionConfig,
+    ) -> Result<PendingWebRtcReplacement, ServiceWebRtcTransportError> {
+        let planned_urls_digest = replacement_urls_digest(&config)?;
+        let session = self.session_entry(session_id).await?;
+        let _replacement_guard = session.replacement_gate.lock().await;
+        let local_description = session
+            .peer
+            .create_restart_offer(generation, config.ice_servers)
+            .await
+            .map_err(transport_error)?;
+        Ok(PendingWebRtcReplacement {
+            session_id: session_id.clone(),
+            generation,
+            local_description,
+            planned_urls_digest,
+            peer: Arc::clone(&session.peer),
+        })
+    }
+
+    /// Build an answerer replacement without disturbing the active route.
+    pub async fn begin_replacement_from_offer(
+        &self,
+        session_id: &SessionId,
+        generation: u64,
+        config: PeerConnectionConfig,
+        offer: SessionDescription,
+    ) -> Result<PendingWebRtcReplacement, ServiceWebRtcTransportError> {
+        let planned_urls_digest = replacement_urls_digest(&config)?;
+        let session = self.session_entry(session_id).await?;
+        let _replacement_guard = session.replacement_gate.lock().await;
+        let local_description = session
+            .peer
+            .accept_restart_offer(generation, config.ice_servers, offer)
+            .await
+            .map_err(transport_error)?;
+        Ok(PendingWebRtcReplacement {
+            session_id: session_id.clone(),
+            generation,
+            local_description,
+            planned_urls_digest,
+            peer: Arc::clone(&session.peer),
+        })
+    }
+
+    pub async fn accept_replacement_answer(
+        &self,
+        pending: &PendingWebRtcReplacement,
+        answer: SessionDescription,
+    ) -> Result<(), ServiceWebRtcTransportError> {
+        let session = self.session_entry(&pending.session_id).await?;
+        let _replacement_guard = session.replacement_gate.lock().await;
+        session
+            .peer
+            .accept_restart_answer(pending.generation, answer)
+            .await
+            .map_err(transport_error)
+    }
+
+    pub async fn next_replacement_candidate(
+        &self,
+        pending: &PendingWebRtcReplacement,
+    ) -> Result<IceCandidate, ServiceWebRtcTransportError> {
+        self.next_replacement_candidate_optional(pending)
+            .await?
+            .ok_or_else(|| {
+                ServiceWebRtcTransportError::Transport(format!(
+                    "replacement candidate stream closed for generation {}",
+                    pending.generation
+                ))
+            })
+    }
+
+    pub async fn next_replacement_candidate_optional(
+        &self,
+        pending: &PendingWebRtcReplacement,
+    ) -> Result<Option<IceCandidate>, ServiceWebRtcTransportError> {
+        let session = self.session_entry(&pending.session_id).await?;
+        let _replacement_guard = session.replacement_gate.lock().await;
+        session
+            .peer
+            .next_restart_candidate_optional(pending.generation)
+            .await
+            .map_err(transport_error)
+    }
+
+    pub async fn add_replacement_candidate(
+        &self,
+        pending: &PendingWebRtcReplacement,
+        candidate: IceCandidate,
+    ) -> Result<(), ServiceWebRtcTransportError> {
+        let session = self.session_entry(&pending.session_id).await?;
+        let _replacement_guard = session.replacement_gate.lock().await;
+        session
+            .peer
+            .add_restart_candidate(pending.generation, candidate)
+            .await
+            .map_err(transport_error)
+    }
+
+    /// Validate the selected relay pair and both reliable-control and media lanes.
+    pub async fn validate_replacement(
+        &self,
+        pending: &PendingWebRtcReplacement,
+        planned_route: RelayRouteEvidence,
+    ) -> Result<VerifiedRelayEvidence, ServiceWebRtcTransportError> {
+        if pending.generation == 0
+            || planned_route.session_id() != pending.session_id.0
+            || planned_route.generation() != pending.generation
+            || planned_route.urls_digest() != &pending.planned_urls_digest
+        {
+            return Err(ServiceWebRtcTransportError::ReplacementEvidenceMismatch);
+        }
+        let session = self.session_entry(&pending.session_id).await?;
+        let _replacement_guard = session.replacement_gate.lock().await;
+        let transport = session
+            .peer
+            .validate_pending_restart(pending.generation)
+            .await
+            .map_err(transport_error)?;
+        let pair = transport.selected_pair();
+        if !pair.nominated
+            || pair.local_candidate_kind != CandidateKind::Relay
+            || pair.remote_candidate_kind != CandidateKind::Relay
+            || !transport.control_round_trip()
+            || !transport.media_round_trip()
+        {
+            return Err(ServiceWebRtcTransportError::ReplacementEvidenceMismatch);
+        }
+        Ok(VerifiedRelayEvidence {
+            session_id: pending.session_id.clone(),
+            generation: pending.generation,
+            planned_urls_digest: pending.planned_urls_digest,
+            route: planned_route,
+            transport,
+        })
+    }
+
+    /// Atomically publish a validated replacement and preserve the stable logical mux.
+    pub async fn commit_replacement(
+        &self,
+        pending: PendingWebRtcReplacement,
+        expected: VerifiedRelayEvidence,
+    ) -> Result<Arc<dyn TransportMuxPort>, ServiceWebRtcTransportError> {
+        if expected.session_id != pending.session_id
+            || expected.generation != pending.generation
+            || expected.planned_urls_digest != pending.planned_urls_digest
+            || expected.route.session_id() != pending.session_id.0
+            || expected.route.generation() != pending.generation
+            || expected.route.urls_digest() != &pending.planned_urls_digest
+        {
+            return Err(ServiceWebRtcTransportError::ReplacementEvidenceMismatch);
+        }
+        let session = self.session_entry(&pending.session_id).await?;
+        let _replacement_guard = session.replacement_gate.lock().await;
+        session
+            .peer
+            .commit_restart(pending.generation, expected.transport)
+            .await
+            .map_err(transport_error)?;
+        let _ = session.relay_failure.generation.send(None);
+        refresh_webrtc_route(&session.mux.core, &session.peer).await;
+        let mux: Arc<dyn TransportMuxPort> = session.mux;
+        Ok(mux)
+    }
+
+    /// Abort exactly one unpublished generation; stale handles cannot touch a newer route.
+    pub async fn abort_replacement(
+        &self,
+        pending: PendingWebRtcReplacement,
+    ) -> Result<bool, ServiceWebRtcTransportError> {
+        let route_token = pending
+            .local_description
+            .restart_route_token()
+            .ok_or(ServiceWebRtcTransportError::InvalidReplacement)?
+            .clone();
+        let session = self.session_entry(&pending.session_id).await?;
+        let _replacement_guard = session.replacement_gate.lock().await;
+        session
+            .peer
+            .abort_restart(pending.generation, &route_token)
+            .map_err(transport_error)
+    }
+
+    /// Wait until the active route has failed or remained disconnected past transport grace.
+    pub async fn wait_failover_needed(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<u64, ServiceWebRtcTransportError> {
+        let session = self.session_entry(session_id).await?;
+        let mut failures = session.relay_failure.generation.subscribe();
+        drop(session);
+        loop {
+            if let Some(generation) = *failures.borrow_and_update() {
+                return Ok(generation);
+            }
+            failures.changed().await.map_err(|_| {
+                ServiceWebRtcTransportError::Transport(
+                    "relay failure notification stream closed".into(),
+                )
+            })?;
+        }
+    }
+
     pub async fn close_session(
         &self,
         session_id: &SessionId,
@@ -249,6 +641,7 @@ impl ServiceWebRtcTransportHost {
             .await
             .remove(session_id)
             .ok_or_else(|| ServiceWebRtcTransportError::SessionNotFound(session_id.clone()))?;
+        let _replacement_guard = session.replacement_gate.lock().await;
         session
             .mux
             .close()
@@ -256,10 +649,45 @@ impl ServiceWebRtcTransportHost {
             .map_err(|error| ServiceWebRtcTransportError::Transport(error.to_string()))
     }
 
+    /// Close a published losing generation without allowing a stale completion to affect a
+    /// newer committed route.
+    pub async fn close_session_if_generation(
+        &self,
+        session_id: &SessionId,
+        generation: u64,
+    ) -> Result<bool, ServiceWebRtcTransportError> {
+        let session = self.session_entry(session_id).await?;
+        let _replacement_guard = session.replacement_gate.lock().await;
+        if session.peer.current_generation().await != generation {
+            return Ok(false);
+        }
+        let removed = {
+            let mut sessions = self.sessions.write().await;
+            let is_same_session = sessions
+                .get(session_id)
+                .is_some_and(|current| Arc::ptr_eq(&current.peer, &session.peer));
+            if is_same_session {
+                sessions.remove(session_id)
+            } else {
+                None
+            }
+        };
+        let Some(removed) = removed else {
+            return Ok(false);
+        };
+        removed
+            .mux
+            .close()
+            .await
+            .map_err(|error| ServiceWebRtcTransportError::Transport(error.to_string()))?;
+        Ok(true)
+    }
+
     pub async fn shutdown(&self) -> Result<(), ServiceWebRtcTransportError> {
         let sessions = std::mem::take(&mut *self.sessions.write().await);
         let mut first_error = None;
         for session in sessions.into_values() {
+            let _replacement_guard = session.replacement_gate.lock().await;
             if let Err(error) = session.mux.close().await {
                 first_error.get_or_insert_with(|| {
                     ServiceWebRtcTransportError::Transport(error.to_string())
@@ -299,6 +727,35 @@ impl ServiceWebRtcTransportHost {
             .map(|session| Arc::clone(&session.peer))
             .ok_or_else(|| ServiceWebRtcTransportError::SessionNotFound(session_id.clone()))
     }
+
+    async fn session_entry(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<ServiceWebRtcSession, ServiceWebRtcTransportError> {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| ServiceWebRtcTransportError::SessionNotFound(session_id.clone()))
+    }
+}
+
+fn replacement_urls_digest(
+    config: &PeerConnectionConfig,
+) -> Result<[u8; 32], ServiceWebRtcTransportError> {
+    if config.ice_transport_policy != IceTransportPolicy::Relay || config.ice_servers.is_empty() {
+        return Err(ServiceWebRtcTransportError::InvalidReplacement);
+    }
+    let urls = config
+        .ice_servers
+        .iter()
+        .flat_map(|server| server.urls.iter().cloned())
+        .collect::<Vec<_>>();
+    if urls.is_empty() {
+        return Err(ServiceWebRtcTransportError::InvalidReplacement);
+    }
+    Ok(urls_digest(&urls))
 }
 
 fn transport_error(error: mrd_transport_webrtc::TransportError) -> ServiceWebRtcTransportError {
@@ -378,6 +835,23 @@ impl WebRtcTransportMux {
         config: TransportMuxConfig,
         peer: Arc<WebRtcPeerConnection>,
     ) -> Result<Self> {
+        Self::new_with_replacement_gate(
+            session_id,
+            config,
+            peer,
+            Arc::new(Mutex::new(())),
+            RelayFailureGate::disabled(),
+        )
+        .await
+    }
+
+    async fn new_with_replacement_gate(
+        session_id: SessionId,
+        config: TransportMuxConfig,
+        peer: Arc<WebRtcPeerConnection>,
+        replacement_gate: Arc<Mutex<()>>,
+        relay_failure: Arc<RelayFailureGate>,
+    ) -> Result<Self> {
         let core = SessionMuxCore::new(
             session_id,
             config,
@@ -386,9 +860,25 @@ impl WebRtcTransportMux {
             "webrtc:pending-remote-candidate",
         );
         refresh_webrtc_route(&core, &peer).await;
-        spawn_webrtc_senders(Arc::clone(&core), Arc::clone(&peer));
-        spawn_webrtc_receivers(Arc::clone(&core), Arc::clone(&peer), config);
-        spawn_webrtc_connection_watcher(Arc::clone(&core), Arc::clone(&peer));
+        spawn_webrtc_senders(
+            Arc::clone(&core),
+            Arc::clone(&peer),
+            Arc::clone(&replacement_gate),
+            Arc::clone(&relay_failure),
+        );
+        spawn_webrtc_receivers(
+            Arc::clone(&core),
+            Arc::clone(&peer),
+            Arc::clone(&replacement_gate),
+            Arc::clone(&relay_failure),
+            config,
+        );
+        spawn_webrtc_connection_watcher(
+            Arc::clone(&core),
+            Arc::clone(&peer),
+            Arc::clone(&replacement_gate),
+            relay_failure,
+        );
         Ok(Self { core, peer })
     }
 }
@@ -408,18 +898,80 @@ async fn fail_webrtc(core: &SessionMuxCore, peer: &WebRtcPeerConnection, reason:
     core.fail(reason).await;
 }
 
+fn route_failure_belongs_to_active(
+    observed_generation: u64,
+    current_generation: u64,
+    pending_generation: Option<u64>,
+) -> bool {
+    observed_generation == current_generation && pending_generation.is_none()
+}
+
+async fn fail_webrtc_if_active(
+    core: &SessionMuxCore,
+    peer: &WebRtcPeerConnection,
+    replacement_gate: &Mutex<()>,
+    relay_failure: &RelayFailureGate,
+    observed_generation: u64,
+    reason: String,
+) -> bool {
+    let replacement_guard = replacement_gate.lock().await;
+    if !route_failure_belongs_to_active(
+        observed_generation,
+        peer.current_generation().await,
+        peer.pending_restart_generation().await,
+    ) {
+        return false;
+    }
+    if relay_failure.enabled.load(Ordering::Acquire) {
+        let _ = relay_failure.generation.send(Some(observed_generation));
+        drop(replacement_guard);
+        loop {
+            if peer.current_generation().await != observed_generation
+                || peer.pending_restart_generation().await.is_some()
+            {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+    fail_webrtc(core, peer, reason).await;
+    true
+}
+
 fn flush_webrtc_video_drops(core: &SessionMuxCore, peer: &WebRtcPeerConnection) {
     core.record_adapter_drops(TransportLane::Video, peer.take_completed_video_drops());
 }
 
-fn spawn_webrtc_connection_watcher(core: Arc<SessionMuxCore>, peer: Arc<WebRtcPeerConnection>) {
+fn spawn_webrtc_connection_watcher(
+    core: Arc<SessionMuxCore>,
+    peer: Arc<WebRtcPeerConnection>,
+    replacement_gate: Arc<Mutex<()>>,
+    relay_failure: Arc<RelayFailureGate>,
+) {
     let owner = Arc::clone(&core);
     let task = tokio::spawn(async move {
-        let reason = match peer.wait_terminated().await {
-            Ok(()) => "WebRTC peer connection terminated".to_owned(),
-            Err(error) => format!("WebRTC connection watcher failed: {error}"),
-        };
-        fail_webrtc(&core, &peer, reason).await;
+        loop {
+            let observed_generation = peer.current_generation().await;
+            let termination = peer.wait_terminated().await;
+            let reason = match termination {
+                Ok(()) => "WebRTC peer connection terminated".to_owned(),
+                Err(error) => format!("WebRTC connection watcher failed: {error}"),
+            };
+            if !fail_webrtc_if_active(
+                &core,
+                &peer,
+                &replacement_gate,
+                &relay_failure,
+                observed_generation,
+                reason,
+            )
+            .await
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                continue;
+            }
+            break;
+        }
     });
     owner.register_task(task);
 }
@@ -450,46 +1002,63 @@ async fn refresh_webrtc_route(core: &SessionMuxCore, peer: &WebRtcPeerConnection
     .await;
 }
 
-fn spawn_webrtc_senders(core: Arc<SessionMuxCore>, peer: Arc<WebRtcPeerConnection>) {
+fn spawn_webrtc_senders(
+    core: Arc<SessionMuxCore>,
+    peer: Arc<WebRtcPeerConnection>,
+    replacement_gate: Arc<Mutex<()>>,
+    relay_failure: Arc<RelayFailureGate>,
+) {
     for lane in TransportLane::ALL {
         let source = Arc::clone(&core);
         let peer = Arc::clone(&peer);
+        let replacement_gate = Arc::clone(&replacement_gate);
+        let relay_failure = Arc::clone(&relay_failure);
         let task = tokio::spawn(async move {
             while let Some(envelope) = source.next_outbound(lane).await {
-                let result = match lane {
-                    TransportLane::Video => {
-                        let Some(metadata) = envelope.video else {
-                            break;
-                        };
-                        if metadata.codec != "h264" {
-                            break;
+                loop {
+                    let observed_generation = peer.current_generation().await;
+                    let result = match lane {
+                        TransportLane::Video => {
+                            let Some(metadata) = envelope.video.as_ref() else {
+                                return;
+                            };
+                            if metadata.codec != "h264" {
+                                return;
+                            }
+                            peer.send_h264_access_unit(&EncodedAccessUnit {
+                                codec: VideoCodec::H264,
+                                timestamp_us: metadata.timestamp_us,
+                                is_keyframe: metadata.keyframe,
+                                bytes: envelope.payload.clone(),
+                            })
+                            .await
                         }
-                        peer.send_h264_access_unit(&EncodedAccessUnit {
-                            codec: VideoCodec::H264,
-                            timestamp_us: metadata.timestamp_us,
-                            is_keyframe: metadata.keyframe,
-                            bytes: envelope.payload,
-                        })
-                        .await
-                    }
-                    TransportLane::ControlReliable => {
-                        send_data_envelope(&peer, ControlLane::Reliable, &envelope).await
-                    }
-                    TransportLane::ControlRealtime => {
-                        send_data_envelope(&peer, ControlLane::Realtime, &envelope).await
-                    }
-                    TransportLane::Bulk => {
-                        send_data_envelope(&peer, ControlLane::Bulk, &envelope).await
-                    }
-                };
-                if let Err(error) = result {
-                    fail_webrtc(
+                        TransportLane::ControlReliable => {
+                            send_data_envelope(&peer, ControlLane::Reliable, &envelope).await
+                        }
+                        TransportLane::ControlRealtime => {
+                            send_data_envelope(&peer, ControlLane::Realtime, &envelope).await
+                        }
+                        TransportLane::Bulk => {
+                            send_data_envelope(&peer, ControlLane::Bulk, &envelope).await
+                        }
+                    };
+                    let Err(error) = result else {
+                        break;
+                    };
+                    if fail_webrtc_if_active(
                         &source,
                         &peer,
+                        &replacement_gate,
+                        &relay_failure,
+                        observed_generation,
                         format!("WebRTC {lane:?} sender failed: {error}"),
                     )
-                    .await;
-                    break;
+                    .await
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             }
         });
@@ -629,14 +1198,39 @@ impl DataEnvelopeReassembler {
 fn spawn_webrtc_receivers(
     core: Arc<SessionMuxCore>,
     peer: Arc<WebRtcPeerConnection>,
+    replacement_gate: Arc<Mutex<()>>,
+    relay_failure: Arc<RelayFailureGate>,
     config: TransportMuxConfig,
 ) {
     let max_payload_len = config.max_payload_len;
     let video_core = Arc::clone(&core);
     let video_peer = Arc::clone(&peer);
+    let video_replacement_gate = Arc::clone(&replacement_gate);
+    let video_relay_failure = Arc::clone(&relay_failure);
     let video_sequence = Arc::new(AtomicU64::new(0));
     let video_task = tokio::spawn(async move {
-        while let Some(access_unit) = video_peer.next_h264_access_unit().await {
+        loop {
+            let observed_generation = video_peer.current_generation().await;
+            let Some(access_unit) = video_peer.next_h264_access_unit().await else {
+                flush_webrtc_video_drops(&video_core, &video_peer);
+                if fail_webrtc_if_active(
+                    &video_core,
+                    &video_peer,
+                    &video_replacement_gate,
+                    &video_relay_failure,
+                    observed_generation,
+                    "WebRTC video receiver closed by peer".into(),
+                )
+                .await
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                continue;
+            };
+            if video_peer.current_generation().await != observed_generation {
+                continue;
+            }
             flush_webrtc_video_drops(&video_core, &video_peer);
             let envelope = TransportEnvelope {
                 session_id: video_core.session_id().clone(),
@@ -652,22 +1246,20 @@ fn spawn_webrtc_receivers(
                 }),
             };
             if let Err(error) = video_core.deliver(envelope).await {
-                fail_webrtc(
+                if fail_webrtc_if_active(
                     &video_core,
                     &video_peer,
+                    &video_replacement_gate,
+                    &video_relay_failure,
+                    observed_generation,
                     format!("WebRTC video delivery failed: {error}"),
                 )
-                .await;
-                return;
+                .await
+                {
+                    return;
+                }
             }
         }
-        flush_webrtc_video_drops(&video_core, &video_peer);
-        fail_webrtc(
-            &video_core,
-            &video_peer,
-            "WebRTC video receiver closed by peer".into(),
-        )
-        .await;
     });
     core.register_task(video_task);
 
@@ -678,24 +1270,61 @@ fn spawn_webrtc_receivers(
     ] {
         let target = Arc::clone(&core);
         let peer = Arc::clone(&peer);
+        let replacement_gate = Arc::clone(&replacement_gate);
+        let relay_failure = Arc::clone(&relay_failure);
         let task = tokio::spawn(async move {
             let mut reassembler = DataEnvelopeReassembler::new(
                 max_payload_len
                     .min(config.byte_capacity(lane))
                     .saturating_add(MAX_ENVELOPE_WIRE_OVERHEAD),
             );
-            while let Some(payload) = peer.next_control(control_lane).await {
+            let mut reassembler_generation = peer.current_generation().await;
+            loop {
+                let observed_generation = peer.current_generation().await;
+                if reassembler_generation != observed_generation {
+                    reassembler = DataEnvelopeReassembler::new(
+                        max_payload_len
+                            .min(config.byte_capacity(lane))
+                            .saturating_add(MAX_ENVELOPE_WIRE_OVERHEAD),
+                    );
+                    reassembler_generation = observed_generation;
+                }
+                let Some(payload) = peer.next_control(control_lane).await else {
+                    if fail_webrtc_if_active(
+                        &target,
+                        &peer,
+                        &replacement_gate,
+                        &relay_failure,
+                        observed_generation,
+                        format!("WebRTC {lane:?} receiver closed by peer"),
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    continue;
+                };
+                if peer.current_generation().await != observed_generation {
+                    continue;
+                }
                 let payload = match reassembler.push(&payload) {
                     Ok(Some(payload)) => payload,
                     Ok(None) => continue,
                     Err(error) => {
-                        fail_webrtc(
+                        if fail_webrtc_if_active(
                             &target,
                             &peer,
+                            &replacement_gate,
+                            &relay_failure,
+                            observed_generation,
                             format!("WebRTC {lane:?} fragment invalid: {error}"),
                         )
-                        .await;
-                        return;
+                        .await
+                        {
+                            return;
+                        }
+                        continue;
                     }
                 };
                 let Ok(envelope) = quic::decode_envelope(&payload, max_payload_len) else {
@@ -705,21 +1334,20 @@ fn spawn_webrtc_receivers(
                     continue;
                 }
                 if let Err(error) = target.deliver(envelope).await {
-                    fail_webrtc(
+                    if fail_webrtc_if_active(
                         &target,
                         &peer,
+                        &replacement_gate,
+                        &relay_failure,
+                        observed_generation,
                         format!("WebRTC {lane:?} delivery failed: {error}"),
                     )
-                    .await;
-                    return;
+                    .await
+                    {
+                        return;
+                    }
                 }
             }
-            fail_webrtc(
-                &target,
-                &peer,
-                format!("WebRTC {lane:?} receiver closed by peer"),
-            )
-            .await;
         });
         core.register_task(task);
     }
@@ -777,6 +1405,9 @@ mod tests {
 
     #[test]
     fn relay_credentials_force_relay_policy_without_debug_secret_leakage() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<ServiceTurnRelayCredentials>();
+
         let credentials = credentials();
         let config = credentials.apply_relay_only(PeerConnectionConfig {
             role: PeerConnectionRole::Offerer,
@@ -822,6 +1453,13 @@ mod tests {
         assert!(error.to_string().contains("fragment zero"));
     }
 
+    #[test]
+    fn stale_or_replacing_route_failure_cannot_fail_the_stable_mux() {
+        assert!(route_failure_belongs_to_active(1, 1, None));
+        assert!(!route_failure_belongs_to_active(0, 1, None));
+        assert!(!route_failure_belongs_to_active(1, 1, Some(2)));
+    }
+
     #[tokio::test]
     async fn service_host_owns_exactly_one_mux_and_closes_it_with_the_session() {
         let host = ServiceWebRtcTransportHost::new();
@@ -862,5 +1500,143 @@ mod tests {
                 .expect("closed send outcome"),
             TransportSendOutcome::Closed
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_uncommitted_replacement_aborts_its_pending_generation() {
+        let host = ServiceWebRtcTransportHost::new();
+        let session_id = SessionId("dropped-replacement".into());
+        host.open_session(
+            session_id.clone(),
+            PeerConnectionConfig {
+                role: PeerConnectionRole::Offerer,
+                ..PeerConnectionConfig::default()
+            },
+        )
+        .await
+        .expect("open WebRTC session");
+        let pending = host
+            .begin_replacement(
+                &session_id,
+                1,
+                credentials().apply_relay_only(PeerConnectionConfig {
+                    role: PeerConnectionRole::Offerer,
+                    ..PeerConnectionConfig::default()
+                }),
+            )
+            .await
+            .expect("begin pending replacement");
+        let peer = host.session(&session_id).await.expect("session peer");
+        assert_eq!(peer.pending_restart_generation().await, Some(1));
+
+        drop(pending);
+
+        assert_eq!(peer.pending_restart_generation().await, None);
+        host.close_session(&session_id)
+            .await
+            .expect("close WebRTC session");
+    }
+
+    #[tokio::test]
+    async fn old_route_closure_is_ignored_while_a_real_replacement_is_pending() {
+        let host = ServiceWebRtcTransportHost::new();
+        let session_id = SessionId("pending-replacement-failure-gate".into());
+        host.open_session(
+            session_id.clone(),
+            PeerConnectionConfig {
+                role: PeerConnectionRole::Offerer,
+                ..PeerConnectionConfig::default()
+            },
+        )
+        .await
+        .expect("open WebRTC session");
+        let pending = host
+            .begin_replacement(
+                &session_id,
+                1,
+                credentials().apply_relay_only(PeerConnectionConfig {
+                    role: PeerConnectionRole::Offerer,
+                    ..PeerConnectionConfig::default()
+                }),
+            )
+            .await
+            .expect("begin pending replacement");
+        let session = host
+            .session_entry(&session_id)
+            .await
+            .expect("session entry");
+
+        assert!(
+            !fail_webrtc_if_active(
+                &session.mux.core,
+                &session.peer,
+                &session.replacement_gate,
+                &session.relay_failure,
+                0,
+                "simulated old-route closure".into(),
+            )
+            .await
+        );
+        assert!(!session.mux.route_snapshot().await.closed);
+
+        drop(pending);
+        host.close_session(&session_id)
+            .await
+            .expect("close WebRTC session");
+    }
+
+    #[tokio::test]
+    async fn relay_managed_failure_reports_generation_without_closing_stable_mux() {
+        let host = Arc::new(ServiceWebRtcTransportHost::new());
+        let session_id = SessionId("relay-managed-health-report".into());
+        host.open_session(
+            session_id.clone(),
+            PeerConnectionConfig {
+                role: PeerConnectionRole::Offerer,
+                ..PeerConnectionConfig::default()
+            },
+        )
+        .await
+        .expect("open WebRTC session");
+        let session = host
+            .session_entry(&session_id)
+            .await
+            .expect("session entry");
+        session.relay_failure.enabled.store(true, Ordering::Release);
+        let failure = tokio::spawn({
+            let core = Arc::clone(&session.mux.core);
+            let peer = Arc::clone(&session.peer);
+            let replacement_gate = Arc::clone(&session.replacement_gate);
+            let relay_failure = Arc::clone(&session.relay_failure);
+            async move {
+                fail_webrtc_if_active(
+                    &core,
+                    &peer,
+                    &replacement_gate,
+                    &relay_failure,
+                    0,
+                    "simulated managed relay failure".into(),
+                )
+                .await
+            }
+        });
+
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                host.wait_failover_needed(&session_id),
+            )
+            .await
+            .expect("health report timeout")
+            .expect("health generation"),
+            0
+        );
+        assert!(!session.mux.route_snapshot().await.closed);
+
+        failure.abort();
+        let _ = failure.await;
+        host.close_session(&session_id)
+            .await
+            .expect("close WebRTC session");
     }
 }

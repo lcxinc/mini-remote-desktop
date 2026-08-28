@@ -40,6 +40,21 @@ pub struct AppState {
     pub devices: Arc<Mutex<DeviceRegistry>>,
     /// Service-owned authenticated signaling connection health.
     pub signaling_status: Arc<crate::signaling::SignalingStatus>,
+    /// Bounded authenticated relay-migration signaling commands and verified events.
+    pub relay_signaling: Arc<crate::signaling::RelaySignalingBus>,
+    signaling_mapper: Arc<RwLock<Option<Arc<crate::signaling::ServiceSignalingMapper>>>>,
+    /// Service-owned WebRTC host whose stable muxes survive atomic relay replacement.
+    pub webrtc_host: Arc<crate::transports::webrtc::ServiceWebRtcTransportHost>,
+    /// Optional verified relay-directory client configured at process startup.
+    relay_directory_client: Arc<RwLock<Option<Arc<crate::relay::RelayDirectoryClient>>>>,
+    /// Optional device-authenticated WAN session backend configured at process startup.
+    wan_session_backend:
+        Arc<RwLock<Option<Arc<dyn crate::wan_session::backend::WanSessionBackend>>>>,
+    /// Process-wide authoritative attended WAN session state coordinator.
+    wan_session_coordinator:
+        Arc<RwLock<Option<Arc<crate::wan_session::coordinator::WanSessionCoordinator>>>>,
+    /// Optional production relay failover coordinator configured after signaling starts.
+    relay_failover_coordinator: Arc<RwLock<Option<Arc<crate::relay::RelayFailoverCoordinator>>>>,
     /// Service-owned security and operations audit events.
     pub audit_log: Arc<AuditLogRegistry>,
     /// Service-owned device pairing and identity state.
@@ -460,6 +475,13 @@ impl AppState {
             sessions: Arc::new(Mutex::new(SessionRegistry::default())),
             devices: Arc::new(Mutex::new(DeviceRegistry::default())),
             signaling_status: Arc::new(crate::signaling::SignalingStatus::default()),
+            relay_signaling: Arc::new(crate::signaling::RelaySignalingBus::default()),
+            signaling_mapper: Arc::new(RwLock::new(None)),
+            webrtc_host: Arc::new(crate::transports::webrtc::ServiceWebRtcTransportHost::new()),
+            relay_directory_client: Arc::new(RwLock::new(None)),
+            wan_session_backend: Arc::new(RwLock::new(None)),
+            wan_session_coordinator: Arc::new(RwLock::new(None)),
+            relay_failover_coordinator: Arc::new(RwLock::new(None)),
             audit_log: Arc::new(audit_log),
             device_identities: Arc::new(device_identities),
             session_authorizations: Arc::new(
@@ -519,6 +541,129 @@ impl AppState {
     /// Get a clone of the device identity registry.
     pub fn device_identities(&self) -> Arc<DeviceIdentityRegistry> {
         self.device_identities.clone()
+    }
+
+    /// Install the process-wide verified relay-directory client exactly once.
+    pub fn bind_relay_directory_client(
+        &self,
+        client: Arc<crate::relay::RelayDirectoryClient>,
+    ) -> Result<(), &'static str> {
+        let mut slot = self
+            .relay_directory_client
+            .write()
+            .map_err(|_| "relay directory client lock poisoned")?;
+        if slot.is_some() {
+            return Err("relay directory client is already bound");
+        }
+        *slot = Some(client);
+        Ok(())
+    }
+
+    /// Return the configured verified relay-directory client, if WAN relay is enabled.
+    pub fn relay_directory_client(&self) -> Option<Arc<crate::relay::RelayDirectoryClient>> {
+        self.relay_directory_client
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    /// Install the process-wide device-authenticated WAN session backend exactly once.
+    pub fn bind_wan_session_backend(
+        &self,
+        backend: Arc<dyn crate::wan_session::backend::WanSessionBackend>,
+    ) -> Result<(), &'static str> {
+        let mut slot = self
+            .wan_session_backend
+            .write()
+            .map_err(|_| "WAN session backend lock poisoned")?;
+        if slot.is_some() {
+            return Err("WAN session backend is already bound");
+        }
+        *slot = Some(backend);
+        Ok(())
+    }
+
+    /// Return the configured WAN session backend, if initial WAN sessions are enabled.
+    pub fn wan_session_backend(
+        &self,
+    ) -> Option<Arc<dyn crate::wan_session::backend::WanSessionBackend>> {
+        self.wan_session_backend
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    /// Install the process-wide WAN session coordinator exactly once.
+    pub fn bind_wan_session_coordinator(
+        &self,
+        coordinator: Arc<crate::wan_session::coordinator::WanSessionCoordinator>,
+    ) -> Result<(), &'static str> {
+        let mut slot = self
+            .wan_session_coordinator
+            .write()
+            .map_err(|_| "WAN session coordinator lock poisoned")?;
+        if slot.is_some() {
+            return Err("WAN session coordinator is already bound");
+        }
+        *slot = Some(coordinator);
+        Ok(())
+    }
+
+    /// Return the authoritative WAN session coordinator, if initial WAN is enabled.
+    pub fn wan_session_coordinator(
+        &self,
+    ) -> Option<Arc<crate::wan_session::coordinator::WanSessionCoordinator>> {
+        self.wan_session_coordinator
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    /// Install the production failover coordinator exactly once.
+    pub fn bind_relay_failover_coordinator(
+        &self,
+        coordinator: Arc<crate::relay::RelayFailoverCoordinator>,
+    ) -> Result<(), &'static str> {
+        let mut slot = self
+            .relay_failover_coordinator
+            .write()
+            .map_err(|_| "relay failover coordinator lock poisoned")?;
+        if slot.is_some() {
+            return Err("relay failover coordinator is already bound");
+        }
+        *slot = Some(coordinator);
+        Ok(())
+    }
+
+    pub fn relay_failover_coordinator(
+        &self,
+    ) -> Option<Arc<crate::relay::RelayFailoverCoordinator>> {
+        self.relay_failover_coordinator
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    pub(crate) fn bind_signaling_mapper(
+        &self,
+        mapper: Arc<crate::signaling::ServiceSignalingMapper>,
+    ) -> Result<(), &'static str> {
+        let mut slot = self
+            .signaling_mapper
+            .write()
+            .map_err(|_| "signaling mapper lock poisoned")?;
+        if slot.is_some() {
+            return Err("signaling mapper is already bound");
+        }
+        *slot = Some(mapper);
+        Ok(())
+    }
+
+    pub(crate) fn signaling_mapper(&self) -> Option<Arc<crate::signaling::ServiceSignalingMapper>> {
+        self.signaling_mapper
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
     }
 
     /// Get a clone of the service-owned device preference registry.

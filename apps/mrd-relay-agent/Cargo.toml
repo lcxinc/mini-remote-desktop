@@ -1,0 +1,67 @@
+[package]
+name = "mrd-relay-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+bytes.workspace = true
+# Dalek's PKCS#8 encoder uses ed25519::pkcs8::KeypairBytes internally. Enable
+# its zeroizing Drop in addition to Dalek's zeroizing SigningKey owner.
+ed25519 = { version = "2.2", default-features = false, features = ["zeroize"] }
+ed25519-dalek = { workspace = true, features = ["pkcs8"] }
+mrd-transport-webrtc = { path = "../../crates/mrd-transport-webrtc" }
+rand = "0.8"
+rcgen = { version = "0.13.2", features = ["zeroize", "x509-parser"] }
+reqwest.workspace = true
+ring.workspace = true
+rustls-pki-types = "1"
+secrecy = { version = "0.10", features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+time = { version = "0.3", features = ["parsing"] }
+tokio.workspace = true
+tracing.workspace = true
+url = "2.5"
+zeroize.workspace = true
+x509-parser = { version = "0.16", features = ["verify"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "time"] }
+tokio-rustls = "0.26"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Globalization",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Security_Cryptography",
+  "Win32_Security_Cryptography_Catalog",
+  "Win32_Security_Cryptography_Sip",
+  "Win32_Security_WinTrust",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
+  "Win32_System_Pipes",
+  "Win32_System_WindowsProgramming",
+  "Win32_UI_Shell",
+] }
+windows-service = "0.8.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "mrd-relay-agent"
+path = "src/main.rs"
+
+[[bin]]
+name = "mrd-relay-coturn-control"
+path = "src/bin/mrd-relay-coturn-control.rs"

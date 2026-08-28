@@ -42,11 +42,154 @@
         "control_events_injected": {"type": "integer", "minimum": 0}
       },
       "additionalProperties": false
+    },
+    "relay": {
+      "type": "object",
+      "required": ["directory", "primary", "backup", "reservation", "selected_pair", "allocation", "injected_failure", "detection", "generation", "restored_media", "cleanup"],
+      "properties": {
+        "directory": {
+          "type": "object",
+          "required": ["directory_id", "session_id", "signing_key_id", "signature_verified", "policy_revision", "expires_at_ms"],
+          "properties": {
+            "directory_id": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+            "session_id": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+            "signing_key_id": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+            "signature_verified": {"type": "boolean"},
+            "policy_revision": {"type": "integer", "minimum": 0},
+            "expires_at_ms": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "primary": {"$ref": "#/$defs/relayNode"},
+        "backup": {"$ref": "#/$defs/relayNode"},
+        "reservation": {
+          "type": "object",
+          "required": ["primary_reservation_id", "primary_node_id", "backup_reservation_id", "backup_node_id", "committed", "expires_at_ms"],
+          "properties": {
+            "primary_reservation_id": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+            "primary_node_id": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+            "backup_reservation_id": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+            "backup_node_id": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+            "committed": {"type": "boolean"},
+            "expires_at_ms": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "selected_pair": {
+          "type": "object",
+          "required": ["relay_node_id", "local_candidate_type", "remote_candidate_type", "transport", "nominated", "runtime_verified"],
+          "properties": {
+            "relay_node_id": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+            "local_candidate_type": {"type": "string", "minLength": 1},
+            "remote_candidate_type": {"type": "string", "minLength": 1},
+            "transport": {"type": "string", "minLength": 1},
+            "nominated": {"type": "boolean"},
+            "runtime_verified": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
+        "allocation": {
+          "type": "object",
+          "required": ["primary_allocation_id", "primary_node_id", "backup_allocation_id", "backup_node_id", "primary_established", "backup_established", "relayed_bytes_before_failure"],
+          "properties": {
+            "primary_allocation_id": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+            "primary_node_id": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+            "backup_allocation_id": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+            "backup_node_id": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+            "primary_established": {"type": "boolean"},
+            "backup_established": {"type": "boolean"},
+            "relayed_bytes_before_failure": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "injected_failure": {
+          "type": "object",
+          "required": ["kind", "target_node_id", "injected_at_ms"],
+          "properties": {
+            "kind": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+            "target_node_id": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+            "injected_at_ms": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "detection": {
+          "type": "object",
+          "required": ["source", "detected_at_ms", "removed_at_ms"],
+          "properties": {
+            "source": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+            "detected_at_ms": {"type": "integer", "minimum": 0},
+            "removed_at_ms": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "generation": {
+          "type": "object",
+          "required": ["before", "after"],
+          "properties": {
+            "before": {"type": "integer", "minimum": 0},
+            "after": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "restored_media": {
+          "type": "object",
+          "required": ["backup_node_id", "media_resumed", "resumed_at_ms", "video_frames_after_recovery", "audio_packets_after_recovery", "control_events_after_recovery", "permissions_unchanged", "release_all_recorded"],
+          "properties": {
+            "backup_node_id": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+            "media_resumed": {"type": "boolean"},
+            "resumed_at_ms": {"type": "integer", "minimum": 0},
+            "video_frames_after_recovery": {"type": "integer", "minimum": 0},
+            "audio_packets_after_recovery": {"type": "integer", "minimum": 0},
+            "control_events_after_recovery": {"type": "integer", "minimum": 0},
+            "permissions_unchanged": {"type": "boolean"},
+            "release_all_recorded": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        },
+        "cleanup": {
+          "type": "object",
+          "required": ["reservation_released", "old_allocation_closed", "replacement_allocation_closed", "input_thawed", "lab_reset"],
+          "properties": {
+            "reservation_released": {"type": "boolean"},
+            "old_allocation_closed": {"type": "boolean"},
+            "replacement_allocation_closed": {"type": "boolean"},
+            "input_thawed": {"type": "boolean"},
+            "lab_reset": {"type": "boolean"}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "$defs": {
+    "relayNode": {
+      "type": "object",
+      "required": ["node_id", "region", "failure_domain"],
+      "properties": {
+        "node_id": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+        "region": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"},
+        "failure_domain": {"type": "string", "minLength": 1, "pattern": ".*\\S.*"}
+      },
+      "additionalProperties": false
     }
   },
   "dependentRequired": {
     "security": ["side_effects"],
     "side_effects": ["security"]
   },
+  "allOf": [
+    {
+      "if": {
+        "required": ["route"],
+        "properties": {"route": {"required": ["selected"], "properties": {"selected": {"const": "relay"}}}}
+      },
+      "then": {"required": ["relay"]}
+    },
+    {
+      "if": {"required": ["relay"]},
+      "then": {"properties": {"route": {"properties": {"selected": {"const": "relay"}}}}}
+    }
+  ],
   "additionalProperties": false
 }

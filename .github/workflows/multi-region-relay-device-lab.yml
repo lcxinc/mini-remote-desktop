@@ -1,0 +1,60 @@
+name: Multi-Region Relay Device Lab
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 18 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  multi-region-relay-device-lab:
+    name: Two-region Linux and Windows TURN acceptance
+    runs-on: [self-hosted, Windows, X64, multi-region-relay]
+    timeout-minutes: 360
+    env:
+      MRD_RELAY_LAB_CONTROL: ${{ vars.MRD_RELAY_LAB_CONTROL }}
+      MRD_RELAY_LAB_CONTROLLER_HOST: ${{ vars.MRD_RELAY_LAB_CONTROLLER_HOST }}
+      MRD_RELAY_LAB_AGENT_HOST: ${{ vars.MRD_RELAY_LAB_AGENT_HOST }}
+      MRD_RELAY_LAB_PRIMARY_NODE: ${{ vars.MRD_RELAY_LAB_PRIMARY_NODE }}
+      MRD_RELAY_LAB_BACKUP_NODE: ${{ vars.MRD_RELAY_LAB_BACKUP_NODE }}
+      MRD_RELAY_LAB_WINDOWS_NODE: ${{ vars.MRD_RELAY_LAB_WINDOWS_NODE }}
+      MRD_RELAY_LAB_PRIMARY_CERT_PATH: ${{ vars.MRD_RELAY_LAB_PRIMARY_CERT_PATH }}
+      MRD_RELAY_LAB_BACKUP_CERT_PATH: ${{ vars.MRD_RELAY_LAB_BACKUP_CERT_PATH }}
+      MRD_RELAY_LAB_UDP_PORT: ${{ vars.MRD_RELAY_LAB_UDP_PORT }}
+      MRD_RELAY_LAB_TLS_PORT: ${{ vars.MRD_RELAY_LAB_TLS_PORT }}
+      MRD_RELAY_LAB_AUTH_SECRET: ${{ secrets.MRD_RELAY_LAB_AUTH_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run all real multi-region relay rows
+        id: live-relay
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass `
+            -File tests/benchmarks/scripts/run_multi_region_relay.ps1 `
+            -Scenario all `
+            -OutputRoot artifacts/e2e/multi-region-relay
+      - name: Upload multi-region relay evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multi-region-relay-device-lab-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/e2e/multi-region-relay/
+          if-no-files-found: error
+      - name: Enforce multi-region relay verdict
+        if: always()
+        shell: powershell
+        run: |
+          $summaryPath = "artifacts/e2e/multi-region-relay/multi-region-relay-summary.json"
+          if (-not (Test-Path -LiteralPath $summaryPath -PathType Leaf)) {
+            [Console]::Error.WriteLine("Required multi-region relay summary is missing")
+            exit 3
+          }
+          $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
+          switch ([string]$summary.verdict) {
+            "PASS" { exit 0 }
+            "INFRA_FAIL" { exit 3 }
+            default { exit 2 }
+          }

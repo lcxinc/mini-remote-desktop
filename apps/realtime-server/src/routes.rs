@@ -1,7 +1,7 @@
 use mrd_proto::{DeviceId, SessionId};
 use mrd_signal_proto::{
-    SessionGrantPayload, SessionIntentPayload, WebRtcAnswerPayload, WebRtcCandidatePayload,
-    WebRtcOfferPayload,
+    relay_candidate_fingerprint, RelayMigrationAnswerPayload, RelayMigrationCandidatePayload,
+    RelayMigrationOfferPayload, SessionGrantV3Payload, SessionIntentV3Payload,
 };
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -11,8 +11,22 @@ struct SessionRoute {
     controller: DeviceId,
     target: DeviceId,
     idempotency_key: [u8; 16],
-    granted_fingerprints: Option<HashSet<String>>,
+    request_commitment: String,
+    granted: bool,
+    latest_migration_generation: u64,
+    migration: Option<MigrationBinding>,
     last_activity_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct MigrationBinding {
+    generation: u64,
+    directory_id: String,
+    node_id: String,
+    offerer: DeviceId,
+    restart_route_token: String,
+    offerer_fingerprints: HashSet<String>,
+    answerer_fingerprints: Option<HashSet<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -31,42 +45,47 @@ impl AuthorizedRoutes {
     pub fn apply_intent(
         &mut self,
         controller: &DeviceId,
-        intent: &SessionIntentPayload,
+        intent: &SessionIntentV3Payload,
         now_ms: u64,
     ) -> Result<IntentDisposition, RouteError> {
-        let key = (controller.clone(), intent.idempotency_key);
+        let request = &intent.request;
+        let key = (controller.clone(), request.idempotency_key);
         if let Some(existing) = self.idempotency.get(&key) {
             let route = self.routes.get(existing).ok_or(RouteError::Conflict)?;
-            return if existing == &intent.session_id
+            return if existing == &request.session_id
                 && &route.controller == controller
-                && route.target == intent.target_device_id
+                && route.target == request.target_device_id
+                && route.request_commitment == intent.request_commitment
             {
                 Ok(IntentDisposition::Duplicate)
             } else {
                 Err(RouteError::Conflict)
             };
         }
-        if self.routes.contains_key(&intent.session_id) {
+        if self.routes.contains_key(&request.session_id) {
             return Err(RouteError::Conflict);
         }
         self.routes.insert(
-            intent.session_id.clone(),
+            request.session_id.clone(),
             SessionRoute {
                 controller: controller.clone(),
-                target: intent.target_device_id.clone(),
-                idempotency_key: intent.idempotency_key,
-                granted_fingerprints: None,
+                target: request.target_device_id.clone(),
+                idempotency_key: request.idempotency_key,
+                request_commitment: intent.request_commitment.clone(),
+                granted: false,
+                latest_migration_generation: 0,
+                migration: None,
                 last_activity_ms: now_ms,
             },
         );
-        self.idempotency.insert(key, intent.session_id.clone());
+        self.idempotency.insert(key, request.session_id.clone());
         Ok(IntentDisposition::Created)
     }
 
     pub fn apply_grant(
         &mut self,
         target: &DeviceId,
-        grant: &SessionGrantPayload,
+        grant: &SessionGrantV3Payload,
         now_ms: u64,
     ) -> Result<DeviceId, RouteError> {
         let route = self
@@ -76,13 +95,10 @@ impl AuthorizedRoutes {
         if &route.target != target || route.controller != grant.controller_device_id {
             return Err(RouteError::Unauthorized);
         }
-        route.granted_fingerprints = Some(
-            grant
-                .accepted_candidate_fingerprints
-                .iter()
-                .cloned()
-                .collect(),
-        );
+        if route.granted {
+            return Err(RouteError::Conflict);
+        }
+        route.granted = true;
         route.last_activity_ms = now_ms;
         Ok(route.controller.clone())
     }
@@ -97,7 +113,7 @@ impl AuthorizedRoutes {
             .routes
             .get_mut(session_id)
             .ok_or(RouteError::UnknownSession)?;
-        if route.granted_fingerprints.is_none() {
+        if !route.granted {
             return Err(RouteError::NotGranted);
         }
         let peer = peer(route, sender)?;
@@ -105,76 +121,111 @@ impl AuthorizedRoutes {
         Ok(peer)
     }
 
-    pub fn resolve_offer(
+    pub fn resolve_migration_offer(
         &mut self,
         sender: &DeviceId,
-        offer: &WebRtcOfferPayload,
+        offer: &RelayMigrationOfferPayload,
         now_ms: u64,
     ) -> Result<DeviceId, RouteError> {
         let route = self
             .routes
             .get_mut(&offer.session_id)
             .ok_or(RouteError::UnknownSession)?;
-        let accepted = route
-            .granted_fingerprints
-            .as_ref()
-            .ok_or(RouteError::NotGranted)?;
-        if !offer
-            .candidate_fingerprints
-            .iter()
-            .all(|fingerprint| accepted.contains(fingerprint))
-        {
-            return Err(RouteError::FingerprintNotGranted);
+        if !route.granted {
+            return Err(RouteError::NotGranted);
         }
         let peer = peer(route, sender)?;
+        let expected = route
+            .latest_migration_generation
+            .checked_add(1)
+            .ok_or(RouteError::MigrationConflict)?;
+        if offer.migration_generation != expected {
+            return Err(RouteError::MigrationConflict);
+        }
+        route.latest_migration_generation = offer.migration_generation;
+        route.migration = Some(MigrationBinding {
+            generation: offer.migration_generation,
+            directory_id: offer.directory_id.clone(),
+            node_id: offer.node_id.clone(),
+            offerer: sender.clone(),
+            restart_route_token: offer.restart_route_token.clone(),
+            offerer_fingerprints: offer.candidate_fingerprints.iter().cloned().collect(),
+            answerer_fingerprints: None,
+        });
         route.last_activity_ms = now_ms;
         Ok(peer)
     }
 
-    pub fn resolve_answer(
+    pub fn resolve_migration_answer(
         &mut self,
         sender: &DeviceId,
-        answer: &WebRtcAnswerPayload,
+        answer: &RelayMigrationAnswerPayload,
         now_ms: u64,
     ) -> Result<DeviceId, RouteError> {
         let route = self
             .routes
             .get_mut(&answer.session_id)
             .ok_or(RouteError::UnknownSession)?;
-        let accepted = route
-            .granted_fingerprints
-            .as_ref()
-            .ok_or(RouteError::NotGranted)?;
-        if !answer
-            .candidate_fingerprints
-            .iter()
-            .all(|fingerprint| accepted.contains(fingerprint))
-        {
-            return Err(RouteError::FingerprintNotGranted);
-        }
         let peer = peer(route, sender)?;
+        let binding = route
+            .migration
+            .as_mut()
+            .ok_or(RouteError::MigrationConflict)?;
+        if &binding.offerer == sender
+            || binding.generation != answer.migration_generation
+            || binding.directory_id != answer.directory_id
+            || binding.node_id != answer.node_id
+            || binding.restart_route_token != answer.restart_route_token
+        {
+            return Err(RouteError::MigrationConflict);
+        }
+        binding.answerer_fingerprints =
+            Some(answer.candidate_fingerprints.iter().cloned().collect());
         route.last_activity_ms = now_ms;
         Ok(peer)
     }
 
-    pub fn resolve_candidate(
+    pub fn resolve_migration_candidate(
         &mut self,
         sender: &DeviceId,
-        candidate: &WebRtcCandidatePayload,
+        candidate: &RelayMigrationCandidatePayload,
         now_ms: u64,
     ) -> Result<DeviceId, RouteError> {
         let route = self
             .routes
             .get_mut(&candidate.session_id)
             .ok_or(RouteError::UnknownSession)?;
-        if !route
-            .granted_fingerprints
+        let peer = peer(route, sender)?;
+        let binding = route
+            .migration
             .as_ref()
-            .is_some_and(|accepted| accepted.contains(&candidate.candidate_fingerprint))
+            .ok_or(RouteError::MigrationConflict)?;
+        if binding.generation != candidate.migration_generation
+            || binding.directory_id != candidate.directory_id
+            || binding.node_id != candidate.node_id
+            || binding.restart_route_token != candidate.restart_route_token
+        {
+            return Err(RouteError::MigrationConflict);
+        }
+        let accepted = if &binding.offerer == sender {
+            Some(&binding.offerer_fingerprints)
+        } else {
+            binding.answerer_fingerprints.as_ref()
+        };
+        let computed = relay_candidate_fingerprint(
+            &candidate.session_id,
+            candidate.migration_generation,
+            &candidate.candidate,
+            candidate.sdp_mid.as_deref(),
+            candidate.sdp_mline_index,
+            candidate.username_fragment.as_deref(),
+            &candidate.restart_route_token,
+        );
+        if computed != candidate.candidate_fingerprint
+            || !accepted.is_some_and(|accepted| accepted.contains(&candidate.candidate_fingerprint))
         {
             return Err(RouteError::FingerprintNotGranted);
         }
-        let peer = peer(route, sender)?;
         route.last_activity_ms = now_ms;
         Ok(peer)
     }
@@ -272,4 +323,6 @@ pub enum RouteError {
     NotGranted,
     #[error("candidate fingerprint was not granted")]
     FingerprintNotGranted,
+    #[error("relay migration generation or binding conflicts with the session route")]
+    MigrationConflict,
 }

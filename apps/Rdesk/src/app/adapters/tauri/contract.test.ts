@@ -1357,6 +1357,7 @@ describe('Tauri Adapter Contract', () => {
         session_id: 'session-1',
         target_device_id: 'device-1',
         access_mode: 'attended',
+        route_preference: 'wan_relay',
         requested_scopes: [...scope],
         requested_profile: null,
       });
@@ -1417,6 +1418,7 @@ describe('Tauri Adapter Contract', () => {
             session_id: 'session-1',
             target_device_id: 'device-1',
             access_mode: 'attended',
+            route_preference: 'wan_relay',
             requested_scopes: ['screen.view'],
             requested_profile: null,
           },
@@ -1602,6 +1604,7 @@ describe('Tauri Adapter Contract', () => {
             session_id: 'session-1',
             target_device_id: 'device-1',
             access_mode: 'attended',
+            route_preference: 'wan_relay',
             requested_scopes: ['screen.view'],
             requested_profile: null,
           }),

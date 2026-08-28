@@ -1,31 +1,80 @@
-# Copy to turnserver.conf, replace every CHANGE_ME value, and keep the file private.
+# MRD coturn baseline. The installers reject every CHANGE_ME value.
+# Keep the rendered configuration private: it contains the per-node REST secret.
+
+# TURN over UDP and TCP. TLS uses 5349 by default; the installers may replace
+# this exact line with 443 only after proving that no other listener owns 443.
 listening-port=3478
 tls-listening-port=5349
-fingerprint
-realm=remote.example.com
-server-name=remote.example.com
-
-# Coturn REST API authentication. Must match RDESK_TURN_AUTH_SECRET.
-use-auth-secret
-static-auth-secret=CHANGE_ME_WITH_AT_LEAST_32_RANDOM_BYTES
-
-# Set these for a public deployment. For NAT, use PUBLIC_IP/PRIVATE_IP.
 listening-ip=0.0.0.0
-# external-ip=203.0.113.10
+# relay-ip=CHANGE_ME_PRIVATE_OR_PUBLIC_IP
+# external-ip=CHANGE_ME_PUBLIC_IP/CHANGE_ME_PRIVATE_IP
 
+fingerprint
+realm=CHANGE_ME_RELAY_REALM
+server-name=CHANGE_ME_RELAY_FQDN
+
+# Per-node TURN REST credentials. Never reuse this secret on another node.
+use-auth-secret
+static-auth-secret=CHANGE_ME_WITH_43_CHAR_BASE64URL_SECRET
+rest-api-separator=:
+
+# Coturn 4.17.2 leaves unauthenticated 401 throttling disabled unless both
+# settings are explicit. Bound invalid REST credential traffic per worker.
+unauthorized-ratelimit
+unauthorized-ratelimit-rps=10
+
+# Bound allocations and bandwidth even if the control plane is unavailable.
+user-quota=4
+total-quota=100
+max-bps=25000000
+# Agent/backend max_egress_bps is bits/s; coturn max-bps/bps-capacity is bytes/s.
+# The one-gigabit example therefore renders as 125000000.
+bps-capacity=125000000
 min-port=49160
 max-port=49260
 stale-nonce=600
-no-multicast-peers
-no-cli
-no-loopback-peers
+max-allocate-timeout=15
+max-allocate-lifetime=900
 
-# TLS is required for turns: URLs.
-cert=/etc/coturn/tls/fullchain.pem
-pkey=/etc/coturn/tls/privkey.pem
+# TLS is mandatory for turns: endpoints. Linux rendering replaces these source
+# paths with systemd credential paths. Windows target adapters use native paths.
+cert=/etc/mrd-relay-agent/tls/fullchain.pem
+pkey=/etc/mrd-relay-agent/tls/privkey.pem
 no-tlsv1
 no-tlsv1_1
 
-# Keep credentials and client addresses out of verbose logs.
+# Keep relay peers away from loopback, link-local, RFC1918, and unique-local
+# networks. Add site-specific management and metadata ranges before deployment.
+denied-peer-ip=0.0.0.0-0.255.255.255
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=100.64.0.0-100.127.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.0.0.0-192.0.0.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=198.18.0.0-198.19.255.255
+denied-peer-ip=::1
+denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+no-multicast-peers
+
+# No unauthenticated management surface or legacy NAT discovery behavior.
+no-cli
+no-rfc5780
+no-software-attribute
+
+# Metrics are an agent-only loopback interface. Username labels would expose
+# expiry:user_id:session_id:node_id and are deliberately not enabled.
+prometheus
+prometheus-address=127.0.0.1
+prometheus-port=9641
+prometheus-path=/metrics
+
+# SIGUSR1 enters coturn drain mode. No new allocations are admitted and coturn
+# exits after the active allocation count reaches this threshold.
+drain-min-allocations=0
+
+# Keep normal logs in the service manager and never enable verbose logging.
 simple-log
 log-file=stdout

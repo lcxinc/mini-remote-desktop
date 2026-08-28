@@ -888,6 +888,37 @@ impl LanDiscoveryState {
             .is_some()
     }
 
+    /// Return fresh, authenticated LAN route evidence from the private peer
+    /// registry.  The public IPC snapshot deliberately omits the signing key,
+    /// key epoch, and trust revision, so callers selecting `Auto` must use this
+    /// method instead of promoting `LanPeerInfo::p2p_available` themselves.
+    pub async fn fresh_authenticated_peer_evidence(
+        &self,
+        device_id: &DeviceId,
+        now_ms: u64,
+        max_age_ms: u64,
+    ) -> Option<crate::wan_session::media::LanDiscoveryEvidence> {
+        self.prune_stale_peers().await;
+        let peer = self.peers.lock().await.controllable_peer(device_id)?;
+        let peer_key_id = peer.peer_key_id?;
+        let peer_public_key = peer.public_key?;
+        let peer_key_epoch = peer.key_epoch?;
+        let fresh = now_ms.saturating_sub(peer.last_seen_ms) <= max_age_ms;
+        let supports_quic = peer
+            .transports
+            .iter()
+            .any(|transport| transport.eq_ignore_ascii_case("quic"));
+        Some(
+            crate::wan_session::media::LanDiscoveryEvidence::from_authenticated_peer(
+                fresh,
+                supports_quic,
+                peer_key_id,
+                peer_public_key,
+                peer_key_epoch,
+            ),
+        )
+    }
+
     async fn controllable_peer(&self, device_id: &DeviceId) -> Option<LanPeerRecord> {
         self.prune_stale_peers().await;
         self.peers.lock().await.controllable_peer(device_id)
@@ -4263,6 +4294,7 @@ async fn send_packet(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_lan_media_receiver(
     app_state: Arc<AppState>,
     session_id: SessionId,
@@ -5674,8 +5706,8 @@ async fn send_quic_media_loop(
                 let mut reliable_fragments_sent = 0_u64;
                 for reliable_fragment in reliable_fragments.unwrap_or_default() {
                     let delay = test_impairment.next_delay();
-                    if !delay.is_zero() {
-                        if run_lan_media_operation_while_authorized(
+                    if !delay.is_zero()
+                        && run_lan_media_operation_while_authorized(
                             &app_state,
                             &session_id,
                             &endpoint,
@@ -5683,9 +5715,8 @@ async fn send_quic_media_loop(
                         )
                         .await
                         .is_none()
-                        {
-                            return Ok(());
-                        }
+                    {
+                        return Ok(());
                     }
                     if !session_allows_media(&app_state, &session_id).await {
                         return Ok(());

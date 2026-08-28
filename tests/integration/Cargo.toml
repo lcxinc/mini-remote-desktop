@@ -14,9 +14,14 @@ path = "resolution_test.rs"
 
 [dependencies]
 anyhow = "1.0"
+async-trait = "0.1"
+base64 = "0.22"
+ed25519-dalek.workspace = true
 mrd-agent-ipc = { path = "../../crates/mrd-agent-ipc" }
+mrd-application = { path = "../../crates/mrd-application" }
 mrd-pipeline-core = { path = "../../crates/mrd-pipeline-core" }
 mrd-proto = { path = "../../crates/mrd-proto" }
+mrd-relay-control = { path = "../../crates/mrd-relay-control" }
 mrd-service = { path = "../../apps/mrd-service" }
 mrd-session = { path = "../../crates/mrd-session" }
 mrd-session-agent = { path = "../../apps/mrd-session-agent" }
@@ -25,7 +30,10 @@ mrd-decode = { path = "../../crates/mrd-decode" }
 mrd-render = { path = "../../crates/mrd-render" }
 mrd-transport-quic-quinn = { path = "../../crates/mrd-transport-quic-quinn" }
 mrd-observability = { path = "../../crates/mrd-observability" }
+ring.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
+zeroize.workspace = true
 
 [[test]]
 name = "automated_e2e_pipeline"
@@ -42,6 +50,10 @@ path = "threaded_transport_e2e.rs"
 [[test]]
 name = "service_agent_media"
 path = "service_agent_media.rs"
+
+[[test]]
+name = "multi_region_relay"
+path = "multi_region_relay.rs"
 
 [target.'cfg(windows)'.dependencies]
 mrd-capture-winrt = { path = "../../crates/mrd-capture-winrt" }

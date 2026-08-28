@@ -64,3 +64,70 @@ fn secure_lan_positive_gate_is_explicit_and_device_lab_only() {
     assert!(yaml.contains("-ProfileId\", \"1080p60\""));
     assert!(yaml.contains("artifacts/e2e/device-lab/secure-lan/"));
 }
+
+fn relay_control_workflow() -> String {
+    fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../.github/workflows/relay-control.yml"
+    ))
+    .unwrap()
+}
+
+fn multi_region_lab_workflow() -> String {
+    fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../.github/workflows/multi-region-relay-device-lab.yml"
+    ))
+    .unwrap()
+}
+
+#[test]
+fn relay_control_ci_runs_postgres_linux_windows_and_deterministic_contracts() {
+    let yaml = relay_control_workflow();
+    for required in [
+        "services:",
+        "postgres:",
+        "MRD_TEST_DATABASE_URL",
+        "test_relay_repository.py",
+        "test_relay_repository_postgres.py",
+        "test_relay_directory_postgres.py",
+        "cargo test -p mrd-relay-control",
+        "cargo build -p mrd-relay-agent",
+        "runs-on: ubuntu-latest",
+        "runs-on: windows-latest",
+        "test_multi_region_relay.ps1",
+        "cargo test -p mrd-quality-gate",
+        "if: always()",
+        "name: Enforce relay control gate",
+    ] {
+        assert!(
+            yaml.contains(required),
+            "missing relay CI contract: {required}"
+        );
+    }
+    assert!(!yaml.contains("continue-on-error: true"));
+}
+
+#[test]
+fn live_multi_region_workflow_is_separate_enforced_and_never_skips_missing_infra() {
+    let yaml = multi_region_lab_workflow();
+    for required in [
+        "multi-region-relay-device-lab:",
+        "runs-on: [self-hosted, Windows, X64, multi-region-relay]",
+        "MRD_RELAY_LAB_CONTROL",
+        "run_multi_region_relay.ps1",
+        "-Scenario all",
+        "if: always()",
+        "name: Enforce multi-region relay verdict",
+        "multi-region-relay-summary.json",
+    ] {
+        assert!(
+            yaml.contains(required),
+            "missing lab workflow contract: {required}"
+        );
+    }
+    assert!(!yaml.contains("continue-on-error: true"));
+    assert!(!yaml.contains("if-no-files-found: ignore"));
+    assert!(!yaml.contains("missing infrastructure; skipping"));
+    assert!(!yaml.contains("exit 0 # infra"));
+}

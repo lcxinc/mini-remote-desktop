@@ -1,0 +1,36 @@
+version: 1
+schema: mrd-relay-regions.v1
+purpose: bootstrap_disaster_recovery_only
+live_consumer: none
+
+# Operator bootstrap and disaster-recovery inventory only. No production
+# process reads this file live; PostgreSQL and signed directories are authoritative.
+defaults:
+  credential_ttl_seconds: 600
+  heartbeat_interval_seconds: 5
+  relay_port_min: 49160
+  relay_port_max: 49260
+
+regions:
+  - region: ap-east
+    nodes:
+      - node_id: relay-hkg-1
+        failure_domain: hkg-rack-a
+        target: linux-systemd
+        endpoints:
+          - turn:relay-hkg-1.example.net:3478?transport=udp
+          - turn:relay-hkg-1.example.net:3478?transport=tcp
+          - turns:relay-hkg-1.example.net:5349?transport=tcp
+        max_allocations: 100
+        max_egress_bps: 1000000000
+  - region: eu-west
+    nodes:
+      - node_id: relay-dub-1
+        failure_domain: dub-rack-b
+        target: docker
+        endpoints:
+          - turn:relay-dub-1.example.net:3478?transport=udp
+          - turn:relay-dub-1.example.net:3478?transport=tcp
+          - turns:relay-dub-1.example.net:443?transport=tcp
+        max_allocations: 100
+        max_egress_bps: 1000000000

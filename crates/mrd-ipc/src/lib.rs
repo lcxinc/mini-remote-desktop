@@ -1568,6 +1568,16 @@ mod wire {
         }
     }
 
+    /// Caller preference for selecting the initial remote-session route.
+    #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum RemoteRoutePreference {
+        #[default]
+        Auto,
+        Lan,
+        WanRelay,
+    }
+
     /// Explicit route lifecycle projection.
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(rename_all = "snake_case")]
@@ -1640,6 +1650,8 @@ mod wire {
         pub session_id: SessionId,
         pub target_device_id: DeviceId,
         pub access_mode: RemoteAccessMode,
+        #[serde(default)]
+        pub route_preference: RemoteRoutePreference,
         pub requested_scopes: Vec<RemotePermissionScope>,
         pub requested_profile: Option<MediaProfile>,
     }

@@ -8,7 +8,10 @@
 
 use anyhow::Result;
 use mrd_proto::{DeviceId, SessionId};
-use mrd_signal_proto::{IceCandidate, ProtocolReasonCode, SignalMessage};
+use mrd_signal_proto::{
+    IceCandidate, ProtocolReasonCode, SessionGrantV3, SessionIntentV3, SignalMessage,
+    WebRtcAnswerV3, WebRtcCandidateV3, WebRtcOfferV3,
+};
 
 /// Identity metadata proven by an end-to-end signed signaling message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,7 +33,7 @@ pub struct VerifiedSignalingIdentity {
 }
 
 /// Authenticated session semantics emitted by a signaling adapter.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum AuthenticatedSessionSignal {
     /// A controller requests attended authorization from this device.
     AuthorizationRequested {
@@ -88,6 +91,88 @@ pub enum AuthenticatedSessionSignal {
         /// SHA-256 candidate fingerprint committed by a grant.
         candidate_fingerprint: String,
     },
+    /// A complete signed protocol-v3 attended WAN session intent.
+    SessionIntentV3 {
+        /// Typed signed payload retained for exact coordinator verification.
+        message: SessionIntentV3,
+    },
+    /// A complete signed protocol-v3 attended WAN session grant.
+    SessionGrantV3 {
+        /// Typed signed payload retained for exact coordinator verification.
+        message: SessionGrantV3,
+    },
+    /// A complete signed protocol-v3 WebRTC offer.
+    WebRtcOfferV3 {
+        /// Typed signed payload retained for manifest verification.
+        message: WebRtcOfferV3,
+    },
+    /// A complete signed protocol-v3 WebRTC answer.
+    WebRtcAnswerV3 {
+        /// Typed signed payload retained for manifest verification.
+        message: WebRtcAnswerV3,
+    },
+    /// A complete signed protocol-v3 WebRTC candidate.
+    WebRtcCandidateV3 {
+        /// Typed signed payload retained for exact fingerprint verification.
+        message: WebRtcCandidateV3,
+    },
+    /// Apply a relay-bound ICE migration offer.
+    RelayMigrationOffer {
+        /// Session identifier.
+        session_id: SessionId,
+        /// Strictly increasing migration generation.
+        migration_generation: u64,
+        /// Signed relay directory identifier used for selection.
+        directory_id: String,
+        /// Selected relay node identifier.
+        node_id: String,
+        /// Remote SDP migration offer.
+        sdp: String,
+        /// Opaque restart route token bound into the signed offer.
+        restart_route_token: String,
+        /// Candidate fingerprints committed by the migration offer.
+        candidate_fingerprints: Vec<String>,
+    },
+    /// Apply a relay-bound ICE migration answer.
+    RelayMigrationAnswer {
+        /// Session identifier.
+        session_id: SessionId,
+        /// Migration generation being answered.
+        migration_generation: u64,
+        /// Signed relay directory identifier used for selection.
+        directory_id: String,
+        /// Selected relay node identifier.
+        node_id: String,
+        /// Remote SDP migration answer.
+        sdp: String,
+        /// Opaque restart route token bound into the signed answer.
+        restart_route_token: String,
+        /// Candidate fingerprints committed by the migration answer.
+        candidate_fingerprints: Vec<String>,
+    },
+    /// Apply a relay-bound ICE migration candidate.
+    RelayMigrationCandidate {
+        /// Session identifier.
+        session_id: SessionId,
+        /// Migration generation receiving the candidate.
+        migration_generation: u64,
+        /// Signed relay directory identifier used for selection.
+        directory_id: String,
+        /// Selected relay node identifier.
+        node_id: String,
+        /// ICE candidate line.
+        candidate: String,
+        /// Optional SDP media identifier.
+        sdp_mid: Option<String>,
+        /// Optional SDP media-line index.
+        sdp_mline_index: Option<u16>,
+        /// Optional ICE username fragment.
+        username_fragment: Option<String>,
+        /// Opaque restart route token bound into the signed candidate.
+        restart_route_token: String,
+        /// SHA-256 candidate fingerprint committed by the grant.
+        candidate_fingerprint: String,
+    },
     /// The authenticated peer closed a session.
     Closed {
         /// Closed session identifier.
@@ -95,6 +180,60 @@ pub enum AuthenticatedSessionSignal {
         /// Stable protocol reason supplied by the peer.
         reason: ProtocolReasonCode,
     },
+}
+
+impl AuthenticatedSessionSignal {
+    /// Return the exact session route without exposing the signed body.
+    pub fn session_id(&self) -> &SessionId {
+        match self {
+            Self::AuthorizationRequested { session_id, .. }
+            | Self::Granted { session_id, .. }
+            | Self::Denied { session_id, .. }
+            | Self::WebRtcOffer { session_id, .. }
+            | Self::WebRtcAnswer { session_id, .. }
+            | Self::WebRtcCandidate { session_id, .. }
+            | Self::RelayMigrationOffer { session_id, .. }
+            | Self::RelayMigrationAnswer { session_id, .. }
+            | Self::RelayMigrationCandidate { session_id, .. }
+            | Self::Closed { session_id, .. } => session_id,
+            Self::SessionIntentV3 { message } => &message.payload.request.session_id,
+            Self::SessionGrantV3 { message } => &message.payload.session_id,
+            Self::WebRtcOfferV3 { message } => &message.payload.session_id,
+            Self::WebRtcAnswerV3 { message } => &message.payload.session_id,
+            Self::WebRtcCandidateV3 { message } => &message.payload.session_id,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::AuthorizationRequested { .. } => "authorization_requested",
+            Self::Granted { .. } => "granted",
+            Self::Denied { .. } => "denied",
+            Self::WebRtcOffer { .. } => "webrtc_offer_v2",
+            Self::WebRtcAnswer { .. } => "webrtc_answer_v2",
+            Self::WebRtcCandidate { .. } => "webrtc_candidate_v2",
+            Self::SessionIntentV3 { .. } => "session_intent_v3",
+            Self::SessionGrantV3 { .. } => "session_grant_v3",
+            Self::WebRtcOfferV3 { .. } => "webrtc_offer_v3",
+            Self::WebRtcAnswerV3 { .. } => "webrtc_answer_v3",
+            Self::WebRtcCandidateV3 { .. } => "webrtc_candidate_v3",
+            Self::RelayMigrationOffer { .. } => "relay_migration_offer",
+            Self::RelayMigrationAnswer { .. } => "relay_migration_answer",
+            Self::RelayMigrationCandidate { .. } => "relay_migration_candidate",
+            Self::Closed { .. } => "closed",
+        }
+    }
+}
+
+impl std::fmt::Debug for AuthenticatedSessionSignal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedSessionSignal")
+            .field("kind", &self.kind())
+            .field("session_id", self.session_id())
+            .field("body", &"REDACTED")
+            .finish()
+    }
 }
 
 /// One verified signaling event ready for application policy.

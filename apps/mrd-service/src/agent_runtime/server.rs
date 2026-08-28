@@ -596,6 +596,8 @@ enum RequestWriteOutcome {
     Cancelled(RequestCancellation),
 }
 
+type MediaSink = Arc<dyn Fn(MediaAccessUnit) + Send + Sync>;
+
 /// Shared server for authenticated agent connections.
 pub struct AgentServer {
     registry: Arc<AgentRegistry>,
@@ -603,7 +605,7 @@ pub struct AgentServer {
     request_timeout: Duration,
     next_request_token: AtomicU64,
     controls: Arc<Mutex<HashMap<AgentConnectionId, ConnectionControl>>>,
-    media_sink: Arc<Mutex<Option<Arc<dyn Fn(MediaAccessUnit) + Send + Sync>>>>,
+    media_sink: Arc<Mutex<Option<MediaSink>>>,
     render_metrics: Arc<Mutex<HashMap<SessionId, RenderBoundaryMetrics>>>,
 }
 

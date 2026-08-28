@@ -72,6 +72,11 @@ impl AgentMediaIngress {
         self.queue.len()
     }
 
+    /// Whether the queue contains no media access units.
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
     /// Number of queued units for one logical session.
     pub fn session_len(&self, session_id: &str) -> usize {
         self.queue

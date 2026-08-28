@@ -12,7 +12,8 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use mrd_proto::DeviceId;
 use mrd_signal_client::{
-    decode_authenticated_message, encode_authenticated_message, MAX_SIGNAL_MESSAGE_BYTES,
+    decode_authenticated_message, encode_authenticated_message, SignalClientError,
+    MAX_SIGNAL_MESSAGE_BYTES,
 };
 use mrd_signal_proto::{
     AuthenticatedSignalMessage, ProtocolReasonCode, SignalEnvelope, SignalErrorMessage,
@@ -286,10 +287,10 @@ async fn handle_socket(socket: WebSocket, state: RealtimeAppState) {
             send_error(&outbound, ProtocolReasonCode::Malformed);
             break;
         }
-        let envelope = match decode_authenticated_message(&text) {
+        let envelope = match decode_inbound(&text) {
             Ok(envelope) => envelope,
-            Err(_) => {
-                send_error(&outbound, ProtocolReasonCode::Malformed);
+            Err(reason) => {
+                send_error(&outbound, reason);
                 continue;
             }
         };
@@ -352,6 +353,15 @@ fn send_error(sender: &mpsc::Sender<String>, reason: ProtocolReasonCode) {
     }
 }
 
+fn decode_inbound(raw: &str) -> Result<SignalEnvelope, ProtocolReasonCode> {
+    decode_authenticated_message(raw).map_err(|error| match error {
+        SignalClientError::Protocol(protocol) => protocol.reason_code(),
+        SignalClientError::Serialize(_) | SignalClientError::MessageTooLarge => {
+            ProtocolReasonCode::Malformed
+        }
+    })
+}
+
 fn random_connection_id() -> Result<ConnectionId, RealtimeError> {
     for _ in 0..4 {
         let mut bytes = [0_u8; 16];
@@ -385,5 +395,18 @@ mod tests {
         assert!(validate_deployment(true, false, "127.0.0.1:9532".parse().unwrap()).is_err());
         assert!(validate_deployment(true, true, "0.0.0.0:9532".parse().unwrap()).is_err());
         assert!(validate_deployment(true, true, "127.0.0.1:9532".parse().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn websocket_wire_decode_preserves_unsupported_version_reason() {
+        for raw in [
+            r#"{"version":2,"message":{"type":"session_intent","payload":{}}}"#,
+            r#"{"version":3,"message":{"type":"protocol_error","payload":{"reason":"malformed","correlation_id":null,"detail":"request rejected"}}}"#,
+        ] {
+            assert_eq!(
+                decode_inbound(raw).unwrap_err(),
+                ProtocolReasonCode::UnsupportedVersion
+            );
+        }
     }
 }

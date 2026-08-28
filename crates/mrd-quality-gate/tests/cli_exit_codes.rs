@@ -1,5 +1,12 @@
 use std::{fs, path::PathBuf, process::Command};
 
+fn gate_binary() -> PathBuf {
+    option_env!("CARGO_BIN_EXE_mrd-quality-gate")
+        .or(option_env!("CARGO_BIN_EXE_mrd_quality_gate"))
+        .map(PathBuf::from)
+        .expect("Cargo must expose the quality-gate binary to integration tests")
+}
+
 fn run_gate(artifact: &str, policy: &str) -> (std::process::Output, PathBuf) {
     let output_path = std::env::temp_dir().join(format!(
         "mrd-quality-gate-{}-{artifact}",
@@ -11,10 +18,7 @@ fn run_gate(artifact: &str, policy: &str) -> (std::process::Output, PathBuf) {
     let policy_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/quality-gates/policies")
         .join(policy);
-    let binary = std::env::var("CARGO_BIN_EXE_mrd-quality-gate")
-        .or_else(|_| std::env::var("CARGO_BIN_EXE_mrd_quality_gate"))
-        .unwrap();
-    Command::new(binary)
+    Command::new(gate_binary())
         .args([
             "--artifact",
             artifact_path.to_str().unwrap(),
@@ -35,10 +39,7 @@ fn run_gate_without_output(artifact: &str, policy: &str) -> std::process::Output
     let policy_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/quality-gates/policies")
         .join(policy);
-    let binary = std::env::var("CARGO_BIN_EXE_mrd-quality-gate")
-        .or_else(|_| std::env::var("CARGO_BIN_EXE_mrd_quality_gate"))
-        .unwrap();
-    Command::new(binary)
+    Command::new(gate_binary())
         .args([
             "--artifact",
             artifact_path.to_str().unwrap(),
@@ -91,10 +92,7 @@ fn unknown_artifact_field_exits_four_instead_of_being_ignored() {
     ));
     fs::write(&artifact_path, serde_json::to_vec(&artifact).unwrap()).unwrap();
 
-    let binary = std::env::var("CARGO_BIN_EXE_mrd-quality-gate")
-        .or_else(|_| std::env::var("CARGO_BIN_EXE_mrd_quality_gate"))
-        .unwrap();
-    let output = Command::new(binary)
+    let output = Command::new(gate_binary())
         .args([
             "--artifact",
             artifact_path.to_str().unwrap(),

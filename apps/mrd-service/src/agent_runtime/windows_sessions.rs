@@ -409,6 +409,7 @@ impl Drop for EnvironmentBlock {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn bootstrap_and_serve(
     mut bootstrap_pipe: WindowsAgentPipe,
     mut control_pipe: WindowsAgentPipe,

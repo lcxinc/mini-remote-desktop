@@ -1,0 +1,45 @@
+[Unit]
+Description=MRD privileged coturn control request
+Documentation=file:/usr/share/doc/mrd-relay-agent/README.md
+
+[Service]
+Type=exec
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/local/libexec/mrd-relay-coturn-control --socket-activated
+StandardInput=null
+StandardOutput=null
+StandardError=journal
+SyslogIdentifier=mrd-relay-coturn-control
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadWritePaths=/etc/mrd-relay-agent/secrets /var/lib/mrd-coturn /run/mrd-coturn
+TimeoutStartSec=15s
+RuntimeMaxSec=15s
+TasksMax=8
+MemoryMax=64M
+KillMode=mixed

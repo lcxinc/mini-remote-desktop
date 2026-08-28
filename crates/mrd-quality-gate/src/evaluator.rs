@@ -34,6 +34,11 @@ pub fn evaluate(run: &RemoteExperienceRun, policy: &GatePolicy) -> Evaluation {
     if let Err(error) = validate_artifact_for_policy(run, policy) {
         return Evaluation::invalid(error);
     }
+    if policy.multi_region_relay_requirements.is_some()
+        && (run.gate_status == Verdict::InfraFail || run.producer_status == "infra_failed")
+    {
+        return Evaluation::infra("multi-region relay infrastructure did not produce evidence");
+    }
 
     let mut failures = Vec::new();
     let required = policy
@@ -54,6 +59,7 @@ pub fn evaluate(run: &RemoteExperienceRun, policy: &GatePolicy) -> Evaluation {
     }
     evaluate_secure_lan_requirements(run, policy, &mut failures);
     evaluate_security_negative_requirements(run, policy, &mut failures);
+    evaluate_multi_region_relay_requirements(run, policy, &mut failures);
     if !failures.is_empty() {
         return Evaluation {
             verdict: Verdict::ProductFail,
@@ -106,6 +112,159 @@ pub fn evaluate(run: &RemoteExperienceRun, policy: &GatePolicy) -> Evaluation {
             verdict: Verdict::ProductFail,
             failures,
         }
+    }
+}
+
+fn evaluate_multi_region_relay_requirements(
+    run: &RemoteExperienceRun,
+    policy: &GatePolicy,
+    failures: &mut Vec<String>,
+) {
+    let Some(requirements) = &policy.multi_region_relay_requirements else {
+        return;
+    };
+    let Some(relay) = &run.relay else {
+        failures.push("multi-region relay runtime evidence is missing".to_owned());
+        return;
+    };
+
+    if run.route.selected != requirements.route_selected {
+        failures.push(format!(
+            "selected route is {}, expected {}",
+            run.route.selected, requirements.route_selected
+        ));
+    }
+    if run.route.candidate_pair != "relay/relay" {
+        failures.push("route candidate_pair is not relay/relay".to_owned());
+    }
+    if requirements.require_signed_directory && !relay.directory.signature_verified {
+        failures.push("relay directory signature was not verified".to_owned());
+    }
+    if relay.directory.policy_revision == 0 {
+        failures.push("relay directory policy revision is zero".to_owned());
+    }
+    if relay.directory.expires_at_ms < relay.reservation.expires_at_ms {
+        failures.push("relay reservation outlives its signed directory".to_owned());
+    }
+    if relay.primary.node_id == relay.backup.node_id {
+        failures.push("primary and backup relay nodes are identical".to_owned());
+    }
+    if requirements.require_distinct_regions && relay.primary.region == relay.backup.region {
+        failures.push("primary and backup relay regions are identical".to_owned());
+    }
+    if requirements.require_distinct_failure_domains
+        && relay.primary.failure_domain == relay.backup.failure_domain
+    {
+        failures.push("primary and backup relay failure domains are identical".to_owned());
+    }
+    if !relay.reservation.committed {
+        failures.push("relay capacity reservations were not committed".to_owned());
+    }
+    if relay.reservation.primary_node_id != relay.primary.node_id
+        || relay.reservation.backup_node_id != relay.backup.node_id
+    {
+        failures.push("relay reservations are not bound to the selected nodes".to_owned());
+    }
+    if relay.reservation.primary_reservation_id == relay.reservation.backup_reservation_id {
+        failures.push("primary and backup relay reservations are identical".to_owned());
+    }
+    if requirements.require_relay_candidate_pair
+        && (relay.selected_pair.local_candidate_type != "relay"
+            || relay.selected_pair.remote_candidate_type != "relay"
+            || !relay.selected_pair.nominated
+            || !relay.selected_pair.runtime_verified)
+    {
+        failures.push("runtime-selected ICE pair is not a nominated relay/relay pair".to_owned());
+    }
+    if relay.selected_pair.relay_node_id != relay.backup.node_id {
+        failures.push("runtime-selected relay does not name the backup node".to_owned());
+    }
+    if !matches!(
+        relay.selected_pair.transport.as_str(),
+        "udp" | "tcp" | "tls"
+    ) {
+        failures.push(format!(
+            "unsupported selected relay transport: {}",
+            relay.selected_pair.transport
+        ));
+    }
+    if !relay.allocation.primary_established || !relay.allocation.backup_established {
+        failures.push("TURN allocations were not established on both relay nodes".to_owned());
+    }
+    if relay.allocation.primary_node_id != relay.primary.node_id
+        || relay.allocation.backup_node_id != relay.backup.node_id
+    {
+        failures.push("TURN allocations are not bound to the selected nodes".to_owned());
+    }
+    if relay.allocation.primary_allocation_id == relay.allocation.backup_allocation_id {
+        failures.push("primary and backup TURN allocations are identical".to_owned());
+    }
+    if relay.allocation.relayed_bytes_before_failure == 0 {
+        failures.push("primary TURN allocation relayed no data before failure".to_owned());
+    }
+    if relay.injected_failure.target_node_id != relay.primary.node_id {
+        failures.push("injected failure did not target the primary relay".to_owned());
+    }
+    if relay.detection.detected_at_ms < relay.injected_failure.injected_at_ms
+        || relay.detection.removed_at_ms < relay.detection.detected_at_ms
+    {
+        failures.push("relay failure detection timestamps are out of order".to_owned());
+    } else if relay.detection.removed_at_ms - relay.injected_failure.injected_at_ms
+        > requirements.max_node_removal_ms
+    {
+        failures.push(format!(
+            "failed relay removal exceeded {}ms",
+            requirements.max_node_removal_ms
+        ));
+    }
+    if relay.generation.before.checked_add(1) != Some(relay.generation.after) {
+        failures.push("relay migration generation did not advance exactly once".to_owned());
+    }
+    if relay.restored_media.backup_node_id != relay.backup.node_id {
+        failures.push("restored media does not name the backup relay".to_owned());
+    }
+    if !relay.restored_media.media_resumed {
+        failures.push("media did not resume after relay migration".to_owned());
+    }
+    if relay.restored_media.resumed_at_ms < relay.injected_failure.injected_at_ms {
+        failures.push("media recovery timestamp precedes failure injection".to_owned());
+    } else if relay.restored_media.resumed_at_ms - relay.injected_failure.injected_at_ms
+        > requirements.max_media_recovery_ms
+    {
+        failures.push(format!(
+            "media recovery exceeded {}ms",
+            requirements.max_media_recovery_ms
+        ));
+    }
+    if relay.restored_media.video_frames_after_recovery
+        < requirements.min_video_frames_after_recovery
+    {
+        failures.push("restored video frame evidence is below minimum".to_owned());
+    }
+    if relay.restored_media.audio_packets_after_recovery
+        < requirements.min_audio_packets_after_recovery
+    {
+        failures.push("restored audio packet evidence is below minimum".to_owned());
+    }
+    if relay.restored_media.control_events_after_recovery
+        < requirements.min_control_events_after_recovery
+    {
+        failures.push("restored control evidence is below minimum".to_owned());
+    }
+    if requirements.require_permissions_unchanged && !relay.restored_media.permissions_unchanged {
+        failures.push("session permissions changed during relay migration".to_owned());
+    }
+    if requirements.require_release_all && !relay.restored_media.release_all_recorded {
+        failures.push("ReleaseAll was not recorded before migration".to_owned());
+    }
+    if requirements.require_cleanup
+        && !(relay.cleanup.reservation_released
+            && relay.cleanup.old_allocation_closed
+            && relay.cleanup.replacement_allocation_closed
+            && relay.cleanup.input_thawed
+            && relay.cleanup.lab_reset)
+    {
+        failures.push("multi-region relay cleanup is incomplete".to_owned());
     }
 }
 

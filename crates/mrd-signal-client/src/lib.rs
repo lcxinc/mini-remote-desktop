@@ -38,13 +38,24 @@ pub fn decode_authenticated_message(raw: &str) -> Result<SignalEnvelope, SignalC
     if raw.len() > MAX_SIGNAL_MESSAGE_BYTES {
         return Err(SignalClientError::MessageTooLarge);
     }
-    serde_json::from_str(raw).map_err(Into::into)
+    let value: serde_json::Value = serde_json::from_str(raw)?;
+    if let (Some(version), Some(message_type)) = (
+        value.get("version").and_then(serde_json::Value::as_u64),
+        value
+            .get("message")
+            .and_then(|message| message.get("type"))
+            .and_then(serde_json::Value::as_str),
+    ) {
+        SignalEnvelope::validate_wire_version(version, message_type)?;
+    }
+    serde_json::from_value(value).map_err(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         decode_authenticated_message, decode_message, encode_authenticated_message, encode_message,
+        SignalClientError,
     };
     use mrd_proto::{BackendRole, DeviceId, SessionId};
     use mrd_signal_proto::{RegisterRequest, SessionAccept, SessionRequest, SignalMessage};
@@ -117,6 +128,29 @@ mod tests {
         ));
         envelope.version = SIGNAL_PROTOCOL_VERSION + 1;
         assert!(encode_authenticated_message(&envelope).is_err());
+    }
+
+    #[test]
+    fn authenticated_wire_decode_preserves_unsupported_version() {
+        use mrd_signal_proto::{ProtocolReasonCode, SignalProtocolError};
+
+        for raw in [
+            r#"{"version":2,"message":{"type":"session_intent","payload":{}}}"#,
+            r#"{"version":3,"message":{"type":"protocol_error","payload":{"reason":"malformed","correlation_id":null,"detail":"request rejected"}}}"#,
+        ] {
+            let error = decode_authenticated_message(raw).unwrap_err();
+            assert!(matches!(
+                error,
+                SignalClientError::Protocol(SignalProtocolError::UnsupportedVersion)
+            ));
+            let SignalClientError::Protocol(protocol) = error else {
+                unreachable!()
+            };
+            assert_eq!(
+                protocol.reason_code(),
+                ProtocolReasonCode::UnsupportedVersion
+            );
+        }
     }
 
     #[test]

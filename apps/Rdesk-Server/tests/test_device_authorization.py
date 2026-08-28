@@ -3,6 +3,8 @@ import sys
 import types
 import unittest
 
+from pydantic import ValidationError
+
 
 class HTTPException(Exception):
     def __init__(self, status_code: int, detail: str):
@@ -36,6 +38,9 @@ class Column:
     def ilike(self, value):
         return ("ilike", value)
 
+    def is_(self, value):
+        return ("is", value)
+
 
 class Select:
     @classmethod
@@ -47,21 +52,34 @@ class Statement:
     def __init__(self):
         self.filters = []
 
-    def where(self, expression):
-        self.filters.append(expression)
+    def where(self, *expressions):
+        self.filters.extend(expressions)
         return self
 
     def options(self, _option):
+        return self
+
+    def with_for_update(self):
+        return self
+
+    def execution_options(self, **_options):
         return self
 
 
 class User:
     id = Column()
 
-    def __init__(self, user_id: str, role: str = "user", username: str = "user"):
+    def __init__(
+        self,
+        user_id: str,
+        role: str = "user",
+        username: str = "user",
+        tenant_id: str | None = None,
+    ):
         self.id = user_id
         self.role = role
         self.username = username
+        self.tenant_id = tenant_id or f"tenant-{user_id}"
 
 
 class Device:
@@ -71,6 +89,8 @@ class Device:
     motherboard_serial = Column()
     bound_user_id = Column()
     status = Column()
+    tenant_id = Column()
+    is_bound = Column()
 
     def __init__(
         self,
@@ -91,6 +111,9 @@ class Device:
         self.favorite = False
         self.bound_user_id = bound_user_id
         self.is_bound = bound_user_id is not None
+        self.tenant_id = (
+            f"tenant-{bound_user_id}" if bound_user_id is not None else "tenant-unbound"
+        )
         self.bound_at = None
 
 
@@ -100,10 +123,12 @@ STUBBED_MODULE_NAMES = (
     "sqlalchemy.ext",
     "sqlalchemy.ext.asyncio",
     "sqlalchemy.orm",
+    "app.core.response_security",
     "app.core.security",
     "app.db.session",
     "app.models.device",
     "app.models.user",
+    "app.services.device_enrollment",
 )
 MISSING_MODULE = object()
 
@@ -114,6 +139,12 @@ def _install_dependency_stubs() -> None:
     fastapi.Depends = Depends
     fastapi.HTTPException = HTTPException
     fastapi.Query = Query
+    fastapi.status = types.SimpleNamespace(
+        HTTP_401_UNAUTHORIZED=401,
+        HTTP_403_FORBIDDEN=403,
+        HTTP_409_CONFLICT=409,
+        HTTP_503_SERVICE_UNAVAILABLE=503,
+    )
 
     sqlalchemy = types.ModuleType("sqlalchemy")
     sqlalchemy.Select = Select
@@ -126,7 +157,15 @@ def _install_dependency_stubs() -> None:
 
     security = types.ModuleType("app.core.security")
     security.create_access_token = lambda *_args: "token"
+    security.create_device_access_token = lambda *_args: "device-token"
+    security.get_device_enrollment_token_optional = object()
+    security.get_current_device = object()
+    security.get_current_device_optional = object()
     security.get_current_user = object()
+    security.get_current_user_optional = object()
+    security.require_admin = object()
+    response_security = types.ModuleType("app.core.response_security")
+    response_security.no_store_sensitive_response = object()
     session = types.ModuleType("app.db.session")
     session.get_db = object()
     device_model = types.ModuleType("app.models.device")
@@ -134,6 +173,18 @@ def _install_dependency_stubs() -> None:
     device_model.generate_device_id_from_serial = lambda _serial: "123456789012"
     user_model = types.ModuleType("app.models.user")
     user_model.User = User
+    enrollment = types.ModuleType("app.services.device_enrollment")
+
+    class DeviceEnrollmentError(Exception):
+        pass
+
+    class DeviceEnrollmentService:
+        def __init__(self, **_kwargs):
+            pass
+
+    enrollment.DeviceEnrollmentError = DeviceEnrollmentError
+    enrollment.DeviceEnrollmentService = DeviceEnrollmentService
+    enrollment.device_serial_digest = lambda serial, **_kwargs: serial
 
     sys.modules.update(
         {
@@ -142,10 +193,12 @@ def _install_dependency_stubs() -> None:
             "sqlalchemy.ext": sqlalchemy_ext,
             "sqlalchemy.ext.asyncio": sqlalchemy_asyncio,
             "sqlalchemy.orm": sqlalchemy_orm,
+            "app.core.response_security": response_security,
             "app.core.security": security,
             "app.db.session": session,
             "app.models.device": device_model,
             "app.models.user": user_model,
+            "app.services.device_enrollment": enrollment,
         }
     )
 
@@ -208,20 +261,19 @@ class FakeSession:
     async def commit(self):
         self.commit_count += 1
 
+    async def flush(self):
+        return None
+
+    async def rollback(self):
+        return None
+
 
 class DeviceAuthorizationTests(unittest.IsolatedAsyncioTestCase):
     async def test_spoofed_payload_user_id_is_rejected(self):
-        attacker = User("attacker")
         unbound = Device("device-1", None)
-        session = FakeSession(scalar_results=[unbound])
-        payload = schemas.DeviceBindRequest(device_id=unbound.device_id, user_id="victim")
-
-        with self.assertRaises(HTTPException) as raised:
-            await devices.bind_device(payload, attacker, session)
-
-        self.assertEqual(raised.exception.status_code, 403)
+        with self.assertRaises(ValidationError):
+            schemas.DeviceBindRequest(device_id=unbound.device_id, user_id="victim")
         self.assertIsNone(unbound.bound_user_id)
-        self.assertEqual(session.commit_count, 0)
 
     async def test_auto_bind_cannot_migrate_another_users_device(self):
         attacker = User("attacker")
@@ -230,9 +282,9 @@ class DeviceAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         payload = schemas.DeviceAutoBindRequest(device_id=victim_device.device_id)
 
         with self.assertRaises(HTTPException) as raised:
-            await devices.auto_bind_device(payload, attacker, session)
+            await devices.auto_bind_device(payload, attacker, victim_device, session)
 
-        self.assertEqual(raised.exception.status_code, 403)
+        self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(victim_device.bound_user_id, "victim")
         self.assertEqual(session.commit_count, 0)
 
@@ -262,7 +314,7 @@ class DeviceAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         session = FakeSession(scalar_results=[unbound])
         payload = schemas.DeviceBindRequest(device_id=unbound.device_id)
 
-        result = await devices.bind_device(payload, owner, session)
+        result = await devices.bind_device(payload, owner, unbound, session)
 
         self.assertEqual(result["user_id"], owner.id)
         self.assertEqual(unbound.bound_user_id, owner.id)

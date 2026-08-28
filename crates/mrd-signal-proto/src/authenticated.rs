@@ -1,18 +1,23 @@
 //! Versioned, end-to-end authenticated signaling messages.
 
+use crate::initial_v3::{
+    SessionGrantV3, SessionIntentV3, WebRtcAnswerV3, WebRtcCandidateV3, WebRtcOfferV3,
+};
 use mrd_identity::{public_key_id, verify_context_bytes, DeviceIdentity};
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::fmt;
 use thiserror::Error;
 
-pub const SIGNAL_PROTOCOL_VERSION: u16 = 2;
+pub const SIGNAL_PROTOCOL_V2: u16 = 2;
+pub const SIGNAL_PROTOCOL_V3: u16 = 3;
+pub const SIGNAL_PROTOCOL_VERSION: u16 = SIGNAL_PROTOCOL_V2;
 pub const SIGNAL_MAX_MESSAGE_LIFETIME_MS: u64 = 5 * 60 * 1_000;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SignalEnvelope {
-    #[serde(deserialize_with = "deserialize_protocol_version")]
     pub version: u16,
     pub message: AuthenticatedSignalMessage,
 }
@@ -20,29 +25,75 @@ pub struct SignalEnvelope {
 impl SignalEnvelope {
     pub fn new(message: AuthenticatedSignalMessage) -> Self {
         Self {
-            version: SIGNAL_PROTOCOL_VERSION,
+            version: message.required_version(),
             message,
         }
     }
 
     pub fn validate_version(&self) -> Result<(), SignalProtocolError> {
-        if self.version == SIGNAL_PROTOCOL_VERSION {
-            Ok(())
-        } else {
-            Err(SignalProtocolError::UnsupportedVersion)
+        if self.message.is_legacy_v2_initial() || self.version != self.message.required_version() {
+            return Err(SignalProtocolError::UnsupportedVersion);
         }
+        Ok(())
+    }
+
+    /// Validate the mandatory envelope/message pairing before decoding a
+    /// potentially sensitive authenticated payload.
+    pub fn validate_wire_version(
+        version: u64,
+        message_type: &str,
+    ) -> Result<(), SignalProtocolError> {
+        let required = match message_type {
+            "session_intent" | "session_grant" | "webrtc_offer" | "webrtc_answer"
+            | "webrtc_candidate" => return Err(SignalProtocolError::UnsupportedVersion),
+            "session_intent_v3"
+            | "session_grant_v3"
+            | "webrtc_offer_v3"
+            | "webrtc_answer_v3"
+            | "webrtc_candidate_v3" => u64::from(SIGNAL_PROTOCOL_V3),
+            "server_challenge"
+            | "register"
+            | "registered"
+            | "presence_heartbeat"
+            | "session_deny"
+            | "relay_migration_offer"
+            | "relay_migration_answer"
+            | "relay_migration_candidate"
+            | "session_close"
+            | "reconnect_request"
+            | "reconnect_grant"
+            | "protocol_error" => u64::from(SIGNAL_PROTOCOL_V2),
+            _ => return Ok(()),
+        };
+        if version != required {
+            return Err(SignalProtocolError::UnsupportedVersion);
+        }
+        Ok(())
     }
 }
 
-fn deserialize_protocol_version<'de, D>(deserializer: D) -> Result<u16, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let version = u16::deserialize(deserializer)?;
-    if version != SIGNAL_PROTOCOL_VERSION {
-        return Err(D::Error::custom("unsupported signaling protocol version"));
+impl<'de> Deserialize<'de> for SignalEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawEnvelope {
+            version: u16,
+            message: AuthenticatedSignalMessage,
+        }
+
+        let raw = RawEnvelope::deserialize(deserializer)?;
+        let envelope = Self {
+            version: raw.version,
+            message: raw.message,
+        };
+        envelope
+            .validate_version()
+            .map_err(|error| D::Error::custom(error.to_string()))?;
+        Ok(envelope)
     }
-    Ok(version)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,6 +109,14 @@ pub enum AuthenticatedSignalMessage {
     WebrtcOffer(WebRtcOffer),
     WebrtcAnswer(WebRtcAnswer),
     WebrtcCandidate(WebRtcCandidate),
+    SessionIntentV3(SessionIntentV3),
+    SessionGrantV3(SessionGrantV3),
+    WebrtcOfferV3(WebRtcOfferV3),
+    WebrtcAnswerV3(WebRtcAnswerV3),
+    WebrtcCandidateV3(WebRtcCandidateV3),
+    RelayMigrationOffer(RelayMigrationOffer),
+    RelayMigrationAnswer(RelayMigrationAnswer),
+    RelayMigrationCandidate(RelayMigrationCandidate),
     SessionClose(SessionClose),
     ReconnectRequest(ReconnectRequest),
     ReconnectGrant(ReconnectGrant),
@@ -65,6 +124,28 @@ pub enum AuthenticatedSignalMessage {
 }
 
 impl AuthenticatedSignalMessage {
+    pub fn required_version(&self) -> u16 {
+        match self {
+            Self::SessionIntentV3(_)
+            | Self::SessionGrantV3(_)
+            | Self::WebrtcOfferV3(_)
+            | Self::WebrtcAnswerV3(_)
+            | Self::WebrtcCandidateV3(_) => SIGNAL_PROTOCOL_V3,
+            _ => SIGNAL_PROTOCOL_V2,
+        }
+    }
+
+    fn is_legacy_v2_initial(&self) -> bool {
+        matches!(
+            self,
+            Self::SessionIntent(_)
+                | Self::SessionGrant(_)
+                | Self::WebrtcOffer(_)
+                | Self::WebrtcAnswer(_)
+                | Self::WebrtcCandidate(_)
+        )
+    }
+
     pub fn verify_for(
         &self,
         expected_peer: &DeviceId,
@@ -83,12 +164,20 @@ impl AuthenticatedSignalMessage {
             Self::Register(message) => verify!(message),
             Self::Registered(message) => verify!(message),
             Self::PresenceHeartbeat(message) => verify!(message),
-            Self::SessionIntent(message) => verify!(message),
-            Self::SessionGrant(message) => verify!(message),
+            Self::SessionIntent(_)
+            | Self::SessionGrant(_)
+            | Self::WebrtcOffer(_)
+            | Self::WebrtcAnswer(_)
+            | Self::WebrtcCandidate(_) => Err(SignalProtocolError::UnsupportedVersion),
+            Self::SessionIntentV3(message) => verify!(message),
+            Self::SessionGrantV3(message) => verify!(message),
+            Self::WebrtcOfferV3(message) => verify!(message),
+            Self::WebrtcAnswerV3(message) => verify!(message),
+            Self::WebrtcCandidateV3(message) => verify!(message),
             Self::SessionDeny(message) => verify!(message),
-            Self::WebrtcOffer(message) => verify!(message),
-            Self::WebrtcAnswer(message) => verify!(message),
-            Self::WebrtcCandidate(message) => verify!(message),
+            Self::RelayMigrationOffer(message) => verify!(message),
+            Self::RelayMigrationAnswer(message) => verify!(message),
+            Self::RelayMigrationCandidate(message) => verify!(message),
             Self::SessionClose(message) => verify!(message),
             Self::ReconnectRequest(message) => verify!(message),
             Self::ReconnectGrant(message) => verify!(message),
@@ -153,12 +242,23 @@ pub trait AuthenticatedPayload: Serialize {
     fn validate_payload(&self) -> Result<(), SignalProtocolError>;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SignedSignal<T> {
     pub payload: T,
     pub signer_public_key: Vec<u8>,
     pub signature: Vec<u8>,
+}
+
+impl<T> fmt::Debug for SignedSignal<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SignedSignal")
+            .field("payload", &"REDACTED")
+            .field("signer_public_key_len", &self.signer_public_key.len())
+            .field("signature_len", &self.signature.len())
+            .finish()
+    }
 }
 
 impl<T> SignedSignal<T>
@@ -346,12 +446,23 @@ pub enum ProtocolReasonCode {
     Internal,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SignalErrorMessage {
     pub reason: ProtocolReasonCode,
     pub correlation_id: Option<[u8; 16]>,
     pub detail: String,
+}
+
+impl std::fmt::Debug for SignalErrorMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SignalErrorMessage")
+            .field("reason", &self.reason)
+            .field("correlation_id", &self.correlation_id)
+            .field("detail", &"REDACTED")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -453,24 +564,6 @@ pub struct SessionIntentPayload {
     pub target_device_id: DeviceId,
     pub requested_transport: String,
 }
-signed_payload!(
-    SessionIntentPayload,
-    "MRD_SIGNAL_SESSION_INTENT_V2",
-    message,
-    {
-        {
-            validate_identifier(&message.session_id.0)?;
-            validate_identifier(&message.target_device_id.0)?;
-            if message.idempotency_key == [0; 16] {
-                return Err(SignalProtocolError::Malformed);
-            }
-            if message.target_device_id != message.claims.intended_peer_device_id {
-                return Err(SignalProtocolError::WrongIntendedPeer);
-            }
-            validate_text(&message.requested_transport, 1, 32)
-        }
-    }
-);
 pub type SessionIntent = SignedSignal<SessionIntentPayload>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -482,30 +575,6 @@ pub struct SessionGrantPayload {
     pub accepted_transport: String,
     pub accepted_candidate_fingerprints: BTreeSet<String>,
 }
-signed_payload!(
-    SessionGrantPayload,
-    "MRD_SIGNAL_SESSION_GRANT_V2",
-    message,
-    {
-        {
-            validate_identifier(&message.session_id.0)?;
-            validate_identifier(&message.controller_device_id.0)?;
-            if message.controller_device_id != message.claims.intended_peer_device_id {
-                return Err(SignalProtocolError::WrongIntendedPeer);
-            }
-            validate_text(&message.accepted_transport, 1, 32)?;
-            if message.accepted_transport == "webrtc"
-                && message.accepted_candidate_fingerprints.is_empty()
-            {
-                return Err(SignalProtocolError::Malformed);
-            }
-            for fingerprint in &message.accepted_candidate_fingerprints {
-                validate_fingerprint(fingerprint)?;
-            }
-            Ok(())
-        }
-    }
-);
 pub type SessionGrant = SignedSignal<SessionGrantPayload>;
 
 impl SessionGrantPayload {
@@ -546,11 +615,6 @@ pub struct WebRtcOfferPayload {
     pub sdp: String,
     pub candidate_fingerprints: BTreeSet<String>,
 }
-signed_payload!(WebRtcOfferPayload, "MRD_SIGNAL_WEBRTC_OFFER_V2", message, {
-    {
-        validate_description(message)
-    }
-});
 pub type WebRtcOffer = SignedSignal<WebRtcOfferPayload>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -561,31 +625,7 @@ pub struct WebRtcAnswerPayload {
     pub sdp: String,
     pub candidate_fingerprints: BTreeSet<String>,
 }
-signed_payload!(
-    WebRtcAnswerPayload,
-    "MRD_SIGNAL_WEBRTC_ANSWER_V2",
-    message,
-    {
-        {
-            validate_identifier(&message.session_id.0)?;
-            validate_text(&message.sdp, 1, 256 * 1_024)?;
-            for fingerprint in &message.candidate_fingerprints {
-                validate_fingerprint(fingerprint)?;
-            }
-            Ok(())
-        }
-    }
-);
 pub type WebRtcAnswer = SignedSignal<WebRtcAnswerPayload>;
-
-fn validate_description(value: &WebRtcOfferPayload) -> Result<(), SignalProtocolError> {
-    validate_identifier(&value.session_id.0)?;
-    validate_text(&value.sdp, 1, 256 * 1_024)?;
-    for fingerprint in &value.candidate_fingerprints {
-        validate_fingerprint(fingerprint)?;
-    }
-    Ok(())
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -597,22 +637,206 @@ pub struct WebRtcCandidatePayload {
     pub sdp_mline_index: Option<u16>,
     pub candidate_fingerprint: String,
 }
+pub type WebRtcCandidate = SignedSignal<WebRtcCandidatePayload>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RelayMigrationOfferPayload {
+    pub claims: AuthClaims,
+    pub session_id: SessionId,
+    pub migration_generation: u64,
+    pub directory_id: String,
+    pub node_id: String,
+    pub sdp: String,
+    pub restart_route_token: String,
+    pub candidate_fingerprints: BTreeSet<String>,
+}
 signed_payload!(
-    WebRtcCandidatePayload,
-    "MRD_SIGNAL_WEBRTC_CANDIDATE_V2",
+    RelayMigrationOfferPayload,
+    "MRD_SIGNAL_RELAY_MIGRATION_OFFER_V2",
     message,
     {
         {
-            validate_identifier(&message.session_id.0)?;
+            validate_migration_description(
+                &message.session_id,
+                message.migration_generation,
+                &message.directory_id,
+                &message.node_id,
+                &message.sdp,
+                &message.restart_route_token,
+                &message.candidate_fingerprints,
+            )
+        }
+    }
+);
+pub type RelayMigrationOffer = SignedSignal<RelayMigrationOfferPayload>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RelayMigrationAnswerPayload {
+    pub claims: AuthClaims,
+    pub session_id: SessionId,
+    pub migration_generation: u64,
+    pub directory_id: String,
+    pub node_id: String,
+    pub sdp: String,
+    pub restart_route_token: String,
+    pub candidate_fingerprints: BTreeSet<String>,
+}
+signed_payload!(
+    RelayMigrationAnswerPayload,
+    "MRD_SIGNAL_RELAY_MIGRATION_ANSWER_V2",
+    message,
+    {
+        {
+            validate_migration_description(
+                &message.session_id,
+                message.migration_generation,
+                &message.directory_id,
+                &message.node_id,
+                &message.sdp,
+                &message.restart_route_token,
+                &message.candidate_fingerprints,
+            )
+        }
+    }
+);
+pub type RelayMigrationAnswer = SignedSignal<RelayMigrationAnswerPayload>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RelayMigrationCandidatePayload {
+    pub claims: AuthClaims,
+    pub session_id: SessionId,
+    pub migration_generation: u64,
+    pub directory_id: String,
+    pub node_id: String,
+    pub candidate: String,
+    pub sdp_mid: Option<String>,
+    pub sdp_mline_index: Option<u16>,
+    pub username_fragment: Option<String>,
+    pub restart_route_token: String,
+    pub candidate_fingerprint: String,
+}
+signed_payload!(
+    RelayMigrationCandidatePayload,
+    "MRD_SIGNAL_RELAY_MIGRATION_CANDIDATE_V2",
+    message,
+    {
+        {
+            validate_migration_binding(
+                &message.session_id,
+                message.migration_generation,
+                &message.directory_id,
+                &message.node_id,
+            )?;
             validate_text(&message.candidate, 1, 8_192)?;
             if let Some(mid) = &message.sdp_mid {
                 validate_text(mid, 1, 128)?;
             }
-            validate_fingerprint(&message.candidate_fingerprint)
+            if let Some(username_fragment) = &message.username_fragment {
+                validate_text(username_fragment, 1, 256)?;
+            }
+            validate_restart_route_token(&message.restart_route_token)?;
+            validate_fingerprint(&message.candidate_fingerprint)?;
+            if relay_candidate_fingerprint(
+                &message.session_id,
+                message.migration_generation,
+                &message.candidate,
+                message.sdp_mid.as_deref(),
+                message.sdp_mline_index,
+                message.username_fragment.as_deref(),
+                &message.restart_route_token,
+            ) != message.candidate_fingerprint
+            {
+                return Err(SignalProtocolError::Malformed);
+            }
+            Ok(())
         }
     }
 );
-pub type WebRtcCandidate = SignedSignal<WebRtcCandidatePayload>;
+pub type RelayMigrationCandidate = SignedSignal<RelayMigrationCandidatePayload>;
+
+fn validate_migration_description(
+    session_id: &SessionId,
+    migration_generation: u64,
+    directory_id: &str,
+    node_id: &str,
+    sdp: &str,
+    restart_route_token: &str,
+    candidate_fingerprints: &BTreeSet<String>,
+) -> Result<(), SignalProtocolError> {
+    validate_migration_binding(session_id, migration_generation, directory_id, node_id)?;
+    validate_text(sdp, 1, 256 * 1_024)?;
+    validate_restart_route_token(restart_route_token)?;
+    if candidate_fingerprints.is_empty() || candidate_fingerprints.len() > 256 {
+        return Err(SignalProtocolError::Malformed);
+    }
+    for fingerprint in candidate_fingerprints {
+        validate_fingerprint(fingerprint)?;
+    }
+    Ok(())
+}
+
+fn validate_restart_route_token(value: &str) -> Result<(), SignalProtocolError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(SignalProtocolError::Malformed);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn relay_candidate_fingerprint(
+    session_id: &SessionId,
+    generation: u64,
+    candidate: &str,
+    sdp_mid: Option<&str>,
+    sdp_mline_index: Option<u16>,
+    username_fragment: Option<&str>,
+    restart_route_token: &str,
+) -> String {
+    let generation = generation.to_be_bytes();
+    let sdp_mline_index = sdp_mline_index.unwrap_or(u16::MAX).to_be_bytes();
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    for field in [
+        b"MRD_RELAY_CANDIDATE_V1\0".as_slice(),
+        session_id.0.as_bytes(),
+        generation.as_slice(),
+        candidate.as_bytes(),
+        sdp_mid.unwrap_or_default().as_bytes(),
+        sdp_mline_index.as_slice(),
+        username_fragment.unwrap_or_default().as_bytes(),
+        restart_route_token.as_bytes(),
+    ] {
+        context.update(&(field.len() as u64).to_be_bytes());
+        context.update(field);
+    }
+    context
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn validate_migration_binding(
+    session_id: &SessionId,
+    migration_generation: u64,
+    directory_id: &str,
+    node_id: &str,
+) -> Result<(), SignalProtocolError> {
+    validate_identifier(&session_id.0)?;
+    validate_identifier(directory_id)?;
+    validate_identifier(node_id)?;
+    if migration_generation == 0 {
+        return Err(SignalProtocolError::Malformed);
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

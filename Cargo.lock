@@ -1517,6 +1517,7 @@ checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
 dependencies = [
  "pkcs8",
  "signature",
+ "zeroize",
 ]
 
 [[package]]
@@ -2677,7 +2678,11 @@ name = "integration-tests"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "ed25519-dalek",
  "mrd-agent-ipc",
+ "mrd-application",
  "mrd-capture-winrt",
  "mrd-decode",
  "mrd-decode-nvdec",
@@ -2687,6 +2692,7 @@ dependencies = [
  "mrd-observability",
  "mrd-pipeline-core",
  "mrd-proto",
+ "mrd-relay-control",
  "mrd-render",
  "mrd-render-d3d11",
  "mrd-render-macos",
@@ -2694,7 +2700,10 @@ dependencies = [
  "mrd-session",
  "mrd-session-agent",
  "mrd-transport-quic-quinn",
+ "ring",
+ "serde_json",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -3464,6 +3473,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "mrd-relay-agent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "ed25519",
+ "ed25519-dalek",
+ "libc",
+ "mrd-transport-webrtc",
+ "rand 0.8.7",
+ "rcgen 0.13.2",
+ "reqwest 0.12.28",
+ "ring",
+ "rustls-pki-types",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "url",
+ "windows-service",
+ "windows-sys 0.59.0",
+ "x509-parser 0.16.0",
+ "zeroize",
+]
+
+[[package]]
+name = "mrd-relay-control"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "mrd-render"
 version = "0.1.0"
 dependencies = [
@@ -3548,6 +3600,7 @@ dependencies = [
  "mrd-ipc",
  "mrd-pipeline-core",
  "mrd-proto",
+ "mrd-relay-control",
  "mrd-render",
  "mrd-render-d3d11",
  "mrd-render-macos",
@@ -3559,6 +3612,7 @@ dependencies = [
  "mrd-transport-webrtc",
  "nix 0.29.0",
  "realtime-server",
+ "reqwest 0.12.28",
  "ring",
  "rusqlite",
  "rustls",
@@ -3566,6 +3620,7 @@ dependencies = [
  "serde_json",
  "sysinfo",
  "thiserror 1.0.69",
+ "time",
  "tokio",
  "tokio-tungstenite 0.24.0",
  "tower-http",
@@ -3688,15 +3743,21 @@ name = "mrd-transport-webrtc"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "getrandom 0.3.4",
  "mrd-encode-nvenc",
  "mrd-observability",
  "mrd-pipeline-core",
+ "rcgen 0.13.2",
  "rtp",
  "rustls",
+ "rustls-platform-verifier",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls",
  "webrtc",
+ "zeroize",
 ]
 
 [[package]]
@@ -4826,6 +4887,7 @@ dependencies = [
  "time",
  "x509-parser 0.16.0",
  "yasna 0.5.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -4977,6 +5039,7 @@ dependencies = [
  "bytes",
  "encoding_rs",
  "futures-core",
+ "futures-util",
  "h2",
  "http",
  "http-body",
@@ -5001,12 +5064,14 @@ dependencies = [
  "tokio",
  "tokio-native-tls",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams 0.4.2",
  "web-sys",
  "webpki-roots 1.0.9",
 ]
@@ -5041,7 +5106,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
+ "wasm-streams 0.5.0",
  "web-sys",
 ]
 
@@ -5390,6 +5455,16 @@ dependencies = [
  "generic-array",
  "pkcs8",
  "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
+ "serde",
  "zeroize",
 ]
 
@@ -7263,6 +7338,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1b4cb0cc549fcf58d7dfc081778139b3d283a081644e833e84682ad71cea24"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

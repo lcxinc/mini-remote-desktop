@@ -11,7 +11,7 @@ use mrd_service::agent_runtime::{
 use mrd_service::{
     app_state::{self, AppState},
     ipc_server::IpcServer,
-    lan_discovery, security, shell, signaling, web_bridge,
+    lan_discovery, relay, security, shell, signaling, wan_session, web_bridge,
     windows_service::{
         ServiceControl as LifecycleControl, ServiceLifecycle,
         SessionChange as LifecycleSessionChange, MRD_WINDOWS_SERVICE_SID,
@@ -126,6 +126,40 @@ async fn run_service(
         }
     }
 
+    let wan_backend = if let Some(config) = wan_session::config::WanSessionBackendConfig::from_env()
+        .context("WAN session backend configuration failed")?
+    {
+        let backend: Arc<dyn wan_session::backend::WanSessionBackend> = Arc::new(
+            wan_session::backend::HttpWanSessionBackend::new(config)
+                .context("WAN session backend startup failed")?,
+        );
+        app_state
+            .bind_wan_session_backend(Arc::clone(&backend))
+            .map_err(anyhow::Error::msg)?;
+        info!("Device-authenticated WAN session backend configured");
+        Some(backend)
+    } else {
+        info!("Initial WAN sessions disabled (MRD_WAN_SESSION_API_URL is unset)");
+        None
+    };
+
+    let relay_client = if let Some(config) =
+        relay::RelayClientConfig::from_env().context("relay directory configuration failed")?
+    {
+        let client = Arc::new(
+            relay::RelayDirectoryClient::new(config)
+                .context("relay directory client startup failed")?,
+        );
+        app_state
+            .bind_relay_directory_client(client)
+            .map_err(anyhow::Error::msg)?;
+        info!("Verified multi-region relay directory configured");
+        app_state.relay_directory_client()
+    } else {
+        info!("Multi-region relay directory disabled (MRD_RELAY_DIRECTORY_URL is unset)");
+        None
+    };
+
     let signaling_task = signaling::spawn_from_env(Arc::clone(&app_state))
         .await
         .context("authenticated signaling startup failed")?;
@@ -135,12 +169,68 @@ async fn run_service(
         info!("Authenticated realtime signaling disabled (MRD_SIGNAL_URL is unset)");
     }
 
-    let ipc_server = IpcServer::new(app_state);
+    let relay_responder = if let (Some(client), true) = (relay_client, signaling_task.is_some()) {
+        let executor: Arc<dyn relay::RelayMigrationExecutor> = Arc::new(
+            relay::ServiceRelayMigrationExecutor::new(
+                Arc::clone(&app_state),
+                std::time::Duration::from_secs(20),
+            )
+            .context("relay migration executor configuration failed")?,
+        );
+        let provider: Arc<dyn relay::RelayAccessProvider> = client;
+        let input: Arc<dyn relay::RelayInputBarrier> =
+            Arc::new(relay::ServiceRelayInputBarrier::new(&app_state));
+        let coordinator = Arc::new(
+            relay::RelayFailoverCoordinator::new(
+                provider,
+                executor,
+                input,
+                Arc::new(relay::SystemRelayClock),
+                std::time::Duration::from_secs(3),
+            )
+            .context("relay failover coordinator configuration failed")?,
+        );
+        app_state
+            .bind_relay_failover_coordinator(Arc::clone(&coordinator))
+            .map_err(anyhow::Error::msg)?;
+        info!("Authenticated multi-region relay failover runtime started");
+        Some(relay::spawn_relay_migration_responder(
+            Arc::clone(&app_state),
+            coordinator,
+        ))
+    } else {
+        if app_state.relay_directory_client().is_some() {
+            warn!("Relay directory is configured but failover is inactive without signaling");
+        }
+        None
+    };
+
+    let wan_session_task = if let (Some(backend), true) = (wan_backend, relay_responder.is_some()) {
+        let task = wan_session::service::bind_and_spawn_wan_session_service(
+            Arc::clone(&app_state),
+            backend,
+        )
+        .await
+        .context("attended WAN session runtime startup failed")?;
+        info!("Attended WAN relay session runtime started");
+        Some(task)
+    } else {
+        if app_state.wan_session_backend().is_some() {
+            warn!(
+                "WAN session backend is configured but initial WAN sessions are inactive without authenticated signaling and relay failover"
+            );
+        }
+        None
+    };
+
+    let ipc_server = IpcServer::new(Arc::clone(&app_state));
     let web_bridge_task = web_bridge::spawn_from_env(ipc_server.clone()).await?;
     let mut ipc_task = Box::pin(ipc_server.run());
     let mut web_task = Box::pin(web_bridge::wait_for_task(web_bridge_task));
     let mut agent_reconcile = tokio::time::interval(std::time::Duration::from_secs(5));
     agent_reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut wan_session_expiry = tokio::time::interval(std::time::Duration::from_secs(1));
+    wan_session_expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     reporter.running()?;
     info!("mrd-service running");
 
@@ -179,14 +269,28 @@ async fn run_service(
                     supervisor.reconcile().await;
                 }
             }
+            _ = wan_session_expiry.tick(), if app_state.wan_session_coordinator().is_some() => {
+                if let Some(coordinator) = app_state.wan_session_coordinator() {
+                    let _ = coordinator.expire_due_sessions().await;
+                }
+            }
         }
     };
 
     reporter.stop_pending()?;
     drop(ipc_task);
     drop(web_task);
+    if let Some(wan_session_task) = wan_session_task {
+        wan_session_task.shutdown().await;
+    }
+    if let Some(relay_responder) = relay_responder {
+        relay_responder.shutdown().await;
+    }
     if let Some(signaling_task) = signaling_task {
         signaling_task.shutdown().await;
+    }
+    if let Err(error) = app_state.webrtc_host.shutdown().await {
+        runtime_error.get_or_insert_with(|| error.into());
     }
     if let Some(supervisor) = agents.as_mut() {
         if let Err(error) = supervisor.stop_all(shutdown_reason).await {

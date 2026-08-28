@@ -1,0 +1,17 @@
+table inet mrd_relay {
+  chain mrd_relay_owner_v1 {
+    comment "mrd-relay-owner-v1"
+  }
+
+  chain input {
+    type filter hook input priority -5; policy accept;
+
+    udp dport 3478 accept
+    tcp dport { 3478, CHANGE_ME_TLS_PORT } accept
+    meta l4proto { tcp, udp } th dport 49160-49260 accept
+
+    iifname "lo" ip saddr 127.0.0.0/8 tcp dport 9641 accept
+    iifname "lo" ip6 saddr ::1 tcp dport 9641 accept
+    tcp dport 9641 drop
+  }
+}

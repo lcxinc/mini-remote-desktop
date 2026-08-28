@@ -1326,7 +1326,7 @@ use mrd_ipc::{
     AuditEventMetadataV2, AuditEventPageV2, AuditEventV2, AuditEventsQueryV2, ConsentDecision,
     ConsentResponse, DecimalU64, RemoteAccessMode, RemoteAuthorizationState, RemoteCursorState,
     RemoteFailure, RemoteMediaState, RemotePermissionScope, RemotePresentationState,
-    RemoteReasonCode, RemoteRouteKind, RemoteRouteState, RemoteSessionEvent,
+    RemoteReasonCode, RemoteRouteKind, RemoteRoutePreference, RemoteRouteState, RemoteSessionEvent,
     RemoteSessionEventEnvelope, RemoteSessionRequest, RemoteSessionRole, RemoteSessionSnapshot,
     RouteCandidateEvidence, RouteCandidateState, RouteEvidence, SessionEventSubscription,
     SessionEventSubscriptionQuery, SessionPermissionChange, TrustedDeviceApproval,
@@ -1360,6 +1360,31 @@ fn secure_remote_session_fixture() -> RemoteSessionSnapshot {
         created_at_ms: 1_700_000_000_000,
         updated_at_ms: 1_700_000_000_100,
         authorization_expires_at_ms: Some(1_700_000_030_000),
+    }
+}
+
+#[test]
+fn remote_route_preference_defaults_to_auto_when_omitted() {
+    let decoded: RemoteSessionRequest = serde_json::from_value(serde_json::json!({
+        "session_id": test_session_id(),
+        "target_device_id": test_device_id(),
+        "access_mode": "attended",
+        "requested_scopes": ["screen.view"],
+        "requested_profile": null
+    }))
+    .unwrap();
+
+    assert_eq!(decoded.route_preference, RemoteRoutePreference::Auto);
+}
+
+#[test]
+fn remote_route_preference_has_exact_wire_values() {
+    for (preference, expected) in [
+        (RemoteRoutePreference::Auto, "auto"),
+        (RemoteRoutePreference::Lan, "lan"),
+        (RemoteRoutePreference::WanRelay, "wan_relay"),
+    ] {
+        assert_eq!(serde_json::to_value(preference).unwrap(), expected);
     }
 }
 
@@ -1508,6 +1533,7 @@ fn secure_remote_requests_have_stable_tags_and_required_fields() {
                     session_id: test_session_id(),
                     target_device_id: test_device_id(),
                     access_mode: RemoteAccessMode::Attended,
+                    route_preference: RemoteRoutePreference::WanRelay,
                     requested_scopes: vec![RemotePermissionScope::ScreenView],
                     requested_profile: Some(test_media_profile()),
                 },

@@ -154,12 +154,7 @@ impl AuthenticatedControlReplayState {
             return Err(ControlSequenceError::Invalid);
         }
         if lane == AuthenticatedControlReplayLane::Cleanup {
-            if sequence
-                > self
-                    .reliable_next_sequence
-                    .checked_add(1)
-                    .unwrap_or(u64::MAX)
-            {
+            if sequence > self.reliable_next_sequence.saturating_add(1) {
                 return Err(ControlSequenceError::OutOfWindow);
             }
             if sequence < self.reliable_next_sequence {

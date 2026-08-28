@@ -16,11 +16,15 @@ use webrtc::{
     },
 };
 
+mod cleanup;
 mod config;
 mod control;
 mod peer;
+mod probe;
 mod stats;
+mod turn_stream;
 
+pub use cleanup::{cleanup_supervisor_snapshot, CleanupFailureSummary, CleanupSupervisorSnapshot};
 pub use config::{
     H264CodecConfig, H264CodecProfile, IceServerConfig, IceTransportPolicy, PeerConnectionConfig,
     PeerConnectionRole, VideoCodecConfig,
@@ -28,7 +32,11 @@ pub use config::{
 pub use control::{
     ControlChannelInfo, ControlChannels, ControlLane, BULK_LABEL, CTRL_REL_LABEL, CTRL_RT_LABEL,
 };
-pub use peer::{IceCandidate, SessionDescription, SessionDescriptionType, WebRtcPeerConnection};
+pub use peer::{
+    IceCandidate, RestartRouteEvidence, RestartRouteToken, SessionDescription,
+    SessionDescriptionType, WebRtcPeerConnection,
+};
+pub use probe::{probe_turn_relay, TurnRelayProbeConfig, TurnRelayProbeEvidence};
 pub use stats::{CandidateKind, SelectedCandidatePairStats};
 
 pub const DEFAULT_MAX_H264_ACCESS_UNIT_BYTES: usize = 4 * 1024 * 1024;
