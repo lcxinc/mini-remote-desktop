@@ -12,6 +12,10 @@ path = "src/lib.rs"
 name = "mrd-service"
 path = "src/main.rs"
 
+[[test]]
+name = "wan_session_e2e"
+path = "tests/wan_session_e2e.rs"
+
 [dependencies]
 async-trait = "0.1"
 ed25519-dalek.workspace = true

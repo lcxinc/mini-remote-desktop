@@ -30,6 +30,7 @@ mrd-decode = { path = "../../crates/mrd-decode" }
 mrd-render = { path = "../../crates/mrd-render" }
 mrd-transport-quic-quinn = { path = "../../crates/mrd-transport-quic-quinn" }
 mrd-observability = { path = "../../crates/mrd-observability" }
+ring.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 zeroize.workspace = true

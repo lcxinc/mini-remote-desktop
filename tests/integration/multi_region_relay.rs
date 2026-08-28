@@ -19,6 +19,7 @@ use mrd_service::{
     },
     transports::{memory::MemoryTransportMux, TransportMuxConfig},
 };
+use ring::digest::{digest, SHA256};
 use serde_json::json;
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
@@ -158,6 +159,28 @@ fn three_nodes_cover_selection_capacity_drain_and_lease_expiry() {
     assert_eq!(capacity.active.load(Ordering::Acquire), 0);
 }
 
+#[test]
+fn initial_wan_generation_zero_is_explicit_and_peer_bound() {
+    let context = RelayAccessContext::for_generation(
+        "initial-wan-integration-session",
+        7,
+        "target-device",
+        0,
+    )
+    .unwrap();
+    assert_eq!(context.generation(), Some(0));
+    assert!(!context.is_refresh());
+    assert_eq!(
+        context.intended_peer_digest(),
+        relay_peer_digest("target-device").unwrap()
+    );
+
+    let request = serde_json::to_value(&context).unwrap();
+    assert_eq!(request["generation"], json!(0));
+    assert!(request.get("refresh").is_none());
+    assert!(request.get("peer_digest").is_none());
+}
+
 #[derive(Default)]
 struct FakeBackend {
     responses: Mutex<VecDeque<Vec<u8>>>,
@@ -258,7 +281,7 @@ fn signing_key() -> SigningKey {
     SigningKey::from_bytes(&[0x42; 32])
 }
 
-fn relay_access_response() -> Vec<u8> {
+fn relay_access_response(generation: Option<u64>) -> Vec<u8> {
     let nodes = [
         ("relay-a", "ap-east", "rack-a"),
         ("relay-b", "ap-east", "rack-a"),
@@ -287,7 +310,12 @@ fn relay_access_response() -> Vec<u8> {
                     }],
                     capabilities: 1,
                     load_class: 1,
-                    selection_reason: "eligible".into(),
+                    selection_reason: if generation.is_some() && *node_id == "relay-a" {
+                        "preferred-region"
+                    } else {
+                        "eligible"
+                    }
+                    .into(),
                     reservation: RelayReservation {
                         reservation_id: format!("reservation-{node_id}"),
                         expires_at_ms,
@@ -314,7 +342,26 @@ fn relay_access_response() -> Vec<u8> {
             })
         })
         .collect::<Vec<_>>();
-    serde_json::to_vec(&json!({"directory": directory, "credentials": credentials})).unwrap()
+    serde_json::to_vec(&json!({
+        "generation": generation,
+        "directory_id": "directory-integration",
+        "relay_url_digest": generation.map(|_| relay_url_digest("turn:relay-a.example.test:3478?transport=udp")),
+        "directory": directory,
+        "credentials": credentials
+    }))
+    .unwrap()
+}
+
+fn relay_url_digest(url: &str) -> String {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"MRD_RELAY_URLS_V1\0");
+    bytes.extend_from_slice(&(url.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(url.as_bytes());
+    digest(&SHA256, &bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[tokio::test]
@@ -322,8 +369,8 @@ async fn relay_failure_migrates_then_security_dominates_and_closes_transports() 
     let backend = Arc::new(FakeBackend::default());
     {
         let mut responses = backend.responses.lock().unwrap();
-        responses.push_back(relay_access_response());
-        responses.push_back(relay_access_response());
+        responses.push_back(relay_access_response(None));
+        responses.push_back(relay_access_response(Some(1)));
     }
     let clock = Arc::new(FakeClock(AtomicU64::new(NOW_MS)));
     let config = RelayClientConfig::new(

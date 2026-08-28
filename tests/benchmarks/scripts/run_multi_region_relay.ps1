@@ -1,6 +1,7 @@
 param(
   [ValidateSet(
     "all",
+    "initial_wan_local",
     "linux_primary_linux_backup",
     "linux_primary_windows_backup",
     "failure_before_allocation",
@@ -17,6 +18,7 @@ param(
   [string]$OutputRoot = "artifacts/e2e/multi-region-relay",
   [string]$RepoRoot = "",
   [string]$LabControlPath = $env:MRD_RELAY_LAB_CONTROL,
+  [string]$InitialWanControlPath = $env:MRD_INITIAL_WAN_LAB_CONTROL,
   [string]$CargoCommand = "cargo"
 )
 
@@ -33,7 +35,21 @@ $OutputRoot = if ([System.IO.Path]::IsPathRooted($OutputRoot)) {
 }
 New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
 $summaryPath = Join-Path $OutputRoot "multi-region-relay-summary.json"
-$infrastructure = Test-MultiRegionRelayInfrastructure
+$infrastructureChecks = New-Object System.Collections.Generic.List[object]
+if ($Scenario -ne "initial_wan_local") {
+  $infrastructureChecks.Add((Test-MultiRegionRelayInfrastructure -Scenario $Scenario -Configuration @{ MRD_RELAY_LAB_CONTROL = $LabControlPath }))
+}
+if ($Scenario -eq "initial_wan_local") {
+  $infrastructureChecks.Add((Test-MultiRegionRelayInfrastructure -Scenario "initial_wan_local" -Configuration @{
+    MRD_INITIAL_WAN_LAB_CONTROL = $InitialWanControlPath
+    MRD_INITIAL_WAN_ATTESTATION_PUBLIC_KEY = $env:MRD_INITIAL_WAN_ATTESTATION_PUBLIC_KEY
+    MRD_INITIAL_WAN_ATTESTATION_KEY_ID = $env:MRD_INITIAL_WAN_ATTESTATION_KEY_ID
+  }))
+}
+$infrastructure = [pscustomobject]@{
+  ready = @($infrastructureChecks | Where-Object { -not $_.ready }).Count -eq 0
+  failures = @($infrastructureChecks | ForEach-Object { @($_.failures) })
+}
 if (-not (Get-Command $CargoCommand -ErrorAction SilentlyContinue)) {
   $infrastructure = [pscustomobject]@{
     ready = $false
@@ -55,11 +71,21 @@ if (-not $infrastructure.ready) {
 $scenarioIds = if ($Scenario -eq "all") { @(Get-MultiRegionRelayScenarioIds) } else { @($Scenario) }
 $rows = New-Object System.Collections.Generic.List[object]
 foreach ($scenarioId in $scenarioIds) {
+  $scenarioControlPath = if ($scenarioId -eq "initial_wan_local") { $InitialWanControlPath } else { $LabControlPath }
   $controlInvoker = {
     param($Request)
-    Invoke-MultiRegionRelayLabControl -ControlPath $LabControlPath -Request $Request
+    Invoke-MultiRegionRelayLabControl -ControlPath $scenarioControlPath -Request $Request
   }
   $row = Invoke-MultiRegionRelayScenario -Scenario $scenarioId -ControlInvoker $controlInvoker
+  if ($scenarioId -eq "initial_wan_local") {
+    $runnerCleanup = @(Invoke-InitialWanRunnerCleanup -InvocationId $row.invocation_id -Artifact $row.artifact)
+    if ($runnerCleanup.Count -gt 0) {
+      $row.actions = @($row.actions) + @($runnerCleanup | ForEach-Object {
+        [pscustomobject]@{ action = "runner_cleanup"; verdict = $_.verdict; failure = $_.failure }
+      })
+      $row.verdict = Get-MultiRegionRelayVerdict -Results @($row.actions)
+    }
+  }
   $artifactPath = Join-Path $OutputRoot "$scenarioId.artifact.json"
   $evaluationPath = Join-Path $OutputRoot "$scenarioId.evaluation.json"
   $evaluationVerdict = $row.verdict
@@ -69,11 +95,32 @@ foreach ($scenarioId in $scenarioIds) {
     Push-Location $RepoRoot
     try {
       try {
-        & $CargoCommand run -q -p mrd-quality-gate --bin mrd-quality-gate -- `
-          --artifact $artifactPath `
-          --policy (Join-Path $RepoRoot "tests\quality-gates\policies\windows-multi-region-relay.v1.json") `
-          --output $evaluationPath
-        $qualityExitCode = $LASTEXITCODE
+        if ($scenarioId -eq "initial_wan_local") {
+          $previousEvidencePath = $env:MRD_INITIAL_WAN_EVIDENCE_PATH
+          $previousInvocationId = $env:MRD_INITIAL_WAN_INVOCATION_ID
+          try {
+            $env:MRD_INITIAL_WAN_EVIDENCE_PATH = $artifactPath
+            $env:MRD_INITIAL_WAN_INVOCATION_ID = $row.invocation_id
+            & $CargoCommand test -q -p mrd-service --test wan_session_e2e evidence_file_contract -- --ignored --exact
+            $contractExitCode = $LASTEXITCODE
+          } finally {
+            $env:MRD_INITIAL_WAN_EVIDENCE_PATH = $previousEvidencePath
+            $env:MRD_INITIAL_WAN_INVOCATION_ID = $previousInvocationId
+          }
+          $contractVerdict = if ($contractExitCode -eq 0) { "PASS" } else { "PRODUCT_FAIL" }
+          Write-MultiRegionRelayUtf8Json -InputObject ([pscustomobject]@{
+            schema_version = "mrd-initial-wan-contract-evaluation.v1"
+            invocation_id = $row.invocation_id
+            verdict = $contractVerdict
+          }) -Path $evaluationPath
+          $qualityExitCode = if ($contractExitCode -eq 0) { 0 } else { 2 }
+        } else {
+          & $CargoCommand run -q -p mrd-quality-gate --bin mrd-quality-gate -- `
+            --artifact $artifactPath `
+            --policy (Join-Path $RepoRoot "tests\quality-gates\policies\windows-multi-region-relay.v1.json") `
+            --output $evaluationPath
+          $qualityExitCode = $LASTEXITCODE
+        }
       } catch {
         $qualityExitCode = 3
       }

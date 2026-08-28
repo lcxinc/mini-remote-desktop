@@ -1,8 +1,9 @@
 # Multi-region TURN relay acceptance record
 
-- Date: 2026-08-26
-- Branch: `codex/multi-region-turn-relay`
-- Implementation commits: `e3c39a23`, `af91b9e9`, `534577f9`, `1c44870a`
+- Date: 2026-08-28
+- Branch: `codex/initial-wan-relay-session`
+- Initial-WAN implementation base: `682bf3a4` (Task 12 gate changes were
+  verified from the working tree before their commit)
 Overall live verdict: **INFRA_FAIL**
 
 This record distinguishes deterministic implementation evidence from real
@@ -36,7 +37,7 @@ product pass is claimed.
 | Session service | PASS | `mrd-service`: 778 tests passed, 4 environment/hardware rows ignored |
 | Backend | PASS for configured local rows | FastAPI: 348 passed, 78 PostgreSQL-gated rows skipped without `MRD_TEST_DATABASE_URL` |
 | Deployment contract | PASS | `deploy/turn/test_deploy_contract.ps1` |
-| Multi-region integration | PASS | 2 tests: three-node/two-region capacity lifecycle plus real failover coordinator/security cleanup |
+| Multi-region integration | PASS | 3 tests: explicit generation-zero peer binding, three-node/two-region capacity lifecycle, and real failover coordinator/security cleanup |
 | Quality and workflow gates | PASS | `mrd-quality-gate`: 48 tests; PowerShell orchestration contracts PASS |
 | Formatting | PASS | `cargo fmt --all -- --check`; `git diff --check` |
 | Strict focused Clippy | PASS | relay-control, relay-agent, signal, realtime, WebRTC, and quality-gate with `--no-deps -D warnings` |
@@ -61,6 +62,39 @@ non-relay Clippy findings in agent runtime, capabilities, generic session/LAN
 handlers, wake-on-LAN, and web bridge code. The relay modules introduced by
 this work produced no strict Clippy finding. The complete `mrd-service` test
 package nevertheless passed.
+
+### Initial attended WAN session gate
+
+The Task 12 non-live evidence contract passed 3/3 tests. It defines eleven
+ignored live rows: forced UDP/TCP/TLS generation zero, target rejection,
+capacity exhaustion, backend loss before approval, signaling disconnect,
+expired generation, service restart, primary failure with cross-failure-domain
+migration, and deterministic `ReleaseAll`.
+
+The contract is fail-closed. It rejects unknown or secret-bearing fields,
+cross-invocation replay, metadata-only traffic claims, mismatched peer
+session/directory/relay-URL bindings, nonzero initial generations, incorrect
+negative outcomes, missing live component identities, and non-exact container
+cleanup. Runtime IDs, probe IDs, evidence IDs, and temporary container names
+must all be bound to the invocation. Every row is Ed25519-attested by the
+configured lab authority; the runner supplies only its protected raw 32-byte
+public-key file and key ID. The signature covers the domain
+`MRD_INITIAL_WAN_EVIDENCE_V1\0` plus whitespace-free JSON with recursively
+lexicographically sorted object keys and the `attestation` field removed.
+The runner additionally inspects the invocation's Docker labels/names after
+reset, marks any leak as a failure, and removes only containers carrying that
+fresh invocation identity. The local PowerShell orchestration
+contract passed, the quality artifact contract passed 14/14 tests, and the
+multi-region deterministic integration target passed 3/3 tests.
+
+These deterministic results do not count as live product evidence. The live
+rows require an explicit `MRD_INITIAL_WAN_LAB_CONTROL` executable and trusted
+`MRD_INITIAL_WAN_ATTESTATION_PUBLIC_KEY` / `_KEY_ID` which bind the authority
+that owns
+two service runtimes, realtime-server, FastAPI/PostgreSQL, and the exact pinned
+coturn containers. The runner observed exit code 3 / `INFRA_FAIL` because that
+control executable was not configured; it started no live row. Docker and the
+pinned coturn image alone are intentionally insufficient for `PASS`.
 
 One WebRTC cleanup-capacity test failed once on an immediate scheduler-entry
 assertion. The exact test then passed five consecutive isolated runs and the
@@ -87,15 +121,17 @@ ran on this controller.
 
 ## Client mainline integration boundary
 
-The proxy/control-plane acceptance scope currently begins with an already
-authenticated, connected relay session. `mrd-service` can consume and emit
-authenticated migration messages and execute failover, but
-`install_connected_relay_session` has no production caller and the service
-does not yet orchestrate the initial WAN grant/offer/answer/candidate flow.
-The legacy Rdesk signaling path is not a substitute for that thin-shell
-architecture. Therefore a fresh end-user WAN session through the new local
-service is **not accepted** by this record; it needs a separate initial-session
-integration plan and security design for candidate commitments.
+`mrd-service` now has a production initial-WAN caller: it dispatches the v3
+intent/grant/offer/answer/candidate flow, binds the target signing key from the
+verified grant, installs generation-zero relay sessions, activates the
+role-specific media authority, and joins cleanup on shutdown. Rdesk also
+propagates the explicit Auto/LAN/WAN Relay preference.
+
+This record still does **not** accept a fresh end-user WAN session as a live
+product pass. The required two-service/FastAPI/realtime/coturn execution has
+not produced an invocation-bound artifact on this host, and the non-Windows
+production runtime remains unqualified. The ignored live tests and their
+static contract are gates for that evidence, not substitutes for it.
 
 ## Required live topology and host modes
 
@@ -138,6 +174,21 @@ executable, controller/agent/primary/backup/Windows hosts, both certificate
 paths, UDP/TLS ports, and lab authorization secret. It contained no endpoint
 values or secret material. No scenario was started and no reset was required
 because preflight detected the missing infrastructure before mutation.
+
+The initial-WAN local row was also invoked explicitly:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File tests/benchmarks/scripts/run_multi_region_relay.ps1 `
+  -Scenario initial_wan_local
+```
+
+- Observed exit code: `3`
+- Observed verdict: `INFRA_FAIL`
+- Sanitized reason: missing initial-WAN lab control and trusted attestation
+  public-key configuration
+- Cleanup: no row or container was started; the temporary summary used for
+  verification was removed after inspection.
 
 ## Rows required for product acceptance
 
