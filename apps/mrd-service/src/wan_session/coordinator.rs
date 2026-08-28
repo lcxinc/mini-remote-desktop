@@ -468,13 +468,31 @@ impl WanSessionCoordinator {
         let workflow = self.workflow()?;
         let entry = self.entry(session_id).await?;
         let _operation = entry.operation.lock().await;
+        let initial_state = self.snapshot(session_id).await?;
+        let base_identity_matches = verified.session_id == *initial_state.identity().session_id()
+            && verified.controller_device_id == *initial_state.identity().controller_device_id()
+            && verified.target_device_id == *initial_state.identity().target_device_id()
+            && verified.controller_key_fingerprint
+                == initial_state.identity().controller_key_fingerprint()
+            && initial_state
+                .identity()
+                .target_key_fingerprint()
+                .is_none_or(|fingerprint| fingerprint == verified.target_key_fingerprint);
+        if !base_identity_matches {
+            return Err(WanSessionCoordinatorError::VerifiedGrantRequired);
+        }
+        if initial_state.identity().target_key_fingerprint().is_none() {
+            entry
+                .state
+                .lock()
+                .await
+                .bind_controller_target_key(&verified.target_key_fingerprint)
+                .map_err(|_| WanSessionCoordinatorError::VerifiedGrantRequired)?;
+        }
         let state = self.snapshot(session_id).await?;
-        let identity_matches = verified.session_id == *state.identity().session_id()
-            && verified.controller_device_id == *state.identity().controller_device_id()
-            && verified.target_device_id == *state.identity().target_device_id()
-            && verified.controller_key_fingerprint == state.identity().controller_key_fingerprint()
-            && verified.target_key_fingerprint == state.identity().target_key_fingerprint();
-        if !identity_matches {
+        if state.identity().target_key_fingerprint()
+            != Some(verified.target_key_fingerprint.as_str())
+        {
             return Err(WanSessionCoordinatorError::VerifiedGrantRequired);
         }
         if state.role() == WanSessionRole::Controller
@@ -785,6 +803,28 @@ impl WanSessionCoordinator {
         expired
     }
 
+    /// Fail and finalize every live session during service shutdown. Terminal
+    /// entries remain immutable and are skipped.
+    pub async fn shutdown_active_sessions(&self) -> usize {
+        let entries = self
+            .registry
+            .lock()
+            .await
+            .sessions
+            .iter()
+            .map(|(session_id, entry)| (session_id.clone(), Arc::clone(entry)))
+            .collect::<Vec<_>>();
+        let mut closed = 0;
+        for (session_id, entry) in entries {
+            let live = !entry.state.lock().await.phase().is_terminal();
+            if live {
+                let _ = self.fail(&session_id, WanSessionFailure::Cancelled).await;
+                closed += 1;
+            }
+        }
+        closed
+    }
+
     async fn apply_with_operation(
         &self,
         session_id: &SessionId,
@@ -920,17 +960,25 @@ impl WanSessionCoordinator {
         if result.is_ok() {
             return result;
         }
+        let failure = match result.as_ref().err() {
+            Some(WanSessionCoordinatorError::DeadlineExceeded)
+            | Some(WanSessionCoordinatorError::Backend(WanSessionPortError::DeadlineExceeded))
+            | Some(WanSessionCoordinatorError::Signaling(WanSessionPortError::DeadlineExceeded))
+            | Some(WanSessionCoordinatorError::Consent(WanSessionPortError::DeadlineExceeded)) => {
+                WanSessionFailure::DeadlineExceeded
+            }
+            Some(WanSessionCoordinatorError::Consent(WanSessionPortError::Rejected)) => {
+                WanSessionFailure::Cancelled
+            }
+            _ => WanSessionFailure::Internal,
+        };
         if self
             .snapshot(session_id)
             .await
             .is_ok_and(|state| !state.phase().is_terminal())
         {
             let _ = self
-                .apply(
-                    session_id,
-                    WanSessionEvent::Failed(WanSessionFailure::Internal),
-                    now_unix_ms,
-                )
+                .apply(session_id, WanSessionEvent::Failed(failure), now_unix_ms)
                 .await;
         }
         result
@@ -997,7 +1045,16 @@ impl WanSessionCoordinator {
                 first_error = result.err();
             }
         }
+        let current_task_id = tokio::task::try_id();
         for mut handle in handles {
+            // A task is allowed to report its own terminal failure. Joining
+            // its JoinHandle here would wait for the current future to return
+            // from this very finalize call. Dropping that one handle detaches
+            // it for the few instructions needed to return; all sibling tasks
+            // remain cancellation-owned and joined below.
+            if current_task_id.is_some_and(|task_id| task_id == handle.id()) {
+                continue;
+            }
             match tokio::time::timeout(CLEANUP_STEP_TIMEOUT, &mut handle).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) if first_error.is_none() => {
@@ -1161,6 +1218,10 @@ impl std::fmt::Debug for VerifiedWanSessionIntent {
 impl VerifiedWanSessionGrant {
     pub fn grant_commitment(&self) -> &str {
         &self.grant_commitment
+    }
+
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
     }
 }
 
@@ -1469,6 +1530,19 @@ pub trait WanSessionClock: Send + Sync {
     fn now_unix_ms(&self) -> u64;
 }
 
+#[derive(Debug, Default)]
+pub struct SystemWanSessionClock;
+
+impl WanSessionClock for SystemWanSessionClock {
+    fn now_unix_ms(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64
+    }
+}
+
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum WanSessionPortError {
     #[error("WAN session port is unavailable")]
@@ -1540,6 +1614,10 @@ impl WanSessionCancellation {
                 break;
             }
         }
+    }
+
+    pub(crate) fn into_receiver(self) -> watch::Receiver<bool> {
+        self.receiver
     }
 }
 

@@ -66,7 +66,7 @@ pub enum WanSessionFailure {
 pub struct WanSessionIdentity {
     binding: WanSessionBinding,
     controller_key_fingerprint: String,
-    target_key_fingerprint: String,
+    target_key_fingerprint: Option<String>,
     deadline_unix_ms: u64,
 }
 
@@ -75,11 +75,11 @@ impl fmt::Debug for WanSessionIdentity {
         formatter
             .debug_struct("WanSessionIdentity")
             .field("binding", &self.binding)
+            .field("controller_key_fingerprint", &"SET")
             .field(
-                "controller_key_fingerprint",
-                &self.controller_key_fingerprint,
+                "target_key_fingerprint",
+                &self.target_key_fingerprint.as_ref().map(|_| "SET"),
             )
-            .field("target_key_fingerprint", &self.target_key_fingerprint)
             .field("deadline_unix_ms", &self.deadline_unix_ms)
             .finish()
     }
@@ -106,7 +106,30 @@ impl WanSessionIdentity {
         Ok(Self {
             binding,
             controller_key_fingerprint,
-            target_key_fingerprint,
+            target_key_fingerprint: Some(target_key_fingerprint),
+            deadline_unix_ms,
+        })
+    }
+
+    /// Controller-side initial requests do not receive a target signing key
+    /// from the backend. The target key is bound exactly once from the first
+    /// independently verified SessionGrantV3 before WebRTC can start.
+    pub fn new_controller_pending_target(
+        session_id: SessionId,
+        controller_device_id: DeviceId,
+        target_device_id: DeviceId,
+        controller_key_fingerprint: String,
+        deadline_unix_ms: u64,
+    ) -> Result<Self, WanSessionModelError> {
+        let binding = WanSessionBinding::new(session_id, controller_device_id, target_device_id)
+            .map_err(|_| WanSessionModelError::InvalidIdentity)?;
+        if !is_digest(&controller_key_fingerprint) || deadline_unix_ms == 0 {
+            return Err(WanSessionModelError::InvalidIdentity);
+        }
+        Ok(Self {
+            binding,
+            controller_key_fingerprint,
+            target_key_fingerprint: None,
             deadline_unix_ms,
         })
     }
@@ -131,8 +154,25 @@ impl WanSessionIdentity {
         &self.controller_key_fingerprint
     }
 
-    pub fn target_key_fingerprint(&self) -> &str {
-        &self.target_key_fingerprint
+    pub fn target_key_fingerprint(&self) -> Option<&str> {
+        self.target_key_fingerprint.as_deref()
+    }
+
+    pub(crate) fn bind_target_key_fingerprint(
+        &mut self,
+        fingerprint: &str,
+    ) -> Result<(), WanSessionModelError> {
+        if !is_digest(fingerprint) || fingerprint == self.controller_key_fingerprint {
+            return Err(WanSessionModelError::InvalidIdentity);
+        }
+        match self.target_key_fingerprint.as_deref() {
+            Some(existing) if existing != fingerprint => Err(WanSessionModelError::InvalidIdentity),
+            Some(_) => Ok(()),
+            None => {
+                self.target_key_fingerprint = Some(fingerprint.to_owned());
+                Ok(())
+            }
+        }
     }
 
     pub fn deadline_unix_ms(&self) -> u64 {
@@ -152,7 +192,7 @@ impl WanSessionIdentity {
             }
             WanSessionRole::Target => {
                 device_id == self.target_device_id()
-                    && key_fingerprint == self.target_key_fingerprint
+                    && self.target_key_fingerprint.as_deref() == Some(key_fingerprint)
             }
         }
     }
@@ -471,6 +511,23 @@ impl WanSessionState {
 
     pub fn identity(&self) -> &WanSessionIdentity {
         &self.identity
+    }
+
+    pub(crate) fn bind_controller_target_key(
+        &mut self,
+        fingerprint: &str,
+    ) -> Result<(), WanSessionModelError> {
+        if self.role != WanSessionRole::Controller
+            || !matches!(
+                self.phase,
+                WanSessionPhase::Created
+                    | WanSessionPhase::BackendBound
+                    | WanSessionPhase::AwaitingConsent
+            )
+        {
+            return Err(WanSessionModelError::InvalidIdentity);
+        }
+        self.identity.bind_target_key_fingerprint(fingerprint)
     }
 
     pub fn phase(&self) -> WanSessionPhase {

@@ -780,6 +780,7 @@ impl GenerationZeroNegotiationContext {
         if grant.grant_commitment() != Some(grant_commitment.as_str())
             || grant.policy_revision() != access.policy_revision()
             || access.generation() != 0
+            || state.identity().target_key_fingerprint().is_none()
             || grant.grant_expires_at_ms() <= now_unix_ms
             || grant.policy_expires_at_ms() <= now_unix_ms
         {
@@ -1256,11 +1257,17 @@ impl GenerationZeroNegotiator {
         }
         if result.is_err() && owns_session && self.coordinator.is_some() {
             if let Some(coordinator) = &self.coordinator {
-                let failure = result
-                    .as_ref()
-                    .err()
-                    .map_or(WanSessionFailure::Transport, negotiation_failure);
-                let _ = coordinator.fail(&session_id, failure).await;
+                let still_live = coordinator
+                    .snapshot(&session_id)
+                    .await
+                    .is_ok_and(|state| !state.phase().is_terminal());
+                if still_live {
+                    let failure = result
+                        .as_ref()
+                        .err()
+                        .map_or(WanSessionFailure::Transport, negotiation_failure);
+                    let _ = coordinator.fail(&session_id, failure).await;
+                }
             }
         }
         drop(ownership_lease);
@@ -1685,7 +1692,10 @@ impl GenerationZeroNegotiator {
             WebRtcDescriptionRoleV3::Answer => context.identity().target_device_id(),
         };
         let expected_peer_key = match context.role() {
-            WanSessionRole::Controller => context.identity().target_key_fingerprint(),
+            WanSessionRole::Controller => context
+                .identity()
+                .target_key_fingerprint()
+                .ok_or(GenerationZeroNegotiationError::InvalidBinding)?,
             WanSessionRole::Target => context.identity().controller_key_fingerprint(),
         };
         match verify_generation_zero_signal(message, local, self.clock.now_unix_ms(), replay) {
@@ -1761,7 +1771,10 @@ impl GenerationZeroNegotiator {
             WebRtcDescriptionRoleV3::Answer => context.identity().target_device_id(),
         };
         let expected_peer_key = match context.role() {
-            WanSessionRole::Controller => context.identity().target_key_fingerprint(),
+            WanSessionRole::Controller => context
+                .identity()
+                .target_key_fingerprint()
+                .ok_or(GenerationZeroNegotiationError::InvalidBinding)?,
             WanSessionRole::Target => context.identity().controller_key_fingerprint(),
         };
         match verify_generation_zero_signal(

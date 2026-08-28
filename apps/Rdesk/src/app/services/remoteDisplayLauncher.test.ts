@@ -153,6 +153,54 @@ describe("launchRemoteDisplayForDevice", () => {
     });
   });
 
+  it.each([
+    ["auto", "auto"],
+    ["lan", "lan"],
+    ["wan_relay", "wan_relay"],
+  ] as const)(
+    "forwards the %s route preference through the remote session launcher",
+    async (_label, routePreference) => {
+      await launchRemoteDisplayForDevice("remote-device", {
+        sessionId: "p2p-quic-session",
+        transportKind: "quic",
+        lanP2P: true,
+        routePreference,
+      });
+
+      expect(mocks.startLanRemoteSession).toHaveBeenCalledWith(
+        "p2p-quic-session",
+        "remote-device",
+        "quic",
+        DEFAULT_HEVC_1080P60_PROFILE,
+        routePreference,
+      );
+    },
+  );
+
+  it.each([
+    ["auto", "webrtc"],
+    ["lan", "quic"],
+    ["wan_relay", "webrtc"],
+  ] as const)(
+    "uses the authorized request path for an explicit %s route even without LAN discovery",
+    async (routePreference, transportKind) => {
+      await launchRemoteDisplayForDevice("remote-device", {
+        sessionId: `${routePreference}-session`,
+        transportKind,
+        routePreference,
+      });
+
+      expect(mocks.startSession).not.toHaveBeenCalled();
+      expect(mocks.startLanRemoteSession).toHaveBeenCalledWith(
+        `${routePreference}-session`,
+        "remote-device",
+        transportKind,
+        undefined,
+        routePreference,
+      );
+    },
+  );
+
   it("requests the macOS VideoToolbox HEVC 2K144 profile for macOS LAN P2P remote display", async () => {
     await launchRemoteDisplayForDevice("remote-mac", {
       sessionId: "p2p-quic-mac-session",

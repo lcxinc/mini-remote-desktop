@@ -11,6 +11,7 @@
  */
 
 import * as tauriAdapter from '../adapters/tauri';
+import type { RemoteRoutePreference } from '../adapters/tauri/types';
 
 // ============================================================================
 // Types
@@ -176,17 +177,22 @@ export const startSession = async (
 };
 
 /**
- * Start a LAN P2P session as controller through attended authorization.
+ * Start a remote session as controller through attended authorization.
+ *
+ * The service owns route selection. QUIC is required only when the caller
+ * explicitly requires LAN; Auto may select WAN relay when no fresh LAN path
+ * is available.
  */
 export const startLanRemoteSession = async (
   sessionId: string,
   targetDeviceId: string,
   transportKind: TransportKind = "webrtc",
-  requestedProfile?: MediaProfile
+  requestedProfile?: MediaProfile,
+  routePreference: RemoteRoutePreference = "auto",
 ): Promise<string> => {
-  if (transportKind !== "quic") {
+  if (routePreference === "lan" && transportKind !== "quic") {
     throw new ServiceCommandError(
-      "Secure LAN remote sessions currently require QUIC",
+      "Explicit LAN remote sessions currently require QUIC",
       "E_SECURE_LAN_TRANSPORT"
     );
   }
@@ -194,7 +200,7 @@ export const startLanRemoteSession = async (
     session_id: sessionId,
     target_device_id: targetDeviceId,
     access_mode: "attended",
-    route_preference: "auto",
+    route_preference: routePreference,
     requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
     requested_profile: requestedProfile ?? null,
   });

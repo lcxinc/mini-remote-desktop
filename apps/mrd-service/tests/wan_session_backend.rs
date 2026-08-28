@@ -18,10 +18,12 @@ use mrd_service::{
     relay::relay_peer_digest,
     wan_session::{
         backend::{
-            HttpWanSessionBackend, WanRelayAccessRequest, WanSessionApproval, WanSessionBackend,
-            WanSessionBackendError, WanSessionBinding, WanSessionStatus,
+            HttpWanSessionBackend, ServiceWanSessionWorkflowBackend, WanRelayAccessRequest,
+            WanSessionApproval, WanSessionBackend, WanSessionBackendError, WanSessionBinding,
+            WanSessionStatus,
         },
         config::WanSessionBackendConfig,
+        coordinator::WanSessionWorkflowBackend,
     },
     AppState,
 };
@@ -496,6 +498,67 @@ async fn typed_operations_bind_ids_and_send_only_the_device_token_header() {
                 "generation": 0
             })
     );
+}
+
+#[tokio::test]
+async fn production_workflow_adapter_maps_exact_backend_grant_and_primary_route() {
+    let canonical_request = request();
+    let expected_binding = binding(&canonical_request);
+    let server = FakeBackend::spawn(canonical_request.clone()).await;
+    let backend: Arc<dyn WanSessionBackend> = Arc::new(
+        HttpWanSessionBackend::new(client_config(
+            &server.base_url,
+            &private_material("workflow-device-auth"),
+        ))
+        .expect("construct WAN backend client"),
+    );
+    let adapter = ServiceWanSessionWorkflowBackend::new(backend);
+
+    let created = adapter
+        .create(&canonical_request, now_ms() + 5_000)
+        .await
+        .expect("workflow create");
+    let approval = WanSessionApproval::new(vec![WanPermissionScopeV3::ScreenView], None)
+        .expect("normalized approval");
+    let approved = adapter
+        .approve(&expected_binding, &approval, now_ms() + 5_000)
+        .await
+        .expect("workflow approve");
+    let access = adapter
+        .access_generation_zero(&expected_binding, 29, now_ms() + 5_000)
+        .await
+        .expect("workflow generation zero access");
+    assert!(adapter
+        .relay_access(&canonical_request.session_id)
+        .is_some());
+    adapter
+        .close_session(&canonical_request.session_id, true)
+        .await
+        .expect("workflow cleanup revokes failed backend session");
+    let request_count_after_revoke = server.requests().len();
+    adapter
+        .close_session(&canonical_request.session_id, true)
+        .await
+        .expect("workflow cleanup is idempotent");
+    assert!(adapter
+        .relay_access(&canonical_request.session_id)
+        .is_none());
+
+    assert_eq!(created.status(), WanSessionStatus::Requested);
+    assert_eq!(approved.status(), WanSessionStatus::Approved);
+    assert_eq!(
+        approved.grant().expect("approved grant").approved_scopes(),
+        &[WanPermissionScopeV3::ScreenView]
+    );
+    assert_eq!(access.policy_revision(), 29);
+    assert_eq!(access.generation(), 0);
+    assert_eq!(access.directory_id(), "directory-wan-session-1");
+    assert_eq!(access.primary_node_id(), "relay-a");
+    assert_eq!(server.requests().len(), request_count_after_revoke);
+    assert!(server
+        .requests()
+        .iter()
+        .any(|request| request.path.ends_with("/revoke")));
 }
 
 #[tokio::test]

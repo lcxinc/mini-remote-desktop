@@ -39,6 +39,30 @@ const RELAY_URL_DIGEST: &str = "444444444444444444444444444444444444444444444444
 const INTENT_COMMITMENT: &str = "5555555555555555555555555555555555555555555555555555555555555555";
 const GRANT_COMMITMENT: &str = "6666666666666666666666666666666666666666666666666666666666666666";
 
+#[test]
+fn controller_can_defer_target_signing_key_until_the_verified_grant() {
+    let identity = WanSessionIdentity::new_controller_pending_target(
+        SessionId("wan-session-pending-target-key".into()),
+        DeviceId("controller-pending-target-key".into()),
+        DeviceId("target-pending-target-key".into()),
+        CONTROLLER_KEY.to_owned(),
+        2_000,
+    )
+    .unwrap();
+
+    assert_eq!(identity.target_key_fingerprint(), None);
+    assert!(identity.verify_actor(
+        WanSessionRole::Controller,
+        identity.controller_device_id(),
+        CONTROLLER_KEY,
+    ));
+    assert!(!identity.verify_actor(
+        WanSessionRole::Target,
+        identity.target_device_id(),
+        TARGET_KEY,
+    ));
+}
+
 fn identity(suffix: &str) -> WanSessionIdentity {
     WanSessionIdentity::new(
         SessionId(format!("wan-session-{suffix}")),
@@ -376,6 +400,33 @@ async fn registry_is_bounded_and_terminal_cleanup_cancels_and_joins_owned_tasks(
         ))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn an_owned_task_can_terminalize_its_session_without_joining_itself() {
+    let coordinator = Arc::new(coordinator(Arc::new(RecordingCleanup::default()), 1));
+    let state = WanSessionState::new(WanSessionRole::Controller, identity("self-finalize"));
+    let session_id = state.identity().session_id().clone();
+    coordinator.begin(state).await.unwrap();
+    let (completed, completion) = tokio::sync::oneshot::channel();
+    let task_coordinator = Arc::clone(&coordinator);
+    let task_session_id = session_id.clone();
+    coordinator
+        .spawn_owned_task(&session_id, move |_| async move {
+            let result = task_coordinator
+                .fail(&task_session_id, WanSessionFailure::Transport)
+                .await;
+            let _ = completed.send(result.is_ok());
+        })
+        .await
+        .unwrap();
+
+    let completed = tokio::time::timeout(std::time::Duration::from_millis(250), completion).await;
+    assert!(matches!(completed, Ok(Ok(true))));
+    assert_eq!(
+        coordinator.snapshot(&session_id).await.unwrap().phase(),
+        WanSessionPhase::Failed
+    );
 }
 
 #[tokio::test]
@@ -722,6 +773,28 @@ impl WanSessionConsentPublisher for FakeConsent {
     }
 }
 
+struct RejectingConsent;
+
+#[async_trait]
+impl WanSessionConsentPublisher for RejectingConsent {
+    async fn publish_attended_request(
+        &self,
+        _: &WanSessionIdentity,
+        _: &WanSessionRequestV3,
+        _: u64,
+    ) -> Result<(), WanSessionPortError> {
+        Ok(())
+    }
+
+    async fn load_attended_approval(
+        &self,
+        _: &WanSessionIdentity,
+        _: u64,
+    ) -> Result<WanSessionApproval, WanSessionPortError> {
+        Err(WanSessionPortError::Rejected)
+    }
+}
+
 fn workflow_coordinator(
     backend: Arc<FakeBackend>,
     signaling: Arc<FakeSignaling>,
@@ -744,8 +817,16 @@ fn workflow_coordinator(
 
 #[tokio::test]
 async fn controller_creates_backend_before_intent_and_installs_exact_approved_generation_zero() {
-    let (identity, controller_key, target_key) =
+    let (known_identity, controller_key, target_key) =
         controller_identity_with_keys("workflow-controller");
+    let identity = WanSessionIdentity::new_controller_pending_target(
+        known_identity.session_id().clone(),
+        known_identity.controller_device_id().clone(),
+        known_identity.target_device_id().clone(),
+        controller_key.key_id().to_owned(),
+        known_identity.deadline_unix_ms(),
+    )
+    .unwrap();
     let request = request_for(&identity);
     let backend = Arc::new(FakeBackend::new(request.clone()));
     let signaling = Arc::new(FakeSignaling::default());
@@ -776,6 +857,10 @@ async fn controller_creates_backend_before_intent_and_installs_exact_approved_ge
         .unwrap();
     let snapshot = coordinator.snapshot(identity.session_id()).await.unwrap();
     assert_eq!(snapshot.phase(), WanSessionPhase::AccessBound);
+    assert_eq!(
+        snapshot.identity().target_key_fingerprint(),
+        Some(target_key.key_id())
+    );
     assert_eq!(snapshot.access().unwrap().generation(), 0);
     assert_eq!(backend.access_calls.load(Ordering::SeqCst), 1);
     assert!(backend
@@ -832,6 +917,43 @@ async fn target_independently_inspects_then_publishes_consent_without_access_unt
             .phase(),
         WanSessionPhase::AccessBound
     );
+}
+
+#[tokio::test]
+async fn rejected_target_consent_terminalizes_without_relocking_the_operation_mutex() {
+    let seed_identity = identity("reject");
+    let request = request_for(&seed_identity);
+    let (verified_intent, _) = verified_target_intent(request.clone());
+    let session_id = verified_intent.identity().session_id().clone();
+    let backend = Arc::new(FakeBackend::new(request));
+    let clock = Arc::new(FakeClock::default());
+    clock.0.store(1_000, Ordering::SeqCst);
+    let coordinator = WanSessionCoordinator::with_workflow_ports(
+        WanSessionCoordinatorConfig::default(),
+        Arc::new(RecordingCleanup::default()),
+        WanSessionWorkflowPorts::new(
+            backend,
+            Arc::new(FakeSignaling::default()),
+            Arc::new(RejectingConsent),
+            clock,
+        ),
+    )
+    .unwrap();
+    coordinator
+        .accept_verified_target_intent(verified_intent)
+        .await
+        .unwrap();
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        coordinator.approve_target(&session_id),
+    )
+    .await;
+    assert!(result.is_ok(), "rejected consent must not deadlock cleanup");
+    assert!(result.unwrap().is_err());
+    let failed = coordinator.snapshot(&session_id).await.unwrap();
+    assert_eq!(failed.phase(), WanSessionPhase::Failed);
+    assert_eq!(failed.failure(), Some(WanSessionFailure::Cancelled));
 }
 
 #[tokio::test]

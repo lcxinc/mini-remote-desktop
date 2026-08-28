@@ -55,9 +55,18 @@ const REQUEST_COMMITMENT: &str = "1111111111111111111111111111111111111111111111
 const INTENT_COMMITMENT: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 const GRANT_COMMITMENT: &str = "3333333333333333333333333333333333333333333333333333333333333333";
 
-fn identity(role: WanSessionRole) -> WanSessionIdentity {
+static NEXT_TEST_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn test_session_id() -> SessionId {
+    SessionId(format!(
+        "negotiation-session-{}",
+        NEXT_TEST_SESSION_ID.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn identity_for_session(role: WanSessionRole, session_id: &SessionId) -> WanSessionIdentity {
     WanSessionIdentity::new(
-        SessionId("negotiation-session".into()),
+        session_id.clone(),
         DeviceId("controller-device".into()),
         DeviceId("target-device".into()),
         "11".repeat(32),
@@ -80,8 +89,12 @@ fn access_binding() -> RelayAccessBinding {
     .expect("valid generation-zero route")
 }
 
-fn state_at_access_bound(role: WanSessionRole, bind_commitment: bool) -> WanSessionState {
-    let mut state = WanSessionState::new(role, identity(role));
+fn state_at_access_bound(
+    session_id: &SessionId,
+    role: WanSessionRole,
+    bind_commitment: bool,
+) -> WanSessionState {
+    let mut state = WanSessionState::new(role, identity_for_session(role, session_id));
     state
         .apply(
             WanSessionEvent::BackendBound {
@@ -121,13 +134,13 @@ fn state_at_access_bound(role: WanSessionRole, bind_commitment: bool) -> WanSess
     state
 }
 
-fn signed_identity() -> (WanSessionIdentity, DeviceIdentity, DeviceIdentity) {
+fn signed_identity(session_id: &SessionId) -> (WanSessionIdentity, DeviceIdentity, DeviceIdentity) {
     let controller =
         DeviceIdentity::generate(&ring::rand::SystemRandom::new()).expect("controller identity");
     let target =
         DeviceIdentity::generate(&ring::rand::SystemRandom::new()).expect("target identity");
     let identity = WanSessionIdentity::new(
-        SessionId("negotiation-session".into()),
+        session_id.clone(),
         DeviceId("controller-device".into()),
         DeviceId("target-device".into()),
         controller.key_id().to_owned(),
@@ -139,9 +152,10 @@ fn signed_identity() -> (WanSessionIdentity, DeviceIdentity, DeviceIdentity) {
 }
 
 fn signed_state_at_access_bound(
+    session_id: &SessionId,
     role: WanSessionRole,
 ) -> (WanSessionState, DeviceIdentity, DeviceIdentity) {
-    let (session_identity, controller, target) = signed_identity();
+    let (session_identity, controller, target) = signed_identity(session_id);
     let mut state = WanSessionState::new(role, session_identity);
     state
         .apply(
@@ -191,9 +205,10 @@ fn generation_zero_negotiator_is_present_and_bounded() {
 
 #[test]
 fn generation_zero_context_requires_access_bound_state() {
+    let session_id = test_session_id();
     let state = WanSessionState::new(
         WanSessionRole::Controller,
-        identity(WanSessionRole::Controller),
+        identity_for_session(WanSessionRole::Controller, &session_id),
     );
     assert_eq!(
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000),
@@ -203,7 +218,8 @@ fn generation_zero_context_requires_access_bound_state() {
 
 #[test]
 fn generation_zero_context_requires_verified_grant_commitment() {
-    let state = state_at_access_bound(WanSessionRole::Controller, false);
+    let session_id = test_session_id();
+    let state = state_at_access_bound(&session_id, WanSessionRole::Controller, false);
     assert_eq!(
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000),
         Err(GenerationZeroNegotiationError::InvalidBinding)
@@ -212,7 +228,8 @@ fn generation_zero_context_requires_verified_grant_commitment() {
 
 #[test]
 fn generation_zero_context_rejects_mutated_commitment_and_preserves_role_peer() {
-    let state = state_at_access_bound(WanSessionRole::Target, true);
+    let session_id = test_session_id();
+    let state = state_at_access_bound(&session_id, WanSessionRole::Target, true);
     assert_eq!(
         GenerationZeroNegotiationContext::from_state(
             &state,
@@ -236,7 +253,7 @@ fn generation_zero_context_rejects_mutated_commitment_and_preserves_role_peer() 
 fn route_proof_is_relay_only_and_debug_redacts_digest() {
     let digest = primary_digest();
     let proof = GenerationZeroRouteProof::for_test(
-        SessionId("negotiation-session".into()),
+        test_session_id(),
         "directory-zero".into(),
         "relay-primary".into(),
         digest.clone(),
@@ -246,7 +263,7 @@ fn route_proof_is_relay_only_and_debug_redacts_digest() {
     assert!(proof.is_relay_to_relay());
     assert!(!debug.contains(&digest));
     assert!(GenerationZeroRouteProof::for_test(
-        SessionId("negotiation-session".into()),
+        test_session_id(),
         "directory-zero".into(),
         "relay-primary".into(),
         "not-a-digest".into(),
@@ -256,6 +273,7 @@ fn route_proof_is_relay_only_and_debug_redacts_digest() {
 
 #[tokio::test]
 async fn no_peer_opens_before_verified_access_and_authorization() {
+    let session_id = test_session_id();
     let host = Arc::new(StubHost::default());
     let bus = Arc::new(mrd_service::signaling::RelaySignalingBus::default());
     let negotiator = GenerationZeroNegotiator::new(
@@ -268,7 +286,7 @@ async fn no_peer_opens_before_verified_access_and_authorization() {
     .with_clock(Arc::new(TestClock));
     let state = WanSessionState::new(
         WanSessionRole::Controller,
-        identity(WanSessionRole::Controller),
+        identity_for_session(WanSessionRole::Controller, &session_id),
     );
     // Context construction is the authorization gate. No access-bound
     // context means the executor cannot reach the host at all.
@@ -282,8 +300,9 @@ async fn no_peer_opens_before_verified_access_and_authorization() {
 
 #[tokio::test]
 async fn primary_only_signed_relay_url_is_used_for_generation_zero() {
-    let access = relay_access("negotiation-session", "target-device").await;
-    let state = state_at_access_bound(WanSessionRole::Controller, true);
+    let session_id = test_session_id();
+    let access = relay_access(&session_id, "target-device").await;
+    let state = state_at_access_bound(&session_id, WanSessionRole::Controller, true);
     let context =
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
             .unwrap();
@@ -302,8 +321,9 @@ async fn primary_only_signed_relay_url_is_used_for_generation_zero() {
 
 #[tokio::test]
 async fn authority_revocation_is_rechecked_before_peer_open() {
-    let access = relay_access("negotiation-session", "target-device").await;
-    let state = state_at_access_bound(WanSessionRole::Controller, true);
+    let session_id = test_session_id();
+    let access = relay_access(&session_id, "target-device").await;
+    let state = state_at_access_bound(&session_id, WanSessionRole::Controller, true);
     let context =
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
             .unwrap();
@@ -331,8 +351,9 @@ async fn authority_revocation_is_rechecked_before_peer_open() {
 
 #[tokio::test]
 async fn timeout_and_cancel_close_physical_peer_without_install() {
-    let access = relay_access("negotiation-session", "target-device").await;
-    let state = state_at_access_bound(WanSessionRole::Controller, true);
+    let session_id = test_session_id();
+    let access = relay_access(&session_id, "target-device").await;
+    let state = state_at_access_bound(&session_id, WanSessionRole::Controller, true);
     let context =
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
             .unwrap();
@@ -354,7 +375,7 @@ async fn timeout_and_cancel_close_physical_peer_without_install() {
     assert_eq!(host.close_count.load(Ordering::Acquire), 1);
     assert_eq!(installer.installs.load(Ordering::Acquire), 0);
 
-    let state = state_at_access_bound(WanSessionRole::Controller, true);
+    let state = state_at_access_bound(&session_id, WanSessionRole::Controller, true);
     let context =
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
             .unwrap();
@@ -384,8 +405,9 @@ async fn timeout_and_cancel_close_physical_peer_without_install() {
 
 #[tokio::test]
 async fn single_owner_rejects_parallel_install_and_releases_after_failure() {
-    let access = relay_access("negotiation-session", "target-device").await;
-    let state = state_at_access_bound(WanSessionRole::Controller, true);
+    let session_id = test_session_id();
+    let access = relay_access(&session_id, "target-device").await;
+    let state = state_at_access_bound(&session_id, WanSessionRole::Controller, true);
     let context =
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
             .unwrap();
@@ -425,7 +447,7 @@ async fn single_owner_rejects_parallel_install_and_releases_after_failure() {
     );
 
     // The failed attempt releases ownership so a bounded retry can start.
-    let state = state_at_access_bound(WanSessionRole::Controller, true);
+    let state = state_at_access_bound(&session_id, WanSessionRole::Controller, true);
     let retry_context =
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
             .unwrap();
@@ -438,8 +460,9 @@ async fn single_owner_rejects_parallel_install_and_releases_after_failure() {
 
 #[tokio::test]
 async fn separate_negotiators_share_session_ownership_lease() {
-    let access = relay_access("negotiation-session", "target-device").await;
-    let state = state_at_access_bound(WanSessionRole::Controller, true);
+    let session_id = test_session_id();
+    let access = relay_access(&session_id, "target-device").await;
+    let state = state_at_access_bound(&session_id, WanSessionRole::Controller, true);
     let context =
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
             .unwrap();
@@ -491,8 +514,10 @@ async fn separate_negotiators_share_session_ownership_lease() {
 
 #[tokio::test]
 async fn controller_executor_orders_manifest_candidates_connection_proof_and_install() {
-    let access = relay_access("negotiation-session", "target-device").await;
-    let (state, _controller, target) = signed_state_at_access_bound(WanSessionRole::Controller);
+    let session_id = test_session_id();
+    let access = relay_access(&session_id, "target-device").await;
+    let (state, _controller, target) =
+        signed_state_at_access_bound(&session_id, WanSessionRole::Controller);
     let context =
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
             .unwrap();
@@ -562,8 +587,10 @@ async fn controller_executor_orders_manifest_candidates_connection_proof_and_ins
 
 #[tokio::test]
 async fn target_executor_buffers_candidate_before_offer_and_skips_history_intent() {
-    let access = relay_access("negotiation-session", "controller-device").await;
-    let (state, controller, _target) = signed_state_at_access_bound(WanSessionRole::Target);
+    let session_id = test_session_id();
+    let access = relay_access(&session_id, "controller-device").await;
+    let (state, controller, _target) =
+        signed_state_at_access_bound(&session_id, WanSessionRole::Target);
     let context =
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
             .unwrap();
@@ -647,8 +674,10 @@ async fn target_executor_buffers_candidate_before_offer_and_skips_history_intent
 
 #[tokio::test]
 async fn coordinator_commit_advances_success_to_relay_verified() {
-    let access = relay_access("negotiation-session", "target-device").await;
-    let (state, _controller, target) = signed_state_at_access_bound(WanSessionRole::Controller);
+    let session_id = test_session_id();
+    let access = relay_access(&session_id, "target-device").await;
+    let (state, _controller, target) =
+        signed_state_at_access_bound(&session_id, WanSessionRole::Controller);
     let context =
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
             .unwrap();
@@ -697,11 +726,7 @@ async fn coordinator_commit_advances_success_to_relay_verified() {
     let _ = driver.await;
     assert!(result.is_ok(), "coordinator-backed negotiation: {result:?}");
     assert_eq!(
-        coordinator
-            .snapshot(&SessionId("negotiation-session".into()))
-            .await
-            .unwrap()
-            .phase(),
+        coordinator.snapshot(&session_id).await.unwrap().phase(),
         WanSessionPhase::RelayVerified
     );
     assert_eq!(installer.installs.load(Ordering::Acquire), 1);
@@ -710,7 +735,8 @@ async fn coordinator_commit_advances_success_to_relay_verified() {
 
 #[tokio::test]
 async fn coordinator_commit_rejects_an_unbound_backend_grant_before_install() {
-    let mut state = state_at_access_bound(WanSessionRole::Controller, false);
+    let session_id = test_session_id();
+    let mut state = state_at_access_bound(&session_id, WanSessionRole::Controller, false);
     state.apply(WanSessionEvent::Negotiating, 1_004).unwrap();
     let identity = state.identity().clone();
     let grant = state.grant().unwrap().clone();
@@ -748,8 +774,10 @@ async fn coordinator_commit_rejects_an_unbound_backend_grant_before_install() {
 
 #[tokio::test]
 async fn coordinator_recheck_after_install_returns_deadline_error_and_cleans_up() {
-    let access = relay_access("negotiation-session", "target-device").await;
-    let (state, _controller, target) = signed_state_at_access_bound(WanSessionRole::Controller);
+    let session_id = test_session_id();
+    let access = relay_access(&session_id, "target-device").await;
+    let (state, _controller, target) =
+        signed_state_at_access_bound(&session_id, WanSessionRole::Controller);
     let context =
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
             .unwrap();
@@ -806,10 +834,7 @@ async fn coordinator_recheck_after_install_returns_deadline_error_and_cleans_up(
     assert_eq!(installer.rollbacks.load(Ordering::Acquire), 1);
     assert_eq!(host.close_count.load(Ordering::Acquire), 1);
     assert_eq!(cleanup.calls.load(Ordering::Acquire), 6);
-    let snapshot = coordinator
-        .snapshot(&SessionId("negotiation-session".into()))
-        .await
-        .unwrap();
+    let snapshot = coordinator.snapshot(&session_id).await.unwrap();
     assert_eq!(snapshot.phase(), WanSessionPhase::Failed);
     assert_eq!(
         snapshot.failure(),
@@ -819,8 +844,10 @@ async fn coordinator_recheck_after_install_returns_deadline_error_and_cleans_up(
 
 #[tokio::test]
 async fn post_install_authority_failure_rolls_back_install_receipt() {
-    let access = relay_access("negotiation-session", "target-device").await;
-    let (state, _controller, target) = signed_state_at_access_bound(WanSessionRole::Controller);
+    let session_id = test_session_id();
+    let access = relay_access(&session_id, "target-device").await;
+    let (state, _controller, target) =
+        signed_state_at_access_bound(&session_id, WanSessionRole::Controller);
     let context =
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
             .unwrap();
@@ -869,8 +896,10 @@ async fn post_install_authority_failure_rolls_back_install_receipt() {
 
 #[tokio::test]
 async fn installer_cancellation_fails_coordinator_and_runs_cleanup() {
-    let access = relay_access("negotiation-session", "target-device").await;
-    let (state, _controller, target) = signed_state_at_access_bound(WanSessionRole::Controller);
+    let session_id = test_session_id();
+    let access = relay_access(&session_id, "target-device").await;
+    let (state, _controller, target) =
+        signed_state_at_access_bound(&session_id, WanSessionRole::Controller);
     let context =
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
             .unwrap();
@@ -935,18 +964,16 @@ async fn installer_cancellation_fails_coordinator_and_runs_cleanup() {
     let _ = driver.await;
     assert_eq!(host.close_count.load(Ordering::Acquire), 1);
     assert_eq!(installer.rollbacks.load(Ordering::Acquire), 1);
-    let snapshot = coordinator
-        .snapshot(&SessionId("negotiation-session".into()))
-        .await
-        .unwrap();
+    let snapshot = coordinator.snapshot(&session_id).await.unwrap();
     assert_eq!(snapshot.phase(), WanSessionPhase::Failed);
     assert_eq!(snapshot.failure(), Some(WanSessionFailure::Cancelled));
 }
 
 #[tokio::test]
 async fn exact_grant_deadline_rejects_before_opening_or_installing() {
-    let access = relay_access("negotiation-session", "target-device").await;
-    let state = state_at_access_bound(WanSessionRole::Controller, true);
+    let session_id = test_session_id();
+    let access = relay_access(&session_id, "target-device").await;
+    let state = state_at_access_bound(&session_id, WanSessionRole::Controller, true);
     let context =
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
             .unwrap();
@@ -970,8 +997,10 @@ async fn exact_grant_deadline_rejects_before_opening_or_installing() {
 
 #[tokio::test]
 async fn executor_rejects_extra_candidate_after_exact_manifest_and_closes_without_install() {
-    let access = relay_access("negotiation-session", "target-device").await;
-    let (state, _controller, target) = signed_state_at_access_bound(WanSessionRole::Controller);
+    let session_id = test_session_id();
+    let access = relay_access(&session_id, "target-device").await;
+    let (state, _controller, target) =
+        signed_state_at_access_bound(&session_id, WanSessionRole::Controller);
     let context =
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
             .unwrap();
@@ -1019,8 +1048,10 @@ async fn executor_rejects_extra_candidate_after_exact_manifest_and_closes_withou
 
 #[tokio::test]
 async fn executor_rejects_duplicate_remote_candidate_and_closes_without_install() {
-    let access = relay_access("negotiation-session", "target-device").await;
-    let (state, _controller, target) = signed_state_at_access_bound(WanSessionRole::Controller);
+    let session_id = test_session_id();
+    let access = relay_access(&session_id, "target-device").await;
+    let (state, _controller, target) =
+        signed_state_at_access_bound(&session_id, WanSessionRole::Controller);
     let context =
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
             .unwrap();
@@ -1063,8 +1094,10 @@ async fn executor_rejects_duplicate_remote_candidate_and_closes_without_install(
 
 #[tokio::test]
 async fn executor_rejects_wrong_remote_description_role_and_closes_without_install() {
-    let access = relay_access("negotiation-session", "target-device").await;
-    let (state, _controller, target) = signed_state_at_access_bound(WanSessionRole::Controller);
+    let session_id = test_session_id();
+    let access = relay_access(&session_id, "target-device").await;
+    let (state, _controller, target) =
+        signed_state_at_access_bound(&session_id, WanSessionRole::Controller);
     let context =
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
             .unwrap();
@@ -1107,8 +1140,9 @@ async fn executor_rejects_wrong_remote_description_role_and_closes_without_insta
 
 #[tokio::test]
 async fn rejected_open_does_not_close_an_existing_peer_session() {
-    let access = relay_access("negotiation-session", "target-device").await;
-    let state = state_at_access_bound(WanSessionRole::Controller, true);
+    let session_id = test_session_id();
+    let access = relay_access(&session_id, "target-device").await;
+    let state = state_at_access_bound(&session_id, WanSessionRole::Controller, true);
     let context =
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
             .unwrap();
@@ -1147,7 +1181,8 @@ fn all_terminal_candidate_and_route_failures_are_closed_errors() {
 
 #[test]
 fn context_state_is_immutable_generation_zero_and_deadline_bound() {
-    let state = state_at_access_bound(WanSessionRole::Controller, true);
+    let session_id = test_session_id();
+    let state = state_at_access_bound(&session_id, WanSessionRole::Controller, true);
     let context =
         GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
             .unwrap();
@@ -2440,16 +2475,16 @@ fn access_response(session_id: &str, peer: &str) -> Vec<u8> {
 }
 
 async fn relay_access(
-    session_id: &str,
+    session_id: &SessionId,
     peer: &str,
 ) -> Arc<mrd_service::relay::VerifiedRelayAccess> {
     let backend = Arc::new(FakeRelayBackend {
-        responses: Mutex::new(VecDeque::from([Ok(access_response(session_id, peer))])),
+        responses: Mutex::new(VecDeque::from([Ok(access_response(&session_id.0, peer))])),
     });
     let client =
         RelayDirectoryClient::with_backend(relay_config(), backend, Arc::new(FakeRelayClock));
     client
-        .access(RelayAccessContext::for_generation(session_id, 7, peer, 0).unwrap())
+        .access(RelayAccessContext::for_generation(&session_id.0, 7, peer, 0).unwrap())
         .await
         .unwrap()
 }

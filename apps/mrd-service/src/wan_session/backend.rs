@@ -13,7 +13,12 @@ use mrd_signal_proto::{
 };
 use reqwest::{header::HeaderValue, Method, StatusCode, Url};
 use serde::{Deserialize, Serialize};
-use std::{fmt, sync::Arc, time::SystemTime};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{Arc, RwLock},
+    time::SystemTime,
+};
 use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::time::{timeout_at, Instant};
@@ -262,6 +267,7 @@ impl WanRelayAccessRequest {
     }
 }
 
+#[derive(Clone)]
 pub struct WanRelayAccess {
     binding: WanSessionBinding,
     generation: u64,
@@ -371,6 +377,231 @@ pub trait WanSessionBackend: Send + Sync {
         &self,
         request: &WanRelayAccessRequest,
     ) -> Result<WanRelayAccess, WanSessionBackendError>;
+}
+
+/// Production adapter from the device-authenticated HTTP/backend port to the
+/// coordinator's deadline-fenced workflow contract.
+pub struct ServiceWanSessionWorkflowBackend {
+    backend: Arc<dyn WanSessionBackend>,
+    bindings: RwLock<HashMap<SessionId, WanSessionBinding>>,
+    relay_access: RwLock<HashMap<SessionId, WanRelayAccess>>,
+}
+
+impl fmt::Debug for ServiceWanSessionWorkflowBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServiceWanSessionWorkflowBackend")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServiceWanSessionWorkflowBackend {
+    pub fn new(backend: Arc<dyn WanSessionBackend>) -> Self {
+        Self {
+            backend,
+            bindings: RwLock::new(HashMap::new()),
+            relay_access: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn snapshot(
+        &self,
+        record: WanSessionRecord,
+    ) -> Result<
+        super::coordinator::WanBackendSessionSnapshot,
+        super::coordinator::WanSessionPortError,
+    > {
+        self.bindings
+            .write()
+            .map_err(|_| super::coordinator::WanSessionPortError::Unavailable)?
+            .insert(
+                record.binding().session_id().clone(),
+                record.binding().clone(),
+            );
+        match record.status() {
+            WanSessionStatus::Requested => {
+                super::coordinator::WanBackendSessionSnapshot::requested(
+                    record.request().clone(),
+                    record.request_commitment().to_owned(),
+                )
+            }
+            WanSessionStatus::Approved => {
+                let grant = super::model::GrantBinding::with_profile(
+                    record.request_commitment().to_owned(),
+                    record
+                        .approved_scopes()
+                        .ok_or(super::coordinator::WanSessionPortError::Rejected)?
+                        .to_vec(),
+                    record.approved_profile().cloned(),
+                    record
+                        .policy_revision()
+                        .ok_or(super::coordinator::WanSessionPortError::Rejected)?,
+                    record
+                        .policy_expires_at_ms()
+                        .ok_or(super::coordinator::WanSessionPortError::Rejected)?,
+                    record
+                        .grant_expires_at_ms()
+                        .ok_or(super::coordinator::WanSessionPortError::Rejected)?,
+                    record.request().route_policy,
+                )
+                .map_err(|_| super::coordinator::WanSessionPortError::Rejected)?;
+                super::coordinator::WanBackendSessionSnapshot::approved(
+                    record.request().clone(),
+                    record.request_commitment().to_owned(),
+                    grant,
+                )
+            }
+            WanSessionStatus::Rejected
+            | WanSessionStatus::Expired
+            | WanSessionStatus::Closed
+            | WanSessionStatus::Revoked => {
+                return Err(super::coordinator::WanSessionPortError::Rejected);
+            }
+        }
+        .map_err(|_| super::coordinator::WanSessionPortError::Rejected)
+    }
+
+    /// Close or revoke the exact backend session previously verified by this
+    /// workflow adapter. Missing bindings are treated as already cleaned so
+    /// coordinator cleanup remains idempotent.
+    pub async fn close_session(
+        &self,
+        session_id: &SessionId,
+        failed: bool,
+    ) -> Result<(), super::coordinator::WanSessionPortError> {
+        let binding = self
+            .bindings
+            .read()
+            .map_err(|_| super::coordinator::WanSessionPortError::Unavailable)?
+            .get(session_id)
+            .cloned();
+        let Some(binding) = binding else {
+            return Ok(());
+        };
+        let result = if failed {
+            self.backend.revoke(&binding).await
+        } else {
+            self.backend.close(&binding).await
+        };
+        match result {
+            Ok(_) | Err(WanSessionBackendError::NotFound) => {
+                self.bindings
+                    .write()
+                    .map_err(|_| super::coordinator::WanSessionPortError::Unavailable)?
+                    .remove(session_id);
+                self.relay_access
+                    .write()
+                    .map_err(|_| super::coordinator::WanSessionPortError::Unavailable)?
+                    .remove(session_id);
+                Ok(())
+            }
+            Err(error) => Err(map_workflow_error(error)),
+        }
+    }
+
+    /// Return the verified generation-zero directory and short-lived TURN
+    /// credentials retained for the exact coordinator session.
+    pub fn relay_access(&self, session_id: &SessionId) -> Option<WanRelayAccess> {
+        self.relay_access
+            .read()
+            .ok()
+            .and_then(|access| access.get(session_id).cloned())
+    }
+}
+
+#[async_trait]
+impl super::coordinator::WanSessionWorkflowBackend for ServiceWanSessionWorkflowBackend {
+    async fn create(
+        &self,
+        request: &WanSessionRequestV3,
+        _absolute_deadline_unix_ms: u64,
+    ) -> Result<
+        super::coordinator::WanBackendSessionSnapshot,
+        super::coordinator::WanSessionPortError,
+    > {
+        self.snapshot(
+            self.backend
+                .create(request)
+                .await
+                .map_err(map_workflow_error)?,
+        )
+    }
+
+    async fn inspect(
+        &self,
+        binding: &WanSessionBinding,
+        _absolute_deadline_unix_ms: u64,
+    ) -> Result<
+        super::coordinator::WanBackendSessionSnapshot,
+        super::coordinator::WanSessionPortError,
+    > {
+        self.snapshot(
+            self.backend
+                .inspect(binding)
+                .await
+                .map_err(map_workflow_error)?,
+        )
+    }
+
+    async fn approve(
+        &self,
+        binding: &WanSessionBinding,
+        approval: &WanSessionApproval,
+        _absolute_deadline_unix_ms: u64,
+    ) -> Result<
+        super::coordinator::WanBackendSessionSnapshot,
+        super::coordinator::WanSessionPortError,
+    > {
+        self.snapshot(
+            self.backend
+                .approve(binding, approval)
+                .await
+                .map_err(map_workflow_error)?,
+        )
+    }
+
+    async fn access_generation_zero(
+        &self,
+        binding: &WanSessionBinding,
+        policy_revision: u64,
+        _absolute_deadline_unix_ms: u64,
+    ) -> Result<super::model::RelayAccessBinding, super::coordinator::WanSessionPortError> {
+        let request = WanRelayAccessRequest::generation_zero(binding.clone(), policy_revision)
+            .map_err(map_workflow_error)?;
+        let access = self
+            .backend
+            .access(&request)
+            .await
+            .map_err(map_workflow_error)?;
+        if access.generation() != 0 {
+            return Err(super::coordinator::WanSessionPortError::Rejected);
+        }
+        let primary = access
+            .verified()
+            .directory()
+            .payload()
+            .candidates
+            .iter()
+            .find(|candidate| candidate.selection_reason == "preferred-region")
+            .ok_or(super::coordinator::WanSessionPortError::Rejected)?;
+        let evidence = access
+            .verified()
+            .route_evidence(&primary.node_id, 0)
+            .map_err(|_| super::coordinator::WanSessionPortError::Rejected)?;
+        let session_id = binding.session_id().clone();
+        let route_binding = super::model::RelayAccessBinding::generation_zero(
+            policy_revision,
+            evidence.directory_id().to_owned(),
+            evidence.node_id().to_owned(),
+            hex_digest(evidence.urls_digest()),
+        )
+        .map_err(|_| super::coordinator::WanSessionPortError::Rejected)?;
+        self.relay_access
+            .write()
+            .map_err(|_| super::coordinator::WanSessionPortError::Unavailable)?
+            .insert(session_id, access);
+        Ok(route_binding)
+    }
 }
 
 pub struct HttpWanSessionBackend {
@@ -899,6 +1130,35 @@ fn map_relay_error(error: RelayClientError) -> WanSessionBackendError {
             WanSessionBackendError::BindingMismatch
         }
     }
+}
+
+fn map_workflow_error(error: WanSessionBackendError) -> super::coordinator::WanSessionPortError {
+    match error {
+        WanSessionBackendError::DeadlineExceeded => {
+            super::coordinator::WanSessionPortError::DeadlineExceeded
+        }
+        WanSessionBackendError::Unavailable => super::coordinator::WanSessionPortError::Unavailable,
+        WanSessionBackendError::InvalidConfiguration
+        | WanSessionBackendError::InvalidRequest
+        | WanSessionBackendError::Unauthorized
+        | WanSessionBackendError::NotFound
+        | WanSessionBackendError::Conflict
+        | WanSessionBackendError::ResponseTooLarge
+        | WanSessionBackendError::InvalidResponse
+        | WanSessionBackendError::BindingMismatch => {
+            super::coordinator::WanSessionPortError::Rejected
+        }
+    }
+}
+
+fn hex_digest(value: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in value {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]

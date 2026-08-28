@@ -46,4 +46,42 @@ describe("startLanRemoteSession", () => {
       requested_profile: profile,
     });
   });
+
+  it("forwards only the selected route preference enum", async () => {
+    await startLanRemoteSession(
+      "session-1",
+      "target-1",
+      "quic",
+      undefined,
+      "wan_relay",
+    );
+
+    expect(adapter.requestRemoteSession).toHaveBeenCalledWith({
+      session_id: "session-1",
+      target_device_id: "target-1",
+      access_mode: "attended",
+      route_preference: "wan_relay",
+      requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+      requested_profile: null,
+    });
+  });
+
+  it("allows an explicitly selected WAN relay route without LAN QUIC", async () => {
+    await startLanRemoteSession(
+      "session-1",
+      "target-1",
+      "webrtc",
+      undefined,
+      "wan_relay",
+    );
+
+    expect(adapter.requestRemoteSession).toHaveBeenCalledWith({
+      session_id: "session-1",
+      target_device_id: "target-1",
+      access_mode: "attended",
+      route_preference: "wan_relay",
+      requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+      requested_profile: null,
+    });
+  });
 });

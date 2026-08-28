@@ -3,7 +3,9 @@
 pub mod backend;
 pub mod config;
 pub mod coordinator;
+pub mod media;
 pub mod model;
+pub mod service;
 pub mod signaling;
 pub mod webrtc;
 

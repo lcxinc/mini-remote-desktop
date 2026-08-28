@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import type { RemoteRoutePreference } from "../adapters/tauri/types";
 import {
   X,
   Maximize2,
@@ -19,16 +20,36 @@ import {
   Send,
 } from "lucide-react";
 
-interface RemoteSessionModalProps {
+export type { RemoteRoutePreference };
+
+const ROUTE_OPTIONS: ReadonlyArray<{
+  value: RemoteRoutePreference;
+  label: string;
+}> = [
+  { value: "auto", label: "Auto" },
+  { value: "lan", label: "LAN" },
+  { value: "wan_relay", label: "WAN Relay" },
+];
+
+export interface RemoteSessionModalProps {
   device: {
     name: string;
     id: string;
     os: string;
   };
   onClose: () => void;
+  /**
+   * The service boundary receives the route enum only. Authentication and
+   * relay details stay owned by mrd-service and are never modal props.
+   */
+  onRoutePreferenceChange?: (routePreference: RemoteRoutePreference) => void;
 }
 
-export function RemoteSessionModal({ device, onClose }: RemoteSessionModalProps) {
+export function RemoteSessionModal({
+  device,
+  onClose,
+  onRoutePreferenceChange,
+}: RemoteSessionModalProps) {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [muted, setMuted] = useState(false);
   const [latency, setLatency] = useState(24);
@@ -36,6 +57,8 @@ export function RemoteSessionModal({ device, onClose }: RemoteSessionModalProps)
   const [elapsed, setElapsed] = useState(0);
   const [showControls, setShowControls] = useState(true);
   const [showToolbar, setShowToolbar] = useState(false);
+  const [routePreference, setRoutePreference] =
+    useState<RemoteRoutePreference>("auto");
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -50,6 +73,13 @@ export function RemoteSessionModal({ device, onClose }: RemoteSessionModalProps)
     const m = Math.floor(s / 60);
     const sec = s % 60;
     return `${m.toString().padStart(2, "0")}:${sec.toString().padStart(2, "0")}`;
+  };
+
+  const handleRoutePreferenceChange = (
+    nextRoutePreference: RemoteRoutePreference,
+  ) => {
+    setRoutePreference(nextRoutePreference);
+    onRoutePreferenceChange?.(nextRoutePreference);
   };
 
   return (
@@ -106,6 +136,38 @@ export function RemoteSessionModal({ device, onClose }: RemoteSessionModalProps)
             >
               <X className="w-3.5 h-3.5" />
             </button>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3 px-4 py-2 bg-[#1f1f36] border-b border-white/10 shrink-0">
+          <span className="text-gray-400" style={{ fontSize: 11 }}>
+            Connection route
+          </span>
+          <div
+            aria-label="Connection route"
+            className="flex items-center gap-1"
+            role="radiogroup"
+          >
+            {ROUTE_OPTIONS.map((option) => (
+              <label
+                className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md cursor-pointer transition-colors ${
+                  routePreference === option.value
+                    ? "bg-blue-500/20 text-blue-300"
+                    : "text-gray-400 hover:bg-white/5 hover:text-gray-200"
+                }`}
+                key={option.value}
+              >
+                <input
+                  checked={routePreference === option.value}
+                  className="sr-only"
+                  name="remote-session-route"
+                  onChange={() => handleRoutePreferenceChange(option.value)}
+                  type="radio"
+                  value={option.value}
+                />
+                <span>{option.label}</span>
+              </label>
+            ))}
           </div>
         </div>
 

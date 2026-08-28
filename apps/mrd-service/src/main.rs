@@ -126,7 +126,7 @@ async fn run_service(
         }
     }
 
-    if let Some(config) = wan_session::config::WanSessionBackendConfig::from_env()
+    let wan_backend = if let Some(config) = wan_session::config::WanSessionBackendConfig::from_env()
         .context("WAN session backend configuration failed")?
     {
         let backend: Arc<dyn wan_session::backend::WanSessionBackend> = Arc::new(
@@ -134,12 +134,14 @@ async fn run_service(
                 .context("WAN session backend startup failed")?,
         );
         app_state
-            .bind_wan_session_backend(backend)
+            .bind_wan_session_backend(Arc::clone(&backend))
             .map_err(anyhow::Error::msg)?;
         info!("Device-authenticated WAN session backend configured");
+        Some(backend)
     } else {
         info!("Initial WAN sessions disabled (MRD_WAN_SESSION_API_URL is unset)");
-    }
+        None
+    };
 
     let relay_client = if let Some(config) =
         relay::RelayClientConfig::from_env().context("relay directory configuration failed")?
@@ -203,12 +205,32 @@ async fn run_service(
         None
     };
 
+    let wan_session_task = if let (Some(backend), true) = (wan_backend, relay_responder.is_some()) {
+        let task = wan_session::service::bind_and_spawn_wan_session_service(
+            Arc::clone(&app_state),
+            backend,
+        )
+        .await
+        .context("attended WAN session runtime startup failed")?;
+        info!("Attended WAN relay session runtime started");
+        Some(task)
+    } else {
+        if app_state.wan_session_backend().is_some() {
+            warn!(
+                "WAN session backend is configured but initial WAN sessions are inactive without authenticated signaling and relay failover"
+            );
+        }
+        None
+    };
+
     let ipc_server = IpcServer::new(Arc::clone(&app_state));
     let web_bridge_task = web_bridge::spawn_from_env(ipc_server.clone()).await?;
     let mut ipc_task = Box::pin(ipc_server.run());
     let mut web_task = Box::pin(web_bridge::wait_for_task(web_bridge_task));
     let mut agent_reconcile = tokio::time::interval(std::time::Duration::from_secs(5));
     agent_reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut wan_session_expiry = tokio::time::interval(std::time::Duration::from_secs(1));
+    wan_session_expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     reporter.running()?;
     info!("mrd-service running");
 
@@ -247,12 +269,20 @@ async fn run_service(
                     supervisor.reconcile().await;
                 }
             }
+            _ = wan_session_expiry.tick(), if app_state.wan_session_coordinator().is_some() => {
+                if let Some(coordinator) = app_state.wan_session_coordinator() {
+                    let _ = coordinator.expire_due_sessions().await;
+                }
+            }
         }
     };
 
     reporter.stop_pending()?;
     drop(ipc_task);
     drop(web_task);
+    if let Some(wan_session_task) = wan_session_task {
+        wan_session_task.shutdown().await;
+    }
     if let Some(relay_responder) = relay_responder {
         relay_responder.shutdown().await;
     }
