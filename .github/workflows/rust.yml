@@ -27,7 +27,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt -p realtime-server -p mrd-service --check
+      - run: cargo fmt --all -- --check
 
   rust-core:
     name: Rust core (${{ matrix.os }})
@@ -182,7 +182,7 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m compileall -q app
-      - run: python -m unittest discover -s tests -v
+      - run: python -m pytest -q
 
   full-workspace-linux:
     name: Full Rust workspace (Linux)
@@ -197,6 +197,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
+            cmake \
+            nasm \
             pkg-config \
             libglib2.0-dev \
             libgtk-3-dev \
@@ -214,7 +216,10 @@ jobs:
             libxkbcommon-dev \
             libxkbcommon-x11-dev
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: full-workspace-linux
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --lib --bins --locked

@@ -1076,7 +1076,7 @@ fn lan_protocol_module_exposes_stable_wire_versions_and_transports() {
     assert_eq!(super::protocol::PROTOCOL_VERSION, 1);
     assert_eq!(super::protocol::LAN_MEDIA_PROTOCOL_VERSION, 3);
     assert!(
-        super::protocol::DISCOVERY_PACKET_BUFFER_BYTES
+        std::hint::black_box(super::protocol::DISCOVERY_PACKET_BUFFER_BYTES)
             > super::protocol::DISCOVERY_SAFE_UDP_PAYLOAD_BYTES
     );
     assert_eq!(super::protocol::LAN_QUIC_MEDIA_TRANSPORT, "quic_datagram");
@@ -4454,17 +4454,12 @@ async fn target_sender_grant_expiry_closes_legacy_session_and_cleans_media() {
     // Drain payloads that were already queued while the grant was live. Once
     // the authoritative expiry cleanup has completed, the peer must never
     // observe another successfully delivered media datagram.
-    loop {
-        match timeout(
-            Duration::from_millis(5),
-            _controller_endpoint.read_datagram(),
-        )
-        .await
-        {
-            Ok(Ok(_)) => continue,
-            Ok(Err(_)) | Err(_) => break,
-        }
-    }
+    while let Ok(Ok(_)) = timeout(
+        Duration::from_millis(5),
+        _controller_endpoint.read_datagram(),
+    )
+    .await
+    {}
     assert!(!matches!(
         timeout(
             Duration::from_millis(100),

@@ -2230,8 +2230,8 @@ impl TestHarness {
         let low_latency_bitrate = config.bitrate.unwrap_or(12_000_000).max(1);
         let speed_bitrate = config.bitrate.unwrap_or(5_000_000).max(1);
         let color_mode = resolved_color_mode(config);
-        let color_pipeline = resolved_color_pipeline(&chain, config);
-        validate_chain_color_config(&chain, color_mode, color_pipeline)?;
+        let color_pipeline = resolved_color_pipeline(chain, config);
+        validate_chain_color_config(chain, color_mode, color_pipeline)?;
         let encoded_codec = match chain {
             TestChain::Custom {
                 encoder: EncoderType::NvencAv1,

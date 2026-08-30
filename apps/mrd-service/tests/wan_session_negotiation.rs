@@ -65,6 +65,10 @@ fn test_session_id() -> SessionId {
 }
 
 fn identity_for_session(role: WanSessionRole, session_id: &SessionId) -> WanSessionIdentity {
+    let expectation = match role {
+        WanSessionRole::Controller => "valid controller identity",
+        WanSessionRole::Target => "valid target identity",
+    };
     WanSessionIdentity::new(
         session_id.clone(),
         DeviceId("controller-device".into()),
@@ -73,10 +77,7 @@ fn identity_for_session(role: WanSessionRole, session_id: &SessionId) -> WanSess
         "22".repeat(32),
         20_000,
     )
-    .expect(match role {
-        WanSessionRole::Controller => "valid controller identity",
-        WanSessionRole::Target => "valid target identity",
-    })
+    .expect(expectation)
 }
 
 fn access_binding() -> RelayAccessBinding {
@@ -621,9 +622,11 @@ async fn target_executor_buffers_candidate_before_offer_and_skips_history_intent
         context.identity().controller_device_id(),
         context.identity().target_device_id(),
         context.grant_commitment(),
-        WebRtcDescriptionRoleV3::Offer,
-        "candidate:remote-controller 1 UDP 1 192.0.2.2 9 typ relay",
-        2,
+        CandidateFixture {
+            role: WebRtcDescriptionRoleV3::Offer,
+            candidate: "candidate:remote-controller 1 UDP 1 192.0.2.2 9 typ relay",
+            counter: 2,
+        },
     );
     let remote_fingerprint = match &remote_candidate.signal {
         AuthenticatedSessionSignal::WebRtcCandidateV3 { message } => {
@@ -1758,10 +1761,18 @@ fn signed_candidate_event(
         controller_device_id,
         target_device_id,
         grant_commitment,
-        WebRtcDescriptionRoleV3::Answer,
-        candidate,
-        counter,
+        CandidateFixture {
+            role: WebRtcDescriptionRoleV3::Answer,
+            candidate,
+            counter,
+        },
     )
+}
+
+struct CandidateFixture<'a> {
+    role: WebRtcDescriptionRoleV3,
+    candidate: &'a str,
+    counter: u64,
 }
 
 fn signed_candidate_event_with_role(
@@ -1770,10 +1781,13 @@ fn signed_candidate_event_with_role(
     controller_device_id: &DeviceId,
     target_device_id: &DeviceId,
     grant_commitment: &str,
-    role: WebRtcDescriptionRoleV3,
-    candidate: &str,
-    counter: u64,
+    fixture: CandidateFixture<'_>,
 ) -> VerifiedSignalingEvent {
+    let CandidateFixture {
+        role,
+        candidate,
+        counter,
+    } = fixture;
     let sdp_mid = Some("0".to_owned());
     let sdp_mline_index = Some(0);
     let username_fragment = Some("remote-fragment".to_owned());

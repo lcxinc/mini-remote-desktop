@@ -28,25 +28,6 @@ pub(super) fn receiver_should_use_local_render_fallback(
     dispatch.allows_local_render_fallback()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::receiver_should_use_local_render_fallback;
-    use crate::agent_runtime::AgentRenderDispatch;
-
-    #[test]
-    fn only_an_unavailable_agent_route_allows_service_local_render_fallback() {
-        assert!(receiver_should_use_local_render_fallback(
-            AgentRenderDispatch::Unavailable
-        ));
-        assert!(!receiver_should_use_local_render_fallback(
-            AgentRenderDispatch::Delivered
-        ));
-        assert!(!receiver_should_use_local_render_fallback(
-            AgentRenderDispatch::Rejected
-        ));
-    }
-}
-
 pub(super) async fn quic_media_v3_frame_to_legacy_frame(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
@@ -182,5 +163,24 @@ pub(super) async fn record_lan_decoded_frames(
             },
             now_ms(),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::receiver_should_use_local_render_fallback;
+    use crate::agent_runtime::AgentRenderDispatch;
+
+    #[test]
+    fn only_an_unavailable_agent_route_allows_service_local_render_fallback() {
+        assert!(receiver_should_use_local_render_fallback(
+            AgentRenderDispatch::Unavailable
+        ));
+        assert!(!receiver_should_use_local_render_fallback(
+            AgentRenderDispatch::Delivered
+        ));
+        assert!(!receiver_should_use_local_render_fallback(
+            AgentRenderDispatch::Rejected
+        ));
     }
 }

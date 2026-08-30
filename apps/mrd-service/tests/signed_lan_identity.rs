@@ -35,17 +35,29 @@ fn current_time_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn announcement(
-    signer: &DeviceIdentity,
-    device_id: &str,
-    device_name: &str,
-    instance_id: &str,
-    discovery_port: u16,
+struct AnnouncementFixture<'a> {
+    device_id: &'a str,
+    device_name: &'a str,
+    instance_id: &'a str,
     discovery_endpoint: SocketAddr,
     issued_at_ms: u64,
     expires_at_ms: u64,
     nonce: [u8; 16],
+}
+
+fn announcement(
+    signer: &DeviceIdentity,
+    fixture: AnnouncementFixture<'_>,
 ) -> SignedLanAnnouncement {
+    let AnnouncementFixture {
+        device_id,
+        device_name,
+        instance_id,
+        discovery_endpoint,
+        issued_at_ms,
+        expires_at_ms,
+        nonce,
+    } = fixture;
     SignedLanAnnouncement::sign(
         signer,
         1,
@@ -57,7 +69,7 @@ fn announcement(
             device_name: device_name.to_string(),
             device_type: "rdesk".to_string(),
             protocol_version: SIGNED_LAN_PROTOCOL_VERSION,
-            discovery_port,
+            discovery_port: discovery_endpoint.port(),
             transports: vec!["quic".to_string(), "quic_stream_media_v2".to_string()],
             service_build_id: Some("signed-lan-test".to_string()),
             media_protocol_version: Some(3),
@@ -118,14 +130,15 @@ fn signed_announcement_rejects_device_name_and_endpoint_tampering() {
     let signer = identity();
     let signed = announcement(
         &signer,
-        "peer-device",
-        "Peer Device",
-        "peer-instance",
-        21116,
-        "192.168.1.50:21116".parse().unwrap(),
-        NOW_MS,
-        NOW_MS + 10_000,
-        [1; 16],
+        AnnouncementFixture {
+            device_id: "peer-device",
+            device_name: "Peer Device",
+            instance_id: "peer-instance",
+            discovery_endpoint: "192.168.1.50:21116".parse().unwrap(),
+            issued_at_ms: NOW_MS,
+            expires_at_ms: NOW_MS + 10_000,
+            nonce: [1; 16],
+        },
     );
 
     signed.verify(NOW_MS).expect("valid announcement");
@@ -144,14 +157,15 @@ fn signed_announcement_rejects_device_name_and_endpoint_tampering() {
 
     let mut tampered_address = announcement(
         &signer,
-        "peer-device",
-        "Peer Device",
-        "peer-instance",
-        21116,
-        "192.168.1.50:21116".parse().unwrap(),
-        NOW_MS,
-        NOW_MS + 10_000,
-        [9; 16],
+        AnnouncementFixture {
+            device_id: "peer-device",
+            device_name: "Peer Device",
+            instance_id: "peer-instance",
+            discovery_endpoint: "192.168.1.50:21116".parse().unwrap(),
+            issued_at_ms: NOW_MS,
+            expires_at_ms: NOW_MS + 10_000,
+            nonce: [9; 16],
+        },
     );
     tampered_address.payload.discovery_endpoint = "192.168.1.99:21116".parse().unwrap();
     assert!(tampered_address.verify(NOW_MS).is_err());
@@ -162,14 +176,15 @@ fn expired_announcement_is_rejected() {
     let signer = identity();
     let signed = announcement(
         &signer,
-        "peer-device",
-        "Peer Device",
-        "peer-instance",
-        21116,
-        "192.168.1.50:21116".parse().unwrap(),
-        NOW_MS - 10_000,
-        NOW_MS - 3_000,
-        [2; 16],
+        AnnouncementFixture {
+            device_id: "peer-device",
+            device_name: "Peer Device",
+            instance_id: "peer-instance",
+            discovery_endpoint: "192.168.1.50:21116".parse().unwrap(),
+            issued_at_ms: NOW_MS - 10_000,
+            expires_at_ms: NOW_MS - 3_000,
+            nonce: [2; 16],
+        },
     );
 
     assert!(signed.verify(NOW_MS).is_err());
@@ -233,14 +248,15 @@ async fn replayed_announcement_is_rejected_without_replacing_the_peer() {
     let signer = identity();
     let signed = announcement(
         &signer,
-        "peer-device",
-        "Peer Device",
-        "peer-instance",
-        21116,
-        "192.168.1.50:21116".parse().unwrap(),
-        NOW_MS,
-        NOW_MS + 10_000,
-        [4; 16],
+        AnnouncementFixture {
+            device_id: "peer-device",
+            device_name: "Peer Device",
+            instance_id: "peer-instance",
+            discovery_endpoint: "192.168.1.50:21116".parse().unwrap(),
+            issued_at_ms: NOW_MS,
+            expires_at_ms: NOW_MS + 10_000,
+            nonce: [4; 16],
+        },
     );
     let source: SocketAddr = "192.168.1.50:21116".parse().unwrap();
 
@@ -264,14 +280,15 @@ async fn signed_announcement_rejects_a_spoofed_udp_source_address() {
     let signer = identity();
     let signed = announcement(
         &signer,
-        "peer-device",
-        "Peer Device",
-        "peer-instance",
-        21116,
-        "192.168.1.50:21116".parse().unwrap(),
-        NOW_MS,
-        NOW_MS + 10_000,
-        [10; 16],
+        AnnouncementFixture {
+            device_id: "peer-device",
+            device_name: "Peer Device",
+            instance_id: "peer-instance",
+            discovery_endpoint: "192.168.1.50:21116".parse().unwrap(),
+            issued_at_ms: NOW_MS,
+            expires_at_ms: NOW_MS + 10_000,
+            nonce: [10; 16],
+        },
     );
 
     let error = ingest_signed_lan_announcement(
@@ -293,14 +310,15 @@ async fn untrusted_signed_peer_is_discoverable_but_not_controllable() {
     let signer = identity();
     let signed = announcement(
         &signer,
-        "untrusted-device",
-        "Untrusted Device",
-        "untrusted-instance",
-        21116,
-        "192.168.1.51:21116".parse().unwrap(),
-        NOW_MS,
-        NOW_MS + 10_000,
-        [5; 16],
+        AnnouncementFixture {
+            device_id: "untrusted-device",
+            device_name: "Untrusted Device",
+            instance_id: "untrusted-instance",
+            discovery_endpoint: "192.168.1.51:21116".parse().unwrap(),
+            issued_at_ms: NOW_MS,
+            expires_at_ms: NOW_MS + 10_000,
+            nonce: [5; 16],
+        },
     );
 
     ingest_signed_lan_announcement(

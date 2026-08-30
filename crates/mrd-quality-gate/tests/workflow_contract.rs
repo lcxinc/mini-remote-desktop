@@ -73,6 +73,18 @@ fn relay_control_workflow() -> String {
     .unwrap()
 }
 
+fn cross_platform_workflow() -> String {
+    fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../.github/workflows/rust.yml"
+    ))
+    .unwrap()
+}
+
+fn repository_attributes() -> String {
+    fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.gitattributes")).unwrap()
+}
+
 fn multi_region_lab_workflow() -> String {
     fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -91,12 +103,12 @@ fn relay_control_ci_runs_postgres_linux_windows_and_deterministic_contracts() {
         "test_relay_repository.py",
         "test_relay_repository_postgres.py",
         "test_relay_directory_postgres.py",
-        "cargo test -p mrd-relay-control",
-        "cargo build -p mrd-relay-agent",
+        "cargo test --locked -p mrd-relay-control",
+        "cargo build --locked -p mrd-relay-agent",
         "runs-on: ubuntu-latest",
         "runs-on: windows-latest",
         "test_multi_region_relay.ps1",
-        "cargo test -p mrd-quality-gate",
+        "cargo test --locked -p mrd-quality-gate",
         "if: always()",
         "name: Enforce relay control gate",
     ] {
@@ -106,6 +118,58 @@ fn relay_control_ci_runs_postgres_linux_windows_and_deterministic_contracts() {
         );
     }
     assert!(!yaml.contains("continue-on-error: true"));
+}
+
+#[test]
+fn cross_platform_ci_runs_real_backend_tests_and_workspace_lints() {
+    let yaml = cross_platform_workflow();
+    for required in [
+        "cargo fmt --all -- --check",
+        "cargo clippy --workspace --all-targets --locked -- -D warnings",
+        "python -m pytest",
+    ] {
+        assert!(
+            yaml.contains(required),
+            "missing core CI command: {required}"
+        );
+    }
+    assert!(
+        !yaml.contains("python -m unittest discover"),
+        "unittest discovery silently misses the pytest suite"
+    );
+}
+
+#[test]
+fn relay_control_ci_covers_runtime_and_deployment_paths_and_preserves_exit_codes() {
+    let yaml = relay_control_workflow();
+    for required in [
+        "apps/mrd-service/src/relay/**",
+        "deploy/turn/**",
+        "tests/benchmarks/scripts/**",
+        "HOME=/root",
+        "$contractExitCode = $LASTEXITCODE",
+        "$qualityGateExitCode = $LASTEXITCODE",
+    ] {
+        assert!(
+            yaml.contains(required),
+            "missing deterministic relay CI contract: {required}"
+        );
+    }
+    assert!(
+        !yaml.contains("| Tee-Object"),
+        "native commands must be captured before log rendering"
+    );
+}
+
+#[test]
+fn cross_platform_scripts_have_deterministic_line_endings() {
+    let attributes = repository_attributes();
+    for required in ["*.ps1 text eol=lf", "*.sh text eol=lf"] {
+        assert!(
+            attributes.contains(required),
+            "missing line-ending contract: {required}"
+        );
+    }
 }
 
 #[test]

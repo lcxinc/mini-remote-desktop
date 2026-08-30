@@ -379,14 +379,10 @@ async fn security_negative_untrusted_emits_authoritative_evidence() {
         reply_socket.local_addr().unwrap(),
         [0x31; 16],
     );
-    drop(reply_socket);
     let audit_baseline = audit_sequence_baseline(&app_state);
     let side_effect_baseline = capture_side_effect_totals(&app_state).await;
 
     let service_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let reply_socket = UdpSocket::bind(request.payload.source_endpoint)
-        .await
-        .unwrap();
     process_lan_discovery_packet(
         &service_socket,
         &app_state,

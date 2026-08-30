@@ -789,7 +789,7 @@ fn run_blocking_sender_loop<C, E>(
 
 enum QuicHostEncoder {
     OpenH264(Box<OpenH264Encoder>),
-    Nvenc(NvencH264Encoder),
+    Nvenc(Box<NvencH264Encoder>),
 }
 
 impl VideoEncoder for QuicHostEncoder {
@@ -811,15 +811,15 @@ fn create_test_encoder(
     fps: u32,
 ) -> Result<QuicHostEncoder, PipelineError> {
     match backend {
-        "nvenc" => Ok(QuicHostEncoder::Nvenc(NvencH264Encoder::new(
+        "nvenc" => Ok(QuicHostEncoder::Nvenc(Box::new(NvencH264Encoder::new(
             width, height, fps,
-        )?)),
-        "nvenc_ll_p1" => Ok(QuicHostEncoder::Nvenc(
+        )?))),
+        "nvenc_ll_p1" => Ok(QuicHostEncoder::Nvenc(Box::new(
             NvencH264Encoder::new_low_latency_p1(width, height, fps)?,
-        )),
-        "nvenc_hq_p5" => Ok(QuicHostEncoder::Nvenc(
+        ))),
+        "nvenc_hq_p5" => Ok(QuicHostEncoder::Nvenc(Box::new(
             NvencH264Encoder::new_high_quality_p5(width, height, fps)?,
-        )),
+        ))),
         "openh264" => Ok(QuicHostEncoder::OpenH264(Box::new(OpenH264Encoder::new(
             width, height, fps,
         )?))),

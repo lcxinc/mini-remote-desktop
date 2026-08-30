@@ -25,7 +25,9 @@ function Read-RequiredText {
 
   $path = Join-Path $PSScriptRoot $RelativePath
   Assert-True (Test-Path -LiteralPath $path -PathType Leaf) "missing $RelativePath"
-  return Get-Content -LiteralPath $path -Raw
+  $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+  $text = [IO.File]::ReadAllText([IO.Path]::GetFullPath($path), $utf8)
+  return $text.Replace("`r`n", "`n").Replace("`r", "`n")
 }
 
 function Assert-Matches {
@@ -1105,7 +1107,7 @@ foreach ($pattern in @(
     '(?i)native.*verified.*drain.*fail closed',
     '(?i)listener.*credential.*allocation.*permission.*bidirectional',
     '(?i)scope.?=.?local',
-    '(?i)public.*Task 11.*INFRA_FAIL',
+    '(?is)public.*Task 11.*INFRA_FAIL',
     '(?i)never.*log.*(?:secret|credential)',
     '(?i)raw.?32.*wire.*43.*(?:persisted|coturn)',
     '(?i)max_egress_bps.*bits/s.*coturn.*bytes/s',

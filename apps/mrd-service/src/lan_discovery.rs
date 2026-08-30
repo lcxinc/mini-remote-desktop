@@ -6680,9 +6680,11 @@ async fn receive_quic_media_loop(
                                     &endpoint,
                                     transport_mux.as_deref(),
                                     &error,
-                                    &mut receiver_stats,
-                                    &mut keyframe_request_sequence,
-                                    &mut last_keyframe_request_at,
+                                    LanHolRecoveryState {
+                                        receiver_stats: &mut receiver_stats,
+                                        keyframe_request_sequence: &mut keyframe_request_sequence,
+                                        last_keyframe_request_at: &mut last_keyframe_request_at,
+                                    },
                                 )
                                 .await;
                                 tracing::warn!(
@@ -6716,9 +6718,11 @@ async fn receive_quic_media_loop(
                             &endpoint,
                             transport_mux.as_deref(),
                             &error,
-                            &mut receiver_stats,
-                            &mut keyframe_request_sequence,
-                            &mut last_keyframe_request_at,
+                            LanHolRecoveryState {
+                                receiver_stats: &mut receiver_stats,
+                                keyframe_request_sequence: &mut keyframe_request_sequence,
+                                last_keyframe_request_at: &mut last_keyframe_request_at,
+                            },
                         )
                         .await;
                         tracing::warn!(
@@ -7290,20 +7294,24 @@ async fn receive_quic_media_loop(
     }
 }
 
+struct LanHolRecoveryState<'a> {
+    receiver_stats: &'a mut LanSenderStatsTracker,
+    keyframe_request_sequence: &'a mut u32,
+    last_keyframe_request_at: &'a mut Option<Instant>,
+}
+
 async fn recover_persistent_media_hol_stall(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
     endpoint: &QuinnDatagramEndpoint,
     transport_mux: Option<&QuicTransportMux>,
     error: &str,
-    receiver_stats: &mut LanSenderStatsTracker,
-    keyframe_request_sequence: &mut u32,
-    last_keyframe_request_at: &mut Option<Instant>,
+    recovery: LanHolRecoveryState<'_>,
 ) {
     if !error.contains("persistent reliable HOL payload timeout") {
         return;
     }
-    receiver_stats.record_ms(
+    recovery.receiver_stats.record_ms(
         "receiver.reliable_hol_timeout",
         LAN_QUIC_PERSISTENT_MEDIA_HOL_TIMEOUT.as_secs_f64() * 1000.0,
     );
@@ -7318,9 +7326,9 @@ async fn recover_persistent_media_hol_stall(
         transport_mux,
         session_id,
         &profile,
-        keyframe_request_sequence,
-        last_keyframe_request_at,
-        receiver_stats,
+        recovery.keyframe_request_sequence,
+        recovery.last_keyframe_request_at,
+        recovery.receiver_stats,
     )
     .await;
 }

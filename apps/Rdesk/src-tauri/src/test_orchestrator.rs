@@ -2997,9 +2997,8 @@ impl TestOrchestrator {
             let events: Vec<_> = record
                 .events
                 .into_iter()
-                .map(|event| {
-                    append_event_to_store(&self.telemetry_store, &run_id, &event);
-                    event
+                .inspect(|event| {
+                    append_event_to_store(&self.telemetry_store, &run_id, event);
                 })
                 .collect();
             self.run_events
@@ -3506,6 +3505,7 @@ fn macos_videotoolbox_hevc_decoder_available() -> bool {
     false
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn append_macos_videotoolbox_decoder_capabilities(
     available_decoders: &mut Vec<String>,
     h264_decoder_available: bool,
@@ -5181,9 +5181,12 @@ mod tests {
             ..Default::default()
         };
 
-        let probe =
-            TestOrchestrator::transport_single_window_access_units(&[input.clone()], 60, &config)
-                .expect("HEVC single-window WebRTC loopback");
+        let probe = TestOrchestrator::transport_single_window_access_units(
+            std::slice::from_ref(&input),
+            60,
+            &config,
+        )
+        .expect("HEVC single-window WebRTC loopback");
 
         assert_eq!(probe.transport, "webrtc_rtp_loopback");
         assert_eq!(probe.rtp_packet_count, 2);

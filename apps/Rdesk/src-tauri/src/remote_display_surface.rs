@@ -419,9 +419,9 @@ impl NativeSurfaceControlInput {
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum NativeSurfaceRealtimeKind {
-    MouseMove,
-    MouseWheel,
-    MouseHorizontalWheel,
+    Move,
+    Wheel,
+    HorizontalWheel,
 }
 
 #[cfg(windows)]
@@ -429,12 +429,10 @@ fn native_surface_realtime_kind(
     event: &mrd_ipc::ControlInputEvent,
 ) -> Option<NativeSurfaceRealtimeKind> {
     match event {
-        mrd_ipc::ControlInputEvent::MouseMove { .. } => Some(NativeSurfaceRealtimeKind::MouseMove),
-        mrd_ipc::ControlInputEvent::MouseWheel { .. } => {
-            Some(NativeSurfaceRealtimeKind::MouseWheel)
-        }
+        mrd_ipc::ControlInputEvent::MouseMove { .. } => Some(NativeSurfaceRealtimeKind::Move),
+        mrd_ipc::ControlInputEvent::MouseWheel { .. } => Some(NativeSurfaceRealtimeKind::Wheel),
         mrd_ipc::ControlInputEvent::MouseHorizontalWheel { .. } => {
-            Some(NativeSurfaceRealtimeKind::MouseHorizontalWheel)
+            Some(NativeSurfaceRealtimeKind::HorizontalWheel)
         }
         _ => None,
     }
@@ -672,6 +670,7 @@ impl NativeSurfaceControlInputReceiver {
         }
     }
 
+    #[cfg(test)]
     pub fn recv_timeout(&self, timeout: std::time::Duration) -> Option<NativeSurfaceControlInput> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -813,7 +812,7 @@ fn apply_windows_surface_input_side_effect(
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn windows_surface_input_events_from_message(
     message: u32,
     wparam: usize,
@@ -1801,7 +1800,7 @@ mod remote_display_surface_input_tests {
         fn focus_snapshot(&self) -> KeyboardSmokeFocusSnapshot {
             unsafe {
                 KeyboardSmokeFocusSnapshot {
-                    hwnd: self.hwnd.0 as isize,
+                    hwnd: self.hwnd.0,
                     foreground: windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0
                         as isize,
                     focus: windows::Win32::UI::Input::KeyboardAndMouse::GetFocus().0 as isize,

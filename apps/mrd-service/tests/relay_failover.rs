@@ -472,10 +472,12 @@ async fn authenticated_remote_offer_refreshes_exact_node_and_commits_answer_side
         .expect("answer-side migration");
 
     assert!(matches!(outcome, RelayRecoveryOutcome::Migrated { .. }));
-    let contexts = fixture.backend.contexts.lock().unwrap();
-    let refresh_context = contexts.last().expect("refresh access context");
-    assert!(refresh_context.is_refresh());
-    assert_eq!(refresh_context.generation(), Some(0));
+    {
+        let contexts = fixture.backend.contexts.lock().unwrap();
+        let refresh_context = contexts.last().expect("refresh access context");
+        assert!(refresh_context.is_refresh());
+        assert_eq!(refresh_context.generation(), Some(0));
+    }
     let snapshot = fixture
         .coordinator
         .snapshot(&fixture.session_id)

@@ -5,9 +5,11 @@ on:
     paths:
       - "apps/Rdesk-Server/**"
       - "apps/mrd-relay-agent/**"
+      - "apps/mrd-service/src/relay/**"
       - "crates/mrd-relay-control/**"
       - "crates/mrd-quality-gate/**"
-      - "tests/benchmarks/scripts/*multi_region_relay*"
+      - "deploy/turn/**"
+      - "tests/benchmarks/scripts/**"
       - "tests/quality-gates/**"
       - ".github/workflows/relay-control.yml"
   push:
@@ -69,7 +71,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Test relay selection and signed directory
-        run: cargo test -p mrd-relay-control
+        run: cargo test --locked -p mrd-relay-control
 
   relay-agent-linux:
     name: Linux relay agent build
@@ -80,9 +82,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build Linux relay agent
-        run: cargo build -p mrd-relay-agent
+        run: cargo build --locked -p mrd-relay-agent
       - name: Test Linux relay agent
-        run: cargo test -p mrd-relay-agent
+        shell: bash
+        run: |
+          cargo_path="$(command -v cargo)"
+          rustup_home="$(rustup show home)"
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          sudo env \
+            HOME=/root \
+            CARGO_HOME="$cargo_home" \
+            RUSTUP_HOME="$rustup_home" \
+            PATH="$PATH" \
+            "$cargo_path" test --locked -p mrd-relay-agent
 
   relay-agent-windows:
     name: Windows relay agent build
@@ -93,9 +105,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build Windows relay agent
-        run: cargo build -p mrd-relay-agent
+        run: cargo build --locked -p mrd-relay-agent
       - name: Test Windows relay agent
-        run: cargo test -p mrd-relay-agent
+        run: cargo test --locked -p mrd-relay-agent
 
   relay-control-gate:
     name: Deterministic relay control gate
@@ -110,12 +122,19 @@ jobs:
         id: relay-contracts
         shell: powershell
         run: |
-          powershell -NoProfile -ExecutionPolicy Bypass `
-            -File tests/benchmarks/scripts/test_multi_region_relay.ps1 2>&1 `
-            | Tee-Object -FilePath multi-region-relay-contracts.log
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p mrd-quality-gate 2>&1 | Tee-Object -FilePath multi-region-relay-quality-gate.log
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $contractLog = "multi-region-relay-contracts.log"
+          & powershell -NoProfile -ExecutionPolicy Bypass `
+            -File tests/benchmarks/scripts/test_multi_region_relay.ps1 `
+            1> $contractLog 2>&1
+          $contractExitCode = $LASTEXITCODE
+          Get-Content -LiteralPath $contractLog | Write-Output
+          if ($contractExitCode -ne 0) { exit $contractExitCode }
+
+          $qualityGateLog = "multi-region-relay-quality-gate.log"
+          & cargo test --locked -p mrd-quality-gate 1> $qualityGateLog 2>&1
+          $qualityGateExitCode = $LASTEXITCODE
+          Get-Content -LiteralPath $qualityGateLog | Write-Output
+          if ($qualityGateExitCode -ne 0) { exit $qualityGateExitCode }
       - name: Upload deterministic relay gate evidence
         if: always()
         uses: actions/upload-artifact@v4

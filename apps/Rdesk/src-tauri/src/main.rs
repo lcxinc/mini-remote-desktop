@@ -15,6 +15,7 @@ mod quic_host;
 #[cfg(test)]
 mod quic_transport_harness;
 mod remote_display_surface;
+#[cfg(test)]
 mod render_host;
 mod render_probe;
 mod render_proxy;
@@ -272,6 +273,8 @@ fn apply_native_chrome(window: WebviewWindow) -> platform::NativeBackdropStatus 
     platform::configure_main_window(&window)
 }
 
+// Tauri derives the stable IPC field names from this command signature.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 fn open_remote_display_window(
     app: AppHandle,
@@ -364,6 +367,8 @@ fn open_remote_display_window(
     Ok(context)
 }
 
+// This helper mirrors the stable Tauri command's profile fields one-for-one.
+#[allow(clippy::too_many_arguments)]
 fn remote_display_profile_query_params(
     profile_width: Option<u32>,
     profile_height: Option<u32>,
@@ -984,6 +989,8 @@ async fn browser_webrtc_preview_stop(
     Ok(())
 }
 
+// Tauri derives the stable IPC field names from this command signature.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn configure_remote_display_native_surface(
     window: WebviewWindow,
@@ -1724,7 +1731,7 @@ fn write_json_file(
 
     let content = serde_json::to_vec_pretty(value)
         .map_err(|error| format!("serialize {label} failed: {error}"))?;
-    std::fs::write(&path, content).map_err(|error| format!("write {label} failed: {error}"))?;
+    std::fs::write(path, content).map_err(|error| format!("write {label} failed: {error}"))?;
     Ok(())
 }
 

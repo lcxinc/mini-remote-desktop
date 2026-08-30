@@ -55,6 +55,7 @@ pub struct SurfaceSourceBindingResponse {
     pub source_id: String,
 }
 
+#[derive(Default)]
 pub struct RenderHost {
     renderers: HashMap<SessionId, HashMap<String, BoxedRenderer>>,
     surface_sources: HashMap<SessionId, HashMap<String, String>>,
@@ -95,43 +96,6 @@ impl RenderHost {
             .or_default()
             .entry(surface_id)
             .or_insert_with(|| DEFAULT_SOURCE_ID.to_string());
-        Ok(())
-    }
-
-    pub fn detach_session(&mut self, session_id: &SessionId) {
-        self.renderers.remove(session_id);
-        self.surface_sources.remove(session_id);
-    }
-
-    pub fn detach_surface(&mut self, session_id: &SessionId, surface_id: &str) {
-        if let Some(renderers) = self.renderers.get_mut(session_id) {
-            renderers.remove(surface_id);
-            if renderers.is_empty() {
-                self.renderers.remove(session_id);
-            }
-        }
-        if let Some(surface_sources) = self.surface_sources.get_mut(session_id) {
-            surface_sources.remove(surface_id);
-            if surface_sources.is_empty() {
-                self.surface_sources.remove(session_id);
-            }
-        }
-    }
-
-    pub fn bind_surface_source(
-        &mut self,
-        session_id: &SessionId,
-        surface_id: &str,
-        source_id: String,
-    ) -> Result<(), String> {
-        let surface_sources = self
-            .surface_sources
-            .get_mut(session_id)
-            .ok_or_else(|| format!("未找到会话 renderer: {}", session_id.0))?;
-        if !surface_sources.contains_key(surface_id) {
-            return Err(format!("未找到 surface: {}", surface_id));
-        }
-        surface_sources.insert(surface_id.to_string(), source_id);
         Ok(())
     }
 
@@ -233,22 +197,11 @@ impl RenderHost {
             renderer_backend: self
                 .renderers
                 .get(session_id)
-                .and_then(|renderers| (!renderers.is_empty()).then(|| native_renderer_backend())),
+                .and_then(|renderers| (!renderers.is_empty()).then(native_renderer_backend)),
             renderer_snapshot,
             surface_source_bindings,
             available_source_ids,
         })
-    }
-}
-
-impl Default for RenderHost {
-    fn default() -> Self {
-        Self {
-            renderers: HashMap::new(),
-            surface_sources: HashMap::new(),
-            frame_sink: None,
-            probe_registry: None,
-        }
     }
 }
 
@@ -269,16 +222,6 @@ fn decoded_frame_snapshot_response(
         },
         bytes: snapshot.bytes,
     }
-}
-
-pub fn render_host_snapshot_with(
-    render_host: &std::sync::Mutex<RenderHost>,
-    session_id: String,
-) -> Result<RenderHostSnapshot, String> {
-    render_host
-        .lock()
-        .expect("lock render host")
-        .snapshot(&SessionId(session_id))
 }
 
 fn create_native_renderer(window_handle: isize) -> Result<BoxedRenderer, String> {
@@ -329,15 +272,15 @@ fn create_native_renderer_instance() -> Result<BoxedRenderer, RenderError> {
 fn native_renderer_backend() -> String {
     #[cfg(windows)]
     {
-        return "d3d11".to_string();
+        "d3d11".to_string()
     }
     #[cfg(target_os = "macos")]
     {
-        return "metal".to_string();
+        "metal".to_string()
     }
     #[cfg(target_os = "linux")]
     {
-        return "linux".to_string();
+        "linux".to_string()
     }
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {

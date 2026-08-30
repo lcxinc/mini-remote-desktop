@@ -1791,16 +1791,28 @@ mod authenticated_tests {
         RemotePermissionScope::InputKeyboard,
     ];
 
-    async fn install_control_authorization(
-        state: &Arc<AppState>,
-        session_id: &SessionId,
+    struct ControlAuthorizationFixture<'a> {
         peer_device_id: DeviceId,
-        peer_identity: &DeviceIdentity,
+        peer_identity: &'a DeviceIdentity,
         role: RemoteSessionRole,
         grant_id: [u8; 32],
         created_at_ms: u64,
         expires_at_ms: u64,
+    }
+
+    async fn install_control_authorization(
+        state: &Arc<AppState>,
+        session_id: &SessionId,
+        fixture: ControlAuthorizationFixture<'_>,
     ) {
+        let ControlAuthorizationFixture {
+            peer_device_id,
+            peer_identity,
+            role,
+            grant_id,
+            created_at_ms,
+            expires_at_ms,
+        } = fixture;
         let request = crate::session_authorization::VerifiedIncomingAuthorizationRequest {
             session_id: session_id.clone(),
             peer_device_id,
@@ -2038,23 +2050,27 @@ mod authenticated_tests {
         install_control_authorization(
             &controller_state,
             &session_id,
-            DeviceId("target-device".to_string()),
-            target_identity.as_ref(),
-            RemoteSessionRole::Controller,
-            grant_id,
-            created_at_ms,
-            expires_at_ms,
+            ControlAuthorizationFixture {
+                peer_device_id: DeviceId("target-device".to_string()),
+                peer_identity: target_identity.as_ref(),
+                role: RemoteSessionRole::Controller,
+                grant_id,
+                created_at_ms,
+                expires_at_ms,
+            },
         )
         .await;
         install_control_authorization(
             &target_state,
             &session_id,
-            DeviceId("controller-device".to_string()),
-            controller_identity.as_ref(),
-            RemoteSessionRole::Agent,
-            grant_id,
-            created_at_ms,
-            expires_at_ms,
+            ControlAuthorizationFixture {
+                peer_device_id: DeviceId("controller-device".to_string()),
+                peer_identity: controller_identity.as_ref(),
+                role: RemoteSessionRole::Agent,
+                grant_id,
+                created_at_ms,
+                expires_at_ms,
+            },
         )
         .await;
 
@@ -2247,12 +2263,14 @@ mod authenticated_tests {
         install_control_authorization(
             &state,
             &session_id,
-            DeviceId("missing-target".to_string()),
-            &target_identity,
-            RemoteSessionRole::Controller,
-            [0x73; 32],
-            created_at_ms,
-            created_at_ms.saturating_add(60_000),
+            ControlAuthorizationFixture {
+                peer_device_id: DeviceId("missing-target".to_string()),
+                peer_identity: &target_identity,
+                role: RemoteSessionRole::Controller,
+                grant_id: [0x73; 32],
+                created_at_ms,
+                expires_at_ms: created_at_ms.saturating_add(60_000),
+            },
         )
         .await;
         let failure = lan_control_failure(

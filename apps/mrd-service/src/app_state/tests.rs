@@ -672,7 +672,6 @@ fn media_pipeline_registry_exposes_active_media_profile_sampling() {
         hdr_enabled: Some(false),
         color_mode: Some("monochrome".to_string()),
         color_pipeline: Some("sdr8".to_string()),
-        ..MediaProfile::default()
     };
 
     registry.set_active_media_profile(session_id.clone(), &profile);

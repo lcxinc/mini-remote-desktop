@@ -577,25 +577,23 @@ fn validate_evidence_with_key(
         {
             return Err("relay access is not identically bound to both peers".to_owned());
         }
-    } else {
-        if required_bool(evidence, "/reservation/owner_verified")?
-            || [
-                "/reservation/controller_directory_id",
-                "/reservation/target_directory_id",
-                "/reservation/controller_relay_url_digest",
-                "/reservation/target_relay_url_digest",
-                "/reservation/primary_reservation_id",
-                "/reservation/backup_reservation_id",
-            ]
-            .iter()
-            .any(|pointer| {
-                evidence
-                    .pointer(pointer)
-                    .is_some_and(|value| !value.is_null())
-            })
-        {
-            return Err("row claims reservation ownership before relay access".to_owned());
-        }
+    } else if required_bool(evidence, "/reservation/owner_verified")?
+        || [
+            "/reservation/controller_directory_id",
+            "/reservation/target_directory_id",
+            "/reservation/controller_relay_url_digest",
+            "/reservation/target_relay_url_digest",
+            "/reservation/primary_reservation_id",
+            "/reservation/backup_reservation_id",
+        ]
+        .iter()
+        .any(|pointer| {
+            evidence
+                .pointer(pointer)
+                .is_some_and(|value| !value.is_null())
+        })
+    {
+        return Err("row claims reservation ownership before relay access".to_owned());
     }
 
     let created = evidence
@@ -644,28 +642,26 @@ fn validate_evidence_with_key(
         {
             return Err("negative row did not fail closed at the expected boundary".to_owned());
         }
-    } else {
-        if !required_bool(evidence, "/authorization/target_approved")?
-            || !required_bool(evidence, "/authorization/grant_signature_verified")?
-            || !required_bool(evidence, "/authorization/scope_digest_equal")?
-            || !required_bool(evidence, "/reservation/committed")?
-            || !required_bool(evidence, "/fault/transport_opened")?
-            || !required_bool(evidence, "/selected_pair/runtime_verified")?
-            || required_str(evidence, "/selected_pair/local_candidate_type")? != "relay"
-            || required_str(evidence, "/selected_pair/remote_candidate_type")? != "relay"
-            || required_str(evidence, "/selected_pair/transport")? != row.transport()
-            || required_u64(evidence, "/traffic/media_frames")? == 0
-            || required_u64(evidence, "/traffic/control_events")? == 0
-            || required_u64(evidence, "/traffic/realtime_control_events")? == 0
-            || required_str(evidence, "/traffic/media_probe_id")?
-                != format!("{invocation_id}:{}:media", row.id())
-            || required_str(evidence, "/traffic/control_probe_id")?
-                != format!("{invocation_id}:{}:control", row.id())
-            || required_str(evidence, "/traffic/realtime_control_probe_id")?
-                != format!("{invocation_id}:{}:realtime-control", row.id())
-        {
-            return Err("connected row lacks relay/relay traffic proof".to_owned());
-        }
+    } else if !required_bool(evidence, "/authorization/target_approved")?
+        || !required_bool(evidence, "/authorization/grant_signature_verified")?
+        || !required_bool(evidence, "/authorization/scope_digest_equal")?
+        || !required_bool(evidence, "/reservation/committed")?
+        || !required_bool(evidence, "/fault/transport_opened")?
+        || !required_bool(evidence, "/selected_pair/runtime_verified")?
+        || required_str(evidence, "/selected_pair/local_candidate_type")? != "relay"
+        || required_str(evidence, "/selected_pair/remote_candidate_type")? != "relay"
+        || required_str(evidence, "/selected_pair/transport")? != row.transport()
+        || required_u64(evidence, "/traffic/media_frames")? == 0
+        || required_u64(evidence, "/traffic/control_events")? == 0
+        || required_u64(evidence, "/traffic/realtime_control_events")? == 0
+        || required_str(evidence, "/traffic/media_probe_id")?
+            != format!("{invocation_id}:{}:media", row.id())
+        || required_str(evidence, "/traffic/control_probe_id")?
+            != format!("{invocation_id}:{}:control", row.id())
+        || required_str(evidence, "/traffic/realtime_control_probe_id")?
+            != format!("{invocation_id}:{}:realtime-control", row.id())
+    {
+        return Err("connected row lacks relay/relay traffic proof".to_owned());
     }
 
     if row != InitialWanRow::PrimaryFailureCrossDomainMigration

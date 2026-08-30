@@ -376,7 +376,7 @@ fn extract_zip_archive(archive_path: &Path, destination: &Path) -> Result<(), Ff
         let mut entry = archive
             .by_index(index)
             .map_err(|error| FfmpegError::Archive(error.to_string()))?;
-        let Some(enclosed_name) = entry.enclosed_name().map(PathBuf::from) else {
+        let Some(enclosed_name) = entry.enclosed_name() else {
             continue;
         };
         let output_path = destination.join(enclosed_name);

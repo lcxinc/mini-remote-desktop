@@ -557,7 +557,7 @@ pub(crate) async fn run_quic_benchmark_pipeline(
 
 enum QuicBenchmarkEncoder {
     OpenH264(Box<OpenH264Encoder>),
-    Nvenc(NvencH264Encoder),
+    Nvenc(Box<NvencH264Encoder>),
 }
 
 impl VideoEncoder for QuicBenchmarkEncoder {
@@ -579,15 +579,15 @@ fn create_test_encoder(
     fps: u32,
 ) -> Result<QuicBenchmarkEncoder, PipelineError> {
     match backend {
-        "nvenc" => Ok(QuicBenchmarkEncoder::Nvenc(NvencH264Encoder::new(
-            width, height, fps,
-        )?)),
-        "nvenc_ll_p1" => Ok(QuicBenchmarkEncoder::Nvenc(
+        "nvenc" => Ok(QuicBenchmarkEncoder::Nvenc(Box::new(
+            NvencH264Encoder::new(width, height, fps)?,
+        ))),
+        "nvenc_ll_p1" => Ok(QuicBenchmarkEncoder::Nvenc(Box::new(
             NvencH264Encoder::new_low_latency_p1(width, height, fps)?,
-        )),
-        "nvenc_hq_p5" => Ok(QuicBenchmarkEncoder::Nvenc(
+        ))),
+        "nvenc_hq_p5" => Ok(QuicBenchmarkEncoder::Nvenc(Box::new(
             NvencH264Encoder::new_high_quality_p5(width, height, fps)?,
-        )),
+        ))),
         "openh264" => Ok(QuicBenchmarkEncoder::OpenH264(Box::new(
             OpenH264Encoder::new(width, height, fps)?,
         ))),

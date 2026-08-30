@@ -162,10 +162,7 @@ fn temporary_config_path() -> PathBuf {
         .unwrap()
         .as_nanos();
     #[cfg(target_os = "linux")]
-    let root = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .expect("Linux CLI contract tests require an absolute HOME");
+    let root = PathBuf::from("/root");
     #[cfg(not(target_os = "linux"))]
     let root = std::env::temp_dir();
     root.join(format!("mrd-relay-agent-cli-{unique}.json"))
