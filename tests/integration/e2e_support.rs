@@ -7,9 +7,11 @@ use mrd_pipeline_core::{
     CapturedFrame, DecodedFrame, EncodedAccessUnit, FrameCapture, FramePixelFormat, PipelineError,
     VideoCodec, VideoEncoder,
 };
+#[cfg(any(target_os = "macos", windows))]
+use mrd_render::RendererFactory;
 #[cfg(not(any(target_os = "macos", windows)))]
 use mrd_render::{RenderError, RendererSnapshot};
-use mrd_render::{RenderFrame, RenderPixelFormat, RendererFactory, RendererInstance};
+use mrd_render::{RenderFrame, RenderPixelFormat, RendererInstance};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
