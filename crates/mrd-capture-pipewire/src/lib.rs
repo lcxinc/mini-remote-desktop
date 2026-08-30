@@ -978,7 +978,7 @@ mod tests {
                         println!("  Frame size: {}x{}", frame.width, frame.height);
                         println!("  Pixel format: {:?}", frame.pixel_format);
                         println!("  Data size: {} bytes", frame.data.len());
-                        assert!(frame.data.len() > 0);
+                        assert!(!frame.data.is_empty());
                         assert!(frame.width > 0);
                         assert!(frame.height > 0);
                     }
@@ -1007,6 +1007,6 @@ mod tests {
         let frame = result.unwrap();
         assert_eq!(frame.width, 1920);
         assert_eq!(frame.height, 1080);
-        assert!(frame.data.len() > 0);
+        assert!(!frame.data.is_empty());
     }
 }
