@@ -987,7 +987,7 @@ impl VideoEncoder for NvencAv1Encoder {
             return Ok(vec![]);
         }
 
-        let force_idr = self.frame_index == 0 || self.frame_index % self.fps as usize == 0;
+        let force_idr = self.frame_index == 0 || self.frame_index.is_multiple_of(self.fps as usize);
         self.frame_index += 1;
         Ok(vec![EncodedAccessUnit {
             codec: VideoCodec::Av1,
