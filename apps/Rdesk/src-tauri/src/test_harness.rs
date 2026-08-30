@@ -4608,7 +4608,12 @@ fn captured_frame_to_render_frame(frame: &CapturedFrame) -> RenderFrame {
 
 fn rgba32_to_bgra32(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
     let mut bgra = vec![0_u8; width * height * 4];
-    for (src, dst) in rgba.chunks_exact(4).zip(bgra.chunks_exact_mut(4)) {
+    for (src, dst) in rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(bgra.as_chunks_mut::<4>().0.iter_mut())
+    {
         dst[0] = src[2];
         dst[1] = src[1];
         dst[2] = src[0];
@@ -4619,7 +4624,12 @@ fn rgba32_to_bgra32(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
 
 fn rgb24_to_bgra32(rgb: &[u8], width: usize, height: usize) -> Vec<u8> {
     let mut bgra = vec![0_u8; width * height * 4];
-    for (src, dst) in rgb.chunks_exact(3).zip(bgra.chunks_exact_mut(4)) {
+    for (src, dst) in rgb
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(bgra.as_chunks_mut::<4>().0.iter_mut())
+    {
         dst[0] = src[2];
         dst[1] = src[1];
         dst[2] = src[0];

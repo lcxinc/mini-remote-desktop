@@ -122,7 +122,7 @@ fn generate_h264_access_units(
 
 fn synthetic_bgra_frame(width: usize, height: usize, frame_index: u64, fps: u32) -> CapturedFrame {
     let mut data = vec![0_u8; width * height * 4];
-    for (index, pixel) in data.chunks_exact_mut(4).enumerate() {
+    for (index, pixel) in data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let x = (index % width) as u8;
         let y = ((index / width) % 256) as u8;
         let t = frame_index as u8;

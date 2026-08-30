@@ -38,7 +38,9 @@ pub(super) fn normalize_lan_mac_address(value: &str) -> Option<String> {
 
     let bytes = normalized
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| std::str::from_utf8(chunk).ok())
         .collect::<Option<Vec<_>>>()?;
 

@@ -1142,7 +1142,7 @@ fn decode_lower_sha256(value: &str) -> Result<[u8; 32], PlatformError> {
         return Err(PlatformError::ConfigInvalid);
     }
     let mut result = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         result[index] = (hex_value(pair[0])? << 4) | hex_value(pair[1])?;
     }
     Ok(result)
@@ -1960,7 +1960,7 @@ fn query_windows_agent_service_identity() -> Result<WindowsAgentServiceIdentity,
     if command_pointer.is_null()
         || command_start < start
         || command_start >= end
-        || command_start % std::mem::align_of::<u16>() != 0
+        || !command_start.is_multiple_of(std::mem::align_of::<u16>())
     {
         return Err(ProcessError::ProbeInvalid);
     }

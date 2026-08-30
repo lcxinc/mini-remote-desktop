@@ -219,7 +219,7 @@ impl TelemetryStore {
                 }
             }
         }
-        runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        runs.sort_by_key(|run| std::cmp::Reverse(run.started_at));
         if let Some(limit) = limit {
             runs.truncate(limit);
         }

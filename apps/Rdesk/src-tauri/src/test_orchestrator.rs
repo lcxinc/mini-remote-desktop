@@ -3066,7 +3066,7 @@ impl TestOrchestrator {
         }
 
         // Sort by started_at descending
-        result.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        result.sort_by_key(|run| std::cmp::Reverse(run.started_at));
 
         // Apply limit
         if let Some(limit) = limit {

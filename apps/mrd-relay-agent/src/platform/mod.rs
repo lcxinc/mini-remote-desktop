@@ -98,7 +98,7 @@ impl PlatformExpectation {
             .collect();
         if max_allocations == 0
             || max_egress_bps == 0
-            || max_egress_bps % 8 != 0
+            || !max_egress_bps.is_multiple_of(8)
             || relay_min_port < 1024
             || relay_min_port > relay_max_port
             || transport_capabilities.is_empty()
@@ -1169,7 +1169,7 @@ fn parse_control_snapshot(
         || wire.measurement_monotonic_ns == 0
         || wire.configured_max_allocations != expectation.max_allocations
         || wire.configured_max_egress_bps != expectation.max_egress_bps
-        || wire.configured_max_egress_bps % 8 != 0
+        || !wire.configured_max_egress_bps.is_multiple_of(8)
         || wire.relay_min_port != expectation.relay_min_port
         || wire.relay_max_port != expectation.relay_max_port
         || wire.transport_capabilities != expectation.transport_capabilities
@@ -1467,7 +1467,7 @@ fn decode_lower_hex_sha256(value: &str) -> Result<[u8; 32], ProcessError> {
         return Err(ProcessError::ProbeInvalid);
     }
     let mut result = [0_u8; 32];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = hex_nibble(chunk[0]).ok_or(ProcessError::ProbeInvalid)?;
         let low = hex_nibble(chunk[1]).ok_or(ProcessError::ProbeInvalid)?;
         result[index] = (high << 4) | low;

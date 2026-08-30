@@ -760,7 +760,7 @@ impl D3d11Renderer {
         let mut b: u64 = 0;
         let mut pixels: u64 = 0;
 
-        for chunk in data.chunks_exact(3) {
+        for chunk in data.as_chunks::<3>().0 {
             r += chunk[0] as u64;
             g += chunk[1] as u64;
             b += chunk[2] as u64;

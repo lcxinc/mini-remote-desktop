@@ -882,7 +882,7 @@ impl FrameCapture for BenchmarkCapture {
     fn capture_frame(&mut self) -> Result<CapturedFrame, PipelineError> {
         self.tick = self.tick.wrapping_add(1);
         let mut data = vec![0_u8; self.width * self.height * 4];
-        for chunk in data.chunks_exact_mut(4) {
+        for chunk in data.as_chunks_mut::<4>().0 {
             chunk[0] = self.tick;
             chunk[1] = 64;
             chunk[2] = 192;

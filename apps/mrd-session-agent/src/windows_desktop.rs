@@ -245,7 +245,9 @@ fn decode_desktop_name_bytes(bytes: &[u8]) -> Result<DesktopKind, DesktopWatchEr
         return Err(DesktopWatchError::DesktopProbe);
     }
     let units = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
         .collect::<Vec<_>>();
     let Some((&0, name_units)) = units.split_last() else {

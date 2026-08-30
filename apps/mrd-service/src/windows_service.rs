@@ -10,9 +10,10 @@ pub const MRD_WINDOWS_SERVICE_SID: &str =
     "S-1-5-80-1879472017-33930626-126605267-2295067401-1052995421";
 
 /// Current SCM-visible service state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
     /// No product work or Agent process is live.
+    #[default]
     Stopped,
     /// IPC, transports, and Agent supervision are accepting work.
     Running,
@@ -96,12 +97,6 @@ pub struct ServiceLifecycle {
     state: ServiceState,
     agents: BTreeSet<u32>,
     last_shutdown_reason: Option<ShutdownReason>,
-}
-
-impl Default for ServiceState {
-    fn default() -> Self {
-        Self::Stopped
-    }
 }
 
 impl ServiceLifecycle {

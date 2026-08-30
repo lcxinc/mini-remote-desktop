@@ -342,8 +342,10 @@ impl MacosMetalRenderer {
                 self.scratch_bgra.resize(expected, 0);
             }
             for (src, dst) in data
-                .chunks_exact(4)
-                .zip(self.scratch_bgra.chunks_exact_mut(4))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(self.scratch_bgra.as_chunks_mut::<4>().0.iter_mut())
             {
                 dst[0] = src[0];
                 dst[1] = src[1];
@@ -1331,7 +1333,7 @@ fn copy_region_size(
 
 #[cfg(target_os = "macos")]
 fn bgra_contains_non_opaque_alpha(data: &[u8]) -> bool {
-    data.chunks_exact(4).any(|pixel| pixel[3] != 255)
+    data.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 255)
 }
 
 #[cfg(target_os = "macos")]
@@ -1517,8 +1519,10 @@ impl RendererInstance for MacosMetalRenderer {
                     self.scratch_bgra.resize(output_len, 0);
                 }
                 for (src, dst) in data
-                    .chunks_exact(3)
-                    .zip(self.scratch_bgra.chunks_exact_mut(4))
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .zip(self.scratch_bgra.as_chunks_mut::<4>().0.iter_mut())
                 {
                     dst[0] = src[2];
                     dst[1] = src[1];

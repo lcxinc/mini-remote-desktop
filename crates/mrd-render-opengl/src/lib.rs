@@ -1175,7 +1175,12 @@ fn copy_mapped_texture_rows(
 
 fn rgba_to_bgra(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
     let mut bgra = vec![0_u8; width * height * 4];
-    for (src, dst) in rgba.chunks_exact(4).zip(bgra.chunks_exact_mut(4)) {
+    for (src, dst) in rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(bgra.as_chunks_mut::<4>().0.iter_mut())
+    {
         dst[0] = src[2];
         dst[1] = src[1];
         dst[2] = src[0];

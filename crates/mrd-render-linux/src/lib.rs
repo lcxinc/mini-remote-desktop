@@ -223,7 +223,9 @@ impl RendererInstance for SoftwareRenderer {
         } else if let Some(data) = frame.as_rgb24() {
             // Convert RGB24 to BGRA32
             self.buffer = data
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .flat_map(|rgb| [rgb[2], rgb[1], rgb[0], 255])
                 .collect();
         }
@@ -643,7 +645,9 @@ impl RendererInstance for X11Renderer {
             bgra.to_vec()
         } else if let Some(rgb) = frame.as_rgb24() {
             // Convert RGB24 to BGRA32
-            rgb.chunks_exact(3)
+            rgb.as_chunks::<3>()
+                .0
+                .iter()
                 .flat_map(|rgb| [rgb[2], rgb[1], rgb[0], 255])
                 .collect()
         } else {

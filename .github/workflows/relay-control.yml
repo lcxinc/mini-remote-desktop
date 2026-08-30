@@ -69,7 +69,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - name: Test relay selection and signed directory
         run: cargo test --locked -p mrd-relay-control
 
@@ -80,7 +80,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - name: Build Linux relay agent
         run: cargo build --locked -p mrd-relay-agent
       - name: Test Linux relay agent
@@ -103,7 +103,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - name: Build Windows relay agent
         run: cargo build --locked -p mrd-relay-agent
       - name: Test Windows relay agent
@@ -117,7 +117,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - name: Run deterministic multi-region orchestration contracts
         id: relay-contracts
         shell: pwsh

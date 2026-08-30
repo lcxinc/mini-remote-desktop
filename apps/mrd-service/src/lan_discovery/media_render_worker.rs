@@ -742,7 +742,7 @@ pub(super) async fn render_lan_frame_once(
     };
     if renderers.is_empty() {
         let no_surface_count = LAN_RENDER_NO_SURFACE_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if no_surface_count <= 5 || no_surface_count % 120 == 0 {
+        if no_surface_count <= 5 || no_surface_count.is_multiple_of(120) {
             tracing::warn!(
                 session_id = %session_id.0,
                 no_surface_count,
@@ -871,7 +871,7 @@ pub(super) async fn render_lan_frame_once(
                 .record_render_queue_replacements(session_id.clone(), render_queue_replacements);
         }
         let present_log_count = LAN_RENDER_PRESENT_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if present_log_count <= 5 || present_log_count % 120 == 0 {
+        if present_log_count <= 5 || present_log_count.is_multiple_of(120) {
             tracing::info!(
                 session_id = %session_id.0,
                 renderer_count = renderers.len(),

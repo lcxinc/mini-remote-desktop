@@ -27,7 +27,7 @@ jobs:
       MRD_RELAY_LAB_AUTH_SECRET: ${{ secrets.MRD_RELAY_LAB_AUTH_SECRET }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - name: Run all real multi-region relay rows
         id: live-relay
         shell: powershell

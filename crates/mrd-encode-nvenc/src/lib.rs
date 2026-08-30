@@ -2272,7 +2272,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             FramePixelFormat::Bgra32 => Ok(frame.data.clone()),
             FramePixelFormat::Rgba32 => {
                 let mut bgra = Vec::with_capacity(frame.data.len());
-                for chunk in frame.data.chunks_exact(4) {
+                for chunk in frame.data.as_chunks::<4>().0 {
                     bgra.push(chunk[2]);
                     bgra.push(chunk[1]);
                     bgra.push(chunk[0]);
@@ -2282,7 +2282,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             }
             FramePixelFormat::Rgb24 => {
                 let mut bgra = Vec::with_capacity(frame.width * frame.height * 4);
-                for chunk in frame.data.chunks_exact(3) {
+                for chunk in frame.data.as_chunks::<3>().0 {
                     bgra.push(chunk[2]);
                     bgra.push(chunk[1]);
                     bgra.push(chunk[0]);

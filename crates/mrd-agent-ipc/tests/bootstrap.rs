@@ -160,7 +160,9 @@ fn raw_execute_issuer_key_id_round_trips_the_mrd_identity_hex_form() {
 
     let parsed = hex
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|digits| u8::from_str_radix(std::str::from_utf8(digits).unwrap(), 16).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(parsed.as_slice(), raw);

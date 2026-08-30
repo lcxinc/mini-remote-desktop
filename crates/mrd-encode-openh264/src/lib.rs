@@ -383,8 +383,12 @@ fn write_bgra_to_i420(data: &[u8], width: usize, height: usize, out: &mut [u8]) 
         let (top_y, bottom_y) = y_rows.split_at_mut(width);
         let chroma_row = (block_y / 2) * (width / 2);
 
-        for (pair_x, (top_pair, bottom_pair)) in
-            top.chunks_exact(8).zip(bottom.chunks_exact(8)).enumerate()
+        for (pair_x, (top_pair, bottom_pair)) in top
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(bottom.as_chunks::<8>().0.iter())
+            .enumerate()
         {
             let p00 = (top_pair[2], top_pair[1], top_pair[0]);
             let p10 = (top_pair[6], top_pair[5], top_pair[4]);
@@ -475,7 +479,7 @@ fn to_rgba(frame: &CapturedFrame) -> Result<Vec<u8>, PipelineError> {
             // BGRA = [B, G, R, A], RGBA = [R, G, B, A]
             // We need to swap B and R in each 4-byte pixel
             let mut rgba = Vec::with_capacity(frame.data.len());
-            for chunk in frame.data.chunks_exact(4) {
+            for chunk in frame.data.as_chunks::<4>().0 {
                 // Swap R and B channels
                 rgba.extend_from_slice(&[chunk[2], chunk[1], chunk[0], chunk[3]]);
             }
@@ -483,7 +487,7 @@ fn to_rgba(frame: &CapturedFrame) -> Result<Vec<u8>, PipelineError> {
         }
         FramePixelFormat::Rgb24 => {
             let mut rgba = Vec::with_capacity(frame.width * frame.height * 4);
-            for chunk in frame.data.chunks_exact(3) {
+            for chunk in frame.data.as_chunks::<3>().0 {
                 rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
             }
             Ok(rgba)
@@ -573,7 +577,7 @@ mod conversion_tests {
         let mut i420 = vec![0_u8; i420_len(width, height).expect("i420 size")];
 
         for frame_index in 0..48_usize {
-            for pixel in bgra.chunks_exact_mut(4) {
+            for pixel in bgra.as_chunks_mut::<4>().0 {
                 pixel.copy_from_slice(&[frame_index as u8, 64, 192, 255]);
             }
             write_bgra_to_i420(&bgra, width, height, &mut i420);

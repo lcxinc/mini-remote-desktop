@@ -118,7 +118,7 @@ fn new_encoder_for_backend(
 
 fn synthetic_frame_bytes(width: usize, height: usize) -> Vec<u8> {
     let mut bytes = vec![0_u8; width * height * 4];
-    for (index, chunk) in bytes.chunks_exact_mut(4).enumerate() {
+    for (index, chunk) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         chunk[0] = (index % 255) as u8;
         chunk[1] = 64;
         chunk[2] = 192;

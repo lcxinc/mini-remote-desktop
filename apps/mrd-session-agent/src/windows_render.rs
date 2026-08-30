@@ -101,7 +101,7 @@ pub fn i420_to_bgra(
     uv_pitch: usize,
     data: &[u8],
 ) -> Result<Vec<u8>, FrameConversionError> {
-    if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
         return Err(FrameConversionError::InvalidI420Dimensions);
     }
     let chroma_width = width / 2;

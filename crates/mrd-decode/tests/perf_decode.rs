@@ -235,7 +235,7 @@ fn nvenc_720p_access_units() -> Vec<Vec<u8>> {
     let mut access_units = Vec::new();
     for frame_index in 0..3u64 {
         let mut data = vec![0u8; 1280 * 720 * 4];
-        for (index, pixel) in data.chunks_exact_mut(4).enumerate() {
+        for (index, pixel) in data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let x = (index % 1280) as u8;
             let y = ((index / 1280) % 256) as u8;
             pixel[0] = x.wrapping_add(frame_index as u8);

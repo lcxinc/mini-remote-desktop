@@ -294,7 +294,7 @@ pub(super) fn decoded_frame_to_rgb24(frame: DecodedFrame) -> Result<(u32, u32, V
                 anyhow::bail!("decoded BGRA frame has invalid byte length");
             }
             let mut rgb = Vec::with_capacity(expected_pixels * 3);
-            for pixel in data.chunks_exact(4) {
+            for pixel in data.as_chunks::<4>().0 {
                 rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
             }
             rgb

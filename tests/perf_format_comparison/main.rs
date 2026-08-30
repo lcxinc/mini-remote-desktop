@@ -102,7 +102,7 @@ fn main() {
 
 fn synthetic_rgb24_frame(width: usize, height: usize) -> Vec<u8> {
     let mut data = vec![0_u8; width * height * 3];
-    for (index, chunk) in data.chunks_exact_mut(3).enumerate() {
+    for (index, chunk) in data.as_chunks_mut::<3>().0.iter_mut().enumerate() {
         chunk[0] = (index % 255) as u8;
         chunk[1] = ((index / 2) % 255) as u8;
         chunk[2] = ((index / 3) % 255) as u8;
@@ -112,7 +112,7 @@ fn synthetic_rgb24_frame(width: usize, height: usize) -> Vec<u8> {
 
 fn synthetic_bgra32_frame(width: usize, height: usize) -> Vec<u8> {
     let mut data = vec![0_u8; width * height * 4];
-    for (index, chunk) in data.chunks_exact_mut(4).enumerate() {
+    for (index, chunk) in data.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         chunk[0] = ((index / 3) % 255) as u8; // B
         chunk[1] = ((index / 2) % 255) as u8; // G
         chunk[2] = (index % 255) as u8;       // R

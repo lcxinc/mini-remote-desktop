@@ -1290,7 +1290,7 @@ fn env_flag_enabled(name: &str) -> bool {
 }
 
 fn yuv420_8bit_frame_size(width: usize, height: usize) -> Result<usize, PipelineError> {
-    if width % 2 != 0 || height % 2 != 0 {
+    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
         return Err(PipelineError::Message(format!(
             "8-bit 4:2:0 output requires even dimensions, got {width}x{height}"
         )));
@@ -1528,7 +1528,7 @@ impl VideoDecoder for VvdecSoftwareDecoder {
         match self.decoder.decode::<&[u8], _>(au) {
             Ok(Some(frame)) => self.push_frame(frame),
             Ok(None) => Ok(()),
-            Err(error) if matches!(error, vvdec::Error::TryAgain) => Ok(()),
+            Err(vvdec::Error::TryAgain) => Ok(()),
             Err(error) => Err(PipelineError::Message(format!(
                 "VVdeC decode failed: {error}"
             ))),
@@ -1572,7 +1572,7 @@ fn vvc_nal_is_random_access_point(nal: &[u8]) -> bool {
     if nal.len() < 2 {
         return false;
     }
-    matches!((nal[1] >> 3) & 0x1f, 7 | 8 | 9 | 10)
+    matches!((nal[1] >> 3) & 0x1f, 7..=10)
 }
 
 impl VideoDecoder for H264SoftwareDecoder {

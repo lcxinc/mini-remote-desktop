@@ -360,7 +360,7 @@ mod windows_full_pipeline {
 
     fn synthetic_frame_bytes(width: usize, height: usize, value: u8) -> Vec<u8> {
         let mut bytes = vec![0_u8; width * height * 4];
-        for (index, chunk) in bytes.chunks_exact_mut(4).enumerate() {
+        for (index, chunk) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             // Create a gradient pattern based on position
             let x = (index % width) as u8;
             let y = (index / width) as u8;

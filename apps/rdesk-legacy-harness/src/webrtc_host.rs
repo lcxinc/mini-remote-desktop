@@ -1464,7 +1464,7 @@ mod tests {
         fn capture_frame(&mut self) -> Result<CapturedFrame, mrd_pipeline_core::PipelineError> {
             self.tick = self.tick.wrapping_add(1);
             let mut data = vec![0_u8; 16 * 16 * 4];
-            for chunk in data.chunks_exact_mut(4) {
+            for chunk in data.as_chunks_mut::<4>().0 {
                 chunk[0] = self.tick;
                 chunk[1] = 64;
                 chunk[2] = 192;
@@ -1871,7 +1871,7 @@ mod tests {
             return;
         };
         let mut frame = vec![0_u8; 1280 * 720 * 4];
-        for (index, chunk) in frame.chunks_exact_mut(4).enumerate() {
+        for (index, chunk) in frame.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let x = (index % 1280) as u8;
             let y = ((index / 1280) % 256) as u8;
             chunk[0] = x;

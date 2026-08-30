@@ -297,7 +297,7 @@ fn captured_frame_into_render_frame(frame: CapturedFrame) -> Result<RenderFrame>
                 );
             }
             let mut bgra = frame.data;
-            for pixel in bgra.chunks_exact_mut(4) {
+            for pixel in bgra.as_chunks_mut::<4>().0 {
                 pixel.swap(0, 2);
             }
             Ok(RenderFrame::from_bgra32(frame.width, frame.height, bgra))
