@@ -120,60 +120,6 @@ impl RegistrationSigner for OneShotEd25519Signer {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn registration_seed_can_sign_only_once() {
-        let seed = Zeroizing::new([42; 32]);
-        let key = derive_registration_public_key(&seed).unwrap();
-        let signer = OneShotEd25519Signer::new(seed, key.key_id).unwrap();
-
-        assert!(signer.sign(b"registration transcript").is_ok());
-        assert_eq!(
-            signer.sign(b"second transcript"),
-            Err(RegistrationSigningError::Unavailable)
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn execute_verifier_binding_rejects_mismatched_bootstrap_material() {
-        use ring::signature::{Ed25519KeyPair, KeyPair};
-
-        let signer = Ed25519KeyPair::from_seed_unchecked(&[91; 32]).unwrap();
-        let public_key: [u8; 32] = signer.public_key().as_ref().try_into().unwrap();
-        let key_id = mrd_agent_ipc::derive_execute_grant_issuer_key_id(&public_key);
-        assert!(bind_execute_verifier(key_id, public_key).is_ok());
-        assert!(matches!(
-            bind_execute_verifier([7; 32], public_key),
-            Err(AgentLauncherError::Bootstrap(
-                AgentBootstrapError::InvalidExecuteGrantIssuerKey
-            ))
-        ));
-        assert!(matches!(
-            bind_execute_verifier(key_id, [0; 32]),
-            Err(AgentLauncherError::Bootstrap(
-                AgentBootstrapError::InvalidExecuteGrantIssuerKey
-            ))
-        ));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn production_media_executor_never_claims_unassembled_capture() {
-        use crate::runtime::AuthorizedCommandExecutor;
-        use mrd_agent_ipc::AgentCapability;
-
-        let executor = build_windows_media_executor();
-        assert!(!executor
-            .capabilities()
-            .as_set()
-            .contains(&AgentCapability::Capture));
-    }
-}
-
 #[cfg(windows)]
 fn build_windows_media_executor() -> crate::media::MediaExecutor<
     crate::capture::UnavailableCaptureAdapter,
@@ -612,5 +558,59 @@ mod windows_platform {
             words,
             byte_len: returned,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registration_seed_can_sign_only_once() {
+        let seed = Zeroizing::new([42; 32]);
+        let key = derive_registration_public_key(&seed).unwrap();
+        let signer = OneShotEd25519Signer::new(seed, key.key_id).unwrap();
+
+        assert!(signer.sign(b"registration transcript").is_ok());
+        assert_eq!(
+            signer.sign(b"second transcript"),
+            Err(RegistrationSigningError::Unavailable)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn execute_verifier_binding_rejects_mismatched_bootstrap_material() {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let signer = Ed25519KeyPair::from_seed_unchecked(&[91; 32]).unwrap();
+        let public_key: [u8; 32] = signer.public_key().as_ref().try_into().unwrap();
+        let key_id = mrd_agent_ipc::derive_execute_grant_issuer_key_id(&public_key);
+        assert!(bind_execute_verifier(key_id, public_key).is_ok());
+        assert!(matches!(
+            bind_execute_verifier([7; 32], public_key),
+            Err(AgentLauncherError::Bootstrap(
+                AgentBootstrapError::InvalidExecuteGrantIssuerKey
+            ))
+        ));
+        assert!(matches!(
+            bind_execute_verifier(key_id, [0; 32]),
+            Err(AgentLauncherError::Bootstrap(
+                AgentBootstrapError::InvalidExecuteGrantIssuerKey
+            ))
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn production_media_executor_never_claims_unassembled_capture() {
+        use crate::runtime::AuthorizedCommandExecutor;
+        use mrd_agent_ipc::AgentCapability;
+
+        let executor = build_windows_media_executor();
+        assert!(!executor
+            .capabilities()
+            .as_set()
+            .contains(&AgentCapability::Capture));
     }
 }

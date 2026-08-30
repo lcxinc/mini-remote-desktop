@@ -146,7 +146,7 @@ pub struct ConsentPrompt {
 }
 
 impl ConsentPrompt {
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub(crate) fn for_native_test(
         session_id: SessionId,
         peer: PeerBinding,
