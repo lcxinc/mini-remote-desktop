@@ -5,9 +5,7 @@ use crate::runtime::{
     RegistrationSigningError,
 };
 use ed25519_dalek::{Signer, SigningKey};
-use mrd_agent_ipc::{
-    derive_registration_public_key, AgentBootstrapError, BoundEd25519ExecuteGrantVerifier,
-};
+use mrd_agent_ipc::{derive_registration_public_key, AgentBootstrapError};
 use std::sync::Mutex;
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -27,7 +25,8 @@ use crate::windows_consent::WindowsConsentSurfaceDriver;
 use crate::windows_desktop::WindowsTrustedDesktopStateSource;
 #[cfg(windows)]
 use mrd_agent_ipc::{
-    read_agent_bootstrap, windows_agent_bootstrap_pipe_name, ReceivedAgentBootstrap,
+    read_agent_bootstrap, windows_agent_bootstrap_pipe_name, BoundEd25519ExecuteGrantVerifier,
+    ReceivedAgentBootstrap,
 };
 #[cfg(windows)]
 use std::{sync::Arc, time::Duration};
