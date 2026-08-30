@@ -259,48 +259,6 @@ impl NvdecDiagnostics {
     }
 }
 
-#[cfg(test)]
-mod diagnostics_tests {
-    use super::NvdecDiagnostics;
-
-    #[test]
-    fn shared_copy_diagnostics_record_attempt_success_and_failure() {
-        let mut diagnostics = NvdecDiagnostics::default();
-
-        diagnostics.record_shared_copy_attempt();
-        diagnostics.record_shared_copy_failure(
-            "register",
-            "cuGraphicsD3D11RegisterResource",
-            Some(999),
-            Some("CUDA_ERROR_UNKNOWN".to_string()),
-            Some("unknown interop failure".to_string()),
-        );
-        diagnostics.record_shared_copy_attempt();
-        diagnostics.record_shared_copy_success();
-
-        assert_eq!(diagnostics.shared_copy_attempts, 2);
-        assert_eq!(diagnostics.shared_copy_successes, 1);
-        assert_eq!(diagnostics.shared_copy_failures, 1);
-        assert_eq!(
-            diagnostics.last_shared_copy_stage.as_deref(),
-            Some("register")
-        );
-        assert_eq!(
-            diagnostics.last_shared_copy_api.as_deref(),
-            Some("cuGraphicsD3D11RegisterResource")
-        );
-        assert_eq!(diagnostics.last_shared_copy_code, Some(999));
-        assert_eq!(
-            diagnostics.last_shared_copy_error_name.as_deref(),
-            Some("CUDA_ERROR_UNKNOWN")
-        );
-        assert_eq!(
-            diagnostics.last_shared_copy_error_description.as_deref(),
-            Some("unknown interop failure")
-        );
-    }
-}
-
 pub struct NvdecDecoder {
     runtime: NvdecRuntimeProbe,
     #[cfg(windows)]
@@ -3734,5 +3692,47 @@ mod imp {
             assert_ne!(texture.shared_handle_y, 0);
             assert_ne!(texture.shared_handle_uv, 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::NvdecDiagnostics;
+
+    #[test]
+    fn shared_copy_diagnostics_record_attempt_success_and_failure() {
+        let mut diagnostics = NvdecDiagnostics::default();
+
+        diagnostics.record_shared_copy_attempt();
+        diagnostics.record_shared_copy_failure(
+            "register",
+            "cuGraphicsD3D11RegisterResource",
+            Some(999),
+            Some("CUDA_ERROR_UNKNOWN".to_string()),
+            Some("unknown interop failure".to_string()),
+        );
+        diagnostics.record_shared_copy_attempt();
+        diagnostics.record_shared_copy_success();
+
+        assert_eq!(diagnostics.shared_copy_attempts, 2);
+        assert_eq!(diagnostics.shared_copy_successes, 1);
+        assert_eq!(diagnostics.shared_copy_failures, 1);
+        assert_eq!(
+            diagnostics.last_shared_copy_stage.as_deref(),
+            Some("register")
+        );
+        assert_eq!(
+            diagnostics.last_shared_copy_api.as_deref(),
+            Some("cuGraphicsD3D11RegisterResource")
+        );
+        assert_eq!(diagnostics.last_shared_copy_code, Some(999));
+        assert_eq!(
+            diagnostics.last_shared_copy_error_name.as_deref(),
+            Some("CUDA_ERROR_UNKNOWN")
+        );
+        assert_eq!(
+            diagnostics.last_shared_copy_error_description.as_deref(),
+            Some("unknown interop failure")
+        );
     }
 }
