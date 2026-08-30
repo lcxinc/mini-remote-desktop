@@ -4,11 +4,13 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
-    time::Duration,
 };
 
 #[cfg(windows)]
 use std::io::Read as _;
+
+#[cfg(windows)]
+use std::time::Duration;
 
 #[cfg(windows)]
 use std::sync::{Mutex, OnceLock};
