@@ -1,13 +1,15 @@
-use mrd_pipeline_core::{
-    CapturedFrame, FrameCapture, FrameMemoryKind, FramePixelFormat, PipelineError,
-};
+#[cfg(windows)]
+use mrd_pipeline_core::FrameMemoryKind;
+use mrd_pipeline_core::{CapturedFrame, FrameCapture, FramePixelFormat, PipelineError};
 use scrap::{Capturer, Display};
 use std::{
-    ffi::c_void,
     io::ErrorKind,
-    mem, thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(windows)]
+use std::{ffi::c_void, mem, time::Instant};
 
 #[cfg(windows)]
 use anyhow::{anyhow, Context};
@@ -44,6 +46,7 @@ use windows::Win32::Graphics::Gdi::{
 const DXGI_SHARED_ACQUIRE_TIMEOUT_MS: u32 = 0;
 #[cfg(windows)]
 const DXGI_SHARED_TEXTURE_RING_SIZE: usize = 3;
+#[cfg(windows)]
 const DXGI_CPU_INITIAL_FRAME_WAIT: Duration = Duration::from_millis(250);
 #[cfg(windows)]
 const DXGI_SHARED_CAPTURE_FLUSH_AFTER_COPY_ENV: &str = "MRD_DXGI_SHARED_CAPTURE_FLUSH_AFTER_COPY";
@@ -97,6 +100,8 @@ impl DxgiDesktopCapture {
     ) -> Result<Self, PipelineError> {
         let width = display.width();
         let height = display.height();
+        #[cfg(not(windows))]
+        let _ = display_index;
         #[cfg(windows)]
         let (source_left, source_top) = {
             let targets = enumerate_dxgi_output_targets().unwrap_or_default();
@@ -137,6 +142,7 @@ impl DxgiDesktopCapture {
 
 impl FrameCapture for DxgiDesktopCapture {
     fn capture_frame(&mut self) -> Result<CapturedFrame, PipelineError> {
+        #[cfg(windows)]
         let initial_wait_started_at = Instant::now();
         loop {
             match self.capturer.frame() {
@@ -486,6 +492,7 @@ impl FrameCapture for DxgiSharedTextureCapture {
     }
 }
 
+#[cfg(any(windows, test))]
 fn recovery_target_dimensions(
     target_width: usize,
     target_height: usize,
@@ -818,6 +825,7 @@ fn repack_bgra(frame: &[u8], width: usize, height: usize) -> Result<Vec<u8>, Pip
     Ok(packed)
 }
 
+#[cfg(any(windows, test))]
 fn centered_crop_origin(
     source_width: usize,
     source_height: usize,
@@ -832,6 +840,7 @@ fn centered_crop_origin(
     )
 }
 
+#[cfg(any(windows, test))]
 fn dxgi_device_name_from_raw(raw: &[u16]) -> Option<String> {
     let end = raw.iter().position(|unit| *unit == 0).unwrap_or(raw.len());
     if end == 0 {
@@ -846,6 +855,7 @@ fn dxgi_device_name_from_raw(raw: &[u16]) -> Option<String> {
     }
 }
 
+#[cfg(any(windows, test))]
 fn dxgi_device_name_matches(raw: &[u16], requested: &str) -> bool {
     let Some(actual) = dxgi_device_name_from_raw(raw) else {
         return false;
@@ -869,6 +879,7 @@ fn dxgi_shared_capture_flush_after_copy_enabled() -> bool {
     )
 }
 
+#[cfg(any(windows, test))]
 fn dxgi_shared_capture_flush_after_copy_enabled_from_env_value(value: Option<&str>) -> bool {
     value.map(str::trim).is_some_and(|value| {
         value == "1"

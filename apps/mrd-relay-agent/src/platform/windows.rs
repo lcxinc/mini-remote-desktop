@@ -25,7 +25,9 @@ pub const TARGET_CONTROL_HELPER: &str = "/usr/local/libexec/mrd-relay-coturn-con
 pub const DPAPI_SECRET_RELATIVE_PATH: &str = "MRD\\RelayAgent\\secrets\\turn-rest-secret.dpapi";
 pub const WINDOWS_MANAGED_LABEL: &str = "io.mrd.relay.managed=true";
 pub const DOCKER_ENGINE_PIPE: &str = r"\\.\pipe\docker_engine";
+#[cfg(windows)]
 pub(crate) const WINDOWS_MANAGED_LABEL_KEY: &str = "io.mrd.relay.managed";
+#[cfg(windows)]
 pub(crate) const WINDOWS_MANAGED_LABEL_VALUE: &str = "true";
 pub(crate) const DOCKER_ENTRYPOINT: &str = "/usr/bin/turnserver";
 pub(crate) const DOCKER_CONFIG_ARGUMENT: &str = "--config";
