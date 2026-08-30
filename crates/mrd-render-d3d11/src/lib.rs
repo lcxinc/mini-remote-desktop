@@ -172,9 +172,13 @@ pub struct D3d11Renderer {
     presented_frame_count: u64,
     present_skipped_count: u64,
     last_present_status: Option<&'static str>,
+    #[cfg(windows)]
     waitable_wait_count: u64,
+    #[cfg(windows)]
     waitable_wait_total_ms: f64,
+    #[cfg(windows)]
     waitable_timeout_count: u64,
+    #[cfg(windows)]
     last_waitable_wait_ms: Option<f64>,
     last_render_prepare_wait_ms: Option<f64>,
     last_render_shared_resource_ms: Option<f64>,
@@ -185,6 +189,7 @@ pub struct D3d11Renderer {
     present_events: VecDeque<RendererPresentEvent>,
 }
 
+#[cfg(any(windows, test))]
 fn fit_viewport_rect(
     surface_width: u32,
     surface_height: u32,
@@ -1447,6 +1452,9 @@ fn should_clear_shared_present_surface(
 
 impl RendererInstance for D3d11Renderer {
     fn attach_target(&mut self, target: RenderTarget) -> Result<(), RenderError> {
+        #[cfg(not(windows))]
+        let _ = target;
+
         #[cfg(windows)]
         {
             self.surface = match target {
@@ -1464,9 +1472,9 @@ impl RendererInstance for D3d11Renderer {
         #[cfg(not(windows))]
         {
             let _ = frame;
-            return Err(RenderError::Message(
+            Err(RenderError::Message(
                 "d3d11 renderer 仅支持 Windows".to_string(),
-            ));
+            ))
         }
 
         #[cfg(windows)]
@@ -1651,9 +1659,9 @@ mod tests {
     use super::{
         should_clear_shared_present_surface, D3d11PresentMode, D3d11PresentStatus, D3d11Renderer,
     };
-    use mrd_render::{
-        RenderFrame, RenderPixelFormat, RenderTarget, RendererFactory, RendererInstance,
-    };
+    use mrd_render::RendererFactory;
+    #[cfg(windows)]
+    use mrd_render::{RenderFrame, RenderPixelFormat, RenderTarget, RendererInstance};
 
     #[test]
     fn fit_viewport_rect_preserves_source_aspect_ratio() {
