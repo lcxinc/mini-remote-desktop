@@ -1,6 +1,8 @@
 //! mrd-service machine-service and foreground-console entry points.
 
-use anyhow::{Context, Result};
+#[cfg(windows)]
+use anyhow::Context;
+use anyhow::Result;
 #[cfg(windows)]
 use mrd_agent_ipc::StopReason;
 #[cfg(windows)]
@@ -8,6 +10,7 @@ use mrd_service::agent_runtime::{
     eligible_interactive_sessions, installed_session_agent_path, AgentServer, ExecuteGrantIssuer,
     WindowsSessionAgentSupervisor,
 };
+#[cfg(windows)]
 use mrd_service::{
     app_state::{self, AppState},
     ipc_server::IpcServer,
@@ -17,11 +20,16 @@ use mrd_service::{
         SessionChange as LifecycleSessionChange, MRD_WINDOWS_SERVICE_SID,
     },
 };
+#[cfg(windows)]
 use ring::rand::{SecureRandom, SystemRandom};
+#[cfg(windows)]
 use std::sync::Arc;
-use tracing::{info, warn, Level};
+#[cfg(windows)]
+use tracing::warn;
+use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
+#[cfg(windows)]
 #[derive(Debug, Clone, Copy)]
 enum RuntimeControl {
     Stop,
@@ -32,6 +40,7 @@ enum RuntimeControl {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RunMode {
     Console,
+    #[cfg(windows)]
     WindowsService,
 }
 
@@ -304,7 +313,7 @@ async fn run_service(
 #[cfg(not(windows))]
 async fn run_service(
     _mode: RunMode,
-    _controls: Option<tokio::sync::mpsc::UnboundedReceiver<RuntimeControl>>,
+    _controls: Option<()>,
     _reporter: StatusReporter,
 ) -> Result<()> {
     Err(anyhow::anyhow!(
@@ -337,6 +346,7 @@ async fn handle_session_change(
     }
 }
 
+#[cfg(windows)]
 async fn next_control(
     controls: &mut Option<tokio::sync::mpsc::UnboundedReceiver<RuntimeControl>>,
 ) -> RuntimeControl {
@@ -408,6 +418,7 @@ enum StatusReporter {
     Scm(windows_service::service_control_handler::ServiceStatusHandle),
 }
 
+#[cfg(windows)]
 impl StatusReporter {
     fn running(&self) -> Result<()> {
         #[cfg(windows)]
