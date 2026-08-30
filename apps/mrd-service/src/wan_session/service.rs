@@ -22,7 +22,10 @@ use mrd_application::{
     ports::{SessionLifecycleState, SessionSnapshot},
     AuthenticatedSessionSignal, VerifiedSignalingEvent,
 };
-use mrd_ipc::{MediaProfileNegotiation, RemoteAuthorizationState, RemotePermissionScope};
+use mrd_ipc::{
+    MediaProfileNegotiation, RemoteAuthorizationState, RemoteFailure, RemotePermissionScope,
+    RemoteReasonCode,
+};
 use mrd_proto::{DeviceId, SessionId};
 use mrd_signal_proto::{WanMediaProfileV3, WanPermissionScopeV3, WanSessionRequestV3};
 use std::{
@@ -474,6 +477,16 @@ pub enum ServiceWanSessionStartError {
     CoordinatorAlreadyBound,
 }
 
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceWanControllerGrantError {
+    #[error("authenticated WAN grant verification failed")]
+    Verification,
+    #[error("WAN coordinator rejected the authenticated grant")]
+    Coordinator,
+    #[error("WAN authorization rejected the authenticated grant")]
+    Authorization,
+}
+
 /// Owns the background V3 intent/grant dispatcher. Dropping the handle does
 /// not silently detach the task; callers should use `shutdown` so live
 /// coordinator entries receive their cancellation fence and full cleanup.
@@ -634,13 +647,9 @@ async fn handle_initial_event(
         )
         .await
     } else {
-        handle_controller_grant(
-            &coordinator,
-            event,
-            &local_device_id,
-            local_identity.as_ref(),
-        )
-        .await
+        apply_verified_controller_grant(&app_state, &coordinator, event)
+            .await
+            .map_err(|_| ())
     };
     if result.is_err() {
         // Verification failures are ignored rather than terminalizing a valid
@@ -682,25 +691,233 @@ async fn handle_target_intent(
     Ok(())
 }
 
-async fn handle_controller_grant(
+async fn apply_verified_controller_grant(
+    app_state: &Arc<crate::AppState>,
     coordinator: &WanSessionCoordinator,
     event: VerifiedSignalingEvent,
-    local_device_id: &DeviceId,
-    local_identity: &mrd_identity::DeviceIdentity,
-) -> Result<(), ()> {
+) -> Result<(), ServiceWanControllerGrantError> {
+    apply_verified_controller_grant_inner(app_state, coordinator, event).await
+}
+
+/// Test-only integration seam for the production controller grant boundary.
+/// The local device and signing identity are always derived from `AppState`.
+#[doc(hidden)]
+#[cfg(any(test, debug_assertions))]
+pub async fn apply_verified_controller_grant_for_service(
+    app_state: &Arc<crate::AppState>,
+    coordinator: &WanSessionCoordinator,
+    event: VerifiedSignalingEvent,
+) -> Result<(), ServiceWanControllerGrantError> {
+    apply_verified_controller_grant_inner(app_state, coordinator, event).await
+}
+
+async fn apply_verified_controller_grant_inner(
+    app_state: &Arc<crate::AppState>,
+    coordinator: &WanSessionCoordinator,
+    event: VerifiedSignalingEvent,
+) -> Result<(), ServiceWanControllerGrantError> {
+    let local_device_id = app_state
+        .devices
+        .lock()
+        .await
+        .get_local_device()
+        .map(|(device_id, _)| device_id.clone())
+        .ok_or(ServiceWanControllerGrantError::Verification)?;
+    let local_identity = app_state.device_identities.machine_identity();
     let verified = VerifiedWanSessionGrant::verify_event(
         event,
-        local_device_id,
-        local_identity,
+        &local_device_id,
+        local_identity.as_ref(),
         now_unix_ms(),
     )
-    .map_err(|_| ())?;
+    .map_err(|_| ServiceWanControllerGrantError::Verification)?;
     let session_id = verified.session_id().clone();
-    coordinator
-        .install_controller_grant(&session_id, verified)
+    if coordinator
+        .install_controller_grant(&session_id, verified.clone())
         .await
-        .map_err(|_| ())?;
+        .is_err()
+    {
+        deny_pending_controller_authorization(
+            app_state,
+            &session_id,
+            controller_grant_mismatch(),
+            now_unix_ms(),
+        )
+        .await;
+        return Err(ServiceWanControllerGrantError::Coordinator);
+    }
+    let state = match coordinator.snapshot(&session_id).await {
+        Ok(state) => state,
+        Err(_) => {
+            deny_pending_controller_authorization(
+                app_state,
+                &session_id,
+                controller_grant_mismatch(),
+                now_unix_ms(),
+            )
+            .await;
+            return Err(ServiceWanControllerGrantError::Coordinator);
+        }
+    };
+    if install_controller_authorization(app_state, &state, &verified)
+        .await
+        .is_err()
+    {
+        let _ = coordinator
+            .fail(&session_id, WanSessionFailure::Internal)
+            .await;
+        return Err(ServiceWanControllerGrantError::Authorization);
+    }
     Ok(())
+}
+
+async fn install_controller_authorization(
+    app_state: &Arc<crate::AppState>,
+    state: &super::model::WanSessionState,
+    verified: &VerifiedWanSessionGrant,
+) -> Result<(), RemoteFailure> {
+    let installed_at_ms = now_unix_ms();
+    let _authorization_guard = app_state.authorization_security_gate.lock().await;
+    let result = async {
+        let identity = state.identity();
+        let grant = state.grant().ok_or_else(controller_grant_mismatch)?;
+        let access = state.access().ok_or_else(controller_grant_mismatch)?;
+        if state.role() != WanSessionRole::Controller
+            || state.phase() != WanSessionPhase::AccessBound
+            || identity.session_id() != verified.session_id()
+            || identity.target_device_id() != verified.target_device_id()
+            || identity.target_key_fingerprint() != Some(verified.target_key_fingerprint())
+            || grant.grant_commitment() != Some(verified.grant_commitment())
+            || grant.policy_expires_at_ms() > verified.expires_at_ms()
+            || verified.expires_at_ms() > identity.deadline_unix_ms()
+        {
+            return Err(controller_grant_mismatch());
+        }
+        let transport_fingerprint_sha256 =
+            decode_sha256(access.relay_url_digest()).ok_or_else(controller_grant_mismatch)?;
+        let authorization_grant = crate::session_authorization::VerifiedSessionGrant {
+            grant_id: format!("sha256:{}", verified.grant_commitment()),
+            session_id: identity.session_id().clone(),
+            granted_scopes: grant
+                .approved_scopes()
+                .iter()
+                .copied()
+                .map(ipc_scope)
+                .collect(),
+            issued_at_ms: verified.issued_at_ms(),
+            expires_at_ms: grant.grant_expires_at_ms(),
+            policy_revision: grant.policy_revision(),
+            route_constraint: "webrtc_relay".to_owned(),
+            transport_fingerprint_sha256,
+        };
+        let existing = app_state
+            .session_authorizations
+            .snapshot_at(identity.session_id(), installed_at_ms)
+            .await
+            .ok_or_else(controller_grant_mismatch)?;
+        if existing.authorization_state == RemoteAuthorizationState::Granted {
+            let existing_grant = app_state
+                .session_authorizations
+                .active_grant(identity.session_id())
+                .await;
+            return if existing.peer_device_id == *verified.target_device_id()
+                && existing.peer_key_id == verified.target_key_fingerprint()
+                && existing_grant.as_ref() == Some(&authorization_grant)
+            {
+                Ok(())
+            } else {
+                Err(controller_grant_mismatch())
+            };
+        }
+        app_state
+            .session_authorizations
+            .bind_outgoing_authenticated_peer(
+                identity.session_id(),
+                verified.target_device_id(),
+                verified.target_key_fingerprint(),
+                verified.target_public_key(),
+                installed_at_ms,
+            )
+            .await?;
+        let snapshot = app_state
+            .session_authorizations
+            .install_verified_grant(authorization_grant, installed_at_ms)
+            .await?;
+        if snapshot.authorization_state == RemoteAuthorizationState::Granted
+            && snapshot.peer_key_id == verified.target_key_fingerprint()
+        {
+            Ok(())
+        } else {
+            Err(controller_grant_mismatch())
+        }
+    }
+    .await;
+    if let Err(failure) = result.as_ref() {
+        record_pending_controller_authorization_denial(
+            app_state,
+            verified.session_id(),
+            failure.clone(),
+            installed_at_ms,
+        )
+        .await;
+    }
+    result
+}
+
+async fn deny_pending_controller_authorization(
+    app_state: &Arc<crate::AppState>,
+    session_id: &SessionId,
+    failure: RemoteFailure,
+    failed_at_ms: u64,
+) {
+    let _authorization_guard = app_state.authorization_security_gate.lock().await;
+    record_pending_controller_authorization_denial(app_state, session_id, failure, failed_at_ms)
+        .await;
+}
+
+async fn record_pending_controller_authorization_denial(
+    app_state: &Arc<crate::AppState>,
+    session_id: &SessionId,
+    failure: RemoteFailure,
+    failed_at_ms: u64,
+) {
+    let is_pending = app_state
+        .session_authorizations
+        .snapshot_at(session_id, failed_at_ms)
+        .await
+        .is_some_and(|snapshot| {
+            snapshot.authorization_state == RemoteAuthorizationState::Authorizing
+        });
+    if is_pending {
+        let _ = app_state
+            .session_authorizations
+            .record_failure(
+                session_id,
+                RemoteAuthorizationState::Denied,
+                failure,
+                failed_at_ms,
+            )
+            .await;
+    }
+}
+
+fn controller_grant_mismatch() -> RemoteFailure {
+    RemoteFailure {
+        code: RemoteReasonCode::PolicyChanged,
+        message: "verified WAN grant does not match the pending authorization".to_owned(),
+        suggested_action: Some("start a new secure WAN session request".to_owned()),
+    }
+}
+
+fn decode_sha256(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 || !value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let mut decoded = [0u8; 32];
+    for (index, output) in decoded.iter_mut().enumerate() {
+        *output = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(decoded)
 }
 
 async fn spawn_generation_zero(

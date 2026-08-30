@@ -474,6 +474,7 @@ impl WanSessionCoordinator {
             && verified.target_device_id == *initial_state.identity().target_device_id()
             && verified.controller_key_fingerprint
                 == initial_state.identity().controller_key_fingerprint()
+            && verified.expires_at_ms <= initial_state.identity().deadline_unix_ms()
             && initial_state
                 .identity()
                 .target_key_fingerprint()
@@ -1127,9 +1128,12 @@ pub struct VerifiedWanSessionGrant {
     controller_device_id: mrd_proto::DeviceId,
     target_device_id: mrd_proto::DeviceId,
     target_key_fingerprint: String,
+    target_public_key: [u8; 32],
     controller_key_fingerprint: String,
     intent_commitment: String,
     grant_commitment: String,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
     approved_scopes: Vec<mrd_signal_proto::WanPermissionScopeV3>,
     approved_profile: Option<mrd_signal_proto::WanMediaProfileV3>,
     policy_revision: u64,
@@ -1180,18 +1184,32 @@ impl VerifiedWanSessionGrant {
         {
             return Err(WanSessionCoordinatorError::VerifiedGrantRequired);
         }
+        let target_public_key: [u8; 32] = event
+            .sender
+            .public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| WanSessionCoordinatorError::VerifiedGrantRequired)?;
         let grant_commitment = message
             .commitment()
             .map_err(|_| WanSessionCoordinatorError::VerifiedGrantRequired)?;
+        let issued_at_ms = claims.issued_at_ms;
+        let expires_at_ms = claims.expires_at_ms;
         let payload = message.payload;
+        if payload.policy_expires_at_ms > expires_at_ms {
+            return Err(WanSessionCoordinatorError::VerifiedGrantRequired);
+        }
         Ok(Self {
             session_id: payload.session_id,
             controller_device_id: payload.controller_device_id,
             target_device_id: payload.target_device_id,
             target_key_fingerprint: event.sender.key_id,
+            target_public_key,
             controller_key_fingerprint: local_controller_identity.key_id().to_owned(),
             intent_commitment: payload.intent_commitment,
             grant_commitment,
+            issued_at_ms,
+            expires_at_ms,
             approved_scopes: payload.approved_scopes,
             approved_profile: payload.approved_profile,
             policy_revision: payload.backend_policy_revision,
@@ -1223,6 +1241,26 @@ impl VerifiedWanSessionGrant {
 
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    pub fn target_device_id(&self) -> &mrd_proto::DeviceId {
+        &self.target_device_id
+    }
+
+    pub fn target_key_fingerprint(&self) -> &str {
+        &self.target_key_fingerprint
+    }
+
+    pub fn target_public_key(&self) -> &[u8; 32] {
+        &self.target_public_key
+    }
+
+    pub fn issued_at_ms(&self) -> u64 {
+        self.issued_at_ms
+    }
+
+    pub fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
     }
 }
 

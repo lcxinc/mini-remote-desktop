@@ -18,6 +18,11 @@ const AUTHORIZATION_RECORD_LIMIT: usize = 2_048;
 const TERMINAL_RECORD_RETENTION_MS: u64 = 10 * 60 * 1_000;
 const MAX_PENDING_INCOMING_AUTHORIZATIONS: usize = 64;
 const MAX_PENDING_INCOMING_PER_PEER: usize = 4;
+const PENDING_OUTGOING_PEER_KEY_PREFIX: &str = "pending_authenticated_peer:";
+
+pub(crate) fn pending_outgoing_peer_key_id(peer_device_id: &DeviceId) -> String {
+    format!("{PENDING_OUTGOING_PEER_KEY_PREFIX}{}", peer_device_id.0)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsentResolutionError {
@@ -504,6 +509,62 @@ impl SessionAuthorizationRegistry {
         Ok(snapshot)
     }
 
+    /// Bind the first independently verified peer key to a controller-side
+    /// authorization that was created before signaling. A pending key marker
+    /// can only be replaced once, for the exact requested device and while the
+    /// authorization is still in its pre-grant state.
+    pub async fn bind_outgoing_authenticated_peer(
+        &self,
+        session_id: &SessionId,
+        peer_device_id: &DeviceId,
+        peer_key_id: &str,
+        peer_public_key: &[u8],
+        bound_at_ms: u64,
+    ) -> Result<RemoteSessionSnapshot, RemoteFailure> {
+        let peer_public_key: [u8; 32] = peer_public_key.try_into().map_err(|_| {
+            failure(
+                RemoteReasonCode::IdentityMismatch,
+                "authenticated WAN peer key has an invalid length",
+            )
+        })?;
+        if public_key_id(&peer_public_key) != peer_key_id {
+            return Err(failure(
+                RemoteReasonCode::IdentityMismatch,
+                "authenticated WAN peer key identifier does not match its public key",
+            ));
+        }
+        let mut inner = self.inner.lock().await;
+        let Some(record) = inner.records.get_mut(session_id) else {
+            return Err(failure(
+                RemoteReasonCode::IdentityMismatch,
+                "authenticated WAN peer has no matching outgoing authorization",
+            ));
+        };
+        let pending_key_id = pending_outgoing_peer_key_id(peer_device_id);
+        if record.snapshot.role != RemoteSessionRole::Controller
+            || record.snapshot.authorization_state != RemoteAuthorizationState::Authorizing
+            || record.request.peer_device_id != *peer_device_id
+            || (record.request.peer_key_id != pending_key_id
+                && record.request.peer_key_id != peer_key_id)
+            || record
+                .peer_public_key
+                .is_some_and(|existing| existing != peer_public_key)
+        {
+            return Err(failure(
+                RemoteReasonCode::IdentityMismatch,
+                "authenticated WAN peer does not match the pending authorization",
+            ));
+        }
+        record.request.peer_key_id = peer_key_id.to_owned();
+        record.snapshot.peer_key_id = peer_key_id.to_owned();
+        record.peer_public_key = Some(peer_public_key);
+        record.snapshot.updated_at_ms = record.snapshot.updated_at_ms.max(bound_at_ms);
+        let snapshot = record.snapshot.clone();
+        drop(inner);
+        self.changed.notify_waiters();
+        Ok(snapshot)
+    }
+
     pub(crate) async fn active_control_authorization(
         &self,
         session_id: &SessionId,
@@ -672,6 +733,12 @@ impl SessionAuthorizationRegistry {
         };
         let policy_binding_is_valid = record.snapshot.role == RemoteSessionRole::Controller
             || grant.policy_revision == record.snapshot.policy_revision.get();
+        let Some(route_kind) = remote_route_kind(&record.request.transport_kind) else {
+            return Err(failure(
+                RemoteReasonCode::PolicyChanged,
+                "verified grant uses an unsupported route constraint",
+            ));
+        };
         if grant.grant_id.trim().is_empty()
             || !scope_binding_is_valid
             || !policy_binding_is_valid
@@ -693,7 +760,7 @@ impl SessionAuthorizationRegistry {
         record.snapshot.policy_revision = DecimalU64::new(grant.policy_revision);
         record.snapshot.authorization_state = RemoteAuthorizationState::Granted;
         record.snapshot.route_state = RemoteRouteState::Connecting;
-        record.snapshot.route_kind = Some(mrd_ipc::RemoteRouteKind::LanQuic);
+        record.snapshot.route_kind = Some(route_kind);
         record.snapshot.presentation_state = RemotePresentationState::Connecting;
         record.snapshot.updated_at_ms = installed_at_ms;
         record.snapshot.authorization_expires_at_ms = Some(grant.expires_at_ms);
@@ -713,7 +780,7 @@ impl SessionAuthorizationRegistry {
             snapshot.session_id.clone(),
             RemoteSessionEvent::RouteChanged {
                 state: RemoteRouteState::Connecting,
-                route: Some(mrd_ipc::RemoteRouteKind::LanQuic),
+                route: Some(route_kind),
                 failure: None,
             },
         );
@@ -1607,6 +1674,15 @@ fn validate_verified_request(
 fn normalize_scopes(scopes: &mut Vec<RemotePermissionScope>) {
     scopes.sort_unstable();
     scopes.dedup();
+}
+
+fn remote_route_kind(transport_kind: &str) -> Option<RemoteRouteKind> {
+    match transport_kind {
+        "quic" | "lan_quic" => Some(RemoteRouteKind::LanQuic),
+        "webrtc" | "webrtc_direct" => Some(RemoteRouteKind::WebRtcDirect),
+        "webrtc_relay" => Some(RemoteRouteKind::WebRtcRelay),
+        _ => None,
+    }
 }
 
 fn parse_sha256_identifier(value: &str) -> Option<[u8; 32]> {

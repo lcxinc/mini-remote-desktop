@@ -1,9 +1,10 @@
-use mrd_identity::UnattendedCredential;
+use mrd_identity::{DeviceIdentity, UnattendedCredential};
 use mrd_ipc::{
     AuditLogQuery, ConsentDecision, ConsentResponse, DecimalU64, IpcRequest, IpcResponse,
     RemoteAccessMode, RemoteAuthorizationState, RemoteCursorState, RemoteFailure, RemoteMediaState,
-    RemotePermissionScope, RemotePresentationState, RemoteReasonCode, RemoteRouteState,
-    RemoteSessionEvent, RemoteSessionRole, SessionEventSubscriptionQuery, UnattendedAccessPolicy,
+    RemotePermissionScope, RemotePresentationState, RemoteReasonCode, RemoteRouteKind,
+    RemoteRouteState, RemoteSessionEvent, RemoteSessionRole, SessionEventSubscriptionQuery,
+    UnattendedAccessPolicy,
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_service::{
@@ -11,6 +12,8 @@ use mrd_service::{
     AppState,
 };
 use std::sync::Arc;
+
+use ring::rand::SystemRandom;
 
 fn attended_request(session_id: &str) -> VerifiedIncomingAuthorizationRequest {
     let created_at_ms = std::time::SystemTime::now()
@@ -41,6 +44,83 @@ fn attended_request(session_id: &str) -> VerifiedIncomingAuthorizationRequest {
         created_at_ms,
         expires_at_ms: created_at_ms + 30_000,
     }
+}
+
+#[tokio::test]
+async fn outgoing_wan_authorization_binds_one_verified_peer_and_relay_route() {
+    let state = AppState::new();
+    let target_device_id = DeviceId("outgoing-wan-target".to_owned());
+    let target_identity = DeviceIdentity::generate(&SystemRandom::new()).unwrap();
+    let created_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let request = VerifiedIncomingAuthorizationRequest {
+        session_id: SessionId("outgoing-wan-authorization".to_owned()),
+        peer_device_id: target_device_id.clone(),
+        peer_key_id: format!("pending_authenticated_peer:{}", target_device_id.0),
+        peer_key_epoch: 1,
+        access_mode: RemoteAccessMode::Attended,
+        requested_scopes: vec![RemotePermissionScope::ScreenView],
+        peer_permission_ceiling: vec![RemotePermissionScope::ScreenView],
+        machine_permission_ceiling: vec![RemotePermissionScope::ScreenView],
+        runtime_capabilities: vec![RemotePermissionScope::ScreenView],
+        transport_kind: "webrtc_relay".to_owned(),
+        request_nonce: [0x51; 16],
+        created_at_ms,
+        expires_at_ms: created_at_ms + 30_000,
+    };
+    state
+        .session_authorizations
+        .begin_outgoing(request.clone())
+        .await
+        .expect("pending outgoing WAN authorization");
+    assert!(state
+        .session_authorizations
+        .bind_outgoing_authenticated_peer(
+            &request.session_id,
+            &DeviceId("wrong-target".to_owned()),
+            target_identity.key_id(),
+            target_identity.public_key(),
+            created_at_ms + 1,
+        )
+        .await
+        .is_err());
+    let bound = state
+        .session_authorizations
+        .bind_outgoing_authenticated_peer(
+            &request.session_id,
+            &target_device_id,
+            target_identity.key_id(),
+            target_identity.public_key(),
+            created_at_ms + 1,
+        )
+        .await
+        .expect("exact outgoing peer binding");
+    assert_eq!(bound.peer_key_id, target_identity.key_id());
+
+    let granted = state
+        .session_authorizations
+        .install_verified_grant(
+            VerifiedSessionGrant {
+                grant_id: format!("sha256:{}", "8".repeat(64)),
+                session_id: request.session_id,
+                granted_scopes: vec![RemotePermissionScope::ScreenView],
+                issued_at_ms: created_at_ms + 1,
+                expires_at_ms: created_at_ms + 20_000,
+                policy_revision: 7,
+                route_constraint: "webrtc_relay".to_owned(),
+                transport_fingerprint_sha256: [0x81; 32],
+            },
+            created_at_ms + 1,
+        )
+        .await
+        .expect("verified WAN grant");
+    assert_eq!(
+        granted.authorization_state,
+        RemoteAuthorizationState::Granted
+    );
+    assert_eq!(granted.route_kind, Some(RemoteRouteKind::WebRtcRelay));
 }
 
 #[tokio::test]

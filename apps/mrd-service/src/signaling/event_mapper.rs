@@ -421,10 +421,30 @@ impl AuthenticatedSessionSignalPort for ServiceSignalingMapper {
         let _signaling_state_guard = self.signaling_state_gate.lock().await;
         match event.signal.clone() {
             AuthenticatedSessionSignal::SessionIntentV3 { .. }
-            | AuthenticatedSessionSignal::SessionGrantV3 { .. }
             | AuthenticatedSessionSignal::WebRtcOfferV3 { .. }
             | AuthenticatedSessionSignal::WebRtcAnswerV3 { .. }
             | AuthenticatedSessionSignal::WebRtcCandidateV3 { .. } => {
+                self.relay_signaling.publish(event).await;
+                Ok(())
+            }
+            AuthenticatedSessionSignal::SessionGrantV3 { ref message } => {
+                let _authorization_guard = self.app_state.authorization_security_gate.lock().await;
+                let authorization = self
+                    .app_state
+                    .session_authorizations
+                    .snapshot_at(&message.payload.session_id, event.sender.issued_at_ms)
+                    .await
+                    .context("WAN grant has no pending controller authorization")?;
+                if authorization.role != mrd_ipc::RemoteSessionRole::Controller
+                    || authorization.authorization_state
+                        != mrd_ipc::RemoteAuthorizationState::Authorizing
+                    || authorization.peer_device_id != event.sender.device_id
+                    || authorization
+                        .authorization_expires_at_ms
+                        .is_none_or(|expires_at_ms| expires_at_ms < event.sender.expires_at_ms)
+                {
+                    bail!("WAN grant does not match the pending controller authorization");
+                }
                 self.relay_signaling.publish(event).await;
                 Ok(())
             }

@@ -412,10 +412,17 @@ async fn request_wan_remote_session(
         .requested_profile
         .as_ref()
         .map(crate::wan_session::media::wan_media_profile);
-    let deadline_unix_ms = current_time_ms().saturating_add(30_000);
+    let requested_authorization_scopes = requested_scopes
+        .iter()
+        .copied()
+        .map(ipc_permission_scope)
+        .collect::<Vec<_>>();
+    let created_at_ms = current_time_ms();
+    let deadline_unix_ms = created_at_ms.saturating_add(30_000);
+    let idempotency_key = wan_idempotency_key(&request.session_id);
     let wan_request = WanSessionRequestV3 {
         session_id: request.session_id.clone(),
-        idempotency_key: wan_idempotency_key(&request.session_id),
+        idempotency_key,
         controller_device_id: controller_device_id.clone(),
         target_device_id: target_device_id.clone(),
         access_mode: WanAccessModeV3::Attended,
@@ -443,26 +450,96 @@ async fn request_wan_remote_session(
             }
         };
 
-    match coordinator.start_controller(identity, wan_request).await {
-        Ok(_) => match coordinator.snapshot(&session_id).await {
-            Ok(state) => IpcResponse::RemoteSessionRequested {
-                session: project_wan_snapshot(&state, current_time_ms()),
-            },
-            Err(_) => wan_remote_failure(
-                session_id,
-                None,
-                RemoteReasonCode::PolicyChanged,
-                "WAN session started without a readable service snapshot",
-                "start a new secure session request",
+    let outgoing_authorization =
+        crate::session_authorization::VerifiedIncomingAuthorizationRequest {
+            session_id: request.session_id.clone(),
+            peer_device_id: target_device_id.clone(),
+            peer_key_id: crate::session_authorization::pending_outgoing_peer_key_id(
+                &target_device_id,
             ),
-        },
-        Err(error) => wan_remote_failure(
-            session_id,
-            None,
-            map_wan_coordinator_reason(&error),
-            "WAN relay session could not be started",
-            "verify the WAN relay backend and retry the secure session",
-        ),
+            peer_key_epoch: 1,
+            access_mode: RemoteAccessMode::Attended,
+            requested_scopes: requested_authorization_scopes.clone(),
+            peer_permission_ceiling: requested_authorization_scopes.clone(),
+            machine_permission_ceiling: requested_authorization_scopes.clone(),
+            runtime_capabilities: requested_authorization_scopes,
+            transport_kind: "webrtc_relay".to_owned(),
+            request_nonce: idempotency_key,
+            created_at_ms,
+            expires_at_ms: deadline_unix_ms,
+        };
+    let authorization = {
+        let _authorization_guard = app_state.authorization_security_gate.lock().await;
+        app_state
+            .session_authorizations
+            .begin_outgoing(outgoing_authorization)
+            .await
+    };
+    if let Err(failure) = authorization {
+        return IpcResponse::RemoteAccessError {
+            session_id: Some(session_id),
+            peer_key_id: None,
+            failure,
+        };
+    }
+
+    match coordinator.start_controller(identity, wan_request).await {
+        Ok(_) => {
+            if coordinator.snapshot(&session_id).await.is_err() {
+                let failure = RemoteFailure {
+                    code: RemoteReasonCode::PolicyChanged,
+                    message: "WAN session started without a readable service snapshot".to_owned(),
+                    suggested_action: Some("start a new secure session request".to_owned()),
+                };
+                let _ = app_state
+                    .session_authorizations
+                    .record_failure(
+                        &session_id,
+                        RemoteAuthorizationState::Denied,
+                        failure.clone(),
+                        current_time_ms(),
+                    )
+                    .await;
+                return IpcResponse::RemoteAccessError {
+                    session_id: Some(session_id),
+                    peer_key_id: None,
+                    failure,
+                };
+            }
+            match app_state.session_authorizations.snapshot(&session_id).await {
+                Some(session) => IpcResponse::RemoteSessionRequested { session },
+                None => wan_remote_failure(
+                    session_id,
+                    None,
+                    RemoteReasonCode::PolicyChanged,
+                    "WAN session authorization disappeared during startup",
+                    "start a new secure session request",
+                ),
+            }
+        }
+        Err(error) => {
+            let failure = RemoteFailure {
+                code: map_wan_coordinator_reason(&error),
+                message: "WAN relay session could not be started".to_owned(),
+                suggested_action: Some(
+                    "verify the WAN relay backend and retry the secure session".to_owned(),
+                ),
+            };
+            let _ = app_state
+                .session_authorizations
+                .record_failure(
+                    &session_id,
+                    RemoteAuthorizationState::Denied,
+                    failure.clone(),
+                    current_time_ms(),
+                )
+                .await;
+            IpcResponse::RemoteAccessError {
+                session_id: Some(session_id),
+                peer_key_id: None,
+                failure,
+            }
+        }
     }
 }
 
@@ -542,108 +619,6 @@ fn map_wan_coordinator_reason(
             RemoteReasonCode::IdentityMismatch
         }
         _ => RemoteReasonCode::RouteLost,
-    }
-}
-
-fn project_wan_snapshot(
-    state: &crate::wan_session::model::WanSessionState,
-    now_ms: u64,
-) -> mrd_ipc::RemoteSessionSnapshot {
-    use mrd_ipc::{
-        DecimalU64, RemoteAuthorizationState, RemoteMediaState, RemotePresentationState,
-        RemoteRouteKind, RemoteRouteState, RemoteSessionRole,
-    };
-    let phase = state.phase();
-    let authorization_state = match phase {
-        crate::wan_session::model::WanSessionPhase::AwaitingConsent => {
-            RemoteAuthorizationState::Authorizing
-        }
-        crate::wan_session::model::WanSessionPhase::Granted
-        | crate::wan_session::model::WanSessionPhase::AccessBound
-        | crate::wan_session::model::WanSessionPhase::Negotiating
-        | crate::wan_session::model::WanSessionPhase::RelayVerified
-        | crate::wan_session::model::WanSessionPhase::Streaming => {
-            RemoteAuthorizationState::Granted
-        }
-        crate::wan_session::model::WanSessionPhase::Failed => RemoteAuthorizationState::Revoked,
-        _ => RemoteAuthorizationState::Authorizing,
-    };
-    let (route_state, media_state, presentation_state) = match phase {
-        crate::wan_session::model::WanSessionPhase::RelayVerified => (
-            RemoteRouteState::Connected,
-            RemoteMediaState::Starting,
-            RemotePresentationState::ConnectedWithoutMedia,
-        ),
-        crate::wan_session::model::WanSessionPhase::Streaming => (
-            RemoteRouteState::Connected,
-            RemoteMediaState::Streaming,
-            RemotePresentationState::Streaming,
-        ),
-        crate::wan_session::model::WanSessionPhase::Failed => (
-            RemoteRouteState::Failed,
-            RemoteMediaState::Failed,
-            RemotePresentationState::Failed,
-        ),
-        _ => (
-            RemoteRouteState::Connecting,
-            RemoteMediaState::Idle,
-            RemotePresentationState::Connecting,
-        ),
-    };
-    let requested_scopes = state
-        .grant()
-        .map(|grant| grant.approved_scopes())
-        .unwrap_or_default()
-        .iter()
-        .map(|scope| ipc_permission_scope(*scope))
-        .collect::<Vec<_>>();
-    let granted_scopes = requested_scopes.clone();
-    let (requested_scopes, granted_scopes) = if state.grant().is_none() {
-        (Vec::new(), Vec::new())
-    } else {
-        (requested_scopes, granted_scopes)
-    };
-    mrd_ipc::RemoteSessionSnapshot {
-        session_id: state.identity().session_id().clone(),
-        role: match state.role() {
-            crate::wan_session::model::WanSessionRole::Controller => RemoteSessionRole::Controller,
-            crate::wan_session::model::WanSessionRole::Target => RemoteSessionRole::Agent,
-        },
-        peer_device_id: match state.role() {
-            crate::wan_session::model::WanSessionRole::Controller => {
-                state.identity().target_device_id().clone()
-            }
-            crate::wan_session::model::WanSessionRole::Target => {
-                state.identity().controller_device_id().clone()
-            }
-        },
-        peer_key_id: match state.role() {
-            crate::wan_session::model::WanSessionRole::Controller => state
-                .identity()
-                .target_key_fingerprint()
-                .unwrap_or("pending_verified_peer")
-                .to_string(),
-            crate::wan_session::model::WanSessionRole::Target => {
-                state.identity().controller_key_fingerprint().to_string()
-            }
-        },
-        access_mode: mrd_ipc::RemoteAccessMode::Attended,
-        authorization_state,
-        route_state,
-        route_kind: Some(RemoteRouteKind::WebRtcRelay),
-        media_state,
-        presentation_state,
-        requested_scopes,
-        granted_scopes,
-        policy_revision: DecimalU64::new(state.grant().map_or(0, |grant| grant.policy_revision())),
-        failure: state.failure().map(|_failure| RemoteFailure {
-            code: RemoteReasonCode::RouteLost,
-            message: "WAN relay session failed".to_string(),
-            suggested_action: Some("start a new secure session request".to_string()),
-        }),
-        created_at_ms: now_ms,
-        updated_at_ms: now_ms,
-        authorization_expires_at_ms: Some(state.identity().deadline_unix_ms()),
     }
 }
 

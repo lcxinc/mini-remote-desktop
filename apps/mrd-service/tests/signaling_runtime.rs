@@ -1399,6 +1399,35 @@ fn v3_initial_debug_surfaces_redact_all_signal_bodies_and_route_tokens() {
 }
 
 #[tokio::test]
+async fn v3_controller_grant_never_reaches_bus_without_pending_authorization() {
+    let app_state = Arc::new(AppState::new());
+    let mapper = ServiceSignalingMapper::new(Arc::clone(&app_state));
+    let peer = identity();
+    let session_id = SessionId("unsolicited-controller-grant".into());
+    let mut subscription = app_state
+        .relay_signaling
+        .subscribe_authenticated_session(session_id.clone(), DeviceId("peer-device".into()));
+
+    let result = mapper
+        .apply_authenticated_signal(verified_event_for_device(
+            &peer,
+            "peer-device",
+            AuthenticatedSessionSignal::SessionGrantV3 {
+                message: inbound_v3_grant(&peer, &session_id.0),
+            },
+        ))
+        .await;
+
+    assert!(result.is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), subscription.recv())
+            .await
+            .is_err(),
+        "unsolicited grant reached the scoped signaling bus"
+    );
+}
+
+#[tokio::test]
 async fn v3_initial_bus_routes_exact_session_and_peer_and_clears_on_close() {
     let app_state = Arc::new(AppState::new());
     let mapper = ServiceSignalingMapper::new(Arc::clone(&app_state));
