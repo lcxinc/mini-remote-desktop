@@ -270,9 +270,7 @@ async fn run_service(
                 }
             }
             _ = wan_session_expiry.tick(), if app_state.wan_session_coordinator().is_some() => {
-                if let Some(coordinator) = app_state.wan_session_coordinator() {
-                    let _ = coordinator.expire_due_sessions().await;
-                }
+                let _ = mrd_service::wan_session::service::expire_due_wan_sessions(&app_state).await;
             }
         }
     };

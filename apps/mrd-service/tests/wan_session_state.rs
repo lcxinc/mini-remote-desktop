@@ -265,43 +265,105 @@ fn deadline_generation_and_route_proof_are_fail_closed() {
 #[derive(Default)]
 struct RecordingCleanup {
     calls: Mutex<Vec<&'static str>>,
+    fail_step: Option<&'static str>,
+}
+
+#[derive(Default)]
+struct CancellationSafeCleanup {
+    freeze_calls: AtomicUsize,
+    total_calls: AtomicUsize,
+    freeze_started: tokio::sync::Notify,
+    release_freeze: tokio::sync::Notify,
+}
+
+impl CancellationSafeCleanup {
+    fn record(&self) {
+        self.total_calls.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[async_trait]
+impl WanSessionCleanup for CancellationSafeCleanup {
+    async fn freeze_input(&self, _: &SessionId) -> Result<(), WanSessionCoordinatorError> {
+        self.record();
+        self.freeze_calls.fetch_add(1, Ordering::AcqRel);
+        self.freeze_started.notify_one();
+        self.release_freeze.notified().await;
+        Ok(())
+    }
+
+    async fn stop_media(&self, _: &SessionId) -> Result<(), WanSessionCoordinatorError> {
+        self.record();
+        Ok(())
+    }
+
+    async fn close_transport(&self, _: &SessionId) -> Result<(), WanSessionCoordinatorError> {
+        self.record();
+        Ok(())
+    }
+
+    async fn remove_failover(&self, _: &SessionId) -> Result<(), WanSessionCoordinatorError> {
+        self.record();
+        Ok(())
+    }
+
+    async fn clear_signaling(&self, _: &SessionId) -> Result<(), WanSessionCoordinatorError> {
+        self.record();
+        Ok(())
+    }
+
+    async fn close_backend(
+        &self,
+        _: &SessionId,
+        _: bool,
+    ) -> Result<(), WanSessionCoordinatorError> {
+        self.record();
+        Ok(())
+    }
 }
 
 impl RecordingCleanup {
+    fn failing(step: &'static str) -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            fail_step: Some(step),
+        }
+    }
+
     fn calls(&self) -> Vec<&'static str> {
         self.calls.lock().unwrap().clone()
     }
 
-    fn record(&self, value: &'static str) {
+    fn record(&self, value: &'static str) -> Result<(), WanSessionCoordinatorError> {
         self.calls.lock().unwrap().push(value);
+        if self.fail_step == Some(value) {
+            Err(WanSessionCoordinatorError::CleanupFailed)
+        } else {
+            Ok(())
+        }
     }
 }
 
 #[async_trait]
 impl WanSessionCleanup for RecordingCleanup {
     async fn freeze_input(&self, _: &SessionId) -> Result<(), WanSessionCoordinatorError> {
-        self.record("freeze_input");
-        Ok(())
+        self.record("freeze_input")
     }
 
     async fn stop_media(&self, _: &SessionId) -> Result<(), WanSessionCoordinatorError> {
-        self.record("stop_media");
-        Ok(())
+        self.record("stop_media")
     }
 
     async fn close_transport(&self, _: &SessionId) -> Result<(), WanSessionCoordinatorError> {
-        self.record("close_transport");
-        Ok(())
+        self.record("close_transport")
     }
 
     async fn remove_failover(&self, _: &SessionId) -> Result<(), WanSessionCoordinatorError> {
-        self.record("remove_failover");
-        Ok(())
+        self.record("remove_failover")
     }
 
     async fn clear_signaling(&self, _: &SessionId) -> Result<(), WanSessionCoordinatorError> {
-        self.record("clear_signaling");
-        Ok(())
+        self.record("clear_signaling")
     }
 
     async fn close_backend(
@@ -313,8 +375,7 @@ impl WanSessionCleanup for RecordingCleanup {
             "revoke_backend"
         } else {
             "close_backend"
-        });
-        Ok(())
+        })
     }
 }
 
@@ -403,6 +464,70 @@ async fn registry_is_bounded_and_terminal_cleanup_cancels_and_joins_owned_tasks(
 }
 
 #[tokio::test]
+async fn terminal_cleanup_receipt_replays_the_first_result_without_running_twice() {
+    let cleanup = Arc::new(RecordingCleanup::failing("close_transport"));
+    let coordinator = coordinator(cleanup.clone(), 1);
+    let state = WanSessionState::new(WanSessionRole::Controller, identity("cleanup-receipt"));
+    let session_id = state.identity().session_id().clone();
+    coordinator.begin(state).await.unwrap();
+
+    assert!(matches!(
+        coordinator.close(&session_id).await,
+        Err(WanSessionCoordinatorError::CleanupFailed)
+    ));
+    assert!(matches!(
+        coordinator.close(&session_id).await,
+        Err(WanSessionCoordinatorError::CleanupFailed)
+    ));
+    assert_eq!(
+        cleanup.calls(),
+        vec![
+            "freeze_input",
+            "stop_media",
+            "close_transport",
+            "remove_failover",
+            "clear_signaling",
+            "close_backend",
+        ],
+        "the stored cleanup receipt must prevent a second side-effect pass"
+    );
+}
+
+#[tokio::test]
+async fn terminal_cleanup_survives_caller_cancellation_without_replaying_side_effects() {
+    let cleanup = Arc::new(CancellationSafeCleanup::default());
+    let coordinator = Arc::new(
+        WanSessionCoordinator::new(
+            WanSessionCoordinatorConfig::default(),
+            cleanup.clone(),
+            Arc::new(FakeClock::default()),
+        )
+        .unwrap(),
+    );
+    let state = WanSessionState::new(WanSessionRole::Controller, identity("cleanup-cancel"));
+    let session_id = state.identity().session_id().clone();
+    coordinator.begin(state).await.unwrap();
+
+    let first_coordinator = coordinator.clone();
+    let first_session_id = session_id.clone();
+    let first = tokio::spawn(async move { first_coordinator.close(&first_session_id).await });
+    cleanup.freeze_started.notified().await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    cleanup.release_freeze.notify_one();
+
+    assert!(tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        coordinator.close(&session_id),
+    )
+    .await
+    .expect("stored cleanup must complete after caller cancellation")
+    .is_ok());
+    assert_eq!(cleanup.freeze_calls.load(Ordering::Acquire), 1);
+    assert_eq!(cleanup.total_calls.load(Ordering::Acquire), 6);
+}
+
+#[tokio::test]
 async fn an_owned_task_can_terminalize_its_session_without_joining_itself() {
     let coordinator = Arc::new(coordinator(Arc::new(RecordingCleanup::default()), 1));
     let state = WanSessionState::new(WanSessionRole::Controller, identity("self-finalize"));
@@ -485,6 +610,30 @@ async fn retry_and_buffer_budgets_are_hard_limits_under_one_deadline() {
         coordinator.snapshot(&id).await.unwrap().failure(),
         Some(WanSessionFailure::DeadlineExceeded)
     );
+}
+
+#[tokio::test]
+async fn streaming_session_expires_at_the_earliest_grant_or_policy_deadline() {
+    let clock = Arc::new(FakeClock::default());
+    let cleanup = Arc::new(RecordingCleanup::default());
+    let coordinator = coordinator_with_clock(cleanup.clone(), 1, clock.clone());
+    let mut state = WanSessionState::new(
+        WanSessionRole::Controller,
+        identity("streaming-grant-expiry"),
+    );
+    let session_id = state.identity().session_id().clone();
+    for event in full_path().into_iter().take(7) {
+        state.apply(event, 10_000).unwrap();
+    }
+    assert_eq!(state.phase(), WanSessionPhase::Streaming);
+    coordinator.begin(state).await.unwrap();
+
+    clock.0.store(17_000, Ordering::SeqCst);
+    assert_eq!(coordinator.expire_due_sessions().await, 1);
+    let expired = coordinator.snapshot(&session_id).await.unwrap();
+    assert_eq!(expired.phase(), WanSessionPhase::Failed);
+    assert_eq!(expired.failure(), Some(WanSessionFailure::DeadlineExceeded));
+    assert_eq!(cleanup.calls().len(), 6);
 }
 
 #[test]

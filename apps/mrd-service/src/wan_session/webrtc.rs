@@ -1255,7 +1255,15 @@ impl GenerationZeroNegotiator {
         if result.is_err() && opened {
             let _ = self.host.close_session(&session_id).await;
         }
-        if result.is_err() && owns_session && self.coordinator.is_some() {
+        // A service-built negotiator carries the shared authorization gate;
+        // its wrapper must perform coordinator failure, cleanup, authorization,
+        // and IPC projection as one terminalization operation. Standalone
+        // coordinator-backed executors retain their self-terminalizing behavior.
+        if result.is_err()
+            && owns_session
+            && self.coordinator.is_some()
+            && self.authorization_gate.is_none()
+        {
             if let Some(coordinator) = &self.coordinator {
                 let still_live = coordinator
                     .snapshot(&session_id)

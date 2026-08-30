@@ -18,20 +18,39 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Return the authoritative secure remote-session projection.
 pub async fn get_remote_session(app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
     let _authorization_guard = app_state.authorization_security_gate.lock().await;
+    let is_wan = match crate::wan_session::service::reconcile_wan_session_under_security_gate(
+        app_state,
+        &session_id,
+    )
+    .await
+    {
+        Ok(state) => state.is_some(),
+        Err(error) => {
+            return wan_remote_failure(
+                session_id,
+                None,
+                map_wan_coordinator_reason(&error),
+                "WAN session state could not be reconciled",
+                "start a new secure WAN session",
+            )
+        }
+    };
     let session = app_state
         .session_authorizations
         .snapshot_at(&session_id, current_time_ms())
         .await;
-    if session.as_ref().is_some_and(|snapshot| {
-        matches!(
-            snapshot.authorization_state,
-            RemoteAuthorizationState::Denied
-                | RemoteAuthorizationState::Expired
-                | RemoteAuthorizationState::Revoked
-                | RemoteAuthorizationState::LockedOut
-                | RemoteAuthorizationState::PolicyChanged
-        )
-    }) {
+    if !is_wan
+        && session.as_ref().is_some_and(|snapshot| {
+            matches!(
+                snapshot.authorization_state,
+                RemoteAuthorizationState::Denied
+                    | RemoteAuthorizationState::Expired
+                    | RemoteAuthorizationState::Revoked
+                    | RemoteAuthorizationState::LockedOut
+                    | RemoteAuthorizationState::PolicyChanged
+            )
+        })
+    {
         crate::lan_discovery::terminate_authorized_remote_sessions_under_security_gate(
             app_state,
             std::slice::from_ref(&session_id),
@@ -50,6 +69,23 @@ pub async fn get_remote_session(app_state: &Arc<AppState>, session_id: SessionId
 /// Return route evidence only when it is bound to the active verified session grant.
 pub async fn get_route_evidence(app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
     let _authorization_guard = app_state.authorization_security_gate.lock().await;
+    let is_wan = match crate::wan_session::service::reconcile_wan_session_under_security_gate(
+        app_state,
+        &session_id,
+    )
+    .await
+    {
+        Ok(state) => state.is_some(),
+        Err(error) => {
+            return wan_remote_failure(
+                session_id,
+                None,
+                map_wan_coordinator_reason(&error),
+                "WAN session state could not be reconciled",
+                "start a new secure WAN session",
+            )
+        }
+    };
     let result = app_state
         .session_authorizations
         .verified_route_evidence_at(&session_id, current_time_ms())
@@ -72,7 +108,7 @@ pub async fn get_route_evidence(app_state: &Arc<AppState>, session_id: SessionId
     } else {
         false
     };
-    if terminal {
+    if terminal && !is_wan {
         crate::lan_discovery::terminate_authorized_remote_sessions_under_security_gate(
             app_state,
             std::slice::from_ref(&session_id),
@@ -98,6 +134,7 @@ pub async fn respond_to_consent(
     app_state: &Arc<AppState>,
     response: mrd_ipc::ConsentResponse,
 ) -> IpcResponse {
+    let _authorization_security_guard = app_state.authorization_security_gate.lock().await;
     let session_id = response.session_id.clone();
     let decision = response.decision;
     let approved_scope_count = response.approved_scopes.len();
@@ -154,25 +191,32 @@ pub async fn respond_to_consent(
                 {
                     let coordinator_result = match decision {
                         mrd_ipc::ConsentDecision::Approve => {
-                            coordinator.approve_target(&session_id).await
+                            coordinator.approve_target(&session_id).await.map(|_| ())
                         }
                         mrd_ipc::ConsentDecision::Deny => {
-                            coordinator
-                                .fail(
-                                    &session_id,
-                                    crate::wan_session::model::WanSessionFailure::Cancelled,
-                                )
+                            crate::wan_session::service::terminalize_wan_session_under_security_gate(
+                                app_state,
+                                &session_id,
+                                crate::wan_session::service::ServiceWanTerminalRequest::Fail {
+                                    failure: crate::wan_session::model::WanSessionFailure::Cancelled,
+                                    remote_failure: RemoteFailure {
+                                        code: RemoteReasonCode::ConsentDenied,
+                                        message: "local user denied the WAN session".to_owned(),
+                                        suggested_action: None,
+                                    },
+                                },
+                            )
                                 .await
+                                .map(|_| ())
                         }
                     };
-                    let denial_already_terminal = coordinator_result.is_err()
-                        && decision == mrd_ipc::ConsentDecision::Deny
-                        && coordinator.snapshot(&session_id).await.is_ok_and(|state| {
-                            state.phase() == crate::wan_session::model::WanSessionPhase::Failed
-                                && state.failure()
-                                    == Some(crate::wan_session::model::WanSessionFailure::Cancelled)
-                        });
-                    if coordinator_result.is_err() && !denial_already_terminal {
+                    if coordinator_result.is_err() {
+                        let _ =
+                            crate::wan_session::service::reconcile_wan_session_under_security_gate(
+                                app_state,
+                                &session_id,
+                            )
+                            .await;
                         return IpcResponse::RemoteAccessError {
                             session_id: Some(session_id),
                             peer_key_id: peer_device_id.map(|device| device.0),
@@ -246,16 +290,13 @@ pub async fn subscribe_session_events(
     }
 }
 
-/// Request a LAN remote session through the secure authorization pipeline.
-pub async fn request_remote_session(
+/// Resolve the initial route once from the caller preference and the current
+/// authenticated LAN cache. The returned value must be carried through both
+/// execution and auditing so an `Auto` request cannot change identity midway.
+pub(crate) async fn resolve_remote_session_route(
     app_state: &Arc<AppState>,
-    request: RemoteSessionRequest,
-) -> IpcResponse {
-    let session_id = request.session_id.clone();
-    if request.access_mode == RemoteAccessMode::Unattended {
-        return unattended_enrollment_unavailable(Some(session_id));
-    }
-
+    request: &RemoteSessionRequest,
+) -> crate::wan_session::media::WanRouteSelection {
     // Auto is deliberately cache-only.  The security gate serializes this
     // read with trust changes, while `fresh_authenticated_lan_evidence` does
     // not issue a discovery probe or wait for a peer announcement.
@@ -271,7 +312,21 @@ pub async fn request_remote_session(
     } else {
         None
     };
-    let route = crate::wan_session::media::select_route(request.route_preference, cached_lan);
+    crate::wan_session::media::select_route(request.route_preference, cached_lan)
+}
+
+/// Request a remote session on an already resolved route. This is crate-visible
+/// so the IPC dispatcher can audit the exact route used by the handler.
+pub(crate) async fn request_remote_session_on_route(
+    app_state: &Arc<AppState>,
+    request: RemoteSessionRequest,
+    route: crate::wan_session::media::WanRouteSelection,
+) -> IpcResponse {
+    let session_id = request.session_id.clone();
+    if request.access_mode == RemoteAccessMode::Unattended {
+        return unattended_enrollment_unavailable(Some(session_id));
+    }
+
     if route == crate::wan_session::media::WanRouteSelection::WanRelay {
         return request_wan_remote_session(app_state, request).await;
     }
@@ -337,6 +392,15 @@ pub async fn request_remote_session(
             }
         }
     }
+}
+
+/// Request a remote session through the secure authorization pipeline.
+pub async fn request_remote_session(
+    app_state: &Arc<AppState>,
+    request: RemoteSessionRequest,
+) -> IpcResponse {
+    let route = resolve_remote_session_route(app_state, &request).await;
+    request_remote_session_on_route(app_state, request, route).await
 }
 
 /// Start the initial attended WAN relay workflow through the bound
@@ -485,25 +549,37 @@ async fn request_wan_remote_session(
 
     match coordinator.start_controller(identity, wan_request).await {
         Ok(_) => {
-            if coordinator.snapshot(&session_id).await.is_err() {
-                let failure = RemoteFailure {
-                    code: RemoteReasonCode::PolicyChanged,
-                    message: "WAN session started without a readable service snapshot".to_owned(),
-                    suggested_action: Some("start a new secure session request".to_owned()),
-                };
-                let _ = app_state
-                    .session_authorizations
-                    .record_failure(
+            let projection_failure = RemoteFailure {
+                code: RemoteReasonCode::PolicyChanged,
+                message: "WAN session started without a readable service projection".to_owned(),
+                suggested_action: Some("start a new secure session request".to_owned()),
+            };
+            let projection = {
+                let _authorization_guard = app_state.authorization_security_gate.lock().await;
+                let projection =
+                    crate::wan_session::service::reconcile_wan_session_under_security_gate(
+                        app_state,
                         &session_id,
-                        RemoteAuthorizationState::Denied,
-                        failure.clone(),
-                        current_time_ms(),
                     )
                     .await;
+                if projection.is_err() {
+                    let _ = app_state
+                        .session_authorizations
+                        .record_failure(
+                            &session_id,
+                            RemoteAuthorizationState::Denied,
+                            projection_failure.clone(),
+                            current_time_ms(),
+                        )
+                        .await;
+                }
+                projection
+            };
+            if projection.is_err() {
                 return IpcResponse::RemoteAccessError {
                     session_id: Some(session_id),
                     peer_key_id: None,
-                    failure,
+                    failure: projection_failure,
                 };
             }
             match app_state.session_authorizations.snapshot(&session_id).await {
@@ -525,15 +601,23 @@ async fn request_wan_remote_session(
                     "verify the WAN relay backend and retry the secure session".to_owned(),
                 ),
             };
-            let _ = app_state
-                .session_authorizations
-                .record_failure(
+            {
+                let _authorization_guard = app_state.authorization_security_gate.lock().await;
+                let _ = app_state
+                    .session_authorizations
+                    .record_failure(
+                        &session_id,
+                        RemoteAuthorizationState::Denied,
+                        failure.clone(),
+                        current_time_ms(),
+                    )
+                    .await;
+                let _ = crate::wan_session::service::reconcile_wan_session_under_security_gate(
+                    app_state,
                     &session_id,
-                    RemoteAuthorizationState::Denied,
-                    failure.clone(),
-                    current_time_ms(),
                 )
                 .await;
+            }
             IpcResponse::RemoteAccessError {
                 session_id: Some(session_id),
                 peer_key_id: None,
@@ -1459,6 +1543,48 @@ pub async fn stop_session(app_state: &Arc<AppState>, session_id: SessionId) -> I
     tracing::info!("Stopping session: {}", session_id.0);
 
     let authorization_security_guard = app_state.authorization_security_gate.lock().await;
+    let session_kind = crate::wan_session::service::resolve_session_kind_under_security_gate(
+        app_state,
+        &session_id,
+    )
+    .await;
+    if session_kind == crate::wan_session::service::ServiceSessionKind::Wan {
+        match crate::wan_session::service::terminalize_wan_session_under_security_gate(
+            app_state,
+            &session_id,
+            crate::wan_session::service::ServiceWanTerminalRequest::Close,
+        )
+        .await
+        {
+            Ok(Some(state)) => {
+                drop(authorization_security_guard);
+                return wan_terminal_response(session_id, &state);
+            }
+            Ok(None) => {
+                if app_state
+                    .session_authorizations
+                    .snapshot(&session_id)
+                    .await
+                    .is_some()
+                {
+                    terminalize_secure_session(
+                        app_state,
+                        &session_id,
+                        RemoteReasonCode::GrantRevoked,
+                        "session stopped".to_owned(),
+                        None,
+                    )
+                    .await;
+                }
+                drop(authorization_security_guard);
+                return IpcResponse::SessionStopped { session_id };
+            }
+            Err(error) => {
+                drop(authorization_security_guard);
+                return wan_terminal_error_response(session_id, &error);
+            }
+        }
+    }
     let secure_session_exists = app_state
         .session_authorizations
         .snapshot(&session_id)
@@ -1535,6 +1661,60 @@ pub async fn fail_session(
     tracing::warn!("Failing session: {} reason={}", session_id.0, reason);
 
     let authorization_security_guard = app_state.authorization_security_gate.lock().await;
+    let session_kind = crate::wan_session::service::resolve_session_kind_under_security_gate(
+        app_state,
+        &session_id,
+    )
+    .await;
+    if session_kind == crate::wan_session::service::ServiceSessionKind::Wan {
+        match crate::wan_session::service::terminalize_wan_session_under_security_gate(
+            app_state,
+            &session_id,
+            crate::wan_session::service::ServiceWanTerminalRequest::Fail {
+                failure: crate::wan_session::model::WanSessionFailure::Transport,
+                remote_failure: RemoteFailure {
+                    code: RemoteReasonCode::RouteLost,
+                    message: reason.clone(),
+                    suggested_action: Some("retry the secure remote session".to_owned()),
+                },
+            },
+        )
+        .await
+        {
+            Ok(Some(state)) => {
+                drop(authorization_security_guard);
+                if state.phase() == crate::wan_session::model::WanSessionPhase::Failed {
+                    app_state.shell.lock().await.last_error =
+                        Some("WAN transport failed".to_owned());
+                }
+                return wan_terminal_response(session_id, &state);
+            }
+            Ok(None) => {
+                if app_state
+                    .session_authorizations
+                    .snapshot(&session_id)
+                    .await
+                    .is_some()
+                {
+                    terminalize_secure_session(
+                        app_state,
+                        &session_id,
+                        RemoteReasonCode::RouteLost,
+                        reason,
+                        Some("retry the secure remote session".to_owned()),
+                    )
+                    .await;
+                }
+                drop(authorization_security_guard);
+                app_state.shell.lock().await.last_error = Some("WAN transport failed".to_owned());
+                return IpcResponse::SessionFailed { session_id };
+            }
+            Err(error) => {
+                drop(authorization_security_guard);
+                return wan_terminal_error_response(session_id, &error);
+            }
+        }
+    }
     let secure_session_exists = app_state
         .session_authorizations
         .snapshot(&session_id)
@@ -1628,6 +1808,44 @@ async fn terminalize_secure_session(
             current_time_ms(),
         )
         .await;
+}
+
+fn wan_terminal_response(
+    session_id: SessionId,
+    state: &crate::wan_session::model::WanSessionState,
+) -> IpcResponse {
+    match state.phase() {
+        crate::wan_session::model::WanSessionPhase::Closed => {
+            IpcResponse::SessionStopped { session_id }
+        }
+        crate::wan_session::model::WanSessionPhase::Failed => {
+            IpcResponse::SessionFailed { session_id }
+        }
+        _ => IpcResponse::RemoteAccessError {
+            session_id: Some(session_id),
+            peer_key_id: None,
+            failure: RemoteFailure {
+                code: RemoteReasonCode::PolicyChanged,
+                message: "WAN session did not reach a terminal state".to_owned(),
+                suggested_action: Some("start a new secure WAN session".to_owned()),
+            },
+        },
+    }
+}
+
+fn wan_terminal_error_response(
+    session_id: SessionId,
+    error: &crate::wan_session::coordinator::WanSessionCoordinatorError,
+) -> IpcResponse {
+    IpcResponse::RemoteAccessError {
+        session_id: Some(session_id),
+        peer_key_id: None,
+        failure: RemoteFailure {
+            code: map_wan_coordinator_reason(error),
+            message: "WAN session cleanup did not complete".to_owned(),
+            suggested_action: Some("restart the service before starting a new session".to_owned()),
+        },
+    }
 }
 
 async fn clear_session_media_state(app_state: &Arc<AppState>, session_id: &SessionId) {
@@ -1734,21 +1952,32 @@ pub async fn recover_session(app_state: &Arc<AppState>, session_id: SessionId) -
 
 /// Handle session list request.
 pub async fn list_sessions(app_state: &Arc<AppState>) -> IpcResponse {
+    let _authorization_guard = app_state.authorization_security_gate.lock().await;
+    let wan_sessions =
+        crate::wan_session::service::wan_session_infos_under_security_gate(app_state).await;
     let sessions = app_state.sessions.lock().await;
-    let session_list = sessions
+    let mut session_list = sessions
         .list_all()
         .into_iter()
-        .map(|snap| mrd_ipc::SessionInfo {
-            session_id: snap.session_id.clone(),
-            role: session_role(&snap),
-            state: snap.lifecycle_state.as_str().to_string(),
-            transport_kind: snap.transport.clone(),
-            last_error: snap.last_error.clone(),
-            sender_active: snap.sender_active,
-            receiver_active: snap.receiver_active,
-            peer_device_id: peer_device_id(&snap),
+        .map(|snap| {
+            let info = mrd_ipc::SessionInfo {
+                session_id: snap.session_id.clone(),
+                role: session_role(&snap),
+                state: snap.lifecycle_state.as_str().to_string(),
+                transport_kind: snap.transport.clone(),
+                last_error: snap.last_error.clone(),
+                sender_active: snap.sender_active,
+                receiver_active: snap.receiver_active,
+                peer_device_id: peer_device_id(&snap),
+            };
+            (info.session_id.clone(), info)
         })
-        .collect();
+        .collect::<std::collections::HashMap<_, _>>();
+    for session in wan_sessions {
+        session_list.insert(session.session_id.clone(), session);
+    }
+    let mut session_list = session_list.into_values().collect::<Vec<_>>();
+    session_list.sort_by(|left, right| left.session_id.0.cmp(&right.session_id.0));
 
     IpcResponse::SessionList {
         sessions: session_list,
@@ -1757,6 +1986,16 @@ pub async fn list_sessions(app_state: &Arc<AppState>) -> IpcResponse {
 
 /// Handle aggregated runtime snapshot request.
 pub async fn runtime_snapshot(app_state: &Arc<AppState>) -> IpcResponse {
+    let authorization_guard = app_state.authorization_security_gate.lock().await;
+    if crate::wan_session::service::reconcile_all_wan_sessions_under_security_gate(app_state)
+        .await
+        .is_err()
+    {
+        return IpcResponse::Error {
+            code: "E_WAN_SESSION_RECONCILE".to_owned(),
+            message: "WAN session state could not be reconciled".to_owned(),
+        };
+    }
     let sessions = app_state.sessions.lock().await;
     let session_snapshots: Vec<mrd_ipc::SessionRuntimeSnapshot> = sessions
         .list_all()
@@ -1764,6 +2003,7 @@ pub async fn runtime_snapshot(app_state: &Arc<AppState>) -> IpcResponse {
         .map(|snap| session_runtime_snapshot(&snap))
         .collect();
     drop(sessions);
+    drop(authorization_guard);
 
     let devices = app_state.devices.lock().await;
     let device_id = devices.get_local_device().map(|(id, _)| id.clone());
@@ -1800,6 +2040,21 @@ fn signaling_runtime_snapshot(
 
 /// Handle session snapshot request
 pub async fn session_snapshot(app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
+    let _authorization_guard = app_state.authorization_security_gate.lock().await;
+    if let Err(error) = crate::wan_session::service::reconcile_wan_session_under_security_gate(
+        app_state,
+        &session_id,
+    )
+    .await
+    {
+        return wan_remote_failure(
+            session_id,
+            None,
+            map_wan_coordinator_reason(&error),
+            "WAN session state could not be reconciled",
+            "start a new secure WAN session",
+        );
+    }
     let sessions = app_state.sessions.lock().await;
     let snap = sessions.get(&session_id);
 

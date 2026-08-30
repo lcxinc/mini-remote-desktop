@@ -173,7 +173,14 @@ impl IpcServer {
                         ),
                     ));
                 }
-                let response = session::request_remote_session(&self.app_state, request).await;
+                let selected_route =
+                    session::resolve_remote_session_route(&self.app_state, &request).await;
+                let response = session::request_remote_session_on_route(
+                    &self.app_state,
+                    request,
+                    selected_route,
+                )
+                .await;
                 if let Some(snapshot) = self
                     .app_state
                     .session_authorizations
@@ -200,11 +207,15 @@ impl IpcServer {
                         snapshot.policy_revision.get().to_string(),
                     ));
                 }
-                self.finish_lan_session_start_audit(
+                let session_kind = match selected_route {
+                    crate::wan_session::media::WanRouteSelection::Lan => SessionStartKind::Lan,
+                    crate::wan_session::media::WanRouteSelection::WanRelay => SessionStartKind::Wan,
+                };
+                self.finish_session_start_audit(
                     response,
                     session_id,
                     target_device_id,
-                    "lan_quic".to_string(),
+                    session_kind,
                     details,
                 )
                 .await
@@ -328,11 +339,11 @@ impl IpcServer {
                         message,
                     },
                 };
-                self.finish_lan_session_start_audit(
+                self.finish_session_start_audit(
                     response,
                     session_id,
                     target_device_id,
-                    transport_kind,
+                    SessionStartKind::Lan,
                     details,
                 )
                 .await
@@ -757,24 +768,47 @@ impl IpcServer {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionStartKind {
+    Lan,
+    Wan,
+}
+
+impl SessionStartKind {
+    fn audit_action(self) -> &'static str {
+        match self {
+            Self::Lan => "session.start_lan",
+            Self::Wan => "session.start_wan",
+        }
+    }
+
+    fn transport_kind(self) -> &'static str {
+        match self {
+            Self::Lan => "lan_quic",
+            Self::Wan => "webrtc_relay",
+        }
+    }
+}
+
 impl IpcServer {
-    async fn finish_lan_session_start_audit(
+    async fn finish_session_start_audit(
         &self,
         response: IpcResponse,
         session_id: mrd_proto::SessionId,
         target_device_id: mrd_proto::DeviceId,
-        transport_kind: String,
+        session_kind: SessionStartKind,
         details: Vec<(String, String)>,
     ) -> IpcResponse {
+        let action = session_kind.audit_action();
         let (outcome, reason) = audit_outcome(&response);
         if self
             .record_audit_event(
-                "session.start_lan",
+                action,
                 outcome,
                 Some(session_id.clone()),
                 self.local_device_id().await,
                 Some(target_device_id),
-                Some(transport_kind),
+                Some(session_kind.transport_kind().to_owned()),
                 reason,
                 details,
             )
@@ -785,6 +819,7 @@ impl IpcServer {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
+            let _authorization_guard = self.app_state.authorization_security_gate.lock().await;
             let _ = self
                 .app_state
                 .session_authorizations
@@ -793,7 +828,7 @@ impl IpcServer {
                     mrd_ipc::RemoteAuthorizationState::Revoked,
                     mrd_ipc::RemoteFailure {
                         code: mrd_ipc::RemoteReasonCode::PolicyChanged,
-                        message: "LAN session start could not be durably audited".to_string(),
+                        message: "session start could not be durably audited".to_string(),
                         suggested_action: Some(
                             "repair the local security store before reconnecting".to_string(),
                         ),
@@ -801,11 +836,42 @@ impl IpcServer {
                     failed_at_ms,
                 )
                 .await;
-            crate::lan_discovery::terminate_authorized_remote_sessions(
-                &self.app_state,
-                std::slice::from_ref(&session_id),
-            )
-            .await;
+            match session_kind {
+                SessionStartKind::Lan => {
+                    crate::lan_discovery::terminate_authorized_remote_sessions_under_security_gate(
+                        &self.app_state,
+                        std::slice::from_ref(&session_id),
+                    )
+                    .await;
+                }
+                SessionStartKind::Wan => {
+                    match crate::wan_session::service::terminalize_wan_session_under_security_gate(
+                        &self.app_state,
+                        &session_id,
+                        crate::wan_session::service::ServiceWanTerminalRequest::Fail {
+                            failure: crate::wan_session::model::WanSessionFailure::Internal,
+                            remote_failure: mrd_ipc::RemoteFailure {
+                                code: mrd_ipc::RemoteReasonCode::PolicyChanged,
+                                message: "session start could not be durably audited".to_owned(),
+                                suggested_action: Some(
+                                    "repair the local security store before reconnecting"
+                                        .to_owned(),
+                                ),
+                            },
+                        },
+                    )
+                    .await
+                    {
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => {
+                            tracing::error!(
+                                session_id = %session_id.0,
+                                "session audit failure left WAN cleanup incomplete"
+                            );
+                        }
+                    }
+                }
+            }
             return security_store_unavailable_response();
         }
         response
@@ -865,7 +931,7 @@ fn is_emergency_safety_command(request: &IpcRequest) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::dispatch_request;
+    use super::{dispatch_request, SessionStartKind};
     use crate::app_state::AppState;
     use crate::ipc_server::IpcServer;
     use crate::session_authorization::VerifiedIncomingAuthorizationRequest;
@@ -1115,13 +1181,13 @@ mod tests {
         app_state.audit_log.fail_action("session.start_lan");
 
         let response = server
-            .finish_lan_session_start_audit(
+            .finish_session_start_audit(
                 IpcResponse::SessionStarted {
                     session_id: session_id.clone(),
                 },
                 session_id.clone(),
                 target_device_id,
-                "quic".to_string(),
+                SessionStartKind::Lan,
                 Vec::new(),
             )
             .await;
@@ -1142,6 +1208,73 @@ mod tests {
             0
         );
         assert!(media_task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn wan_start_audit_failure_without_coordinator_never_falls_back_to_lan_cleanup() {
+        let app_state = Arc::new(AppState::new());
+        let server = IpcServer::new(Arc::clone(&app_state));
+        let session_id = SessionId("wan-audit-no-lan-fallback".to_owned());
+        let target_device_id = DeviceId("wan-audit-target".to_owned());
+        app_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_owned(),
+                source_device_id: Some(DeviceId("unrelated-lan-controller".to_owned())),
+                target_device_id: Some(target_device_id.clone()),
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Streaming,
+                last_error: None,
+                sender_active: true,
+                receiver_active: false,
+            },
+        );
+        let media_task = tokio::spawn(std::future::pending::<()>());
+        app_state
+            .media_tasks
+            .lock()
+            .await
+            .register(session_id.clone(), media_task.abort_handle());
+        app_state.audit_log.fail_action("session.start_wan");
+
+        let response = server
+            .finish_session_start_audit(
+                IpcResponse::SessionStarted {
+                    session_id: session_id.clone(),
+                },
+                session_id.clone(),
+                target_device_id,
+                SessionStartKind::Wan,
+                Vec::new(),
+            )
+            .await;
+
+        assert!(matches!(
+            response,
+            IpcResponse::Error { ref code, .. } if code == "E_SECURITY_STORE_UNAVAILABLE"
+        ));
+        let sessions = app_state.sessions.lock().await;
+        let unrelated_lan = sessions
+            .get(&session_id)
+            .expect("unrelated LAN projection must remain present");
+        assert_eq!(
+            unrelated_lan.lifecycle_state,
+            SessionLifecycleState::Streaming
+        );
+        assert!(unrelated_lan.sender_active);
+        drop(sessions);
+        assert_eq!(
+            app_state.media_tasks.lock().await.active_count(&session_id),
+            1
+        );
+        media_task.abort();
+        let _ = media_task.await;
     }
 
     #[tokio::test]

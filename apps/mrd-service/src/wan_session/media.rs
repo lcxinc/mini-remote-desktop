@@ -390,23 +390,26 @@ async fn fail_media_session(
     media: &dyn WanMediaActivationPort,
     session_id: &SessionId,
 ) {
-    if let Err(_error) = coordinator
+    let coordinator_entry_missing = match coordinator
         .fail(session_id, super::model::WanSessionFailure::Transport)
         .await
     {
-        // A coordinator cleanup adapter normally owns these operations.  The
-        // direct fallback keeps the port fail-closed if the registry entry has
-        // already disappeared during shutdown.
-        tracing::warn!(session_id = %session_id.0, "WAN media failure could not be recorded by coordinator");
-    }
-    // Keep these operations idempotent and unconditional.  The coordinator's
-    // cleanup adapter normally performs the same actions, but a shutdown race
-    // or a missing registry entry must not leave media/failover state behind.
-    if media.stop_media(session_id).await.is_err() {
-        tracing::warn!(session_id = %session_id.0, "WAN media stop cleanup failed");
-    }
-    if media.remove_failover(session_id).await.is_err() {
-        tracing::warn!(session_id = %session_id.0, "WAN media failover cleanup failed");
+        Ok(_) => false,
+        Err(super::coordinator::WanSessionCoordinatorError::SessionNotFound) => true,
+        Err(_) => {
+            tracing::warn!(session_id = %session_id.0, "WAN media failure could not be recorded by coordinator");
+            false
+        }
+    };
+    // The coordinator cleanup receipt is the sole owner while an entry exists.
+    // Direct compensation is reserved for the explicit missing-entry race.
+    if coordinator_entry_missing {
+        if media.stop_media(session_id).await.is_err() {
+            tracing::warn!(session_id = %session_id.0, "WAN media stop cleanup failed");
+        }
+        if media.remove_failover(session_id).await.is_err() {
+            tracing::warn!(session_id = %session_id.0, "WAN media failover cleanup failed");
+        }
     }
 }
 

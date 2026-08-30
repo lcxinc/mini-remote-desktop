@@ -299,8 +299,41 @@ impl DeviceIdentityRegistry {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn trust_authenticated_peer_for_test(
+    /// Revalidate the current pinned key state when a signed protocol message
+    /// does not carry a trust-store epoch. A matching untrusted key remains
+    /// distinguishable from a durably suspended or revoked key.
+    pub fn authenticated_peer_trust_current_key(
+        &self,
+        peer_key_id: &str,
+        public_key: &[u8],
+    ) -> Result<AuthenticatedPeerTrust, DeviceIdentityRegistryError> {
+        let record = match &self.backend {
+            DeviceIdentityBackend::InMemory {
+                authenticated_peers,
+                ..
+            } => authenticated_peers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(peer_key_id)
+                .cloned(),
+            DeviceIdentityBackend::Persistent { store, .. } => store.trust_record(peer_key_id)?,
+        };
+        let Some(record) = record else {
+            return Ok(AuthenticatedPeerTrust::Untrusted);
+        };
+        if record.public_key != public_key {
+            return Ok(AuthenticatedPeerTrust::EpochMismatch);
+        }
+        Ok(match record.state {
+            TrustState::Trusted => AuthenticatedPeerTrust::Trusted,
+            TrustState::Suspended => AuthenticatedPeerTrust::Suspended,
+            TrustState::Revoked => AuthenticatedPeerTrust::Revoked,
+        })
+    }
+
+    #[doc(hidden)]
+    #[cfg(any(test, debug_assertions))]
+    pub fn trust_authenticated_peer_for_test(
         &self,
         identity: &DeviceIdentity,
         epoch: u64,

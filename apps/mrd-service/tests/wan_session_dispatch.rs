@@ -4,20 +4,25 @@ use mrd_application::{
 };
 use mrd_identity::DeviceIdentity;
 use mrd_ipc::{
-    ConsentDecision, ConsentResponse, DecimalU64, IpcResponse, LanDiscoverySnapshot, LanPeerInfo,
-    RemoteAccessMode, RemoteAuthorizationState, RemotePermissionScope, RemoteRouteKind,
-    RemoteRoutePreference, RemoteSessionRequest,
+    AuditLogQuery, ConsentDecision, ConsentResponse, DecimalU64, IpcRequest, IpcResponse,
+    LanDiscoverySnapshot, LanPeerInfo, RemoteAccessMode, RemoteAuthorizationState,
+    RemotePermissionScope, RemoteRouteKind, RemoteRoutePreference, RemoteSessionRequest,
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_service::{
-    handlers::session::request_remote_session,
+    handlers::session::{
+        fail_session, get_remote_session, get_route_evidence, list_sessions,
+        request_remote_session, respond_to_consent, runtime_snapshot, session_snapshot,
+        stop_session,
+    },
+    ipc_server::IpcServer,
     wan_session::{
         backend::{WanSessionApproval, WanSessionBinding},
         coordinator::{
             NoopWanSessionCleanup, SystemWanSessionClock, WanBackendSessionSnapshot,
-            WanSessionClock, WanSessionConsentPublisher, WanSessionCoordinator,
-            WanSessionCoordinatorConfig, WanSessionPortError, WanSessionWorkflowBackend,
-            WanSessionWorkflowPorts, WanSessionWorkflowSignaling,
+            WanSessionCleanup, WanSessionClock, WanSessionConsentPublisher, WanSessionCoordinator,
+            WanSessionCoordinatorConfig, WanSessionCoordinatorError, WanSessionPortError,
+            WanSessionWorkflowBackend, WanSessionWorkflowPorts, WanSessionWorkflowSignaling,
         },
         media::{
             enable_input_after_control_evidence, select_route, start_verified_media,
@@ -25,8 +30,8 @@ use mrd_service::{
             WanMediaActivationError, WanMediaActivationPort, WanMediaAuthority, WanRouteSelection,
         },
         model::{
-            GrantBinding, RelayAccessBinding, RelayRouteProof, WanSessionEvent, WanSessionIdentity,
-            WanSessionPhase, WanSessionRole, WanSessionState,
+            GrantBinding, RelayAccessBinding, RelayRouteProof, WanSessionEvent, WanSessionFailure,
+            WanSessionIdentity, WanSessionPhase, WanSessionRole, WanSessionState,
         },
         service::{apply_verified_controller_grant_for_service, ServiceWanSessionConsentPublisher},
     },
@@ -36,10 +41,15 @@ use mrd_signal_proto::{
     AuthClaims, SessionGrantV3, SessionGrantV3Payload, WanAccessModeV3, WanMediaProfileV3,
     WanPermissionScopeV3, WanRoutePolicyV3, WanSessionRequestV3,
 };
+use mrd_store_sqlite::TrustState;
 use ring::rand::SystemRandom;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
+};
+use tokio::{
+    sync::Barrier,
+    time::{timeout, Duration},
 };
 
 const REQUEST_COMMITMENT: &str = "11";
@@ -51,6 +61,8 @@ struct ControllerRequestBackend {
     request: Mutex<Option<WanSessionRequestV3>>,
     grant_deadlines: Mutex<Option<(u64, u64)>>,
     reject_create: bool,
+    create_entered: Option<Arc<Barrier>>,
+    create_release: Option<Arc<Barrier>>,
 }
 
 impl ControllerRequestBackend {
@@ -59,6 +71,8 @@ impl ControllerRequestBackend {
             request: Mutex::new(None),
             grant_deadlines: Mutex::new(None),
             reject_create: false,
+            create_entered: None,
+            create_release: None,
         }
     }
 
@@ -67,6 +81,21 @@ impl ControllerRequestBackend {
             request: Mutex::new(None),
             grant_deadlines: Mutex::new(None),
             reject_create: true,
+            create_entered: None,
+            create_release: None,
+        }
+    }
+
+    fn gate_controlled_rejection(
+        create_entered: Arc<Barrier>,
+        create_release: Arc<Barrier>,
+    ) -> Self {
+        Self {
+            request: Mutex::new(None),
+            grant_deadlines: Mutex::new(None),
+            reject_create: true,
+            create_entered: Some(create_entered),
+            create_release: Some(create_release),
         }
     }
 
@@ -82,6 +111,12 @@ impl WanSessionWorkflowBackend for ControllerRequestBackend {
         request: &WanSessionRequestV3,
         _: u64,
     ) -> Result<WanBackendSessionSnapshot, WanSessionPortError> {
+        if let Some(create_entered) = &self.create_entered {
+            create_entered.wait().await;
+        }
+        if let Some(create_release) = &self.create_release {
+            create_release.wait().await;
+        }
         if self.reject_create {
             return Err(WanSessionPortError::Rejected);
         }
@@ -224,6 +259,28 @@ fn now_unix_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+struct AdjustableClock {
+    now_unix_ms: AtomicU64,
+}
+
+impl AdjustableClock {
+    fn new(now_unix_ms: u64) -> Self {
+        Self {
+            now_unix_ms: AtomicU64::new(now_unix_ms),
+        }
+    }
+
+    fn set(&self, now_unix_ms: u64) {
+        self.now_unix_ms.store(now_unix_ms, Ordering::SeqCst);
+    }
+}
+
+impl WanSessionClock for AdjustableClock {
+    fn now_unix_ms(&self) -> u64 {
+        self.now_unix_ms.load(Ordering::SeqCst)
+    }
 }
 
 struct ControllerAuthorizationFixture {
@@ -610,6 +667,42 @@ async fn controller_wan_request_creates_and_grants_exact_authorization() {
 }
 
 #[tokio::test]
+async fn controller_wan_grant_rechecks_a_revoked_target_key_before_admission() {
+    let fixture = controller_authorization_fixture("revoked-key").await;
+    fixture
+        .app_state
+        .device_identities
+        .trust_authenticated_peer_for_test(&fixture.target_identity, 1, TrustState::Revoked);
+
+    assert!(
+        apply_verified_controller_grant_for_service(
+            &fixture.app_state,
+            &fixture.coordinator,
+            controller_grant_event(&fixture, ControllerGrantMutation::Valid),
+        )
+        .await
+        .is_err(),
+        "a durably revoked target key must not cross the grant admission gate"
+    );
+    let authorization = fixture
+        .app_state
+        .session_authorizations
+        .snapshot(&fixture.session_id)
+        .await
+        .expect("rejected controller authorization remains queryable");
+    assert_eq!(
+        authorization.authorization_state,
+        RemoteAuthorizationState::Denied
+    );
+    assert!(fixture
+        .app_state
+        .session_authorizations
+        .active_grant(&fixture.session_id)
+        .await
+        .is_none());
+}
+
+#[tokio::test]
 async fn controller_wan_authorization_rejects_every_mismatched_grant_binding() {
     for (suffix, mutation) in [
         ("peer-mismatch", ControllerGrantMutation::Peer),
@@ -682,7 +775,7 @@ async fn controller_wan_start_failure_terminalizes_pre_signaling_authorization()
         .expect("controller workflow coordinator"),
     );
     app_state
-        .bind_wan_session_coordinator(coordinator)
+        .bind_wan_session_coordinator(coordinator.clone())
         .expect("bind controller workflow coordinator");
 
     let response = request_remote_session(
@@ -714,6 +807,914 @@ async fn controller_wan_start_failure_terminalizes_pre_signaling_authorization()
             .await
             .is_none(),
         "failed startup must leave no active authorization"
+    );
+    assert_eq!(
+        coordinator.snapshot(&session_id).await.unwrap().phase(),
+        WanSessionPhase::Failed
+    );
+    let sessions = app_state.sessions.lock().await;
+    let projection = sessions
+        .get(&session_id)
+        .expect("failed WAN startup projection retained");
+    assert!(matches!(
+        projection.lifecycle_state,
+        mrd_application::ports::SessionLifecycleState::Failed { .. }
+    ));
+}
+
+#[tokio::test]
+async fn controller_wan_start_failure_waits_for_authorization_security_gate() {
+    let app_state = Arc::new(AppState::default());
+    let controller_device_id = DeviceId("controller-wan-start-gate".to_owned());
+    let target_device_id = DeviceId("target-wan-start-gate".to_owned());
+    let session_id = SessionId("controller-wan-start-gate".to_owned());
+    app_state
+        .devices
+        .lock()
+        .await
+        .register(controller_device_id, "Controller".to_owned());
+
+    let create_entered = Arc::new(Barrier::new(2));
+    let create_release = Arc::new(Barrier::new(2));
+    let signaling = Arc::new(AuthorizationObservingSignaling {
+        authorizations: Arc::clone(&app_state.session_authorizations),
+        observed_exact_authorization: AtomicBool::new(false),
+        controller_identity: Mutex::new(None),
+    });
+    let coordinator = Arc::new(
+        WanSessionCoordinator::with_workflow_ports(
+            WanSessionCoordinatorConfig::default(),
+            Arc::new(NoopWanSessionCleanup),
+            WanSessionWorkflowPorts::new(
+                Arc::new(ControllerRequestBackend::gate_controlled_rejection(
+                    Arc::clone(&create_entered),
+                    Arc::clone(&create_release),
+                )),
+                signaling,
+                Arc::new(UnusedControllerConsent),
+                Arc::new(SystemWanSessionClock),
+            ),
+        )
+        .expect("controller workflow coordinator"),
+    );
+    app_state
+        .bind_wan_session_coordinator(Arc::clone(&coordinator))
+        .expect("bind controller workflow coordinator");
+
+    let request_app_state = Arc::clone(&app_state);
+    let request_session_id = session_id.clone();
+    let request_target_device_id = target_device_id.clone();
+    let request_task = tokio::spawn(async move {
+        request_remote_session(
+            &request_app_state,
+            RemoteSessionRequest {
+                session_id: request_session_id,
+                target_device_id: request_target_device_id,
+                access_mode: RemoteAccessMode::Attended,
+                route_preference: RemoteRoutePreference::WanRelay,
+                requested_scopes: vec![RemotePermissionScope::ScreenView],
+                requested_profile: None,
+            },
+        )
+        .await
+    });
+
+    create_entered.wait().await;
+    let authorization_guard = app_state.authorization_security_gate.lock().await;
+    create_release.wait().await;
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if coordinator
+                .snapshot(&session_id)
+                .await
+                .is_ok_and(|state| state.phase() == WanSessionPhase::Failed)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("coordinator failure must finish while the security gate is held");
+    tokio::task::yield_now().await;
+
+    let authorization = app_state
+        .session_authorizations
+        .snapshot(&session_id)
+        .await
+        .expect("pre-signaling authorization remains queryable");
+    assert_eq!(
+        authorization.authorization_state,
+        RemoteAuthorizationState::Authorizing,
+        "terminal authorization and WAN projection must wait for the same security gate"
+    );
+
+    drop(authorization_guard);
+    let response = timeout(Duration::from_secs(1), request_task)
+        .await
+        .expect("request must finish after the security gate is released")
+        .expect("request task must not panic");
+    assert!(matches!(response, IpcResponse::RemoteAccessError { .. }));
+    assert_eq!(
+        app_state
+            .session_authorizations
+            .snapshot(&session_id)
+            .await
+            .expect("terminal authorization remains queryable")
+            .authorization_state,
+        RemoteAuthorizationState::Denied
+    );
+}
+
+#[tokio::test]
+async fn controller_wan_query_list_and_repeated_stop_converge_on_closed() {
+    let fixture = controller_authorization_fixture("lifecycle-stop").await;
+    assert!(matches!(
+        get_remote_session(&fixture.app_state, fixture.session_id.clone()).await,
+        IpcResponse::RemoteSession { .. }
+    ));
+    let IpcResponse::SessionSnapshot { snapshot } =
+        session_snapshot(&fixture.app_state, fixture.session_id.clone()).await
+    else {
+        panic!("live WAN workflow must have a runtime projection");
+    };
+    assert_eq!(snapshot.role, "controller");
+    assert_eq!(snapshot.state, "connecting");
+    assert_eq!(snapshot.transport_kind, "webrtc_relay");
+    assert_eq!(
+        snapshot.peer_device_id,
+        Some(fixture.target_device_id.clone())
+    );
+    let IpcResponse::SessionList { sessions } = list_sessions(&fixture.app_state).await else {
+        panic!("expected WAN-aware session list");
+    };
+    let listed = sessions
+        .iter()
+        .find(|session| session.session_id == fixture.session_id)
+        .expect("live WAN controller must be listed before media starts");
+    assert_eq!(listed.role, "controller");
+    assert_eq!(listed.transport_kind, "webrtc_relay");
+    assert_eq!(listed.state, "connecting");
+
+    assert!(matches!(
+        stop_session(&fixture.app_state, fixture.session_id.clone()).await,
+        IpcResponse::SessionStopped { .. }
+    ));
+    assert!(matches!(
+        stop_session(&fixture.app_state, fixture.session_id.clone()).await,
+        IpcResponse::SessionStopped { .. }
+    ));
+    assert_eq!(
+        fixture
+            .coordinator
+            .snapshot(&fixture.session_id)
+            .await
+            .unwrap()
+            .phase(),
+        WanSessionPhase::Closed
+    );
+    let IpcResponse::RemoteSession { session } =
+        get_remote_session(&fixture.app_state, fixture.session_id.clone()).await
+    else {
+        panic!("closed WAN authorization must remain queryable");
+    };
+    assert_eq!(
+        session.authorization_state,
+        RemoteAuthorizationState::Revoked
+    );
+    let IpcResponse::SessionList { sessions } = list_sessions(&fixture.app_state).await else {
+        panic!("expected WAN-aware terminal session list");
+    };
+    assert_eq!(
+        sessions
+            .iter()
+            .find(|session| session.session_id == fixture.session_id)
+            .map(|session| session.state.as_str()),
+        Some("closed")
+    );
+}
+
+#[tokio::test]
+async fn runtime_queries_reconcile_a_streaming_wan_coordinator_before_projection() {
+    let app_state = Arc::new(AppState::default());
+    let mut state = relay_verified_state(WanSessionRole::Controller, "runtime-reconcile");
+    state
+        .apply(WanSessionEvent::Streaming, 1_006)
+        .expect("advance coordinator authority to streaming");
+    let session_id = state.identity().session_id().clone();
+    let coordinator = Arc::new(
+        WanSessionCoordinator::new(
+            WanSessionCoordinatorConfig::default(),
+            Arc::new(NoopWanSessionCleanup),
+            Arc::new(FixedClock),
+        )
+        .expect("runtime projection coordinator"),
+    );
+    coordinator
+        .begin(state)
+        .await
+        .expect("register streaming WAN authority");
+    app_state
+        .bind_wan_session_coordinator(coordinator)
+        .expect("bind runtime projection coordinator");
+    assert!(app_state.sessions.lock().await.get(&session_id).is_none());
+
+    let IpcResponse::SessionSnapshot { snapshot } =
+        session_snapshot(&app_state, session_id.clone()).await
+    else {
+        panic!("session snapshot must reconcile coordinator-owned WAN state");
+    };
+    assert_eq!(snapshot.state, "streaming");
+    assert_eq!(snapshot.transport_kind, "webrtc_relay");
+
+    app_state.sessions.lock().await.remove(&session_id);
+    let IpcResponse::RuntimeSnapshot { snapshot } = runtime_snapshot(&app_state).await else {
+        panic!("expected aggregate runtime snapshot");
+    };
+    let projected = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.session_id == session_id)
+        .expect("runtime snapshot must reconcile coordinator-owned WAN state");
+    assert_eq!(projected.state, "streaming");
+    assert_eq!(projected.transport_kind, "webrtc_relay");
+}
+
+#[tokio::test]
+async fn pending_wan_stop_without_coordinator_never_cleans_a_colliding_lan_projection() {
+    let app_state = Arc::new(AppState::default());
+    let session_id = SessionId("pending-wan-stop-collision".to_owned());
+    let peer_device_id = DeviceId("pending-wan-stop-target".to_owned());
+    let now = now_unix_ms();
+    app_state
+        .session_authorizations
+        .begin_outgoing(
+            mrd_service::session_authorization::VerifiedIncomingAuthorizationRequest {
+                session_id: session_id.clone(),
+                peer_device_id: peer_device_id.clone(),
+                peer_key_id: format!("pending_authenticated_peer:{}", peer_device_id.0),
+                peer_key_epoch: 1,
+                access_mode: RemoteAccessMode::Attended,
+                requested_scopes: vec![RemotePermissionScope::ScreenView],
+                peer_permission_ceiling: vec![RemotePermissionScope::ScreenView],
+                machine_permission_ceiling: vec![RemotePermissionScope::ScreenView],
+                runtime_capabilities: vec![RemotePermissionScope::ScreenView],
+                transport_kind: "webrtc_relay".to_owned(),
+                request_nonce: [91; 16],
+                created_at_ms: now,
+                expires_at_ms: now.saturating_add(30_000),
+            },
+        )
+        .await
+        .expect("pending outgoing WAN authorization");
+    app_state.sessions.lock().await.insert(
+        session_id.clone(),
+        mrd_application::ports::SessionSnapshot {
+            session_id: session_id.clone(),
+            transport: "quic".to_owned(),
+            source_device_id: Some(DeviceId("unrelated-lan-source".to_owned())),
+            target_device_id: Some(DeviceId("unrelated-lan-target".to_owned())),
+            local_listen_addr: None,
+            local_server_name: None,
+            local_cert_der_b64: None,
+            remote_listen_addr: None,
+            remote_server_name: None,
+            remote_cert_der_b64: None,
+            lifecycle_state: mrd_application::ports::SessionLifecycleState::Streaming,
+            last_error: None,
+            sender_active: true,
+            receiver_active: false,
+        },
+    );
+    let media_task = tokio::spawn(std::future::pending::<()>());
+    app_state
+        .media_tasks
+        .lock()
+        .await
+        .register(session_id.clone(), media_task.abort_handle());
+
+    assert!(matches!(
+        stop_session(&app_state, session_id.clone()).await,
+        IpcResponse::SessionStopped { .. }
+    ));
+    assert_eq!(
+        app_state
+            .session_authorizations
+            .snapshot(&session_id)
+            .await
+            .expect("stopped WAN authorization retained")
+            .authorization_state,
+        RemoteAuthorizationState::Revoked
+    );
+    let sessions = app_state.sessions.lock().await;
+    let unrelated_lan = sessions
+        .get(&session_id)
+        .expect("colliding LAN projection retained");
+    assert_eq!(
+        unrelated_lan.lifecycle_state,
+        mrd_application::ports::SessionLifecycleState::Streaming
+    );
+    assert!(unrelated_lan.sender_active);
+    drop(sessions);
+    assert_eq!(
+        app_state.media_tasks.lock().await.active_count(&session_id),
+        1
+    );
+    media_task.abort();
+    let _ = media_task.await;
+}
+
+#[tokio::test]
+async fn controller_wan_repeated_failure_converges_on_one_failed_result() {
+    let fixture = controller_authorization_fixture("lifecycle-fail").await;
+
+    assert!(matches!(
+        fail_session(
+            &fixture.app_state,
+            fixture.session_id.clone(),
+            "test route loss".to_owned(),
+        )
+        .await,
+        IpcResponse::SessionFailed { .. }
+    ));
+    assert!(matches!(
+        fail_session(
+            &fixture.app_state,
+            fixture.session_id.clone(),
+            "conflicting retry reason".to_owned(),
+        )
+        .await,
+        IpcResponse::SessionFailed { .. }
+    ));
+    let state = fixture
+        .coordinator
+        .snapshot(&fixture.session_id)
+        .await
+        .unwrap();
+    assert_eq!(state.phase(), WanSessionPhase::Failed);
+    assert_eq!(
+        state.failure(),
+        Some(mrd_service::wan_session::model::WanSessionFailure::Transport)
+    );
+    let authorization = fixture
+        .app_state
+        .session_authorizations
+        .snapshot(&fixture.session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        authorization.authorization_state,
+        RemoteAuthorizationState::Revoked
+    );
+    assert_eq!(
+        authorization.failure.as_ref().map(|failure| failure.code),
+        Some(mrd_ipc::RemoteReasonCode::RouteLost)
+    );
+}
+
+#[tokio::test]
+async fn terminal_authorization_query_fences_the_live_wan_workflow() {
+    let fixture = controller_authorization_fixture("authorization-revoked").await;
+    let authorization = fixture
+        .app_state
+        .session_authorizations
+        .snapshot(&fixture.session_id)
+        .await
+        .expect("pending controller authorization");
+    assert_eq!(
+        fixture
+            .app_state
+            .session_authorizations
+            .revoke_peer_authorizations(&authorization.peer_key_id, now_unix_ms())
+            .await,
+        vec![fixture.session_id.clone()]
+    );
+
+    let IpcResponse::RemoteSession { session } =
+        get_remote_session(&fixture.app_state, fixture.session_id.clone()).await
+    else {
+        panic!("revoked WAN authorization must remain queryable");
+    };
+    assert_eq!(
+        session.authorization_state,
+        RemoteAuthorizationState::Revoked
+    );
+    let workflow = fixture
+        .coordinator
+        .snapshot(&fixture.session_id)
+        .await
+        .expect("terminal WAN workflow");
+    assert_eq!(workflow.phase(), WanSessionPhase::Failed);
+    assert_eq!(workflow.failure(), Some(WanSessionFailure::Cancelled));
+}
+
+#[tokio::test]
+async fn terminal_authorization_route_query_fences_the_live_wan_workflow() {
+    let fixture = controller_authorization_fixture("route-revoked").await;
+    let authorization = fixture
+        .app_state
+        .session_authorizations
+        .snapshot(&fixture.session_id)
+        .await
+        .expect("pending controller authorization");
+    fixture
+        .app_state
+        .session_authorizations
+        .revoke_peer_authorizations(&authorization.peer_key_id, now_unix_ms())
+        .await;
+
+    assert!(matches!(
+        get_route_evidence(&fixture.app_state, fixture.session_id.clone()).await,
+        IpcResponse::RemoteAccessError { .. }
+    ));
+    let workflow = fixture
+        .coordinator
+        .snapshot(&fixture.session_id)
+        .await
+        .expect("terminal WAN workflow");
+    assert_eq!(workflow.phase(), WanSessionPhase::Failed);
+    assert_eq!(workflow.failure(), Some(WanSessionFailure::Cancelled));
+}
+
+#[tokio::test]
+async fn target_wan_list_and_stop_use_agent_lifecycle_projection() {
+    let app_state = Arc::new(AppState::default());
+    let controller_device_id = DeviceId("target-list-controller".to_owned());
+    let target_device_id = DeviceId("target-list-local".to_owned());
+    let session_id = SessionId("target-list-session".to_owned());
+    let deadline_unix_ms = now_unix_ms().saturating_add(30_000);
+    let identity = WanSessionIdentity::new(
+        session_id.clone(),
+        controller_device_id.clone(),
+        target_device_id,
+        digest("a"),
+        digest("b"),
+        deadline_unix_ms,
+    )
+    .expect("target WAN identity");
+    let coordinator = Arc::new(
+        WanSessionCoordinator::new(
+            WanSessionCoordinatorConfig::default(),
+            Arc::new(NoopWanSessionCleanup),
+            Arc::new(SystemWanSessionClock),
+        )
+        .expect("target WAN coordinator"),
+    );
+    coordinator
+        .begin(WanSessionState::new(
+            WanSessionRole::Target,
+            identity.clone(),
+        ))
+        .await
+        .expect("begin target WAN workflow");
+    app_state
+        .bind_wan_session_coordinator(coordinator.clone())
+        .expect("bind target WAN coordinator");
+    app_state
+        .session_authorizations
+        .begin_verified_incoming(
+            mrd_service::session_authorization::VerifiedIncomingAuthorizationRequest {
+                session_id: session_id.clone(),
+                peer_device_id: controller_device_id.clone(),
+                peer_key_id: identity.controller_key_fingerprint().to_owned(),
+                peer_key_epoch: 1,
+                access_mode: RemoteAccessMode::Attended,
+                requested_scopes: vec![RemotePermissionScope::ScreenView],
+                peer_permission_ceiling: vec![RemotePermissionScope::ScreenView],
+                machine_permission_ceiling: vec![RemotePermissionScope::ScreenView],
+                runtime_capabilities: vec![RemotePermissionScope::ScreenView],
+                transport_kind: "webrtc_relay".to_owned(),
+                request_nonce: [0x61; 16],
+                created_at_ms: now_unix_ms(),
+                expires_at_ms: deadline_unix_ms,
+            },
+        )
+        .await
+        .expect("target authorization");
+
+    let IpcResponse::SessionList { sessions } = list_sessions(&app_state).await else {
+        panic!("target WAN list response");
+    };
+    let target = sessions
+        .iter()
+        .find(|session| session.session_id == session_id)
+        .expect("target WAN session projection");
+    assert_eq!(target.role, "agent");
+    assert_eq!(target.state, "listening");
+    assert_eq!(target.transport_kind, "webrtc_relay");
+    assert_eq!(target.peer_device_id, Some(controller_device_id));
+
+    assert!(matches!(
+        stop_session(&app_state, session_id.clone()).await,
+        IpcResponse::SessionStopped { .. }
+    ));
+    assert_eq!(
+        coordinator.snapshot(&session_id).await.unwrap().phase(),
+        WanSessionPhase::Closed
+    );
+}
+
+#[tokio::test]
+async fn target_wan_consent_denial_converges_authorization_workflow_and_projection() {
+    let app_state = Arc::new(AppState::default());
+    let session_id = SessionId("target-consent-denial".to_owned());
+    let controller_device_id = DeviceId("target-consent-controller".to_owned());
+    let created_at_ms = now_unix_ms();
+    let deadline_unix_ms = created_at_ms.saturating_add(30_000);
+    let identity = WanSessionIdentity::new(
+        session_id.clone(),
+        controller_device_id.clone(),
+        DeviceId("target-consent-local".to_owned()),
+        digest("a"),
+        digest("b"),
+        deadline_unix_ms,
+    )
+    .expect("target consent identity");
+    let mut workflow = WanSessionState::new(WanSessionRole::Target, identity.clone());
+    workflow
+        .apply(
+            WanSessionEvent::BackendBound {
+                request_commitment: digest("1"),
+            },
+            created_at_ms,
+        )
+        .unwrap();
+    workflow
+        .apply(
+            WanSessionEvent::AwaitingConsent {
+                intent_commitment: digest("2"),
+            },
+            created_at_ms.saturating_add(1),
+        )
+        .unwrap();
+    let coordinator = Arc::new(
+        WanSessionCoordinator::new(
+            WanSessionCoordinatorConfig::default(),
+            Arc::new(NoopWanSessionCleanup),
+            Arc::new(SystemWanSessionClock),
+        )
+        .expect("target consent coordinator"),
+    );
+    coordinator.begin(workflow).await.unwrap();
+    app_state
+        .bind_wan_session_coordinator(coordinator.clone())
+        .expect("bind target consent coordinator");
+    app_state
+        .session_authorizations
+        .begin_verified_incoming(
+            mrd_service::session_authorization::VerifiedIncomingAuthorizationRequest {
+                session_id: session_id.clone(),
+                peer_device_id: controller_device_id,
+                peer_key_id: identity.controller_key_fingerprint().to_owned(),
+                peer_key_epoch: 1,
+                access_mode: RemoteAccessMode::Attended,
+                requested_scopes: vec![RemotePermissionScope::ScreenView],
+                peer_permission_ceiling: vec![RemotePermissionScope::ScreenView],
+                machine_permission_ceiling: vec![RemotePermissionScope::ScreenView],
+                runtime_capabilities: vec![RemotePermissionScope::ScreenView],
+                transport_kind: "webrtc_relay".to_owned(),
+                request_nonce: [0x64; 16],
+                created_at_ms,
+                expires_at_ms: deadline_unix_ms,
+            },
+        )
+        .await
+        .expect("target consent authorization");
+
+    assert!(matches!(
+        respond_to_consent(
+            &app_state,
+            ConsentResponse {
+                session_id: session_id.clone(),
+                decision: ConsentDecision::Deny,
+                approved_scopes: Vec::new(),
+                expected_policy_revision: DecimalU64::new(1),
+            },
+        )
+        .await,
+        IpcResponse::ConsentRecorded { .. }
+    ));
+    let workflow = coordinator.snapshot(&session_id).await.unwrap();
+    assert_eq!(workflow.phase(), WanSessionPhase::Failed);
+    assert_eq!(workflow.failure(), Some(WanSessionFailure::Cancelled));
+    let authorization = app_state
+        .session_authorizations
+        .snapshot(&session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        authorization.authorization_state,
+        RemoteAuthorizationState::Denied
+    );
+    let sessions = app_state.sessions.lock().await;
+    let projection = sessions
+        .get(&session_id)
+        .expect("target consent terminal projection");
+    assert!(matches!(
+        projection.lifecycle_state,
+        mrd_application::ports::SessionLifecycleState::Failed { .. }
+    ));
+    assert_eq!(projection.transport, "webrtc_relay");
+}
+
+#[tokio::test]
+async fn service_expiry_converges_workflow_authorization_and_projection() {
+    let app_state = Arc::new(AppState::default());
+    let session_id = SessionId("service-expiry-session".to_owned());
+    let controller_device_id = DeviceId("service-expiry-controller".to_owned());
+    let target_device_id = DeviceId("service-expiry-target".to_owned());
+    let deadline_unix_ms = 2_000;
+    let clock = Arc::new(AdjustableClock::new(1_000));
+    let coordinator = Arc::new(
+        WanSessionCoordinator::new(
+            WanSessionCoordinatorConfig::default(),
+            Arc::new(NoopWanSessionCleanup),
+            clock.clone(),
+        )
+        .expect("expiry coordinator"),
+    );
+    coordinator
+        .begin(WanSessionState::new(
+            WanSessionRole::Controller,
+            WanSessionIdentity::new(
+                session_id.clone(),
+                controller_device_id,
+                target_device_id.clone(),
+                digest("a"),
+                digest("b"),
+                deadline_unix_ms,
+            )
+            .expect("expiry identity"),
+        ))
+        .await
+        .expect("begin expiring workflow");
+    app_state
+        .bind_wan_session_coordinator(coordinator.clone())
+        .expect("bind expiry coordinator");
+    app_state
+        .session_authorizations
+        .begin_outgoing(
+            mrd_service::session_authorization::VerifiedIncomingAuthorizationRequest {
+                session_id: session_id.clone(),
+                peer_device_id: target_device_id,
+                peer_key_id: digest("b"),
+                peer_key_epoch: 1,
+                access_mode: RemoteAccessMode::Attended,
+                requested_scopes: vec![RemotePermissionScope::ScreenView],
+                peer_permission_ceiling: vec![RemotePermissionScope::ScreenView],
+                machine_permission_ceiling: vec![RemotePermissionScope::ScreenView],
+                runtime_capabilities: vec![RemotePermissionScope::ScreenView],
+                transport_kind: "webrtc_relay".to_owned(),
+                request_nonce: [0x62; 16],
+                created_at_ms: 1_000,
+                expires_at_ms: deadline_unix_ms,
+            },
+        )
+        .await
+        .expect("expiring authorization");
+    clock.set(deadline_unix_ms);
+
+    assert_eq!(
+        mrd_service::wan_session::service::expire_due_wan_sessions(&app_state).await,
+        1
+    );
+    let workflow = coordinator.snapshot(&session_id).await.unwrap();
+    assert_eq!(workflow.phase(), WanSessionPhase::Failed);
+    assert_eq!(
+        workflow.failure(),
+        Some(WanSessionFailure::DeadlineExceeded)
+    );
+    let authorization = app_state
+        .session_authorizations
+        .snapshot(&session_id)
+        .await
+        .expect("expired authorization retained");
+    assert_eq!(
+        authorization.authorization_state,
+        RemoteAuthorizationState::Expired
+    );
+    assert_eq!(
+        authorization.failure.as_ref().map(|failure| failure.code),
+        Some(mrd_ipc::RemoteReasonCode::AuthorizationTimeout)
+    );
+    let IpcResponse::SessionList { sessions } = list_sessions(&app_state).await else {
+        panic!("expiry list response");
+    };
+    assert_eq!(
+        sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .map(|session| session.state.as_str()),
+        Some("failed")
+    );
+}
+
+#[tokio::test]
+async fn service_shutdown_converges_workflow_authorization_and_projection() {
+    let app_state = Arc::new(AppState::default());
+    let session_id = SessionId("service-shutdown-session".to_owned());
+    let controller_device_id = DeviceId("service-shutdown-controller".to_owned());
+    let target_device_id = DeviceId("service-shutdown-target".to_owned());
+    let created_at_ms = now_unix_ms();
+    let deadline_unix_ms = created_at_ms.saturating_add(30_000);
+    let coordinator = Arc::new(
+        WanSessionCoordinator::new(
+            WanSessionCoordinatorConfig::default(),
+            Arc::new(NoopWanSessionCleanup),
+            Arc::new(SystemWanSessionClock),
+        )
+        .expect("shutdown coordinator"),
+    );
+    coordinator
+        .begin(WanSessionState::new(
+            WanSessionRole::Controller,
+            WanSessionIdentity::new(
+                session_id.clone(),
+                controller_device_id,
+                target_device_id.clone(),
+                digest("a"),
+                digest("b"),
+                deadline_unix_ms,
+            )
+            .expect("shutdown identity"),
+        ))
+        .await
+        .expect("begin shutdown workflow");
+    app_state
+        .bind_wan_session_coordinator(coordinator.clone())
+        .expect("bind shutdown coordinator");
+    app_state
+        .session_authorizations
+        .begin_outgoing(
+            mrd_service::session_authorization::VerifiedIncomingAuthorizationRequest {
+                session_id: session_id.clone(),
+                peer_device_id: target_device_id,
+                peer_key_id: digest("b"),
+                peer_key_epoch: 1,
+                access_mode: RemoteAccessMode::Attended,
+                requested_scopes: vec![RemotePermissionScope::ScreenView],
+                peer_permission_ceiling: vec![RemotePermissionScope::ScreenView],
+                machine_permission_ceiling: vec![RemotePermissionScope::ScreenView],
+                runtime_capabilities: vec![RemotePermissionScope::ScreenView],
+                transport_kind: "webrtc_relay".to_owned(),
+                request_nonce: [0x63; 16],
+                created_at_ms,
+                expires_at_ms: deadline_unix_ms,
+            },
+        )
+        .await
+        .expect("shutdown authorization");
+
+    assert_eq!(
+        mrd_service::wan_session::service::shutdown_active_wan_sessions(&app_state).await,
+        1
+    );
+    let workflow = coordinator.snapshot(&session_id).await.unwrap();
+    assert_eq!(workflow.phase(), WanSessionPhase::Failed);
+    assert_eq!(workflow.failure(), Some(WanSessionFailure::Cancelled));
+    let authorization = app_state
+        .session_authorizations
+        .snapshot(&session_id)
+        .await
+        .expect("shutdown authorization retained");
+    assert_eq!(
+        authorization.authorization_state,
+        RemoteAuthorizationState::Revoked
+    );
+    assert_eq!(
+        authorization.failure.as_ref().map(|failure| failure.code),
+        Some(mrd_ipc::RemoteReasonCode::GrantRevoked)
+    );
+}
+
+#[tokio::test]
+async fn wan_request_audit_uses_wan_action_and_transport() {
+    let app_state = Arc::new(AppState::default());
+    let controller_device_id = DeviceId("wan-audit-controller".to_owned());
+    let target_device_id = DeviceId("wan-audit-target".to_owned());
+    let session_id = SessionId("wan-audit-session".to_owned());
+    app_state
+        .devices
+        .lock()
+        .await
+        .register(controller_device_id, "Controller".to_owned());
+    let coordinator = Arc::new(
+        WanSessionCoordinator::with_workflow_ports(
+            WanSessionCoordinatorConfig::default(),
+            Arc::new(NoopWanSessionCleanup),
+            WanSessionWorkflowPorts::new(
+                Arc::new(ControllerRequestBackend::new()),
+                Arc::new(AuthorizationObservingSignaling {
+                    authorizations: Arc::clone(&app_state.session_authorizations),
+                    observed_exact_authorization: AtomicBool::new(false),
+                    controller_identity: Mutex::new(None),
+                }),
+                Arc::new(UnusedControllerConsent),
+                Arc::new(SystemWanSessionClock),
+            ),
+        )
+        .expect("WAN audit coordinator"),
+    );
+    app_state
+        .bind_wan_session_coordinator(coordinator)
+        .expect("bind WAN audit coordinator");
+
+    let server = IpcServer::new(app_state.clone());
+    let response = server
+        .handle_request(IpcRequest::RequestRemoteSession {
+            request: RemoteSessionRequest {
+                session_id: session_id.clone(),
+                target_device_id,
+                access_mode: RemoteAccessMode::Attended,
+                route_preference: RemoteRoutePreference::WanRelay,
+                requested_scopes: vec![RemotePermissionScope::ScreenView],
+                requested_profile: None,
+            },
+        })
+        .await;
+    assert!(matches!(
+        response,
+        IpcResponse::RemoteSessionRequested { .. }
+    ));
+    let events = app_state
+        .audit_log
+        .query(&AuditLogQuery {
+            session_id: Some(session_id.clone()),
+            action: Some("session.start_wan".to_owned()),
+            limit: Some(10),
+        })
+        .expect("WAN start audit query");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].transport_kind.as_deref(), Some("webrtc_relay"));
+
+    assert!(matches!(
+        server
+            .handle_request(IpcRequest::StopSession {
+                session_id: session_id.clone(),
+            })
+            .await,
+        IpcResponse::SessionStopped { .. }
+    ));
+    let stopped = app_state
+        .audit_log
+        .query(&AuditLogQuery {
+            session_id: Some(session_id),
+            action: Some("session.stop".to_owned()),
+            limit: Some(10),
+        })
+        .expect("WAN stop audit query");
+    assert_eq!(stopped.len(), 1);
+    assert_eq!(stopped[0].transport_kind.as_deref(), Some("webrtc_relay"));
+    assert_eq!(
+        stopped[0].peer_device_id.as_ref(),
+        Some(&DeviceId("wan-audit-target".to_owned()))
+    );
+}
+
+#[tokio::test]
+async fn auto_request_audit_uses_the_selected_wan_route_even_before_registration() {
+    let app_state = Arc::new(AppState::default());
+    let session_id = SessionId("auto-selected-wan-audit".to_owned());
+    let server = IpcServer::new(app_state.clone());
+
+    let response = server
+        .handle_request(IpcRequest::RequestRemoteSession {
+            request: RemoteSessionRequest {
+                session_id: session_id.clone(),
+                target_device_id: DeviceId("auto-selected-wan-target".to_owned()),
+                access_mode: RemoteAccessMode::Attended,
+                route_preference: RemoteRoutePreference::Auto,
+                requested_scopes: vec![RemotePermissionScope::ScreenView],
+                requested_profile: None,
+            },
+        })
+        .await;
+    assert!(matches!(response, IpcResponse::RemoteAccessError { .. }));
+
+    let wan_events = app_state
+        .audit_log
+        .query(&AuditLogQuery {
+            session_id: Some(session_id.clone()),
+            action: Some("session.start_wan".to_owned()),
+            limit: Some(10),
+        })
+        .expect("selected WAN audit query");
+    assert_eq!(wan_events.len(), 1);
+    assert_eq!(
+        wan_events[0].transport_kind.as_deref(),
+        Some("webrtc_relay")
+    );
+    assert!(
+        app_state
+            .audit_log
+            .query(&AuditLogQuery {
+                session_id: Some(session_id),
+                action: Some("session.start_lan".to_owned()),
+                limit: Some(10),
+            })
+            .expect("LAN audit query")
+            .is_empty(),
+        "Auto selected WAN must never be mis-audited as LAN"
     );
 }
 
@@ -753,6 +1754,73 @@ impl WanMediaActivationPort for RecordingMediaPort {
         } else {
             Ok(())
         }
+    }
+
+    async fn stop_media(&self, _session_id: &SessionId) -> Result<(), WanMediaActivationError> {
+        self.calls.lock().unwrap().push("stop-media".to_owned());
+        Ok(())
+    }
+
+    async fn remove_failover(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<(), WanMediaActivationError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push("remove-failover".to_owned());
+        Ok(())
+    }
+}
+
+struct MediaCleanupAdapter {
+    media: Arc<RecordingMediaPort>,
+}
+
+#[async_trait]
+impl WanSessionCleanup for MediaCleanupAdapter {
+    async fn freeze_input(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<(), WanSessionCoordinatorError> {
+        Ok(())
+    }
+
+    async fn stop_media(&self, session_id: &SessionId) -> Result<(), WanSessionCoordinatorError> {
+        WanMediaActivationPort::stop_media(self.media.as_ref(), session_id)
+            .await
+            .map_err(|_| WanSessionCoordinatorError::CleanupFailed)
+    }
+
+    async fn close_transport(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<(), WanSessionCoordinatorError> {
+        Ok(())
+    }
+
+    async fn remove_failover(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), WanSessionCoordinatorError> {
+        WanMediaActivationPort::remove_failover(self.media.as_ref(), session_id)
+            .await
+            .map_err(|_| WanSessionCoordinatorError::CleanupFailed)
+    }
+
+    async fn clear_signaling(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<(), WanSessionCoordinatorError> {
+        Ok(())
+    }
+
+    async fn close_backend(
+        &self,
+        _session_id: &SessionId,
+        _failed: bool,
+    ) -> Result<(), WanSessionCoordinatorError> {
+        Ok(())
     }
 }
 
@@ -859,6 +1927,54 @@ async fn media_start_failure_fails_the_exact_session() {
         .is_err());
     let failed = coordinator.snapshot(&session_id).await.unwrap();
     assert_eq!(failed.phase(), WanSessionPhase::Failed);
+}
+
+#[tokio::test]
+async fn media_start_failure_leaves_cleanup_owned_by_the_coordinator_once() {
+    let state = relay_verified_state(WanSessionRole::Controller, "failure-cleanup-owner");
+    let session_id = state.identity().session_id().clone();
+    let media = Arc::new(RecordingMediaPort {
+        calls: Mutex::new(Vec::new()),
+        fail: true,
+    });
+    let coordinator = Arc::new(
+        WanSessionCoordinator::new(
+            Default::default(),
+            Arc::new(MediaCleanupAdapter {
+                media: Arc::clone(&media),
+            }),
+            Arc::new(FixedClock),
+        )
+        .unwrap(),
+    );
+    coordinator.begin(state.clone()).await.unwrap();
+
+    assert!(start_verified_media(&coordinator, &state, media.as_ref())
+        .await
+        .is_err());
+    {
+        let calls = media.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "stop-media")
+                .count(),
+            1,
+            "the coordinator cleanup receipt must own media stop exactly once"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "remove-failover")
+                .count(),
+            1,
+            "the coordinator cleanup receipt must own failover removal exactly once"
+        );
+    }
+    assert_eq!(
+        coordinator.snapshot(&session_id).await.unwrap().phase(),
+        WanSessionPhase::Failed
+    );
 }
 
 #[tokio::test]

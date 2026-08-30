@@ -1,6 +1,7 @@
 use crate::app_state::{redact_audit_correlation_id, AppState, DeviceIdentityRegistryError};
 use mrd_ipc::{
-    DecimalU64, DeviceIdentitySnapshot, IpcResponse, TrustedDeviceSnapshot, TrustedDeviceState,
+    DecimalU64, DeviceIdentitySnapshot, IpcResponse, RemoteFailure, RemoteReasonCode,
+    TrustedDeviceSnapshot, TrustedDeviceState,
 };
 use mrd_proto::DeviceId;
 use mrd_store_sqlite::{
@@ -211,9 +212,56 @@ async fn transition_trusted_device(
                 .session_authorizations
                 .revoke_peer_authorizations(&peer_key_id, now_unix_ms())
                 .await;
+            let mut lan_session_ids = Vec::new();
+            for session_id in revoked_session_ids {
+                match crate::wan_session::service::resolve_session_kind_under_security_gate(
+                    app_state,
+                    &session_id,
+                )
+                .await
+                {
+                    crate::wan_session::service::ServiceSessionKind::Wan => {
+                    match crate::wan_session::service::terminalize_wan_session_under_security_gate(
+                        app_state,
+                        &session_id,
+                        crate::wan_session::service::ServiceWanTerminalRequest::Fail {
+                            failure: crate::wan_session::model::WanSessionFailure::Cancelled,
+                            remote_failure: RemoteFailure {
+                                code: RemoteReasonCode::GrantRevoked,
+                                message: "trusted device access was revoked".to_owned(),
+                                suggested_action: Some(
+                                    "start a new session after restoring trust".to_owned(),
+                                ),
+                            },
+                        },
+                    )
+                    .await
+                    {
+                        Ok(Some(_)) | Ok(None) => {}
+                        Err(_) => {
+                            app_state.mark_security_unhealthy();
+                            tracing::error!(
+                                session_id = %session_id.0,
+                                "trusted-device transition left WAN cleanup incomplete"
+                            );
+                        }
+                    }
+                    }
+                    crate::wan_session::service::ServiceSessionKind::Lan => {
+                        lan_session_ids.push(session_id);
+                    }
+                    crate::wan_session::service::ServiceSessionKind::Unknown => {
+                        app_state.mark_security_unhealthy();
+                        tracing::error!(
+                            session_id = %session_id.0,
+                            "trusted-device transition could not resolve session authority"
+                        );
+                    }
+                }
+            }
             crate::lan_discovery::terminate_authorized_remote_sessions_under_security_gate(
                 app_state,
-                &revoked_session_ids,
+                &lan_session_ids,
             )
             .await;
             IpcResponse::TrustedDeviceUpdated { device }

@@ -8,7 +8,7 @@ use mrd_ipc::{
     SessionEventSubscriptionQuery, UnattendedAccessPolicy, UnattendedAccessSnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex, Notify};
 use tokio::time::{timeout, Duration};
@@ -406,6 +406,15 @@ impl SessionAuthorizationRegistry {
 
     pub async fn snapshot(&self, session_id: &SessionId) -> Option<RemoteSessionSnapshot> {
         self.snapshot_at(session_id, unix_time_ms()).await
+    }
+
+    pub(crate) async fn transport_kind(&self, session_id: &SessionId) -> Option<String> {
+        self.inner
+            .lock()
+            .await
+            .records
+            .get(session_id)
+            .map(|record| record.request.transport_kind.clone())
     }
 
     pub async fn snapshot_at(
@@ -864,11 +873,23 @@ impl SessionAuthorizationRegistry {
         revoked_at_ms: u64,
     ) -> Vec<SessionId> {
         let mut inner = self.inner.lock().await;
+        let proven_peer_devices = inner
+            .records
+            .values()
+            .filter(|record| {
+                record.request.peer_key_id == peer_key_id
+                    && !is_terminal_authorization_state(record.snapshot.authorization_state)
+            })
+            .map(|record| record.request.peer_device_id.clone())
+            .collect::<HashSet<_>>();
         let session_ids = inner
             .records
             .iter()
             .filter(|(_, record)| {
-                record.request.peer_key_id == peer_key_id
+                (record.request.peer_key_id == peer_key_id
+                    || (record.request.peer_key_id
+                        == pending_outgoing_peer_key_id(&record.request.peer_device_id)
+                        && proven_peer_devices.contains(&record.request.peer_device_id)))
                     && !is_terminal_authorization_state(record.snapshot.authorization_state)
             })
             .map(|(session_id, _)| session_id.clone())
@@ -2107,6 +2128,70 @@ mod tests {
         assert_eq!(
             snapshot.authorization_state,
             RemoteAuthorizationState::Expired
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_revoke_only_fences_pending_outgoing_for_the_proven_device() {
+        let registry = SessionAuthorizationRegistry::default();
+        let peer_public_key = [7; 32];
+        let peer_key_id = public_key_id(&peer_public_key);
+
+        let mut exact = control_request("revoke-exact-device-a", &peer_public_key);
+        exact.peer_device_id = DeviceId("device-a".to_owned());
+        exact.transport_kind = "webrtc_relay".to_owned();
+        let exact_session_id = exact.session_id.clone();
+        registry
+            .begin_outgoing(exact)
+            .await
+            .expect("begin exact authorization for device A");
+
+        let mut pending_a = control_request("revoke-pending-device-a", &peer_public_key);
+        pending_a.peer_device_id = DeviceId("device-a".to_owned());
+        pending_a.peer_key_id = pending_outgoing_peer_key_id(&pending_a.peer_device_id);
+        pending_a.transport_kind = "webrtc_relay".to_owned();
+        let pending_a_session_id = pending_a.session_id.clone();
+        registry
+            .begin_outgoing(pending_a)
+            .await
+            .expect("begin pending authorization for device A");
+
+        let mut pending_b = control_request("revoke-pending-device-b", &peer_public_key);
+        pending_b.peer_device_id = DeviceId("device-b".to_owned());
+        pending_b.peer_key_id = pending_outgoing_peer_key_id(&pending_b.peer_device_id);
+        pending_b.transport_kind = "webrtc_relay".to_owned();
+        let pending_b_session_id = pending_b.session_id.clone();
+        registry
+            .begin_outgoing(pending_b)
+            .await
+            .expect("begin unrelated pending authorization for device B");
+
+        let mut revoked = registry
+            .revoke_peer_authorizations(&peer_key_id, CREATED_AT_MS + 1)
+            .await;
+        revoked.sort_by(|left, right| left.0.cmp(&right.0));
+
+        assert_eq!(
+            revoked,
+            vec![exact_session_id.clone(), pending_a_session_id.clone()]
+        );
+        for session_id in [&exact_session_id, &pending_a_session_id] {
+            let snapshot = registry
+                .snapshot_at(session_id, CREATED_AT_MS + 1)
+                .await
+                .expect("revoked authorization remains queryable");
+            assert_eq!(
+                snapshot.authorization_state,
+                RemoteAuthorizationState::Revoked
+            );
+        }
+        let unrelated = registry
+            .snapshot_at(&pending_b_session_id, CREATED_AT_MS + 1)
+            .await
+            .expect("unrelated pending authorization remains queryable");
+        assert_eq!(
+            unrelated.authorization_state,
+            RemoteAuthorizationState::Authorizing
         );
     }
 }

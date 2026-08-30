@@ -737,6 +737,46 @@ async fn coordinator_commit_advances_success_to_relay_verified() {
 }
 
 #[tokio::test]
+async fn service_owned_negotiation_failure_remains_live_for_unified_terminalization() {
+    let session_id = test_session_id();
+    let access = relay_access(&session_id, "target-device").await;
+    let (state, _controller, _target) =
+        signed_state_at_access_bound(&session_id, WanSessionRole::Controller);
+    let context =
+        GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
+            .unwrap();
+    let coordinator = Arc::new(
+        WanSessionCoordinator::new(
+            Default::default(),
+            Arc::new(NoopWanSessionCleanup),
+            Arc::new(CoordinatorTestClock),
+        )
+        .unwrap(),
+    );
+    coordinator.begin(state).await.unwrap();
+    let negotiator = GenerationZeroNegotiator::new(
+        Arc::new(StubHost::default()),
+        Arc::new(mrd_service::signaling::RelaySignalingBus::default()),
+        Arc::new(CountingInstaller::default()),
+        Duration::from_secs(1),
+    )
+    .unwrap()
+    .with_clock(Arc::new(TestClock))
+    .with_coordinator(Arc::clone(&coordinator))
+    .with_authorization_gate(Arc::new(tokio::sync::Mutex::new(())));
+
+    assert_eq!(
+        negotiator.negotiate(context, &access).await,
+        Err(GenerationZeroNegotiationError::TransportUnavailable)
+    );
+    assert_eq!(
+        coordinator.snapshot(&session_id).await.unwrap().phase(),
+        WanSessionPhase::Negotiating,
+        "the service wrapper must own authorization-gated terminalization"
+    );
+}
+
+#[tokio::test]
 async fn coordinator_commit_rejects_an_unbound_backend_grant_before_install() {
     let session_id = test_session_id();
     let mut state = state_at_access_bound(&session_id, WanSessionRole::Controller, false);

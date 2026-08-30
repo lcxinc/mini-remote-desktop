@@ -10,6 +10,15 @@ use mrd_service::ipc_server::IpcServer;
 use mrd_service::{
     app_state::AppState,
     session_authorization::{VerifiedIncomingAuthorizationRequest, VerifiedSessionGrant},
+    wan_session::{
+        coordinator::{
+            NoopWanSessionCleanup, SystemWanSessionClock, WanSessionCoordinator,
+            WanSessionCoordinatorConfig,
+        },
+        model::{
+            WanSessionFailure, WanSessionIdentity, WanSessionPhase, WanSessionRole, WanSessionState,
+        },
+    },
 };
 use mrd_store_sqlite::{AuditDraft, SecretBytes, SecretProtector, TrustState};
 use ring::{
@@ -846,6 +855,182 @@ async fn suspending_trusted_peer_via_ipc_revokes_active_and_pending_authorizatio
 #[tokio::test]
 async fn revoking_trusted_peer_via_ipc_revokes_active_and_pending_authorizations() {
     assert_applied_trust_transition_revokes_authorizations(false).await;
+}
+
+#[tokio::test]
+async fn revoking_trusted_peer_via_ipc_terminalizes_the_matching_wan_workflow() {
+    let path = temp_db();
+    let protector: Arc<dyn SecretProtector> = Arc::new(TestSecretProtector { key: [0x83; 32] });
+    let peer = DeviceIdentity::generate(&SystemRandom::new()).expect("peer identity");
+    let peer_key_id = peer.key_id().to_owned();
+    let state = Arc::new(
+        AppState::open_persistent(&path, protector).expect("persistent service security state"),
+    );
+    state
+        .device_identities
+        .approve_authenticated_peer(
+            &peer_key_id,
+            peer.public_key(),
+            1,
+            audit(1, "trust.approved", &peer_key_id),
+        )
+        .expect("trusted peer approval");
+    let mut request = peer_authorization_request("trust-transition-wan", &peer_key_id);
+    request.transport_kind = "webrtc_relay".to_owned();
+    let session_id = request.session_id.clone();
+    let deadline_unix_ms = request.expires_at_ms;
+    state
+        .session_authorizations
+        .begin_verified_incoming(request)
+        .await
+        .expect("pending WAN peer authorization");
+    let coordinator = Arc::new(
+        WanSessionCoordinator::new(
+            WanSessionCoordinatorConfig::default(),
+            Arc::new(NoopWanSessionCleanup),
+            Arc::new(SystemWanSessionClock),
+        )
+        .expect("WAN coordinator"),
+    );
+    coordinator
+        .begin(WanSessionState::new(
+            WanSessionRole::Target,
+            WanSessionIdentity::new(
+                session_id.clone(),
+                DeviceId("trusted-controller".to_owned()),
+                DeviceId("local-target".to_owned()),
+                peer_key_id.clone(),
+                "b".repeat(64),
+                deadline_unix_ms,
+            )
+            .expect("WAN target identity"),
+        ))
+        .await
+        .expect("begin WAN target workflow");
+    state
+        .bind_wan_session_coordinator(coordinator.clone())
+        .expect("bind WAN coordinator");
+
+    let response = IpcServer::new(state.clone())
+        .handle_request(IpcRequest::RevokeTrustedDevice {
+            peer_key_id,
+            expected_trust_revision: DecimalU64::new(1),
+        })
+        .await;
+    assert!(matches!(response, IpcResponse::TrustedDeviceUpdated { .. }));
+    let workflow = coordinator
+        .snapshot(&session_id)
+        .await
+        .expect("retained WAN terminal state");
+    assert_eq!(workflow.phase(), WanSessionPhase::Failed);
+    assert_eq!(workflow.failure(), Some(WanSessionFailure::Cancelled));
+
+    drop(state);
+    remove_sqlite_files(&path);
+}
+
+#[tokio::test]
+async fn trust_revoke_fences_pending_outgoing_wan_without_cleaning_a_colliding_lan_projection() {
+    let path = temp_db();
+    let protector: Arc<dyn SecretProtector> = Arc::new(TestSecretProtector { key: [0x84; 32] });
+    let peer = DeviceIdentity::generate(&SystemRandom::new()).expect("peer identity");
+    let peer_key_id = peer.key_id().to_owned();
+    let state = Arc::new(
+        AppState::open_persistent(&path, protector).expect("persistent service security state"),
+    );
+    state
+        .device_identities
+        .approve_authenticated_peer(
+            &peer_key_id,
+            peer.public_key(),
+            1,
+            audit(1, "trust.approved", &peer_key_id),
+        )
+        .expect("trusted peer approval");
+
+    let mut proven_request =
+        peer_authorization_request("trust-revoke-proven-wan-device", &peer_key_id);
+    proven_request.peer_device_id = DeviceId("pending-wan-target".to_owned());
+    proven_request.transport_kind = "webrtc_relay".to_owned();
+    state
+        .session_authorizations
+        .begin_outgoing(proven_request)
+        .await
+        .expect("exact peer key proves the pending WAN device association");
+
+    let mut request = peer_authorization_request("trust-revoke-pending-wan", &peer_key_id);
+    request.peer_device_id = DeviceId("pending-wan-target".to_owned());
+    request.peer_key_id = format!("pending_authenticated_peer:{}", request.peer_device_id.0);
+    request.transport_kind = "webrtc_relay".to_owned();
+    let session_id = request.session_id.clone();
+    state
+        .session_authorizations
+        .begin_outgoing(request)
+        .await
+        .expect("pending outgoing WAN authorization");
+
+    state.sessions.lock().await.insert(
+        session_id.clone(),
+        SessionSnapshot {
+            session_id: session_id.clone(),
+            transport: "quic".to_owned(),
+            source_device_id: Some(DeviceId("unrelated-lan-controller".to_owned())),
+            target_device_id: Some(DeviceId("unrelated-lan-target".to_owned())),
+            local_listen_addr: None,
+            local_server_name: None,
+            local_cert_der_b64: None,
+            remote_listen_addr: None,
+            remote_server_name: None,
+            remote_cert_der_b64: None,
+            lifecycle_state: SessionLifecycleState::Streaming,
+            last_error: None,
+            sender_active: true,
+            receiver_active: false,
+        },
+    );
+    let media_task = tokio::spawn(std::future::pending::<()>());
+    state
+        .media_tasks
+        .lock()
+        .await
+        .register(session_id.clone(), media_task.abort_handle());
+
+    let response = IpcServer::new(Arc::clone(&state))
+        .handle_request(IpcRequest::RevokeTrustedDevice {
+            peer_key_id,
+            expected_trust_revision: DecimalU64::new(1),
+        })
+        .await;
+    assert!(matches!(response, IpcResponse::TrustedDeviceUpdated { .. }));
+    let authorization = state
+        .session_authorizations
+        .snapshot(&session_id)
+        .await
+        .expect("pending WAN authorization retained as terminal evidence");
+    assert_eq!(
+        authorization.authorization_state,
+        RemoteAuthorizationState::Revoked
+    );
+    assert_eq!(
+        authorization.failure.as_ref().map(|failure| failure.code),
+        Some(RemoteReasonCode::GrantRevoked)
+    );
+    let sessions = state.sessions.lock().await;
+    let unrelated_lan = sessions
+        .get(&session_id)
+        .expect("colliding LAN projection must remain present");
+    assert_eq!(
+        unrelated_lan.lifecycle_state,
+        SessionLifecycleState::Streaming
+    );
+    assert!(unrelated_lan.sender_active);
+    drop(sessions);
+    assert_eq!(state.media_tasks.lock().await.active_count(&session_id), 1);
+
+    media_task.abort();
+    let _ = media_task.await;
+    drop(state);
+    remove_sqlite_files(&path);
 }
 
 #[tokio::test]

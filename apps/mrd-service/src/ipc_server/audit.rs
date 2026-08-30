@@ -28,6 +28,19 @@ impl IpcServer {
         &self,
         session_id: &SessionId,
     ) -> (Option<DeviceId>, Option<String>) {
+        if let Some(coordinator) = self.app_state.wan_session_coordinator() {
+            if let Ok(state) = coordinator.snapshot(session_id).await {
+                let peer_device_id = match state.role() {
+                    crate::wan_session::model::WanSessionRole::Controller => {
+                        state.identity().target_device_id().clone()
+                    }
+                    crate::wan_session::model::WanSessionRole::Target => {
+                        state.identity().controller_device_id().clone()
+                    }
+                };
+                return (Some(peer_device_id), Some("webrtc_relay".to_owned()));
+            }
+        }
         let sessions = self.app_state.sessions.lock().await;
         let Some(snapshot) = sessions.get(session_id) else {
             return (None, None);

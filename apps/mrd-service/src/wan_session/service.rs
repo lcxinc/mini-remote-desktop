@@ -5,13 +5,13 @@ use super::{
     coordinator::{
         SystemWanSessionClock, VerifiedWanSessionGrant, VerifiedWanSessionIntent,
         WanSessionConsentPublisher, WanSessionCoordinator, WanSessionCoordinatorConfig,
-        WanSessionPortError, WanSessionWorkflowPorts,
+        WanSessionCoordinatorError, WanSessionPortError, WanSessionWorkflowPorts,
     },
     media::{
         ipc_media_profile, start_verified_media, WanMediaActivationError, WanMediaActivationPort,
         WanMediaAuthority,
     },
-    model::{WanSessionFailure, WanSessionPhase, WanSessionRole},
+    model::{WanSessionFailure, WanSessionPhase, WanSessionRole, WanSessionState},
     signaling::ServiceWanSessionWorkflowSignaling,
     webrtc::{
         GenerationZeroNegotiationContext, GenerationZeroNegotiationError, GenerationZeroNegotiator,
@@ -24,7 +24,7 @@ use mrd_application::{
 };
 use mrd_ipc::{
     MediaProfileNegotiation, RemoteAuthorizationState, RemoteFailure, RemotePermissionScope,
-    RemoteReasonCode,
+    RemoteReasonCode, SessionInfo,
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_signal_proto::{WanMediaProfileV3, WanPermissionScopeV3, WanSessionRequestV3};
@@ -41,6 +41,527 @@ use tokio::{
 
 const WAN_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_INITIAL_EVENT_TASKS: usize = 32;
+
+/// Service-owned terminal request for an already registered WAN session.
+/// Callers must hold `AppState::authorization_security_gate` so authorization,
+/// workflow cleanup, and the public projection cannot race trust changes.
+#[derive(Debug, Clone)]
+pub(crate) enum ServiceWanTerminalRequest {
+    Close,
+    Fail {
+        failure: WanSessionFailure,
+        remote_failure: RemoteFailure,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServiceSessionKind {
+    Wan,
+    Lan,
+    Unknown,
+}
+
+/// Resolve the session authority while the authorization security gate is
+/// held. Coordinator ownership wins, followed by the original authorization
+/// transport, then the runtime projection. A missing WAN coordinator never
+/// turns an explicit WAN authorization into a LAN session.
+pub(crate) async fn resolve_session_kind_under_security_gate(
+    app_state: &Arc<crate::AppState>,
+    session_id: &SessionId,
+) -> ServiceSessionKind {
+    if let Some(coordinator) = app_state.wan_session_coordinator() {
+        if coordinator.snapshot(session_id).await.is_ok() {
+            return ServiceSessionKind::Wan;
+        }
+    }
+    if let Some(transport) = app_state
+        .session_authorizations
+        .transport_kind(session_id)
+        .await
+    {
+        return if transport == "webrtc_relay" {
+            ServiceSessionKind::Wan
+        } else {
+            ServiceSessionKind::Lan
+        };
+    }
+    match app_state
+        .sessions
+        .lock()
+        .await
+        .get(session_id)
+        .map(|snapshot| snapshot.transport.as_str() == "webrtc_relay")
+    {
+        Some(true) => ServiceSessionKind::Wan,
+        Some(false) => ServiceSessionKind::Lan,
+        None => ServiceSessionKind::Unknown,
+    }
+}
+
+/// Resolve and terminalize one WAN session while the authorization security
+/// gate is held. `Ok(None)` means the id is not owned by the WAN coordinator.
+/// A terminal coordinator state is projected even when its stored cleanup
+/// receipt is an error, but the same error is returned on every retry.
+pub(crate) async fn terminalize_wan_session_under_security_gate(
+    app_state: &Arc<crate::AppState>,
+    session_id: &SessionId,
+    request: ServiceWanTerminalRequest,
+) -> Result<Option<WanSessionState>, WanSessionCoordinatorError> {
+    let Some(coordinator) = app_state.wan_session_coordinator() else {
+        return Ok(None);
+    };
+    let current = match coordinator.snapshot(session_id).await {
+        Ok(state) => state,
+        Err(WanSessionCoordinatorError::SessionNotFound) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let operation = match current.phase() {
+        WanSessionPhase::Closed => coordinator.close(session_id).await,
+        WanSessionPhase::Failed => {
+            coordinator
+                .fail(
+                    session_id,
+                    current.failure().unwrap_or(WanSessionFailure::Internal),
+                )
+                .await
+        }
+        _ => match &request {
+            ServiceWanTerminalRequest::Close => coordinator.close(session_id).await,
+            ServiceWanTerminalRequest::Fail { failure, .. } => {
+                coordinator.fail(session_id, *failure).await
+            }
+        },
+    };
+    let terminal = coordinator.snapshot(session_id).await?;
+    if terminal.phase().is_terminal() {
+        let requested_remote_failure = match &request {
+            ServiceWanTerminalRequest::Fail {
+                failure,
+                remote_failure,
+            } if terminal.failure() == Some(*failure) => Some(remote_failure.clone()),
+            ServiceWanTerminalRequest::Close | ServiceWanTerminalRequest::Fail { .. } => None,
+        };
+        publish_terminal_wan_state(app_state, &terminal, requested_remote_failure).await;
+    }
+    match operation {
+        Ok(_) => Ok(Some(terminal)),
+        Err(
+            WanSessionCoordinatorError::SessionTerminal | WanSessionCoordinatorError::Transition(_),
+        ) if terminal.phase().is_terminal() => Ok(Some(terminal)),
+        Err(error) => Err(error),
+    }
+}
+
+/// Re-publish a coordinator terminal state without replaying cleanup. This is
+/// used by query/list paths and by future deadline/shutdown reconciliation.
+pub(crate) async fn reconcile_wan_session_under_security_gate(
+    app_state: &Arc<crate::AppState>,
+    session_id: &SessionId,
+) -> Result<Option<WanSessionState>, WanSessionCoordinatorError> {
+    let Some(coordinator) = app_state.wan_session_coordinator() else {
+        return Ok(None);
+    };
+    let state = match coordinator.snapshot(session_id).await {
+        Ok(state) => state,
+        Err(WanSessionCoordinatorError::SessionNotFound) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !state.phase().is_terminal() {
+        if let Some(authorization) = app_state.session_authorizations.snapshot(session_id).await {
+            if is_terminal_authorization_state(authorization.authorization_state) {
+                let failure = authorization
+                    .failure
+                    .clone()
+                    .unwrap_or_else(|| RemoteFailure {
+                        code: RemoteReasonCode::GrantRevoked,
+                        message: "secure WAN authorization ended".to_owned(),
+                        suggested_action: Some("start a new secure WAN session".to_owned()),
+                    });
+                return terminalize_wan_session_under_security_gate(
+                    app_state,
+                    session_id,
+                    ServiceWanTerminalRequest::Fail {
+                        failure: wan_failure_from_remote_reason(failure.code),
+                        remote_failure: failure,
+                    },
+                )
+                .await;
+            }
+        }
+    }
+    if state.phase().is_terminal() {
+        publish_terminal_wan_state(app_state, &state, None).await;
+    } else {
+        project_wan_session_state(app_state, &state).await;
+    }
+    Ok(Some(state))
+}
+
+/// Reconcile every coordinator-owned WAN workflow before reading the shared
+/// runtime projection. Callers must hold `authorization_security_gate` so
+/// terminal authorization changes and visible session state remain atomic.
+pub(crate) async fn reconcile_all_wan_sessions_under_security_gate(
+    app_state: &Arc<crate::AppState>,
+) -> Result<(), WanSessionCoordinatorError> {
+    let Some(coordinator) = app_state.wan_session_coordinator() else {
+        return Ok(());
+    };
+    let session_ids = coordinator
+        .snapshots()
+        .await
+        .into_iter()
+        .map(|state| state.identity().session_id().clone())
+        .collect::<Vec<_>>();
+    for session_id in session_ids {
+        reconcile_wan_session_under_security_gate(app_state, &session_id).await?;
+    }
+    Ok(())
+}
+
+/// Build deterministic IPC list projections from the workflow authority.
+/// Existing media flags are used only after the coordinator reached Streaming.
+pub(crate) async fn wan_session_infos_under_security_gate(
+    app_state: &Arc<crate::AppState>,
+) -> Vec<SessionInfo> {
+    let Some(coordinator) = app_state.wan_session_coordinator() else {
+        return Vec::new();
+    };
+    let states = coordinator.snapshots().await;
+    for state in &states {
+        if state.phase().is_terminal() {
+            publish_terminal_wan_state(app_state, state, None).await;
+        }
+    }
+    let projected = app_state
+        .sessions
+        .lock()
+        .await
+        .list_all()
+        .into_iter()
+        .map(|snapshot| (snapshot.session_id.clone(), snapshot))
+        .collect::<HashMap<_, _>>();
+    let mut sessions = states
+        .iter()
+        .map(|state| {
+            let lifecycle = wan_lifecycle(state);
+            let active = projected.get(state.identity().session_id());
+            let media_is_streaming = lifecycle == SessionLifecycleState::Streaming;
+            SessionInfo {
+                session_id: state.identity().session_id().clone(),
+                role: wan_role_name(state.role()).to_owned(),
+                state: lifecycle.as_str().to_owned(),
+                transport_kind: "webrtc_relay".to_owned(),
+                last_error: wan_last_error(state),
+                sender_active: media_is_streaming
+                    && active.is_some_and(|snapshot| snapshot.sender_active),
+                receiver_active: media_is_streaming
+                    && active.is_some_and(|snapshot| snapshot.receiver_active),
+                peer_device_id: Some(wan_peer_device_id(state).clone()),
+            }
+        })
+        .collect::<Vec<_>>();
+    sessions.sort_by(|left, right| left.session_id.0.cmp(&right.session_id.0));
+    sessions
+}
+
+/// Service heartbeat entrypoint for deadline expiry. The authorization gate
+/// makes the workflow transition and its public security projection atomic
+/// with trust and policy changes.
+pub async fn expire_due_wan_sessions(app_state: &Arc<crate::AppState>) -> usize {
+    let _authorization_guard = app_state.authorization_security_gate.lock().await;
+    let Some(coordinator) = app_state.wan_session_coordinator() else {
+        return 0;
+    };
+    let expired = coordinator.expire_due_sessions().await;
+    for state in coordinator.snapshots().await {
+        if state.phase().is_terminal() {
+            publish_terminal_wan_state(app_state, &state, None).await;
+        }
+    }
+    expired
+}
+
+/// Service shutdown entrypoint. Every live workflow is cancelled and cleaned
+/// before its authorization and IPC projection become terminal.
+pub async fn shutdown_active_wan_sessions(app_state: &Arc<crate::AppState>) -> usize {
+    let _authorization_guard = app_state.authorization_security_gate.lock().await;
+    let Some(coordinator) = app_state.wan_session_coordinator() else {
+        return 0;
+    };
+    let shutdown = coordinator.shutdown_active_sessions().await;
+    for state in coordinator.snapshots().await {
+        if state.phase().is_terminal() {
+            publish_terminal_wan_state(app_state, &state, None).await;
+        }
+    }
+    shutdown
+}
+
+async fn fail_wan_session(
+    app_state: &Arc<crate::AppState>,
+    session_id: &SessionId,
+    failure: WanSessionFailure,
+) -> Result<Option<WanSessionState>, WanSessionCoordinatorError> {
+    let _authorization_guard = app_state.authorization_security_gate.lock().await;
+    terminalize_wan_session_under_security_gate(
+        app_state,
+        session_id,
+        ServiceWanTerminalRequest::Fail {
+            failure,
+            remote_failure: wan_remote_failure(failure),
+        },
+    )
+    .await
+}
+
+pub(crate) async fn reconcile_wan_session(
+    app_state: &Arc<crate::AppState>,
+    session_id: &SessionId,
+) -> Result<Option<WanSessionState>, WanSessionCoordinatorError> {
+    let _authorization_guard = app_state.authorization_security_gate.lock().await;
+    reconcile_wan_session_under_security_gate(app_state, session_id).await
+}
+
+async fn publish_terminal_wan_state(
+    app_state: &Arc<crate::AppState>,
+    state: &WanSessionState,
+    requested_remote_failure: Option<RemoteFailure>,
+) {
+    if !state.phase().is_terminal() {
+        return;
+    }
+    let (authorization_state, remote_failure) = match state.phase() {
+        WanSessionPhase::Closed => (
+            RemoteAuthorizationState::Revoked,
+            RemoteFailure {
+                code: RemoteReasonCode::GrantRevoked,
+                message: "secure WAN session was closed".to_owned(),
+                suggested_action: None,
+            },
+        ),
+        WanSessionPhase::Failed => {
+            let failure = state.failure().unwrap_or(WanSessionFailure::Internal);
+            let authorization_state = wan_failure_authorization_state(failure);
+            (
+                authorization_state,
+                requested_remote_failure.unwrap_or_else(|| wan_remote_failure(failure)),
+            )
+        }
+        _ => return,
+    };
+    let _ = app_state
+        .session_authorizations
+        .record_failure(
+            state.identity().session_id(),
+            authorization_state,
+            remote_failure,
+            now_unix_ms(),
+        )
+        .await;
+    project_wan_session_state(app_state, state).await;
+}
+
+async fn project_wan_session_state(app_state: &Arc<crate::AppState>, state: &WanSessionState) {
+    let session_id = state.identity().session_id().clone();
+    let mut sessions = app_state.sessions.lock().await;
+    let previous = sessions.get(&session_id).cloned();
+    let (source_device_id, target_device_id) = match state.role() {
+        WanSessionRole::Controller => (
+            Some(state.identity().controller_device_id().clone()),
+            Some(state.identity().target_device_id().clone()),
+        ),
+        WanSessionRole::Target => (Some(state.identity().controller_device_id().clone()), None),
+    };
+    let lifecycle_state = wan_lifecycle(state);
+    let media_is_streaming = lifecycle_state == SessionLifecycleState::Streaming;
+    sessions.insert(
+        session_id.clone(),
+        SessionSnapshot {
+            session_id,
+            transport: "webrtc_relay".to_owned(),
+            source_device_id,
+            target_device_id,
+            local_listen_addr: previous
+                .as_ref()
+                .and_then(|snapshot| snapshot.local_listen_addr.clone()),
+            local_server_name: previous
+                .as_ref()
+                .and_then(|snapshot| snapshot.local_server_name.clone()),
+            local_cert_der_b64: previous
+                .as_ref()
+                .and_then(|snapshot| snapshot.local_cert_der_b64.clone()),
+            remote_listen_addr: previous
+                .as_ref()
+                .and_then(|snapshot| snapshot.remote_listen_addr.clone()),
+            remote_server_name: previous
+                .as_ref()
+                .and_then(|snapshot| snapshot.remote_server_name.clone()),
+            remote_cert_der_b64: previous
+                .as_ref()
+                .and_then(|snapshot| snapshot.remote_cert_der_b64.clone()),
+            lifecycle_state,
+            last_error: wan_last_error(state),
+            sender_active: media_is_streaming
+                && previous
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.sender_active),
+            receiver_active: media_is_streaming
+                && previous
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.receiver_active),
+        },
+    );
+}
+
+fn wan_lifecycle(state: &WanSessionState) -> SessionLifecycleState {
+    match state.phase() {
+        WanSessionPhase::Created
+        | WanSessionPhase::BackendBound
+        | WanSessionPhase::AwaitingConsent
+            if state.role() == WanSessionRole::Target =>
+        {
+            SessionLifecycleState::Listening
+        }
+        WanSessionPhase::Created
+        | WanSessionPhase::BackendBound
+        | WanSessionPhase::AwaitingConsent
+        | WanSessionPhase::Granted
+        | WanSessionPhase::AccessBound
+        | WanSessionPhase::Negotiating => SessionLifecycleState::Connecting,
+        WanSessionPhase::RelayVerified => SessionLifecycleState::Connected,
+        WanSessionPhase::Streaming => SessionLifecycleState::Streaming,
+        WanSessionPhase::Closed => SessionLifecycleState::Closed,
+        WanSessionPhase::Failed => SessionLifecycleState::Failed {
+            message: wan_last_error(state).unwrap_or_else(|| "WAN session failed".to_owned()),
+        },
+    }
+}
+
+fn wan_role_name(role: WanSessionRole) -> &'static str {
+    match role {
+        WanSessionRole::Controller => "controller",
+        WanSessionRole::Target => "agent",
+    }
+}
+
+fn wan_peer_device_id(state: &WanSessionState) -> &DeviceId {
+    match state.role() {
+        WanSessionRole::Controller => state.identity().target_device_id(),
+        WanSessionRole::Target => state.identity().controller_device_id(),
+    }
+}
+
+fn wan_last_error(state: &WanSessionState) -> Option<String> {
+    state.failure().map(|failure| {
+        match failure {
+            WanSessionFailure::DeadlineExceeded => "WAN session deadline exceeded",
+            WanSessionFailure::IdentityMismatch => "WAN session identity verification failed",
+            WanSessionFailure::PolicyMismatch => "WAN session policy changed",
+            WanSessionFailure::RouteMismatch => "WAN relay route verification failed",
+            WanSessionFailure::CapacityExceeded => "WAN session capacity exceeded",
+            WanSessionFailure::RetryBudgetExceeded => "WAN session retry budget exceeded",
+            WanSessionFailure::BufferCapacityExceeded => "WAN session buffer capacity exceeded",
+            WanSessionFailure::Transport => "WAN transport failed",
+            WanSessionFailure::Cancelled => "WAN session was cancelled",
+            WanSessionFailure::InvalidTransition
+            | WanSessionFailure::ConflictingDuplicate
+            | WanSessionFailure::Internal => "WAN session failed",
+        }
+        .to_owned()
+    })
+}
+
+fn wan_failure_authorization_state(failure: WanSessionFailure) -> RemoteAuthorizationState {
+    match failure {
+        WanSessionFailure::DeadlineExceeded => RemoteAuthorizationState::Expired,
+        WanSessionFailure::IdentityMismatch => RemoteAuthorizationState::Denied,
+        WanSessionFailure::PolicyMismatch => RemoteAuthorizationState::PolicyChanged,
+        _ => RemoteAuthorizationState::Revoked,
+    }
+}
+
+fn is_terminal_authorization_state(state: RemoteAuthorizationState) -> bool {
+    matches!(
+        state,
+        RemoteAuthorizationState::Denied
+            | RemoteAuthorizationState::Expired
+            | RemoteAuthorizationState::Revoked
+            | RemoteAuthorizationState::LockedOut
+            | RemoteAuthorizationState::PolicyChanged
+    )
+}
+
+fn wan_failure_from_remote_reason(reason: RemoteReasonCode) -> WanSessionFailure {
+    match reason {
+        RemoteReasonCode::IdentityMismatch | RemoteReasonCode::CertificateBindingMismatch => {
+            WanSessionFailure::IdentityMismatch
+        }
+        RemoteReasonCode::AuthorizationTimeout | RemoteReasonCode::GrantExpired => {
+            WanSessionFailure::DeadlineExceeded
+        }
+        RemoteReasonCode::PolicyChanged | RemoteReasonCode::ScopeDenied => {
+            WanSessionFailure::PolicyMismatch
+        }
+        RemoteReasonCode::LanUnreachable
+        | RemoteReasonCode::IceDirectFailed
+        | RemoteReasonCode::TurnAllocationFailed
+        | RemoteReasonCode::RouteLost
+        | RemoteReasonCode::RouteMigrationTimeout => WanSessionFailure::Transport,
+        RemoteReasonCode::TrustRequired
+        | RemoteReasonCode::ConsentDenied
+        | RemoteReasonCode::CredentialInvalid
+        | RemoteReasonCode::CredentialLocked
+        | RemoteReasonCode::GrantRevoked
+        | RemoteReasonCode::ReplayDetected
+        | RemoteReasonCode::ProtocolDowngradeBlocked
+        | RemoteReasonCode::EncoderUnavailable
+        | RemoteReasonCode::DecoderUnavailable
+        | RemoteReasonCode::CaptureSourceLost
+        | RemoteReasonCode::ProfileDowngraded
+        | RemoteReasonCode::CongestionDownshift
+        | RemoteReasonCode::RenderBudgetExceeded => WanSessionFailure::Cancelled,
+    }
+}
+
+fn wan_remote_failure(failure: WanSessionFailure) -> RemoteFailure {
+    let code = match failure {
+        WanSessionFailure::DeadlineExceeded => RemoteReasonCode::AuthorizationTimeout,
+        WanSessionFailure::IdentityMismatch => RemoteReasonCode::IdentityMismatch,
+        WanSessionFailure::PolicyMismatch => RemoteReasonCode::PolicyChanged,
+        WanSessionFailure::RouteMismatch | WanSessionFailure::Transport => {
+            RemoteReasonCode::RouteLost
+        }
+        WanSessionFailure::CapacityExceeded => RemoteReasonCode::TurnAllocationFailed,
+        WanSessionFailure::Cancelled => RemoteReasonCode::GrantRevoked,
+        WanSessionFailure::RetryBudgetExceeded
+        | WanSessionFailure::BufferCapacityExceeded
+        | WanSessionFailure::InvalidTransition
+        | WanSessionFailure::ConflictingDuplicate
+        | WanSessionFailure::Internal => RemoteReasonCode::PolicyChanged,
+    };
+    RemoteFailure {
+        code,
+        message: wan_last_error_for_failure(failure).to_owned(),
+        suggested_action: Some("start a new secure WAN session".to_owned()),
+    }
+}
+
+fn wan_last_error_for_failure(failure: WanSessionFailure) -> &'static str {
+    match failure {
+        WanSessionFailure::DeadlineExceeded => "WAN session deadline exceeded",
+        WanSessionFailure::IdentityMismatch => "WAN session identity verification failed",
+        WanSessionFailure::PolicyMismatch => "WAN session policy changed",
+        WanSessionFailure::RouteMismatch => "WAN relay route verification failed",
+        WanSessionFailure::CapacityExceeded => "WAN session capacity exceeded",
+        WanSessionFailure::RetryBudgetExceeded => "WAN session retry budget exceeded",
+        WanSessionFailure::BufferCapacityExceeded => "WAN session buffer capacity exceeded",
+        WanSessionFailure::Transport => "WAN transport failed",
+        WanSessionFailure::Cancelled => "WAN session was cancelled",
+        WanSessionFailure::InvalidTransition
+        | WanSessionFailure::ConflictingDuplicate
+        | WanSessionFailure::Internal => "WAN session failed",
+    }
+}
 
 /// Idempotent production cleanup used by every terminal coordinator path.
 /// A weak AppState reference avoids an AppState -> coordinator -> cleanup cycle.
@@ -623,7 +1144,7 @@ async fn run_wan_session_service(
 
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
-    let _ = coordinator.shutdown_active_sessions().await;
+    let _ = shutdown_active_wan_sessions(&app_state).await;
 }
 
 async fn handle_initial_event(
@@ -654,15 +1175,20 @@ async fn handle_initial_event(
     if result.is_err() {
         // Verification failures are ignored rather than terminalizing a valid
         // session: an attacker cannot turn a malformed frame into a close.
+        let _ = reconcile_wan_session(&app_state, &session_id).await;
         return;
     }
-    if spawn_generation_zero(app_state, Arc::clone(&coordinator), backend, &session_id)
-        .await
-        .is_err()
+    let _ = reconcile_wan_session(&app_state, &session_id).await;
+    if spawn_generation_zero(
+        Arc::clone(&app_state),
+        Arc::clone(&coordinator),
+        backend,
+        &session_id,
+    )
+    .await
+    .is_err()
     {
-        let _ = coordinator
-            .fail(&session_id, WanSessionFailure::RouteMismatch)
-            .await;
+        let _ = fail_wan_session(&app_state, &session_id, WanSessionFailure::RouteMismatch).await;
     }
 }
 
@@ -763,9 +1289,7 @@ async fn apply_verified_controller_grant_inner(
         .await
         .is_err()
     {
-        let _ = coordinator
-            .fail(&session_id, WanSessionFailure::Internal)
-            .await;
+        let _ = fail_wan_session(app_state, &session_id, WanSessionFailure::Internal).await;
         return Err(ServiceWanControllerGrantError::Authorization);
     }
     Ok(())
@@ -779,6 +1303,21 @@ async fn install_controller_authorization(
     let installed_at_ms = now_unix_ms();
     let _authorization_guard = app_state.authorization_security_gate.lock().await;
     let result = async {
+        let trust = app_state
+            .device_identities
+            .authenticated_peer_trust_current_key(
+                verified.target_key_fingerprint(),
+                verified.target_public_key(),
+            )
+            .map_err(|_| controller_grant_trust_invalid())?;
+        if matches!(
+            trust,
+            crate::app_state::AuthenticatedPeerTrust::Suspended
+                | crate::app_state::AuthenticatedPeerTrust::Revoked
+                | crate::app_state::AuthenticatedPeerTrust::EpochMismatch
+        ) {
+            return Err(controller_grant_trust_invalid());
+        }
         let identity = state.identity();
         let grant = state.grant().ok_or_else(controller_grant_mismatch)?;
         let access = state.access().ok_or_else(controller_grant_mismatch)?;
@@ -909,6 +1448,14 @@ fn controller_grant_mismatch() -> RemoteFailure {
     }
 }
 
+fn controller_grant_trust_invalid() -> RemoteFailure {
+    RemoteFailure {
+        code: RemoteReasonCode::TrustRequired,
+        message: "authenticated WAN peer trust is no longer active".to_owned(),
+        suggested_action: Some("restore peer trust before starting a new session".to_owned()),
+    }
+}
+
 fn decode_sha256(value: &str) -> Option<[u8; 32]> {
     if value.len() != 64 || !value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
         return None;
@@ -969,6 +1516,7 @@ async fn spawn_generation_zero(
     )
     .map_err(|_| ())?;
     let media = Arc::new(ServiceWanMediaActivationPort::new(&app_state));
+    let failure_app_state = Arc::clone(&app_state);
     let owned_session_id = session_id.clone();
     let task_coordinator = Arc::clone(&coordinator);
     coordinator
@@ -981,20 +1529,30 @@ async fn spawn_generation_zero(
                 )
                 .await;
             if let Err(error) = outcome {
-                let still_live = task_coordinator
-                    .snapshot(&owned_session_id)
-                    .await
-                    .is_ok_and(|state| !state.phase().is_terminal());
-                if still_live {
-                    let _ = task_coordinator
-                        .fail(&owned_session_id, negotiation_failure(error))
-                        .await;
-                }
+                // Always reconcile through the service terminalizer. Some
+                // coordinator commit errors are already terminal, while host
+                // errors remain live for this wrapper to fail; both require the
+                // same authorization-gated public projection.
+                let _ = fail_wan_session(
+                    &failure_app_state,
+                    &owned_session_id,
+                    negotiation_failure(error),
+                )
+                .await;
                 return;
             }
             if let Ok(state) = task_coordinator.snapshot(&owned_session_id).await {
-                let _ =
-                    start_verified_media(task_coordinator.as_ref(), &state, media.as_ref()).await;
+                if start_verified_media(task_coordinator.as_ref(), &state, media.as_ref())
+                    .await
+                    .is_err()
+                {
+                    let _ = fail_wan_session(
+                        &failure_app_state,
+                        &owned_session_id,
+                        WanSessionFailure::Transport,
+                    )
+                    .await;
+                }
             }
         })
         .await

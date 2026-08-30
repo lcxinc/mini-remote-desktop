@@ -19,7 +19,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    sync::{watch, Mutex},
+    sync::{watch, Mutex, OnceCell},
     task::JoinHandle,
 };
 
@@ -121,7 +121,7 @@ pub struct WanSessionCoordinator {
     cleanup: Arc<dyn WanSessionCleanup>,
     clock: Arc<dyn WanSessionClock>,
     workflow: Option<WanSessionWorkflowPorts>,
-    registry: Mutex<Registry>,
+    registry: Arc<Mutex<Registry>>,
 }
 
 impl std::fmt::Debug for WanSessionCoordinator {
@@ -146,7 +146,11 @@ struct SessionEntry {
     cancellation: watch::Sender<bool>,
     task_group: Mutex<SessionTaskGroup>,
     budgets: Mutex<SessionBudgets>,
-    finalized: std::sync::atomic::AtomicBool,
+    cleanup_receipt: OnceCell<CleanupReceipt>,
+}
+
+struct CleanupReceipt {
+    result: watch::Receiver<Option<Result<(), WanSessionCoordinatorError>>>,
 }
 
 #[derive(Default)]
@@ -172,7 +176,7 @@ impl WanSessionCoordinator {
             cleanup,
             clock,
             workflow: None,
-            registry: Mutex::new(Registry::default()),
+            registry: Arc::new(Mutex::new(Registry::default())),
         })
     }
 
@@ -187,7 +191,7 @@ impl WanSessionCoordinator {
             cleanup,
             clock,
             workflow: Some(workflow),
-            registry: Mutex::new(Registry::default()),
+            registry: Arc::new(Mutex::new(Registry::default())),
         })
     }
 
@@ -619,7 +623,7 @@ impl WanSessionCoordinator {
                 cancellation,
                 task_group: Mutex::new(SessionTaskGroup::default()),
                 budgets: Mutex::new(SessionBudgets::default()),
-                finalized: std::sync::atomic::AtomicBool::new(false),
+                cleanup_receipt: OnceCell::new(),
             }),
         );
         registry.active_sessions += 1;
@@ -777,8 +781,10 @@ impl WanSessionCoordinator {
             .await
     }
 
-    /// Expire all sessions whose single absolute deadline has elapsed. The
-    /// service heartbeat should call this even when no signaling arrives.
+    /// Expire all sessions whose effective authorization deadline has elapsed.
+    /// Once a grant is installed, its grant and policy deadlines can only
+    /// shorten the identity deadline. The service heartbeat should call this
+    /// even when no signaling arrives.
     pub async fn expire_due_sessions(&self) -> usize {
         let now = self.clock.now_unix_ms();
         let entries = self
@@ -793,7 +799,17 @@ impl WanSessionCoordinator {
         for (session_id, entry) in entries {
             let due = {
                 let state = entry.state.lock().await;
-                !state.phase().is_terminal() && now >= state.identity().deadline_unix_ms()
+                let deadline = state.grant().map_or_else(
+                    || state.identity().deadline_unix_ms(),
+                    |grant| {
+                        state
+                            .identity()
+                            .deadline_unix_ms()
+                            .min(grant.grant_expires_at_ms())
+                            .min(grant.policy_expires_at_ms())
+                    },
+                );
+                !state.phase().is_terminal() && now >= deadline
             };
             if due {
                 let _ = self
@@ -872,6 +888,27 @@ impl WanSessionCoordinator {
         let entry = self.entry(session_id).await?;
         let state = entry.state.lock().await.clone();
         Ok(state)
+    }
+
+    /// Return a deterministic bounded snapshot of every live or retained
+    /// terminal WAN session. The coordinator remains the workflow source of
+    /// truth; callers may project these states for IPC but must not infer
+    /// authorization from them.
+    pub async fn snapshots(&self) -> Vec<WanSessionState> {
+        let mut entries = self
+            .registry
+            .lock()
+            .await
+            .sessions
+            .iter()
+            .map(|(session_id, entry)| (session_id.clone(), Arc::clone(entry)))
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0 .0.cmp(&right.0 .0));
+        let mut snapshots = Vec::with_capacity(entries.len());
+        for (_, entry) in entries {
+            snapshots.push(entry.state.lock().await.clone());
+        }
+        snapshots
     }
 
     pub async fn spawn_owned_task<F, Fut>(
@@ -1022,11 +1059,52 @@ impl WanSessionCoordinator {
         entry: &Arc<SessionEntry>,
         failed: bool,
     ) -> Result<(), WanSessionCoordinatorError> {
-        use std::sync::atomic::Ordering;
-        if entry.finalized.swap(true, Ordering::AcqRel) {
-            return Ok(());
+        let cleanup = Arc::clone(&self.cleanup);
+        let registry = Arc::clone(&self.registry);
+        let config = self.config;
+        let owned_session_id = session_id.clone();
+        let owned_entry = Arc::clone(entry);
+        let calling_task_id = tokio::task::try_id();
+        let receipt = entry
+            .cleanup_receipt
+            .get_or_init(|| async move {
+                let (result_sender, result) = watch::channel(None);
+                tokio::spawn(async move {
+                    let cleanup_result = Self::run_cleanup(
+                        cleanup,
+                        registry,
+                        config,
+                        owned_session_id,
+                        owned_entry,
+                        failed,
+                        calling_task_id,
+                    )
+                    .await;
+                    result_sender.send_replace(Some(cleanup_result));
+                });
+                CleanupReceipt { result }
+            })
+            .await;
+        let mut result = receipt.result.clone();
+        loop {
+            if let Some(cleanup_result) = result.borrow().as_ref().cloned() {
+                return cleanup_result;
+            }
+            if result.changed().await.is_err() {
+                return Err(WanSessionCoordinatorError::TaskJoinFailed);
+            }
         }
+    }
 
+    async fn run_cleanup(
+        cleanup: Arc<dyn WanSessionCleanup>,
+        registry: Arc<Mutex<Registry>>,
+        config: WanSessionCoordinatorConfig,
+        session_id: SessionId,
+        entry: Arc<SessionEntry>,
+        failed: bool,
+        calling_task_id: Option<tokio::task::Id>,
+    ) -> Result<(), WanSessionCoordinatorError> {
         let handles = {
             let mut group = entry.task_group.lock().await;
             group.closed = true;
@@ -1036,25 +1114,24 @@ impl WanSessionCoordinator {
 
         let mut first_error = None;
         for result in [
-            bounded_cleanup(self.cleanup.freeze_input(session_id)).await,
-            bounded_cleanup(self.cleanup.stop_media(session_id)).await,
-            bounded_cleanup(self.cleanup.close_transport(session_id)).await,
-            bounded_cleanup(self.cleanup.remove_failover(session_id)).await,
-            bounded_cleanup(self.cleanup.clear_signaling(session_id)).await,
-            bounded_cleanup(self.cleanup.close_backend(session_id, failed)).await,
+            bounded_cleanup(cleanup.freeze_input(&session_id)).await,
+            bounded_cleanup(cleanup.stop_media(&session_id)).await,
+            bounded_cleanup(cleanup.close_transport(&session_id)).await,
+            bounded_cleanup(cleanup.remove_failover(&session_id)).await,
+            bounded_cleanup(cleanup.clear_signaling(&session_id)).await,
+            bounded_cleanup(cleanup.close_backend(&session_id, failed)).await,
         ] {
             if first_error.is_none() {
                 first_error = result.err();
             }
         }
-        let current_task_id = tokio::task::try_id();
         for mut handle in handles {
             // A task is allowed to report its own terminal failure. Joining
             // its JoinHandle here would wait for the current future to return
             // from this very finalize call. Dropping that one handle detaches
             // it for the few instructions needed to return; all sibling tasks
             // remain cancellation-owned and joined below.
-            if current_task_id.is_some_and(|task_id| task_id == handle.id()) {
+            if calling_task_id.is_some_and(|task_id| task_id == handle.id()) {
                 continue;
             }
             match tokio::time::timeout(CLEANUP_STEP_TIMEOUT, &mut handle).await {
@@ -1075,10 +1152,10 @@ impl WanSessionCoordinator {
             }
         }
 
-        let mut registry = self.registry.lock().await;
+        let mut registry = registry.lock().await;
         registry.active_sessions = registry.active_sessions.saturating_sub(1);
-        registry.terminal_order.push_back(session_id.clone());
-        while registry.terminal_order.len() > self.config.max_terminal_sessions {
+        registry.terminal_order.push_back(session_id);
+        while registry.terminal_order.len() > config.max_terminal_sessions {
             if let Some(expired) = registry.terminal_order.pop_front() {
                 registry.sessions.remove(&expired);
             }
@@ -1660,7 +1737,7 @@ impl WanSessionCancellation {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum WanSessionCoordinatorError {
     #[error("invalid WAN session coordinator configuration")]
     InvalidConfiguration,
