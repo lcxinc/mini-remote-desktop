@@ -1,3 +1,4 @@
+#[cfg(windows)]
 use std::ffi::{c_int, c_void};
 
 /// Decoded frame data from NVDEC
@@ -231,6 +232,7 @@ pub struct NvdecCapabilityProbe {
     pub wired_reason: String,
 }
 
+#[cfg(any(windows, test))]
 impl NvdecDiagnostics {
     fn record_shared_copy_attempt(&mut self) {
         self.shared_copy_attempts = self.shared_copy_attempts.saturating_add(1);
