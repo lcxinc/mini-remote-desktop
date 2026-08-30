@@ -62,6 +62,10 @@ impl RendererFactory for LinuxRendererFactory {
 }
 
 impl LinuxRenderer {
+    /// Create a renderer using the best available Linux backend.
+    ///
+    /// X11 is preferred when the feature and display are available; otherwise
+    /// the renderer falls back to the software backend.
     pub fn new() -> Result<Self, LinuxRenderError> {
         let backend = Self::select_backend()?;
         let (width, height) = backend.dimensions();
@@ -92,6 +96,7 @@ impl LinuxRenderer {
         Ok(RendererBackend::Software(SoftwareRenderer::new()?))
     }
 
+    /// Return the stable identifier of the active rendering backend.
     pub fn backend_name(&self) -> &'static str {
         match &self.backend {
             RendererBackend::Software(_) => "software",
@@ -112,6 +117,9 @@ impl LinuxRenderer {
         width: usize,
         height: usize,
     ) -> Result<(), LinuxRenderError> {
+        #[cfg(not(feature = "x11"))]
+        let _ = title;
+
         self.width = width.max(1) as u32;
         self.height = height.max(1) as u32;
         match &mut self.backend {
@@ -192,6 +200,7 @@ pub struct SoftwareRenderer {
 }
 
 impl SoftwareRenderer {
+    /// Create an empty software renderer with the default frame dimensions.
     pub fn new() -> Result<Self, LinuxRenderError> {
         Ok(Self {
             buffer: Vec::new(),
@@ -285,6 +294,7 @@ unsafe impl Send for X11Renderer {}
 
 #[cfg(feature = "x11")]
 impl X11Renderer {
+    /// Connect to the current X11 display and initialize its graphics context.
     pub fn new() -> Result<Self, LinuxRenderError> {
         use std::ptr;
         use x11::xlib;
@@ -339,6 +349,7 @@ impl X11Renderer {
         (self.width, self.height)
     }
 
+    /// Create and map an X11 window owned by this renderer.
     pub fn create_window(
         &mut self,
         title: &str,
@@ -698,12 +709,15 @@ impl RendererInstance for X11Renderer {
 /// Linux-specific render errors
 #[derive(Debug, Error)]
 pub enum LinuxRenderError {
+    /// A rendering backend could not be initialized.
     #[error("Failed to initialize Linux renderer: {0}")]
     InitFailed(String),
 
+    /// No supported rendering backend was available.
     #[error("No suitable rendering backend available")]
     NoBackend,
 
+    /// An X11 operation failed.
     #[error("X11 rendering failed: {0}")]
     X11Error(String),
 }

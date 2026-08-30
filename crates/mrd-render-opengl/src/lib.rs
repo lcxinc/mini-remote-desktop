@@ -19,6 +19,7 @@ const SUPPORTED_FORMATS: &[RenderPixelFormat] = &[
     RenderPixelFormat::D3D11SharedP010,
 ];
 
+#[cfg(any(windows, test))]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct TextureCache {
     width: usize,
@@ -27,6 +28,7 @@ struct TextureCache {
     parameters_configured: bool,
 }
 
+#[cfg(any(windows, test))]
 impl TextureCache {
     fn needs_reallocate(
         &self,
@@ -1173,6 +1175,7 @@ fn copy_mapped_texture_rows(
     Ok(data)
 }
 
+#[cfg(windows)]
 fn rgba_to_bgra(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
     let mut bgra = vec![0_u8; width * height * 4];
     for (src, dst) in rgba
@@ -1189,6 +1192,7 @@ fn rgba_to_bgra(rgba: &[u8], width: usize, height: usize) -> Vec<u8> {
     bgra
 }
 
+#[cfg(windows)]
 fn nv12_planes_to_bgra(
     y_plane: &[u8],
     y_pitch: usize,
@@ -1223,6 +1227,7 @@ fn nv12_planes_to_bgra(
     bgra
 }
 
+#[cfg(windows)]
 fn p010_planes_to_bgra(
     y_plane: &[u8],
     y_pitch: usize,
@@ -1261,6 +1266,7 @@ fn p010_planes_to_bgra(
 }
 
 #[inline]
+#[cfg(windows)]
 fn clamp_10bit_to_8bit(value: i32) -> u8 {
     ((value.clamp(0, 1023) + 2) >> 2) as u8
 }
