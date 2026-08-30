@@ -318,6 +318,7 @@ use protocol::{
     LAN_REMOTE_POWER_CONTROL_TRANSPORT, PROTOCOL_VERSION,
 };
 use remote_power::accept_lan_remote_device_power_action;
+#[cfg(any(windows, target_os = "macos", test))]
 use runtime_flags::env_bool_override;
 use service_identity::service_build_id;
 #[cfg(test)]
