@@ -1,4 +1,6 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(any(windows, target_os = "macos", test))]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(super) fn now_us() -> u64 {
     SystemTime::now()
@@ -7,6 +9,7 @@ pub(super) fn now_us() -> u64 {
         .as_micros() as u64
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 pub(super) fn duration_as_millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }

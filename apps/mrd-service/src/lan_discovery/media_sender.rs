@@ -9,9 +9,10 @@ use mrd_proto::SessionId;
 
 use super::media_access_unit::h264_access_unit_is_keyframe;
 pub(crate) use super::media_access_unit::LanAccessUnitCodec;
+#[cfg(any(windows, target_os = "macos"))]
+use super::media_profile::lan_profile_requests_hevc_main10;
 use super::media_profile::{
-    default_media_profile, lan_color_mode_for_profile, lan_profile_requests_hevc_main10,
-    missing_profile_receiver_media_capabilities,
+    default_media_profile, lan_color_mode_for_profile, missing_profile_receiver_media_capabilities,
 };
 use crate::agent_runtime::AgentMediaIngress;
 

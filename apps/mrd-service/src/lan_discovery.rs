@@ -22,7 +22,7 @@ use mrd_pipeline_core::DecodedFrameData;
 #[cfg(test)]
 use mrd_pipeline_core::{CapturedFrame, FramePixelFormat};
 use mrd_proto::{DeviceId, SessionId};
-#[cfg(test)]
+#[cfg(all(test, any(windows, target_os = "macos")))]
 use mrd_render::RenderFrame;
 #[cfg(test)]
 use mrd_transport_quic_quinn::QuicAuReassemblerConfig;
@@ -209,12 +209,12 @@ use media_receiver_decoder::{
     create_lan_receiver_decoder, create_lan_receiver_decoder_with_preference,
     try_decode_h264_keyframe_with_fallback,
 };
+#[cfg(all(test, any(windows, target_os = "macos")))]
+use media_receiver_decoder_candidates::default_lan_receiver_decoder_candidates;
 #[cfg(all(test, target_os = "macos"))]
 use media_receiver_decoder_candidates::preferred_lan_receiver_decoder_candidates_from_preference;
 #[cfg(test)]
-use media_receiver_decoder_candidates::{
-    default_lan_receiver_decoder_candidates, prioritize_lan_receiver_decoder_candidates,
-};
+use media_receiver_decoder_candidates::prioritize_lan_receiver_decoder_candidates;
 use media_receiver_runtime::{
     quic_media_v3_frame_to_legacy_frame, receiver_should_use_local_render_fallback,
     record_lan_decoded_frames,
@@ -338,9 +338,13 @@ const LAN_CAPTURE_PUMP_DRIVES_SENDER_ENV: &str = "MRD_LAN_CAPTURE_PUMP_DRIVES_SE
 const LAN_CAPTURE_PUMP_REPEAT_LATEST_ENV: &str = "MRD_LAN_CAPTURE_PUMP_REPEAT_LATEST";
 #[cfg(target_os = "macos")]
 const LAN_CAPTURE_PUMP_REPEAT_PACING_FPS_ENV: &str = "MRD_LAN_CAPTURE_PUMP_REPEAT_PACING_FPS";
+#[cfg(any(windows, target_os = "macos"))]
 const LAN_RENDER_PACING_ENV: &str = "MRD_LAN_RENDER_PACING";
+#[cfg(any(windows, target_os = "macos"))]
 const LAN_RENDER_MAX_FPS_ENV: &str = "MRD_LAN_RENDER_MAX_FPS";
+#[cfg(any(windows, target_os = "macos"))]
 const LAN_RENDER_QUEUE_CAPACITY_ENV: &str = "MRD_LAN_RENDER_QUEUE_CAPACITY";
+#[cfg(any(windows, target_os = "macos"))]
 const LAN_RENDER_QUEUE_POLICY_ENV: &str = "MRD_LAN_RENDER_QUEUE_POLICY";
 const LAN_MEDIA_PAYLOAD_HASH_ENV: &str = "MRD_LAN_MEDIA_PAYLOAD_HASH";
 #[cfg(windows)]
@@ -374,12 +378,17 @@ const LAN_QUIC_PER_MESSAGE_CONCURRENT_READS: usize = 8;
 const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_BITRATE_MBPS: u32 = 80;
 const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_FPS: u32 = 120;
 const LAN_QUIC_DATAGRAM_SEND_BUDGET: Duration = Duration::from_millis(4);
+#[cfg(any(windows, target_os = "macos"))]
 const LAN_RENDER_PACING_PRECISE_SLEEP_MIN_FPS: u32 = 90;
+#[cfg(any(windows, target_os = "macos"))]
 const LAN_RENDER_PACING_PRECISE_SLEEP_GUARD: Duration = Duration::from_millis(2);
 const LAN_RENDER_PACING_POLL_INTERVAL: Duration = Duration::from_millis(1);
+#[cfg(any(windows, target_os = "macos"))]
 const LAN_RENDER_PACING_PRESENT_LEAD: Duration = Duration::from_micros(250);
 const LAN_RENDER_PACING_DEFAULT_MIN_FPS: u32 = 120;
+#[cfg(any(windows, target_os = "macos"))]
 const LAN_RENDER_PACING_DEFAULT_MAX_PENDING_FRAMES: usize = 3;
+#[cfg(any(windows, target_os = "macos"))]
 const LAN_RENDER_PACING_MAX_PENDING_FRAMES_LIMIT: usize = 8;
 const LAN_MEDIA_KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(20);
 const LAN_REMOTE_SESSION_ACK_TIMEOUT: Duration = Duration::from_secs(10);

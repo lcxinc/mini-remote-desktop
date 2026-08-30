@@ -2,12 +2,17 @@ use mrd_ipc::MediaProfile;
 #[cfg(any(windows, target_os = "macos"))]
 use std::time::Duration;
 
+#[cfg(any(windows, target_os = "macos", test))]
+use super::env_bool_override;
 use super::{
-    env_bool_override, fnv1a64, fnv1a64_media_metadata, LAN_MEDIA_PAYLOAD_HASH_ENV,
-    LAN_RENDER_PACING_DEFAULT_MAX_PENDING_FRAMES, LAN_RENDER_PACING_DEFAULT_MIN_FPS,
-    LAN_RENDER_PACING_ENV, LAN_RENDER_PACING_MAX_PENDING_FRAMES_LIMIT,
-    LAN_RENDER_PACING_PRECISE_SLEEP_GUARD, LAN_RENDER_PACING_PRECISE_SLEEP_MIN_FPS,
-    LAN_RENDER_PACING_PRESENT_LEAD, LAN_RENDER_QUEUE_CAPACITY_ENV, LAN_RENDER_QUEUE_POLICY_ENV,
+    fnv1a64, fnv1a64_media_metadata, LAN_MEDIA_PAYLOAD_HASH_ENV, LAN_RENDER_PACING_DEFAULT_MIN_FPS,
+};
+#[cfg(any(windows, target_os = "macos"))]
+use super::{
+    LAN_RENDER_PACING_DEFAULT_MAX_PENDING_FRAMES, LAN_RENDER_PACING_ENV,
+    LAN_RENDER_PACING_MAX_PENDING_FRAMES_LIMIT, LAN_RENDER_PACING_PRECISE_SLEEP_GUARD,
+    LAN_RENDER_PACING_PRECISE_SLEEP_MIN_FPS, LAN_RENDER_PACING_PRESENT_LEAD,
+    LAN_RENDER_QUEUE_CAPACITY_ENV, LAN_RENDER_QUEUE_POLICY_ENV,
 };
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -251,6 +256,7 @@ pub(crate) fn lan_render_pacing_target_fps_from_values(
     }
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 pub(crate) fn lan_render_pacing_from_env_value(value: Option<&str>) -> Option<bool> {
     env_bool_override(value)
 }

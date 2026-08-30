@@ -103,6 +103,7 @@ fn get_motherboard_serial() -> String {
 }
 
 /// 简单的随机种子生成器（用于回退场景）
+#[cfg(target_os = "windows")]
 fn rand_seed() -> u32 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()

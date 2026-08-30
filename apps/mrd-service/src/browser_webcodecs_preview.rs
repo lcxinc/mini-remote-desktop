@@ -3,20 +3,22 @@ use crate::browser_preview_capture::open_browser_preview_dxgi_capture;
 use bytes::Bytes;
 #[cfg(windows)]
 use mrd_encode_nvenc::{NvencH264Encoder, NvencHevcEncoder};
+#[cfg(windows)]
 use mrd_pipeline_core::{EncodedAccessUnit, VideoCodec};
 #[cfg(windows)]
 use mrd_pipeline_core::{FrameCapture, VideoEncoder};
 use serde::{Deserialize, Serialize};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+#[cfg(windows)]
 use std::{
-    hint,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    thread,
+    hint, thread,
     time::{Duration, Instant},
 };
 use tokio::{sync::mpsc, task::JoinHandle};
+#[cfg(windows)]
 use tracing::info;
 
 const DEFAULT_BROWSER_WEBCODECS_FPS: u32 = 120;
@@ -412,6 +414,7 @@ fn run_browser_webcodecs_capture_sender(
     running.store(false, Ordering::Relaxed);
 }
 
+#[cfg(windows)]
 fn video_codec_for_webcodecs_preview(codec: BrowserWebcodecsPreviewCodec) -> VideoCodec {
     match codec {
         BrowserWebcodecsPreviewCodec::H264 => VideoCodec::H264,
@@ -421,6 +424,7 @@ fn video_codec_for_webcodecs_preview(codec: BrowserWebcodecsPreviewCodec) -> Vid
     }
 }
 
+#[cfg(windows)]
 fn frame_header(
     access_unit: &EncodedAccessUnit,
     sequence: u64,
@@ -457,6 +461,7 @@ fn send_error(
         .and_then(|message| outbound.blocking_send(message).ok());
 }
 
+#[cfg(windows)]
 fn sanitize_target_dimensions(
     width: Option<u32>,
     height: Option<u32>,
@@ -473,6 +478,7 @@ fn sanitize_target_dimensions(
     (target_width.max(2), target_height.max(2))
 }
 
+#[cfg(windows)]
 fn sleep_until_frame_deadline(deadline: Instant) {
     loop {
         let now = Instant::now();

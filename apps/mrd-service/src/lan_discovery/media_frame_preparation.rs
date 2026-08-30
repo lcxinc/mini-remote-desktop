@@ -4,17 +4,17 @@ use mrd_pipeline_core::{CapturedFrame, DecodedFrame, DecodedFrameData, FramePixe
 #[cfg(any(windows, target_os = "macos"))]
 use mrd_render::RenderFrame;
 
-pub(super) fn captured_frame_memory_path(frame: &CapturedFrame) -> &'static str {
+pub(super) fn captured_frame_memory_path(_frame: &CapturedFrame) -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        if frame.macos_cv_pixel_buffer().is_some() {
+        if _frame.macos_cv_pixel_buffer().is_some() {
             return "macos_cv_pixel_buffer";
         }
     }
 
     #[cfg(windows)]
     {
-        if frame.d3d11_shared_bgra().is_some() {
+        if _frame.d3d11_shared_bgra().is_some() {
             return "d3d11_shared_bgra";
         }
     }
@@ -178,6 +178,7 @@ fn nv12_cpu_frame_len(width: usize, height: usize) -> Option<usize> {
     })
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 pub(super) fn nv12_to_rgb24(
     data: &[u8],
     pitch: usize,
@@ -221,6 +222,7 @@ pub(super) fn nv12_to_rgb24(
     Ok(rgb)
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 pub(super) fn i420_to_rgb24(
     data: &[u8],
     y_pitch: usize,
@@ -271,6 +273,7 @@ pub(super) fn i420_to_rgb24(
     Ok(rgb)
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 pub(super) fn decoded_frame_to_rgb24(frame: DecodedFrame) -> Result<(u32, u32, Vec<u8>)> {
     let expected_pixels = frame
         .width

@@ -1085,6 +1085,7 @@ struct PipelineRenderer {
     render_thread: Option<thread::JoinHandle<()>>,
     render_done: Option<mpsc::Receiver<()>>,
     last_error: Arc<Mutex<Option<String>>>,
+    #[cfg(windows)]
     d3d11_device_ptr: Option<usize>,
 }
 
@@ -1095,7 +1096,7 @@ impl PipelineRenderer {
         height: usize,
         target_hwnd: Option<isize>,
         target_display_ref: Option<String>,
-        use_shared_texture_decode: bool,
+        _use_shared_texture_decode: bool,
     ) -> Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(1);
         let last_error = Arc::new(Mutex::new(None));
@@ -1137,7 +1138,7 @@ impl PipelineRenderer {
         }
 
         #[cfg(windows)]
-        if renderer_type == RendererType::Opengl && use_shared_texture_decode {
+        if renderer_type == RendererType::Opengl && _use_shared_texture_decode {
             let renderer = mrd_render_opengl::OpenglRenderer::new_hybrid().map_err(|error| {
                 anyhow::anyhow!("create OpenGL hybrid renderer failed: {error}")
             })?;
@@ -1196,6 +1197,7 @@ impl PipelineRenderer {
             render_thread: Some(render_thread),
             render_done: Some(render_done_rx),
             last_error,
+            #[cfg(windows)]
             d3d11_device_ptr: None,
         })
     }
@@ -1306,7 +1308,7 @@ fn run_renderer_thread(
     width: usize,
     height: usize,
     target_hwnd: Option<isize>,
-    target_display_ref: Option<&str>,
+    _target_display_ref: Option<&str>,
     receiver: mpsc::Receiver<RenderCommand>,
 ) -> Result<()> {
     match renderer_type {
@@ -1318,7 +1320,7 @@ fn run_renderer_thread(
                     None => Some(D3d11TestWindow::new_on_display(
                         width,
                         height,
-                        target_display_ref,
+                        _target_display_ref,
                     )?),
                 };
                 let hwnd = target_hwnd.unwrap_or_else(|| {
@@ -1382,7 +1384,7 @@ fn run_renderer_thread(
                     None => Some(D3d11TestWindow::new_on_display(
                         width,
                         height,
-                        target_display_ref,
+                        _target_display_ref,
                     )?),
                 };
                 let hwnd = target_hwnd.unwrap_or_else(|| {
@@ -4001,6 +4003,7 @@ fn create_vvenc_encoder(
     Ok(Box::new(encoder) as Box<dyn VideoEncoder>)
 }
 
+#[cfg(windows)]
 fn create_hevc_nvdec_decoder(
     use_shared_texture_decode: bool,
     d3d11_device_ptr: Option<*mut core::ffi::c_void>,
@@ -4046,6 +4049,7 @@ fn create_hevc_nvdec_decoder(
     }
 }
 
+#[cfg(windows)]
 fn create_av1_nvdec_decoder(
     use_shared_texture_decode: bool,
     d3d11_device_ptr: Option<*mut core::ffi::c_void>,
@@ -5055,6 +5059,7 @@ fn select_pipeline_dimensions(
     (even_dimension(width), even_dimension(height))
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn parse_window_handle(input: Option<&str>) -> Result<isize> {
     let input = input.ok_or_else(|| anyhow::anyhow!("window capture requires a window handle"))?;
     let trimmed = input.trim().rsplit(':').next().unwrap_or(input).trim();
@@ -5078,6 +5083,7 @@ fn parse_window_handle(input: Option<&str>) -> Result<isize> {
     Ok(value as isize)
 }
 
+#[cfg(any(windows, test))]
 fn parse_display_index(input: Option<&str>) -> Result<u32> {
     let Some(input) = input else {
         return Ok(0);
@@ -6680,6 +6686,7 @@ mod tests {
             render_thread: Some(render_thread),
             render_done: Some(render_done_rx),
             last_error: Arc::new(Mutex::new(None)),
+            #[cfg(windows)]
             d3d11_device_ptr: None,
         };
 
@@ -6704,6 +6711,7 @@ mod tests {
             render_thread: Some(render_thread),
             render_done: Some(render_done_rx),
             last_error: Arc::new(Mutex::new(None)),
+            #[cfg(windows)]
             d3d11_device_ptr: None,
         };
         let (drop_done_tx, drop_done_rx) = mpsc::channel();

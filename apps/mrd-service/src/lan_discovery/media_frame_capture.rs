@@ -19,7 +19,9 @@ use super::{
     WindowsLanCaptureBackend,
 };
 use crate::app_state::AppState;
-use anyhow::{Context, Result};
+#[cfg(any(not(test), windows, target_os = "macos"))]
+use anyhow::Context;
+use anyhow::Result;
 #[cfg(test)]
 use mrd_ipc::CaptureSource;
 #[cfg(not(test))]

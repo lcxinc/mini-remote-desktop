@@ -480,8 +480,8 @@ fn validate_h264_profile(profile: &MediaProfile) -> Result<(), WanMediaActivatio
     if !profile.codec.eq_ignore_ascii_case("h264")
         || profile.width < 2
         || profile.height < 2
-        || profile.width % 2 != 0
-        || profile.height % 2 != 0
+        || !profile.width.is_multiple_of(2)
+        || !profile.height.is_multiple_of(2)
         || profile.fps == 0
         || profile.bitrate_mbps == 0
     {

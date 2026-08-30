@@ -1,5 +1,7 @@
+#[cfg(windows)]
 use anyhow::Result;
 use mrd_ipc::MediaProfile;
+#[cfg(windows)]
 use std::sync::OnceLock;
 
 #[cfg(windows)]

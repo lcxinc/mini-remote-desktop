@@ -1011,6 +1011,7 @@ async fn configure_remote_display_native_surface(
         .lock()
         .unwrap()
         .context_for_label(&app_handle, &label);
+    #[cfg(windows)]
     let desired_control_session = (enabled
         && (pointer_control_enabled || keyboard_control_enabled))
         .then(|| {

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,10 +45,12 @@ pub fn run_render_probe(config: RenderProbeConfig) -> Result<RenderProbeResult> 
     }
 }
 
+#[cfg(windows)]
 fn frame_count(config: &RenderProbeConfig) -> usize {
     config.frames.clamp(1, 600)
 }
 
+#[cfg(any(windows, test))]
 fn summarize_probe(
     config: RenderProbeConfig,
     mut frame_times_ms: Vec<f64>,

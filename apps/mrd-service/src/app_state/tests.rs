@@ -2,7 +2,9 @@ use super::*;
 use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
 use mrd_ipc::{MediaProfile, MediaStageMetrics};
 use mrd_proto::{DeviceId, SessionId};
+#[cfg(any(windows, target_os = "macos"))]
 use mrd_render::RenderFrame;
+#[cfg(any(windows, target_os = "macos"))]
 use std::sync::Arc;
 
 #[test]

@@ -11,6 +11,7 @@ pub struct NativeBackdropStatus {
 }
 
 impl NativeBackdropStatus {
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     pub fn applied(platform: &'static str, effect: &'static str) -> Self {
         Self {
             platform,

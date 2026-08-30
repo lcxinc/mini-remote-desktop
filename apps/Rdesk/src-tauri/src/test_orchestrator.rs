@@ -15,6 +15,7 @@ use mrd_pipeline_core::{
     CapturedFrame, ColorMode, ColorPipeline, DecodedFrame, DecodedFrameData, EncodedAccessUnit,
     FramePixelFormat, VideoEncoder,
 };
+#[cfg(any(windows, target_os = "macos"))]
 use mrd_render::{RenderFrame, RendererFactory};
 use mrd_test_telemetry as telemetry;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -2597,6 +2598,7 @@ impl TestOrchestrator {
         }
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     fn decoded_frame_to_render_frame(frame: &DecodedFrame) -> RenderFrame {
         match &frame.data {
             DecodedFrameData::CpuRgb24(data) => {
@@ -2676,6 +2678,7 @@ impl TestOrchestrator {
         rgb
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     fn cpu_nv12_to_bgra32(nv12: &[u8], width: usize, height: usize, pitch: usize) -> Vec<u8> {
         let mut bgra = vec![0_u8; width * height * 4];
         let uv_base = pitch * height;
@@ -2747,6 +2750,7 @@ impl TestOrchestrator {
         bgra
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     fn cpu_i420_to_bgra32(
         i420: &[u8],
         width: usize,
@@ -2828,6 +2832,7 @@ impl TestOrchestrator {
         bgra
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     fn cpu_p010_to_bgra32(p010: &[u8], width: usize, height: usize, pitch: usize) -> Vec<u8> {
         let mut bgra = vec![0_u8; width * height * 4];
         let uv_base = pitch * height;
@@ -2891,6 +2896,7 @@ impl TestOrchestrator {
         bgra
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     #[inline]
     fn write_limited_bgra_pixel(bgra: &mut [u8], offset: usize, y: u8, u: u8, v: u8) {
         if offset + 3 >= bgra.len() {
@@ -2910,6 +2916,7 @@ impl TestOrchestrator {
         bgra[offset + 3] = 255;
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     #[inline]
     fn write_p010_bgra_pixel(bgra: &mut [u8], offset: usize, y10: u16, u10: u16, v10: u16) {
         if offset + 3 >= bgra.len() {
@@ -2929,6 +2936,7 @@ impl TestOrchestrator {
         bgra[offset + 3] = 255;
     }
 
+    #[cfg(any(windows, target_os = "macos"))]
     #[inline]
     fn clamp_10bit_to_8bit(value: i32) -> u8 {
         (((value.clamp(0, 1023) + 2) >> 2).min(255)) as u8

@@ -1,12 +1,14 @@
 #[cfg(windows)]
 use mrd_capture_dxgi::DxgiSharedTextureCapture;
 
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BrowserPreviewDisplaySource {
     Primary,
     DisplaySourceId(String),
 }
 
+#[cfg(any(windows, test))]
 pub(crate) fn parse_browser_preview_display_source_id(
     source_id: Option<&str>,
 ) -> Result<BrowserPreviewDisplaySource, String> {
