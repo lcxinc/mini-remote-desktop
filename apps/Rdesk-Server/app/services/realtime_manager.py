@@ -7,6 +7,7 @@ from urllib.error import URLError
 from urllib.request import urlopen
 import json
 import subprocess
+import threading
 
 
 EXPECTED_SERVICE = "realtime-server"
@@ -14,17 +15,13 @@ EXPECTED_PROTOCOL_VERSION = 1
 
 
 class ProcessHandle(Protocol):
-    def poll(self) -> int | None:
-        ...
+    def poll(self) -> int | None: ...
 
-    def terminate(self) -> None:
-        ...
+    def terminate(self) -> None: ...
 
-    def wait(self, timeout: float | None = None) -> int:
-        ...
+    def wait(self, timeout: float | None = None) -> int: ...
 
-    def kill(self) -> None:
-        ...
+    def kill(self) -> None: ...
 
 
 SpawnProcess = Callable[[list[str], Path], ProcessHandle]
@@ -56,61 +53,74 @@ class RealtimeSidecarManager:
         self.workdir = Path(workdir)
         self.spawner = spawner or _spawn_process
         self._process: ProcessHandle | None = None
+        self._lifecycle_lock = threading.RLock()
 
     def status(self) -> RealtimeStatus:
-        process = self._process
-        running = bool(process and process.poll() is None)
-        reachable = False
-        health_status = "unreachable"
-
-        try:
-            with urlopen(self.health_url, timeout=1.5) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-                if (
-                    isinstance(payload, dict)
-                    and payload.get("status") == "ok"
-                    and payload.get("service") == EXPECTED_SERVICE
-                    and payload.get("protocol_version") == EXPECTED_PROTOCOL_VERSION
-                ):
-                    reachable = True
-                    health_status = "ok"
-                else:
-                    health_status = "unexpected-service"
-        except (URLError, OSError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError):
+        with self._lifecycle_lock:
+            process = self._process
+            running = bool(process and process.poll() is None)
             reachable = False
+            health_status = "unreachable"
 
-        pid = getattr(process, "pid", None) if running else None
-        return RealtimeStatus(
-            running=running,
-            reachable=reachable,
-            status=health_status,
-            pid=pid,
-        )
+            try:
+                with urlopen(self.health_url, timeout=1.5) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                    if (
+                        isinstance(payload, dict)
+                        and payload.get("status") == "ok"
+                        and payload.get("service") == EXPECTED_SERVICE
+                        and payload.get("protocol_version") == EXPECTED_PROTOCOL_VERSION
+                    ):
+                        reachable = True
+                        health_status = "ok"
+                    else:
+                        health_status = "unexpected-service"
+            except (
+                URLError,
+                OSError,
+                TimeoutError,
+                json.JSONDecodeError,
+                UnicodeDecodeError,
+            ):
+                reachable = False
+
+            pid = getattr(process, "pid", None) if running else None
+            return RealtimeStatus(
+                running=running,
+                reachable=reachable,
+                status=health_status,
+                pid=pid,
+            )
 
     def start(self) -> RealtimeStatus:
-        if self._process and self._process.poll() is None:
-            return self.status()
-        if not self.workdir.is_dir():
-            raise RuntimeError(f"realtime-server workdir does not exist: {self.workdir}")
+        with self._lifecycle_lock:
+            if self._process and self._process.poll() is None:
+                return self.status()
+            if not self.workdir.is_dir():
+                raise RuntimeError(
+                    f"realtime-server workdir does not exist: {self.workdir}"
+                )
 
-        self._process = self.spawner(self.command, self.workdir)
-        return self.status()
+            self._process = self.spawner(self.command, self.workdir)
+            return self.status()
 
     def stop(self) -> RealtimeStatus:
-        if not self._process or self._process.poll() is not None:
+        with self._lifecycle_lock:
+            if not self._process or self._process.poll() is not None:
+                self._process = None
+                return self.status()
+
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait(timeout=3)
+
             self._process = None
             return self.status()
 
-        self._process.terminate()
-        try:
-            self._process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            self._process.kill()
-            self._process.wait(timeout=3)
-
-        self._process = None
-        return self.status()
-
     def restart(self) -> RealtimeStatus:
-        self.stop()
-        return self.start()
+        with self._lifecycle_lock:
+            self.stop()
+            return self.start()

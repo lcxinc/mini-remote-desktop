@@ -2,14 +2,15 @@
 
 提供网络分组的 CRUD 操作和设备管理功能。
 """
+
 from datetime import datetime
 from uuid import uuid4
-from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import Select, select, func, delete
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.security import get_current_user
 from app.db.session import get_db
@@ -29,12 +30,21 @@ from app.schemas.network_group import (
 router = APIRouter(prefix="/network-groups", tags=["network-groups"])
 
 
+def _owned_bound_device_filters(
+    user: User,
+) -> tuple[ColumnElement[bool], ColumnElement[bool], ColumnElement[bool]]:
+    return (
+        Device.tenant_id == user.tenant_id,
+        Device.is_bound.is_(True),
+        Device.bound_user_id == user.id,
+    )
+
+
 async def _ensure_default_group(db: AsyncSession, user: User) -> NetworkGroup:
     """确保用户有默认网络分组，没有则创建"""
     existing = await db.scalar(
         select(NetworkGroup).where(
-            NetworkGroup.user_id == user.id,
-            NetworkGroup.name == "默认网络"
+            NetworkGroup.user_id == user.id, NetworkGroup.name == "默认网络"
         )
     )
     if existing:
@@ -53,7 +63,9 @@ async def _ensure_default_group(db: AsyncSession, user: User) -> NetworkGroup:
     return default_group
 
 
-def _to_out(group: NetworkGroup, device_count: int = 0, online_count: int = 0) -> NetworkGroupOut:
+def _to_out(
+    group: NetworkGroup, device_count: int = 0, online_count: int = 0
+) -> NetworkGroupOut:
     """转换为输出格式"""
     return NetworkGroupOut(
         id=group.id,
@@ -71,7 +83,7 @@ def _to_out(group: NetworkGroup, device_count: int = 0, online_count: int = 0) -
 @router.get("", response_model=list[NetworkGroupOut])
 async def get_network_groups(
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user=Depends(get_current_user),
 ) -> list[NetworkGroupOut]:
     """获取当前用户的所有网络分组"""
     # 确保有默认分组
@@ -89,20 +101,27 @@ async def get_network_groups(
     result = []
     for group in groups:
         # 统计设备数
-        device_count_stmt = select(func.count(DeviceNetworkGroup.id)).where(
-            DeviceNetworkGroup.network_group_id == group.id
+        device_count_stmt = (
+            select(func.count(DeviceNetworkGroup.id))
+            .join(Device, DeviceNetworkGroup.device_id == Device.id)
+            .where(
+                DeviceNetworkGroup.network_group_id == group.id,
+                *_owned_bound_device_filters(current_user),
+            )
         )
         device_count = (await db.scalar(device_count_stmt)) or 0
 
         # 统计在线设备数
-        online_count_stmt = select(func.count(DeviceNetworkGroup.id)).join(
-            Device, DeviceNetworkGroup.device_id == Device.id
-        ).join(
-            DeviceStatus, Device.id == DeviceStatus.device_id
-        ).where(
-            DeviceNetworkGroup.network_group_id == group.id,
-            DeviceNetworkGroup.is_enabled == True,
-            DeviceStatus.status == "online"
+        online_count_stmt = (
+            select(func.count(DeviceNetworkGroup.id))
+            .join(Device, DeviceNetworkGroup.device_id == Device.id)
+            .join(DeviceStatus, Device.id == DeviceStatus.device_id)
+            .where(
+                DeviceNetworkGroup.network_group_id == group.id,
+                DeviceNetworkGroup.is_enabled.is_(True),
+                DeviceStatus.status == "online",
+                *_owned_bound_device_filters(current_user),
+            )
         )
         online_count = (await db.scalar(online_count_stmt)) or 0
 
@@ -115,14 +134,13 @@ async def get_network_groups(
 async def create_network_group(
     data: NetworkGroupCreate,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user=Depends(get_current_user),
 ) -> NetworkGroupOut:
     """创建新的网络分组"""
     # 检查名称是否重复
     existing = await db.scalar(
         select(NetworkGroup).where(
-            NetworkGroup.user_id == current_user.id,
-            NetworkGroup.name == data.name
+            NetworkGroup.user_id == current_user.id, NetworkGroup.name == data.name
         )
     )
     if existing:
@@ -146,33 +164,39 @@ async def create_network_group(
 async def get_network_group(
     group_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user=Depends(get_current_user),
 ) -> NetworkGroupOut:
     """获取分组详情"""
     group = await db.scalar(
         select(NetworkGroup).where(
-            NetworkGroup.id == group_id,
-            NetworkGroup.user_id == current_user.id
+            NetworkGroup.id == group_id, NetworkGroup.user_id == current_user.id
         )
     )
     if not group:
         raise HTTPException(status_code=404, detail="分组不存在")
 
     # 统计设备数
-    device_count_stmt = select(func.count(DeviceNetworkGroup.id)).where(
-        DeviceNetworkGroup.network_group_id == group_id
+    device_count_stmt = (
+        select(func.count(DeviceNetworkGroup.id))
+        .join(Device, DeviceNetworkGroup.device_id == Device.id)
+        .where(
+            DeviceNetworkGroup.network_group_id == group_id,
+            *_owned_bound_device_filters(current_user),
+        )
     )
     device_count = (await db.scalar(device_count_stmt)) or 0
 
     # 统计在线设备数
-    online_count_stmt = select(func.count(DeviceNetworkGroup.id)).join(
-        Device, DeviceNetworkGroup.device_id == Device.id
-    ).join(
-        DeviceStatus, Device.id == DeviceStatus.device_id
-    ).where(
-        DeviceNetworkGroup.network_group_id == group_id,
-        DeviceNetworkGroup.is_enabled == True,
-        DeviceStatus.status == "online"
+    online_count_stmt = (
+        select(func.count(DeviceNetworkGroup.id))
+        .join(Device, DeviceNetworkGroup.device_id == Device.id)
+        .join(DeviceStatus, Device.id == DeviceStatus.device_id)
+        .where(
+            DeviceNetworkGroup.network_group_id == group_id,
+            DeviceNetworkGroup.is_enabled.is_(True),
+            DeviceStatus.status == "online",
+            *_owned_bound_device_filters(current_user),
+        )
     )
     online_count = (await db.scalar(online_count_stmt)) or 0
 
@@ -184,13 +208,12 @@ async def update_network_group(
     group_id: str,
     data: NetworkGroupUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user=Depends(get_current_user),
 ) -> NetworkGroupOut:
     """更新网络分组信息"""
     group = await db.scalar(
         select(NetworkGroup).where(
-            NetworkGroup.id == group_id,
-            NetworkGroup.user_id == current_user.id
+            NetworkGroup.id == group_id, NetworkGroup.user_id == current_user.id
         )
     )
     if not group:
@@ -202,7 +225,7 @@ async def update_network_group(
             select(NetworkGroup).where(
                 NetworkGroup.user_id == current_user.id,
                 NetworkGroup.name == data.name,
-                NetworkGroup.id != group_id
+                NetworkGroup.id != group_id,
             )
         )
         if existing:
@@ -221,19 +244,26 @@ async def update_network_group(
     await db.refresh(group)
 
     # 重新统计
-    device_count_stmt = select(func.count(DeviceNetworkGroup.id)).where(
-        DeviceNetworkGroup.network_group_id == group_id
+    device_count_stmt = (
+        select(func.count(DeviceNetworkGroup.id))
+        .join(Device, DeviceNetworkGroup.device_id == Device.id)
+        .where(
+            DeviceNetworkGroup.network_group_id == group_id,
+            *_owned_bound_device_filters(current_user),
+        )
     )
     device_count = (await db.scalar(device_count_stmt)) or 0
 
-    online_count_stmt = select(func.count(DeviceNetworkGroup.id)).join(
-        Device, DeviceNetworkGroup.device_id == Device.id
-    ).join(
-        DeviceStatus, Device.id == DeviceStatus.device_id
-    ).where(
-        DeviceNetworkGroup.network_group_id == group_id,
-        DeviceNetworkGroup.is_enabled == True,
-        DeviceStatus.status == "online"
+    online_count_stmt = (
+        select(func.count(DeviceNetworkGroup.id))
+        .join(Device, DeviceNetworkGroup.device_id == Device.id)
+        .join(DeviceStatus, Device.id == DeviceStatus.device_id)
+        .where(
+            DeviceNetworkGroup.network_group_id == group_id,
+            DeviceNetworkGroup.is_enabled.is_(True),
+            DeviceStatus.status == "online",
+            *_owned_bound_device_filters(current_user),
+        )
     )
     online_count = (await db.scalar(online_count_stmt)) or 0
 
@@ -244,7 +274,7 @@ async def update_network_group(
 async def delete_network_group(
     group_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user=Depends(get_current_user),
 ) -> None:
     """删除网络分组
 
@@ -252,8 +282,7 @@ async def delete_network_group(
     """
     group = await db.scalar(
         select(NetworkGroup).where(
-            NetworkGroup.id == group_id,
-            NetworkGroup.user_id == current_user.id
+            NetworkGroup.id == group_id, NetworkGroup.user_id == current_user.id
         )
     )
     if not group:
@@ -279,14 +308,13 @@ async def delete_network_group(
 async def get_group_devices(
     group_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user=Depends(get_current_user),
 ) -> list[DeviceInGroupOut]:
     """获取分组内的设备列表"""
     # 验证分组归属
     group = await db.scalar(
         select(NetworkGroup).where(
-            NetworkGroup.id == group_id,
-            NetworkGroup.user_id == current_user.id
+            NetworkGroup.id == group_id, NetworkGroup.user_id == current_user.id
         )
     )
     if not group:
@@ -295,10 +323,12 @@ async def get_group_devices(
     # 获取分组内的设备
     associations = await db.scalars(
         select(DeviceNetworkGroup)
-        .options(
-            selectinload(DeviceNetworkGroup.device).selectinload(Device.status)
+        .join(Device, DeviceNetworkGroup.device_id == Device.id)
+        .options(selectinload(DeviceNetworkGroup.device).selectinload(Device.status))
+        .where(
+            DeviceNetworkGroup.network_group_id == group_id,
+            *_owned_bound_device_filters(current_user),
         )
-        .where(DeviceNetworkGroup.network_group_id == group_id)
     )
     associations_list = list(associations.all())
 
@@ -307,14 +337,16 @@ async def get_group_devices(
         if assoc.device:
             device = assoc.device
             status = device.status.status if device.status else "offline"
-            result.append(DeviceInGroupOut(
-                id=assoc.id,
-                device_id=device.device_id,
-                name=device.name,
-                status=status,
-                is_enabled=assoc.is_enabled,
-                ip=device.ip,
-            ))
+            result.append(
+                DeviceInGroupOut(
+                    id=assoc.id,
+                    device_id=device.device_id,
+                    name=device.name,
+                    status=status,
+                    is_enabled=assoc.is_enabled,
+                    ip=device.ip,
+                )
+            )
 
     return result
 
@@ -324,7 +356,7 @@ async def add_devices_to_group(
     group_id: str,
     data: AddDevicesRequest,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user=Depends(get_current_user),
 ) -> None:
     """添加设备到分组
 
@@ -333,17 +365,22 @@ async def add_devices_to_group(
     # 验证分组归属
     group = await db.scalar(
         select(NetworkGroup).where(
-            NetworkGroup.id == group_id,
-            NetworkGroup.user_id == current_user.id
+            NetworkGroup.id == group_id, NetworkGroup.user_id == current_user.id
         )
     )
     if not group:
         raise HTTPException(status_code=404, detail="分组不存在")
 
-    for device_id_str in data.device_ids:
+    for device_id_str in sorted(set(data.device_ids)):
         # 检查设备是否存在
         device = await db.scalar(
-            select(Device).where(Device.device_id == device_id_str)
+            select(Device)
+            .where(
+                Device.device_id == device_id_str,
+                *_owned_bound_device_filters(current_user),
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         if not device:
             continue
@@ -352,7 +389,7 @@ async def add_devices_to_group(
         existing = await db.scalar(
             select(DeviceNetworkGroup).where(
                 DeviceNetworkGroup.network_group_id == group_id,
-                DeviceNetworkGroup.device_id == device.id
+                DeviceNetworkGroup.device_id == device.id,
             )
         )
         if existing:
@@ -375,14 +412,13 @@ async def remove_device_from_group(
     group_id: str,
     device_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user=Depends(get_current_user),
 ) -> None:
     """从分组移除设备"""
     # 验证分组归属
     group = await db.scalar(
         select(NetworkGroup).where(
-            NetworkGroup.id == group_id,
-            NetworkGroup.user_id == current_user.id
+            NetworkGroup.id == group_id, NetworkGroup.user_id == current_user.id
         )
     )
     if not group:
@@ -390,7 +426,13 @@ async def remove_device_from_group(
 
     # 查找设备
     device = await db.scalar(
-        select(Device).where(Device.device_id == device_id)
+        select(Device)
+        .where(
+            Device.device_id == device_id,
+            *_owned_bound_device_filters(current_user),
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if not device:
         raise HTTPException(status_code=404, detail="设备不存在")
@@ -399,7 +441,7 @@ async def remove_device_from_group(
     await db.execute(
         delete(DeviceNetworkGroup).where(
             DeviceNetworkGroup.network_group_id == group_id,
-            DeviceNetworkGroup.device_id == device.id
+            DeviceNetworkGroup.device_id == device.id,
         )
     )
     await db.commit()
@@ -411,14 +453,13 @@ async def set_device_enabled(
     device_id: str,
     data: SetDeviceEnabledRequest,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user=Depends(get_current_user),
 ) -> None:
     """设置设备在分组中的启用状态"""
     # 验证分组归属
     group = await db.scalar(
         select(NetworkGroup).where(
-            NetworkGroup.id == group_id,
-            NetworkGroup.user_id == current_user.id
+            NetworkGroup.id == group_id, NetworkGroup.user_id == current_user.id
         )
     )
     if not group:
@@ -426,7 +467,13 @@ async def set_device_enabled(
 
     # 查找设备
     device = await db.scalar(
-        select(Device).where(Device.device_id == device_id)
+        select(Device)
+        .where(
+            Device.device_id == device_id,
+            *_owned_bound_device_filters(current_user),
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if not device:
         raise HTTPException(status_code=404, detail="设备不存在")
@@ -435,7 +482,7 @@ async def set_device_enabled(
     assoc = await db.scalar(
         select(DeviceNetworkGroup).where(
             DeviceNetworkGroup.network_group_id == group_id,
-            DeviceNetworkGroup.device_id == device.id
+            DeviceNetworkGroup.device_id == device.id,
         )
     )
     if not assoc:
