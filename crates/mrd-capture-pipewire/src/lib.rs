@@ -16,7 +16,9 @@ use std::io::Read;
 use std::os::fd::{AsRawFd, OwnedFd};
 #[cfg(feature = "pipewire")]
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::SystemTime;
+#[cfg(feature = "pipewire")]
+use std::time::{Duration, Instant};
 
 const DEFAULT_WIDTH: u32 = 1920;
 const DEFAULT_HEIGHT: u32 = 1080;
@@ -47,74 +49,70 @@ impl CaptureBackend {
             CaptureBackend::Fallback(capture) => capture.dimensions(),
         }
     }
-
-    fn start(&mut self) -> Result<(), PipewireCaptureError> {
-        match self {
-            #[cfg(feature = "x11")]
-            CaptureBackend::X11(capture) => capture
-                .start()
-                .map_err(|e| PipewireCaptureError::X11Error(e.to_string())),
-            #[cfg(feature = "pipewire")]
-            CaptureBackend::PipeWire(_) => Ok(()),
-            CaptureBackend::Fallback(_) => Ok(()),
-        }
-    }
-
-    async fn start_async(&mut self) -> Result<(), PipewireCaptureError> {
-        match self {
-            #[cfg(feature = "x11")]
-            CaptureBackend::X11(capture) => capture
-                .start()
-                .map_err(|e| PipewireCaptureError::X11Error(e.to_string())),
-            #[cfg(feature = "pipewire")]
-            CaptureBackend::PipeWire(capture) => capture.start().await,
-            CaptureBackend::Fallback(_) => Ok(()),
-        }
-    }
 }
 
+/// A display that can be selected as a Linux screen-capture source.
 #[derive(Debug, Clone)]
 pub struct PipewireDisplayTarget {
+    /// Stable backend-local display identifier.
     pub id: u32,
+    /// Human-readable display name.
     pub name: String,
+    /// Display width in physical pixels.
     pub width: u32,
+    /// Display height in physical pixels.
     pub height: u32,
+    /// Whether this is the primary display reported by the backend.
     pub is_primary: bool,
 }
 
+/// A top-level window that can be selected as a Linux capture source.
 #[derive(Debug, Clone)]
 pub struct PipewireWindowTarget {
+    /// Stable backend-local window identifier.
     pub id: u32,
+    /// Current window title.
     pub title: String,
+    /// Name of the application that owns the window.
     pub app_name: String,
+    /// Window width in physical pixels.
     pub width: u32,
+    /// Window height in physical pixels.
     pub height: u32,
 }
 
 /// Errors specific to Linux capture
 #[derive(Debug, thiserror::Error)]
 pub enum PipewireCaptureError {
+    /// The selected capture backend could not be initialized.
     #[error("Linux capture initialization failed: {0}")]
     InitFailed(String),
 
+    /// No usable display or window source was available.
     #[error("No screen capture source available")]
     NoSourceAvailable,
 
+    /// The desktop portal denied the capture request.
     #[error("Screen capture permission denied by desktop portal")]
     PermissionDenied,
 
+    /// A capture operation did not complete before its deadline.
     #[error("Frame capture timeout")]
     Timeout,
 
+    /// The requested capture mechanism is unavailable in this build or environment.
     #[error("Platform support not available: {0}")]
     PlatformNotAvailable(String),
 
+    /// The X11 backend reported an error.
     #[error("X11 error: {0}")]
     X11Error(String),
 
+    /// The PipeWire or GStreamer backend reported an error.
     #[error("PipeWire error: {0}")]
     PipeWireError(String),
 
+    /// The desktop portal request failed.
     #[error("Portal request failed: {0}")]
     PortalError(String),
 }
@@ -395,7 +393,6 @@ pub struct X11ScreenCapture {
     width: u32,
     height: u32,
     x_image: Option<*mut x11::xlib::XImage>,
-    screen: i32,
 }
 
 #[cfg(feature = "x11")]
@@ -403,6 +400,7 @@ unsafe impl Send for X11ScreenCapture {}
 
 #[cfg(feature = "x11")]
 impl X11ScreenCapture {
+    /// Opens the current X11 display and selects its root window for capture.
     pub fn new() -> Result<Self, PipewireCaptureError> {
         use x11::xlib;
 
@@ -424,7 +422,6 @@ impl X11ScreenCapture {
                 width: (xlib::XDisplayWidth)(display, screen) as u32,
                 height: (xlib::XDisplayHeight)(display, screen) as u32,
                 x_image: None,
-                screen,
             };
 
             Ok(capture)
@@ -498,6 +495,7 @@ impl X11ScreenCapture {
         }
     }
 
+    /// Lists displays exposed by the current X11 server.
     pub fn get_display_targets() -> Result<Vec<PipewireDisplayTarget>, PipewireCaptureError> {
         use x11::xlib;
 
@@ -530,6 +528,7 @@ impl X11ScreenCapture {
         }
     }
 
+    /// Lists capturable X11 windows.
     pub fn get_window_targets() -> Result<Vec<PipewireWindowTarget>, PipewireCaptureError> {
         Ok(vec![])
     }
@@ -550,6 +549,7 @@ pub struct PipeWireScreenCapture {
 
 #[cfg(feature = "pipewire")]
 impl PipeWireScreenCapture {
+    /// Creates an inactive PipeWire capture instance.
     pub fn new() -> Result<Self, PipewireCaptureError> {
         Ok(Self {
             width: DEFAULT_WIDTH,
@@ -573,7 +573,7 @@ impl PipeWireScreenCapture {
             self.portal_fd = Some(portal.fd);
             self.start_gstreamer_pipewire_reader()?;
             self.active = true;
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(not(feature = "portal"))]
@@ -623,6 +623,7 @@ impl PipeWireScreenCapture {
         })
     }
 
+    /// Lists display sources available through PipeWire.
     pub fn get_display_targets() -> Result<Vec<PipewireDisplayTarget>, PipewireCaptureError> {
         // Query PipeWire for screen outputs
         Ok(vec![PipewireDisplayTarget {
@@ -634,6 +635,7 @@ impl PipeWireScreenCapture {
         }])
     }
 
+    /// Lists window sources available through PipeWire.
     pub fn get_window_targets() -> Result<Vec<PipewireWindowTarget>, PipewireCaptureError> {
         // Query PipeWire for windows
         Ok(vec![])
