@@ -1006,6 +1006,7 @@ async fn configure_remote_display_native_surface(
     let app_handle = window.app_handle().clone();
     let pointer_control_enabled = pointer_control_enabled.unwrap_or(false);
     let keyboard_control_enabled = keyboard_control_enabled.unwrap_or(false);
+    #[cfg(windows)]
     let initial_context = state
         .render_window_registry
         .lock()
