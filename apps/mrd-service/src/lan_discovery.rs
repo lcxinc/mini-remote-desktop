@@ -165,8 +165,10 @@ use media_error_policy::{
 #[cfg(target_os = "macos")]
 use media_frame_capture::macos_lan_capture_stream_fps;
 use media_frame_capture::{
-    capture_source_kind_from_id, create_lan_frame_capture, selected_capture_source_id,
-    LanSenderFrameCapture,
+    capture_source_kind_from_id, create_lan_frame_capture, LanSenderFrameCapture,
+};
+pub(crate) use media_frame_capture::{
+    create_software_frame_capture, selected_capture_source_id, LanFrameCapture,
 };
 #[cfg(test)]
 use media_frame_capture::{synthetic_capture_source, TEST_SYNTHETIC_CAPTURE_SOURCE_ID};
@@ -176,8 +178,9 @@ use media_frame_capture::{MacosPumpedLanFrameCapture, MacosPumpedLanFrameState};
 use media_frame_preparation::decoded_frame_to_rgb24;
 #[cfg(test)]
 use media_frame_preparation::window_h264_capture_dimensions;
-use media_frame_preparation::{
-    captured_frame_memory_path, h264_target_dimensions, prepare_frame_for_h264,
+use media_frame_preparation::{captured_frame_memory_path, h264_target_dimensions};
+pub(crate) use media_frame_preparation::{
+    decoded_frame_format_stage, decoded_frame_pixel_format, prepare_frame_for_h264,
 };
 use media_keyframe_request::{
     decode_lan_keyframe_request_datagram, encode_lan_keyframe_request_datagram,
@@ -237,6 +240,8 @@ use media_render_policy::{
     render_pacing_precise_sleep_guard, render_profile_requests_high_resolution_timer,
     should_interrupt_render_pacing_sleep,
 };
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) use media_render_worker::render_lan_decoded_frame;
 #[cfg(all(test, target_os = "macos"))]
 use media_render_worker::upload_lan_render_frame;
 #[cfg(all(test, any(windows, target_os = "macos")))]

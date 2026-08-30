@@ -4,6 +4,7 @@ pub mod backend;
 pub mod config;
 pub mod coordinator;
 pub mod media;
+mod media_runtime;
 pub mod model;
 pub mod service;
 pub mod signaling;

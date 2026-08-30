@@ -221,6 +221,14 @@ impl MacosScreenCapture {
         }
     }
 
+    /// Force CPU-backed frames even when direct CVPixelBuffer output is
+    /// enabled globally. Software encoders use this per-capture override.
+    pub fn force_cpu_output(&mut self) {
+        if let Some(capture) = self.screencapturekit.as_mut() {
+            capture.set_direct_cv_pixel_buffer(false);
+        }
+    }
+
     pub fn capture_frame_with_timeout(
         &mut self,
         timeout: Duration,
@@ -248,7 +256,10 @@ impl MacosScreenCapture {
 impl FrameCapture for MacosScreenCapture {
     fn output_memory_kind(&self) -> FrameMemoryKind {
         if self.active_backend == MacosCaptureBackend::ScreenCaptureKit
-            && macos_capture_direct_cv_pixel_buffer_enabled()
+            && self
+                .screencapturekit
+                .as_ref()
+                .is_some_and(|capture| capture.direct_cv_pixel_buffer)
         {
             return FrameMemoryKind::MacosCvPixelBuffer;
         }
@@ -632,6 +643,7 @@ struct ScreenCaptureKitCapture {
     height: usize,
     fps: u32,
     queue_depth: u32,
+    direct_cv_pixel_buffer: bool,
     stream: Option<SCStream>,
     queue: Option<DispatchQueue>,
     shared: Arc<(Mutex<ScreenCaptureKitState>, Condvar)>,
@@ -678,6 +690,7 @@ impl ScreenCaptureKitCapture {
             height,
             fps: env_u32("MRD_MACOS_CAPTURE_FPS", DEFAULT_STREAM_FPS).clamp(1, 240),
             queue_depth: env_u32("MRD_MACOS_CAPTURE_QUEUE_DEPTH", DEFAULT_QUEUE_DEPTH).clamp(2, 8),
+            direct_cv_pixel_buffer: macos_capture_direct_cv_pixel_buffer_enabled(),
             stream: None,
             queue: None,
             shared: Arc::new((
@@ -720,6 +733,15 @@ impl ScreenCaptureKitCapture {
         }
 
         self.fps = fps;
+        self.stop_stream();
+        self.reset_state();
+    }
+
+    fn set_direct_cv_pixel_buffer(&mut self, enabled: bool) {
+        if self.direct_cv_pixel_buffer == enabled {
+            return;
+        }
+        self.direct_cv_pixel_buffer = enabled;
         self.stop_stream();
         self.reset_state();
     }
@@ -804,9 +826,12 @@ impl ScreenCaptureKitCapture {
             DispatchQoS::UserInteractive,
         );
         let shared = self.shared.clone();
+        let direct_cv_pixel_buffer = self.direct_cv_pixel_buffer;
         let mut stream = SCStream::new(&filter, &config);
         let handler_id = stream.add_output_handler_with_queue(
-            move |sample, output_type| handle_screencapturekit_sample(&shared, sample, output_type),
+            move |sample, output_type| {
+                handle_screencapturekit_sample(&shared, sample, output_type, direct_cv_pixel_buffer)
+            },
             SCStreamOutputType::Screen,
             Some(&queue),
         );
@@ -885,6 +910,7 @@ fn handle_screencapturekit_sample(
     shared: &Arc<(Mutex<ScreenCaptureKitState>, Condvar)>,
     sample: CMSampleBuffer,
     output_type: SCStreamOutputType,
+    direct_cv_pixel_buffer: bool,
 ) {
     if output_type != SCStreamOutputType::Screen {
         return;
@@ -913,7 +939,7 @@ fn handle_screencapturekit_sample(
         return;
     }
 
-    if pixel_format == NV12_VIDEO_RANGE_FOURCC && macos_capture_direct_cv_pixel_buffer_enabled() {
+    if pixel_format == NV12_VIDEO_RANGE_FOURCC && direct_cv_pixel_buffer {
         let width = buffer.width();
         let height = buffer.height();
         let timestamp_us = match now_us() {

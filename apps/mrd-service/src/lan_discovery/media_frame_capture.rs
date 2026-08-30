@@ -47,7 +47,7 @@ use std::time::Duration;
 #[cfg(target_os = "macos")]
 use std::time::Instant as StdInstant;
 
-pub(super) enum LanFrameCapture {
+pub(crate) enum LanFrameCapture {
     #[cfg(windows)]
     DxgiShared(mrd_capture_dxgi::DxgiSharedTextureCapture),
     #[cfg(windows)]
@@ -66,7 +66,7 @@ pub(super) enum LanFrameCapture {
 unsafe impl Send for LanFrameCapture {}
 
 impl LanFrameCapture {
-    fn capture_frame(&mut self) -> Result<CapturedFrame> {
+    pub(crate) fn capture_frame(&mut self) -> Result<CapturedFrame> {
         match self {
             #[cfg(windows)]
             LanFrameCapture::DxgiShared(capture) => {
@@ -473,7 +473,7 @@ impl MacosSyntheticCvPixelBufferCapture {
 
 #[cfg(test)]
 #[derive(Debug)]
-pub(super) struct SyntheticFrameCapture {
+pub(crate) struct SyntheticFrameCapture {
     width: usize,
     height: usize,
     frame_index: u64,
@@ -537,7 +537,7 @@ pub(super) fn synthetic_capture_source() -> CaptureSource {
     }
 }
 
-pub(super) async fn selected_capture_source_id(
+pub(crate) async fn selected_capture_source_id(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
 ) -> Result<String> {
@@ -604,6 +604,44 @@ pub(super) async fn create_lan_frame_capture(
 
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
+        anyhow::bail!(
+            "remote desktop capture is currently only available on Windows, macOS, and Linux"
+        )
+    }
+}
+
+/// Build a CPU-backed capture path for software encoders. This deliberately
+/// bypasses platform shared-texture selection used by the LAN hardware path.
+pub(crate) async fn create_software_frame_capture(
+    source_id: &str,
+    profile: &MediaProfile,
+) -> Result<LanFrameCapture> {
+    #[cfg(windows)]
+    {
+        let _ = profile;
+        create_windows_lan_winrt_capture(source_id)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut capture = create_macos_lan_frame_capture(source_id, profile)?;
+        if let LanFrameCapture::Macos(capture) = &mut capture {
+            capture.force_cpu_output();
+        }
+        Ok(capture)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = profile;
+        Ok(LanFrameCapture::Pipewire(
+            crate::capture_source::create_frame_capture_async(source_id).await?,
+        ))
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (source_id, profile);
         anyhow::bail!(
             "remote desktop capture is currently only available on Windows, macOS, and Linux"
         )

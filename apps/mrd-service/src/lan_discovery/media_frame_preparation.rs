@@ -22,7 +22,7 @@ pub(super) fn captured_frame_memory_path(frame: &CapturedFrame) -> &'static str 
     "cpu"
 }
 
-pub(super) fn prepare_frame_for_h264(
+pub(crate) fn prepare_frame_for_h264(
     frame: CapturedFrame,
     profile: &MediaProfile,
 ) -> Result<CapturedFrame> {
@@ -313,7 +313,7 @@ pub(super) fn decoded_frame_to_rgb24(frame: DecodedFrame) -> Result<(u32, u32, V
     Ok((frame.width as u32, frame.height as u32, rgb))
 }
 
-pub(super) fn decoded_frame_pixel_format(frame: &DecodedFrame) -> &'static str {
+pub(crate) fn decoded_frame_pixel_format(frame: &DecodedFrame) -> &'static str {
     match &frame.data {
         DecodedFrameData::CpuRgb24(_) => "cpu_rgb24",
         DecodedFrameData::CpuBgra32(_) => "cpu_bgra32",
@@ -327,7 +327,7 @@ pub(super) fn decoded_frame_pixel_format(frame: &DecodedFrame) -> &'static str {
     }
 }
 
-pub(super) fn decoded_frame_format_stage(frame: &DecodedFrame) -> &'static str {
+pub(crate) fn decoded_frame_format_stage(frame: &DecodedFrame) -> &'static str {
     match &frame.data {
         DecodedFrameData::CpuRgb24(_) => "receiver.format.cpu_rgb24",
         DecodedFrameData::CpuBgra32(_) => "receiver.format.cpu_bgra32",

@@ -27,7 +27,8 @@ use mrd_service::{
         media::{
             enable_input_after_control_evidence, select_route, start_verified_media,
             ControlEvidenceBarrier, LanDiscoveryEvidence, WanInputActivationPort,
-            WanMediaActivationError, WanMediaActivationPort, WanMediaAuthority, WanRouteSelection,
+            WanMediaActivationError, WanMediaActivationPort, WanMediaActivationReceipt,
+            WanMediaAuthority, WanRouteSelection,
         },
         model::{
             GrantBinding, RelayAccessBinding, RelayRouteProof, WanSessionEvent, WanSessionFailure,
@@ -1728,8 +1729,8 @@ struct RecordingMediaPort {
 impl WanMediaActivationPort for RecordingMediaPort {
     async fn start_target_capture_send(
         &self,
-        _authority: &WanMediaAuthority,
-    ) -> Result<(), WanMediaActivationError> {
+        authority: &WanMediaAuthority,
+    ) -> Result<WanMediaActivationReceipt, WanMediaActivationError> {
         self.calls
             .lock()
             .unwrap()
@@ -1737,14 +1738,14 @@ impl WanMediaActivationPort for RecordingMediaPort {
         if self.fail {
             Err(WanMediaActivationError::StartupFailed)
         } else {
-            Ok(())
+            Ok(WanMediaActivationReceipt::ready_for_test(authority, 1))
         }
     }
 
     async fn start_controller_receive_render(
         &self,
-        _authority: &WanMediaAuthority,
-    ) -> Result<(), WanMediaActivationError> {
+        authority: &WanMediaAuthority,
+    ) -> Result<WanMediaActivationReceipt, WanMediaActivationError> {
         self.calls
             .lock()
             .unwrap()
@@ -1752,7 +1753,7 @@ impl WanMediaActivationPort for RecordingMediaPort {
         if self.fail {
             Err(WanMediaActivationError::StartupFailed)
         } else {
-            Ok(())
+            Ok(WanMediaActivationReceipt::ready_for_test(authority, 1))
         }
     }
 

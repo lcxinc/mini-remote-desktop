@@ -45,7 +45,9 @@ pub use file_transfer_registry::FileTransferRegistry;
 pub use lan_identity::default_lan_device_identity;
 #[cfg(test)]
 pub(crate) use lan_identity::lan_device_identity_from;
-pub use media_pipeline_registry::MediaPipelineRegistry;
+pub use media_pipeline_registry::{
+    MediaPipelineRegistry, WanMediaRuntimeRole, WanMediaRuntimeSnapshot,
+};
 pub use media_profile_registry::MediaProfileRegistry;
 #[cfg(any(windows, target_os = "macos"))]
 pub use media_render_queue_registry::{

@@ -13,8 +13,11 @@ use async_trait::async_trait;
 use mrd_ipc::{LanDiscoverySnapshot, MediaProfile, RemoteRoutePreference};
 use mrd_proto::{DeviceId, SessionId};
 use mrd_signal_proto::{WanMediaProfileV3, WanPermissionScopeV3};
-use std::fmt;
+use std::{fmt, time::Duration};
 use thiserror::Error;
+use tokio::sync::oneshot;
+
+const WAN_MEDIA_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum age accepted for an already cached LAN discovery record when the
 /// caller asks for `Auto`.  Auto never probes or waits for a new announcement.
@@ -319,6 +322,91 @@ impl WanMediaPlan {
     }
 }
 
+/// First real codec/transport boundary crossed by one exact WAN media runtime.
+#[derive(Clone, PartialEq, Eq)]
+pub struct WanMediaReadyEvidence {
+    session_id: SessionId,
+    generation: u64,
+    role: WanSessionRole,
+    sequence: u64,
+}
+
+impl fmt::Debug for WanMediaReadyEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WanMediaReadyEvidence")
+            .field("session_id", &"OPAQUE")
+            .field("generation", &self.generation)
+            .field("role", &self.role)
+            .field("sequence", &self.sequence)
+            .finish()
+    }
+}
+
+impl WanMediaReadyEvidence {
+    pub(crate) fn from_authority(authority: &WanMediaAuthority, sequence: u64) -> Self {
+        Self {
+            session_id: authority.session_id().clone(),
+            generation: authority.generation(),
+            role: authority.role(),
+            sequence,
+        }
+    }
+
+    fn matches(&self, authority: &WanMediaAuthority) -> bool {
+        self.session_id == *authority.session_id()
+            && self.generation == authority.generation()
+            && self.role == authority.role()
+    }
+}
+
+pub(crate) type WanMediaReadySender =
+    oneshot::Sender<Result<WanMediaReadyEvidence, WanMediaActivationError>>;
+
+/// Single-use receipt proving that an owned media task crossed its first real
+/// capture/send or receive/decode boundary.
+pub struct WanMediaActivationReceipt {
+    ready: oneshot::Receiver<Result<WanMediaReadyEvidence, WanMediaActivationError>>,
+}
+
+impl fmt::Debug for WanMediaActivationReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WanMediaActivationReceipt")
+            .finish_non_exhaustive()
+    }
+}
+
+impl WanMediaActivationReceipt {
+    pub(crate) fn pending() -> (Self, WanMediaReadySender) {
+        let (ready_tx, ready) = oneshot::channel();
+        (Self { ready }, ready_tx)
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub fn ready_for_test(authority: &WanMediaAuthority, sequence: u64) -> Self {
+        let (receipt, ready) = Self::pending();
+        let _ = ready.send(Ok(WanMediaReadyEvidence::from_authority(
+            authority, sequence,
+        )));
+        receipt
+    }
+
+    async fn wait(
+        self,
+        authority: &WanMediaAuthority,
+    ) -> Result<WanMediaReadyEvidence, WanMediaActivationError> {
+        let evidence = tokio::time::timeout(WAN_MEDIA_READINESS_TIMEOUT, self.ready)
+            .await
+            .map_err(|_| WanMediaActivationError::ReadinessTimeout)?
+            .map_err(|_| WanMediaActivationError::StartupFailed)??;
+        if !evidence.matches(authority) {
+            return Err(WanMediaActivationError::ReadinessMismatch);
+        }
+        Ok(evidence)
+    }
+}
+
 /// Minimum service-owned media API.  Implementations may bridge these calls
 /// to local capture/decoder/render registries or to signed Agent commands.
 #[async_trait]
@@ -326,12 +414,12 @@ pub trait WanMediaActivationPort: Send + Sync {
     async fn start_target_capture_send(
         &self,
         authority: &WanMediaAuthority,
-    ) -> Result<(), WanMediaActivationError>;
+    ) -> Result<WanMediaActivationReceipt, WanMediaActivationError>;
 
     async fn start_controller_receive_render(
         &self,
         authority: &WanMediaAuthority,
-    ) -> Result<(), WanMediaActivationError>;
+    ) -> Result<WanMediaActivationReceipt, WanMediaActivationError>;
 
     async fn stop_media(&self, _session_id: &SessionId) -> Result<(), WanMediaActivationError> {
         Ok(())
@@ -374,9 +462,28 @@ pub async fn start_verified_media(
         WanMediaAction::CaptureAndSend => media.start_target_capture_send(&authority).await,
         WanMediaAction::ReceiveAndRender => media.start_controller_receive_render(&authority).await,
     };
-    if let Err(error) = start_result {
+    let receipt = match start_result {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            fail_media_session(coordinator, media, authority.session_id()).await;
+            return Err(error);
+        }
+    };
+    if let Err(error) = receipt.wait(&authority).await {
         fail_media_session(coordinator, media, authority.session_id()).await;
         return Err(error);
+    }
+    let current_state = match coordinator.snapshot(authority.session_id()).await {
+        Ok(state) => state,
+        Err(_) => {
+            fail_media_session(coordinator, media, authority.session_id()).await;
+            return Err(WanMediaActivationError::CoordinatorFailure);
+        }
+    };
+    let current = WanMediaAuthority::from_relay_verified(&current_state);
+    if current.as_ref() != Ok(&authority) {
+        fail_media_session(coordinator, media, authority.session_id()).await;
+        return Err(WanMediaActivationError::AuthorityChanged);
     }
     if let Err(_error) = coordinator.record_streaming(authority.session_id()).await {
         fail_media_session(coordinator, media, authority.session_id()).await;
@@ -490,6 +597,12 @@ pub enum WanMediaActivationError {
     ControlEvidenceRequired,
     #[error("WAN media startup failed")]
     StartupFailed,
+    #[error("WAN media readiness timed out")]
+    ReadinessTimeout,
+    #[error("WAN media readiness evidence did not match authority")]
+    ReadinessMismatch,
+    #[error("WAN media authority changed during startup")]
+    AuthorityChanged,
     #[error("WAN media coordinator operation failed")]
     CoordinatorFailure,
 }

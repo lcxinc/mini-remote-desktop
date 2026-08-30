@@ -91,7 +91,7 @@ pub(super) enum LanRenderTaskOutcome {
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-pub(super) async fn render_lan_decoded_frame(
+pub(crate) async fn render_lan_decoded_frame(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
     decoded_frame: DecodedFrame,

@@ -716,6 +716,26 @@ impl ServiceWebRtcTransportHost {
             .ok_or_else(|| ServiceWebRtcTransportError::SessionNotFound(session_id.clone()))
     }
 
+    /// Return the stable media mux only while it still represents the exact
+    /// relay generation authorized by the WAN coordinator.
+    pub(crate) async fn verified_media_mux(
+        &self,
+        session_id: &SessionId,
+        generation: u64,
+    ) -> Result<Arc<dyn TransportMuxPort>, ServiceWebRtcTransportError> {
+        let session = self.session_entry(session_id).await?;
+        let _replacement_guard = session.replacement_gate.lock().await;
+        let route = session.mux.route_snapshot().await;
+        if session.peer.current_generation().await != generation
+            || route.session_id != *session_id
+            || route.kind != TransportRouteKind::WebRtcRelay
+            || route.closed
+        {
+            return Err(ServiceWebRtcTransportError::ReplacementEvidenceMismatch);
+        }
+        Ok(session.mux)
+    }
+
     async fn session(
         &self,
         session_id: &SessionId,

@@ -8,9 +8,10 @@ use super::{
         WanSessionCoordinatorError, WanSessionPortError, WanSessionWorkflowPorts,
     },
     media::{
-        ipc_media_profile, start_verified_media, WanMediaActivationError, WanMediaActivationPort,
-        WanMediaAuthority,
+        start_verified_media, WanMediaActivationError, WanMediaActivationPort,
+        WanMediaActivationReceipt, WanMediaAuthority,
     },
+    media_runtime::{start_controller_runtime, start_target_runtime},
     model::{WanSessionFailure, WanSessionPhase, WanSessionRole, WanSessionState},
     signaling::ServiceWanSessionWorkflowSignaling,
     webrtc::{
@@ -18,13 +19,14 @@ use super::{
     },
 };
 use async_trait::async_trait;
+#[cfg(any(test, debug_assertions))]
+use mrd_application::ports::TransportRouteKind;
 use mrd_application::{
-    ports::{SessionLifecycleState, SessionSnapshot},
+    ports::{SessionLifecycleState, SessionSnapshot, TransportMuxPort},
     AuthenticatedSessionSignal, VerifiedSignalingEvent,
 };
 use mrd_ipc::{
-    MediaProfileNegotiation, RemoteAuthorizationState, RemoteFailure, RemotePermissionScope,
-    RemoteReasonCode, SessionInfo,
+    RemoteAuthorizationState, RemoteFailure, RemotePermissionScope, RemoteReasonCode, SessionInfo,
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_signal_proto::{WanMediaProfileV3, WanPermissionScopeV3, WanSessionRequestV3};
@@ -297,7 +299,7 @@ pub async fn shutdown_active_wan_sessions(app_state: &Arc<crate::AppState>) -> u
     shutdown
 }
 
-async fn fail_wan_session(
+pub(crate) async fn fail_wan_session(
     app_state: &Arc<crate::AppState>,
     session_id: &SessionId,
     failure: WanSessionFailure,
@@ -802,71 +804,65 @@ impl WanSessionConsentPublisher for ServiceWanSessionConsentPublisher {
 /// registries only after `WanMediaAuthority` has proven RelayVerified.
 pub struct ServiceWanMediaActivationPort {
     app_state: Weak<crate::AppState>,
+    #[cfg(any(test, debug_assertions))]
+    test_mux: Option<(SessionId, Arc<dyn TransportMuxPort>)>,
 }
 
 impl ServiceWanMediaActivationPort {
     pub fn new(app_state: &Arc<crate::AppState>) -> Self {
         Self {
             app_state: Arc::downgrade(app_state),
+            #[cfg(any(test, debug_assertions))]
+            test_mux: None,
         }
     }
 
-    async fn activate(
+    #[cfg(any(test, debug_assertions))]
+    pub fn with_test_mux(
+        app_state: &Arc<crate::AppState>,
+        session_id: SessionId,
+        mux: Arc<dyn TransportMuxPort>,
+    ) -> Self {
+        Self {
+            app_state: Arc::downgrade(app_state),
+            test_mux: Some((session_id, mux)),
+        }
+    }
+
+    async fn resolve_mux(
         &self,
         authority: &WanMediaAuthority,
-        sender: bool,
-    ) -> Result<(), WanMediaActivationError> {
+    ) -> Result<Arc<dyn TransportMuxPort>, WanMediaActivationError> {
+        #[cfg(any(test, debug_assertions))]
+        if let Some((session_id, mux)) = &self.test_mux {
+            let route = mux.route_snapshot().await;
+            if *session_id != *authority.session_id()
+                || route.session_id != *authority.session_id()
+                || route.kind != TransportRouteKind::TestMemory
+                || route.closed
+            {
+                return Err(WanMediaActivationError::StartupFailed);
+            }
+            return Ok(Arc::clone(mux));
+        }
+
         let app_state = self
             .app_state
             .upgrade()
             .ok_or(WanMediaActivationError::StartupFailed)?;
-        if let Some(profile) = authority.approved_profile() {
-            let profile = ipc_media_profile(profile);
-            app_state.media_profiles.lock().await.set(
-                authority.session_id().clone(),
-                MediaProfileNegotiation {
-                    requested: profile.clone(),
-                    selected: profile.clone(),
-                    status: "accepted".to_owned(),
-                    reason: None,
-                    selected_source_id: None,
-                    selected_width: Some(profile.width),
-                    selected_height: Some(profile.height),
-                    downgrade_reason: None,
-                },
-            );
-            app_state
-                .media_pipelines
-                .lock()
-                .await
-                .set_active_media_profile(authority.session_id().clone(), &profile);
-        }
-        let mut sessions = app_state.sessions.lock().await;
-        let previous = sessions.get(authority.session_id()).cloned();
-        sessions.insert(
-            authority.session_id().clone(),
-            SessionSnapshot {
-                session_id: authority.session_id().clone(),
-                transport: "webrtc_relay".to_owned(),
-                source_device_id: previous
-                    .as_ref()
-                    .and_then(|value| value.source_device_id.clone()),
-                target_device_id: previous
-                    .as_ref()
-                    .and_then(|value| value.target_device_id.clone()),
-                local_listen_addr: None,
-                local_server_name: None,
-                local_cert_der_b64: None,
-                remote_listen_addr: None,
-                remote_server_name: None,
-                remote_cert_der_b64: None,
-                lifecycle_state: SessionLifecycleState::Streaming,
-                last_error: None,
-                sender_active: sender,
-                receiver_active: !sender,
-            },
-        );
-        Ok(())
+        app_state
+            .webrtc_host
+            .verified_media_mux(authority.session_id(), authority.generation())
+            .await
+            .map_err(|_| WanMediaActivationError::StartupFailed)
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub async fn stop_media_for_test(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), WanMediaActivationError> {
+        WanMediaActivationPort::stop_media(self, session_id).await
     }
 }
 
@@ -875,21 +871,35 @@ impl WanMediaActivationPort for ServiceWanMediaActivationPort {
     async fn start_target_capture_send(
         &self,
         authority: &WanMediaAuthority,
-    ) -> Result<(), WanMediaActivationError> {
+    ) -> Result<WanMediaActivationReceipt, WanMediaActivationError> {
         if authority.role() != WanSessionRole::Target {
             return Err(WanMediaActivationError::StartupFailed);
         }
-        self.activate(authority, true).await
+        let app_state = self
+            .app_state
+            .upgrade()
+            .ok_or(WanMediaActivationError::StartupFailed)?;
+        let mux = self.resolve_mux(authority).await?;
+        #[cfg(any(test, debug_assertions))]
+        let test_synthetic_capture = self.test_mux.is_some();
+        #[cfg(not(any(test, debug_assertions)))]
+        let test_synthetic_capture = false;
+        start_target_runtime(app_state, authority.clone(), mux, test_synthetic_capture).await
     }
 
     async fn start_controller_receive_render(
         &self,
         authority: &WanMediaAuthority,
-    ) -> Result<(), WanMediaActivationError> {
+    ) -> Result<WanMediaActivationReceipt, WanMediaActivationError> {
         if authority.role() != WanSessionRole::Controller {
             return Err(WanMediaActivationError::StartupFailed);
         }
-        self.activate(authority, false).await
+        let app_state = self
+            .app_state
+            .upgrade()
+            .ok_or(WanMediaActivationError::StartupFailed)?;
+        let mux = self.resolve_mux(authority).await?;
+        start_controller_runtime(app_state, authority.clone(), mux).await
     }
 
     async fn stop_media(&self, session_id: &SessionId) -> Result<(), WanMediaActivationError> {
@@ -1552,6 +1562,8 @@ async fn spawn_generation_zero(
                         WanSessionFailure::Transport,
                     )
                     .await;
+                } else {
+                    let _ = reconcile_wan_session(&failure_app_state, &owned_session_id).await;
                 }
             }
         })

@@ -10,6 +10,30 @@ use std::collections::{HashMap, VecDeque};
 
 const MEDIA_STAGE_SAMPLE_LIMIT: usize = 240;
 
+/// Role-specific WAN media runtime owned by one authenticated session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WanMediaRuntimeRole {
+    /// Captures and encodes the local target desktop for the controller.
+    TargetSender,
+    /// Receives, decodes, and hands frames to the controller render boundary.
+    ControllerReceiver,
+}
+
+/// Internal readiness and ownership evidence for an active WAN media runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WanMediaRuntimeSnapshot {
+    /// Installed relay generation used by the runtime.
+    pub generation: u64,
+    /// Role-specific direction of the runtime.
+    pub role: WanMediaRuntimeRole,
+    /// Number of service-owned tasks registered for this runtime.
+    pub owned_tasks: usize,
+    /// Whether real media evidence has crossed the codec/mux boundary.
+    pub ready: bool,
+    /// First envelope sequence that established readiness.
+    pub ready_sequence: Option<u64>,
+}
+
 /// Runtime receiver media pipeline state keyed by session.
 #[derive(Debug, Default)]
 pub struct MediaPipelineRegistry {
@@ -20,6 +44,7 @@ pub struct MediaPipelineRegistry {
 
 #[derive(Debug, Clone, Default)]
 struct MediaPipelineState {
+    wan_media_runtime: Option<WanMediaRuntimeSnapshot>,
     attached_surfaces: HashMap<String, AttachedRenderSurface>,
     active_encoder: Option<String>,
     active_decoder: Option<String>,
@@ -64,6 +89,63 @@ struct MediaPipelineState {
 }
 
 impl MediaPipelineRegistry {
+    /// Reserve one pipeline entry for a role-specific WAN media runtime.
+    ///
+    /// Returns `false` when a runtime already owns the session, preventing a
+    /// duplicate activation from replacing live task/readiness evidence.
+    pub fn begin_wan_media_runtime(
+        &mut self,
+        session_id: SessionId,
+        generation: u64,
+        role: WanMediaRuntimeRole,
+        owned_tasks: usize,
+    ) -> bool {
+        let state = self.pipelines.entry(session_id).or_default();
+        if state.wan_media_runtime.is_some() {
+            return false;
+        }
+        state.wan_media_runtime = Some(WanMediaRuntimeSnapshot {
+            generation,
+            role,
+            owned_tasks,
+            ready: false,
+            ready_sequence: None,
+        });
+        true
+    }
+
+    /// Publish first-frame readiness for the exact installed WAN generation.
+    pub fn mark_wan_media_ready(
+        &mut self,
+        session_id: &SessionId,
+        generation: u64,
+        role: WanMediaRuntimeRole,
+        sequence: u64,
+    ) -> bool {
+        let Some(runtime) = self
+            .pipelines
+            .get_mut(session_id)
+            .and_then(|state| state.wan_media_runtime.as_mut())
+        else {
+            return false;
+        };
+        if runtime.generation != generation || runtime.role != role {
+            return false;
+        }
+        if !runtime.ready {
+            runtime.ready = true;
+            runtime.ready_sequence = Some(sequence);
+        }
+        true
+    }
+
+    /// Return the current WAN media ownership/readiness evidence.
+    pub fn wan_media_runtime(&self, session_id: &SessionId) -> Option<WanMediaRuntimeSnapshot> {
+        self.pipelines
+            .get(session_id)
+            .and_then(|state| state.wan_media_runtime.clone())
+    }
+
     pub fn attach_surface(&mut self, session_id: SessionId, surface: AttachedRenderSurface) {
         let session_id_label = session_id.0.clone();
         let surface_id = surface.surface_id.clone();
