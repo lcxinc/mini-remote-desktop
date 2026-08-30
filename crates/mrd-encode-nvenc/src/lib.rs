@@ -2360,6 +2360,31 @@ struct GstreamerNvencEncoder {
 }
 
 #[cfg(not(windows))]
+#[derive(Clone, Copy)]
+struct GstreamerNvencProfile {
+    codec: VideoCodec,
+    element: &'static str,
+    parser: &'static str,
+    caps: &'static str,
+}
+
+#[cfg(not(windows))]
+const GSTREAMER_H264_PROFILE: GstreamerNvencProfile = GstreamerNvencProfile {
+    codec: VideoCodec::H264,
+    element: "nvh264enc",
+    parser: "h264parse",
+    caps: "video/x-h264,stream-format=byte-stream,alignment=au",
+};
+
+#[cfg(not(windows))]
+const GSTREAMER_HEVC_PROFILE: GstreamerNvencProfile = GstreamerNvencProfile {
+    codec: VideoCodec::Hevc,
+    element: "nvh265enc",
+    parser: "h265parse",
+    caps: "video/x-h265,stream-format=byte-stream,alignment=au",
+};
+
+#[cfg(not(windows))]
 struct GstreamerNvencProcess {
     child: Child,
     stdin: ChildStdin,
@@ -2382,23 +2407,20 @@ const GST_OUTPUT_IDLE: Duration = Duration::from_millis(8);
 #[cfg(not(windows))]
 impl GstreamerNvencEncoder {
     fn new(
-        codec: VideoCodec,
-        element: &'static str,
-        parser: &'static str,
-        caps: &'static str,
+        profile: GstreamerNvencProfile,
         width: usize,
         height: usize,
         fps: u32,
         bitrate: u32,
     ) -> Result<Self, PipelineError> {
-        require_gst_element(element)?;
-        require_gst_element(parser)?;
+        require_gst_element(profile.element)?;
+        require_gst_element(profile.parser)?;
         require_gst_element("rawvideoparse")?;
         Ok(Self {
-            codec,
-            element,
-            parser,
-            caps,
+            codec: profile.codec,
+            element: profile.element,
+            parser: profile.parser,
+            caps: profile.caps,
             width: width.max(2),
             height: height.max(2),
             fps: fps.max(1),
@@ -2422,7 +2444,7 @@ impl GstreamerNvencEncoder {
             )));
         }
 
-        let force_idr = self.frame_index == 0 || self.frame_index % self.fps as usize == 0;
+        let force_idr = self.frame_index == 0 || self.frame_index.is_multiple_of(self.fps as usize);
         let timestamp_us = frame.timestamp_us;
         let codec = self.codec;
         let output = self.encode_with_process(&frame.data)?;
@@ -2768,15 +2790,11 @@ fn require_gst_element(element: &str) -> Result<(), PipelineError> {
 
 #[cfg(not(windows))]
 fn probe_gstreamer_nvenc(
-    codec: VideoCodec,
-    element: &'static str,
-    parser: &'static str,
-    caps: &'static str,
+    profile: GstreamerNvencProfile,
     width: usize,
     height: usize,
 ) -> Result<(), PipelineError> {
-    let mut encoder =
-        GstreamerNvencEncoder::new(codec, element, parser, caps, width, height, 30, 1_000_000)?;
+    let mut encoder = GstreamerNvencEncoder::new(profile, width, height, 30, 1_000_000)?;
     let frame = CapturedFrame::from_cpu(
         width,
         height,
@@ -2789,7 +2807,8 @@ fn probe_gstreamer_nvenc(
         Ok(())
     } else {
         Err(PipelineError::message(format!(
-            "Linux GStreamer NVENC probe for `{element}` produced no encoded output"
+            "Linux GStreamer NVENC probe for `{}` produced no encoded output",
+            profile.element
         )))
     }
 }
@@ -2877,10 +2896,7 @@ impl NvencH264Encoder {
     ) -> Result<Self, PipelineError> {
         Ok(Self {
             encoder: GstreamerNvencEncoder::new(
-                VideoCodec::H264,
-                "nvh264enc",
-                "h264parse",
-                "video/x-h264,stream-format=byte-stream,alignment=au",
+                GSTREAMER_H264_PROFILE,
                 width,
                 height,
                 fps,
@@ -2907,14 +2923,7 @@ impl NvencH264Encoder {
     }
 
     pub fn probe_h264_available() -> Result<(), PipelineError> {
-        probe_gstreamer_nvenc(
-            VideoCodec::H264,
-            "nvh264enc",
-            "h264parse",
-            "video/x-h264,stream-format=byte-stream,alignment=au",
-            160,
-            64,
-        )
+        probe_gstreamer_nvenc(GSTREAMER_H264_PROFILE, 160, 64)
     }
 }
 
@@ -2967,10 +2976,7 @@ impl NvencHevcEncoder {
     ) -> Result<Self, PipelineError> {
         Ok(Self {
             encoder: GstreamerNvencEncoder::new(
-                VideoCodec::Hevc,
-                "nvh265enc",
-                "h265parse",
-                "video/x-h265,stream-format=byte-stream,alignment=au",
+                GSTREAMER_HEVC_PROFILE,
                 width,
                 height,
                 fps,
@@ -3002,14 +3008,7 @@ impl NvencHevcEncoder {
     }
 
     pub fn probe_hevc_available() -> Result<(), PipelineError> {
-        probe_gstreamer_nvenc(
-            VideoCodec::Hevc,
-            "nvh265enc",
-            "h265parse",
-            "video/x-h265,stream-format=byte-stream,alignment=au",
-            160,
-            64,
-        )
+        probe_gstreamer_nvenc(GSTREAMER_HEVC_PROFILE, 160, 64)
     }
 
     pub fn probe_hevc_main10_available() -> Result<(), PipelineError> {
