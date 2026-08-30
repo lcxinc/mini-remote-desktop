@@ -767,7 +767,7 @@ mod tests {
         }
 
         match X11Renderer::new() {
-            Ok(mut renderer) => {
+            Ok(renderer) => {
                 println!("X11 renderer created successfully");
                 println!("Dimensions: {}x{}", renderer.width, renderer.height);
             }
