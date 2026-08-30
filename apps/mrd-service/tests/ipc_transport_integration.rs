@@ -209,12 +209,23 @@ async fn ipc_transport_session_flow_through_transport() {
 
     let mut client = IpcClient::with_endpoint(endpoint);
     let session_id = SessionId("transport-session-test".to_string());
+    let local_device_id = DeviceId("transport-local-device".to_string());
+    let registration = client
+        .send_request(IpcRequest::RegisterDevice {
+            device_id: local_device_id.clone(),
+            device_name: "Transport Local Device".to_string(),
+        })
+        .await;
+    assert!(matches!(
+        registration,
+        Ok(IpcResponse::DeviceRegistered { .. })
+    ));
 
-    // Start session
+    // Start the explicit local self-test session.
     let start_response = client
         .send_request(IpcRequest::StartSession {
             session_id: session_id.clone(),
-            target_device_id: DeviceId("remote-agent".to_string()),
+            target_device_id: local_device_id,
             transport_kind: "quic".to_string(),
         })
         .await;

@@ -1,12 +1,15 @@
 import { openRemoteDisplayWindow } from "../adapters/tauri";
-import type { RemoteRoutePreference } from "../adapters/tauri/types";
+import type {
+  RemoteRoutePreference,
+  RemoteSessionSnapshot,
+} from "../adapters/tauri/types";
 import { isTauriRuntime } from "../utils/runtime";
 import { deviceService } from "./deviceService";
 import {
   listRemoteCaptureSources,
   selectRemoteCaptureSource,
-  startLanRemoteSession,
-  startSession,
+  requestRemoteSession,
+  startLocalTestSession,
   stopSession,
   type CaptureSource,
   type CaptureSourceSelection,
@@ -14,12 +17,14 @@ import {
   type TransportKind,
 } from "./ipcSessionService";
 import { saveWebRemoteSession } from "./webRemoteSessionService";
+import { waitForRemoteSessionStreaming } from "./remoteSessionStateService";
 
 export type RemoteDisplayLaunchResult = {
   sessionId: string;
   windowLabel: string | null;
   mode: "native_window" | "route";
   captureSourceSelection?: CaptureSourceSelection | null;
+  remoteSession?: RemoteSessionSnapshot;
 };
 
 export type RemoteApplicationCatalogResult = {
@@ -140,6 +145,9 @@ export async function launchRemoteDisplayForDevice(
       : undefined;
 
   if (!tauriRuntime) {
+    if (!options?.localTest) {
+      throw new Error("Secure remote sessions require the desktop client");
+    }
     saveWebRemoteSession({
       sessionId,
       targetDeviceId,
@@ -148,33 +156,23 @@ export async function launchRemoteDisplayForDevice(
       targetIp: options?.targetIp ?? "127.0.0.1",
       transportKind: "webrtc",
       createdAt: Date.now(),
-      mode: options?.localTest ? "web_to_local" : "web_to_peer",
+      mode: "web_to_local",
     });
     return { sessionId, windowLabel: null, mode: "route" };
   }
 
-  const hasExplicitRoutePreference = options?.routePreference !== undefined;
-  const shouldUseAuthorizedRemoteRequest = Boolean(
-    !targetIsLocal && (options?.lanP2P || hasExplicitRoutePreference),
-  );
+  const remoteSession = targetIsLocal
+    ? undefined
+    : await requestRemoteSession(
+        sessionId,
+        targetDeviceId,
+        transportKind,
+        lanRequestedProfile,
+        options?.routePreference ?? (options?.lanP2P ? "lan" : "auto"),
+      );
   const startedSessionId = targetIsLocal
-    ? sessionId
-    : shouldUseAuthorizedRemoteRequest
-      ? hasExplicitRoutePreference
-        ? await startLanRemoteSession(
-            sessionId,
-            targetDeviceId,
-            transportKind,
-            lanRequestedProfile,
-            options.routePreference,
-          )
-        : await startLanRemoteSession(
-            sessionId,
-            targetDeviceId,
-            transportKind,
-            lanRequestedProfile,
-          )
-      : await startSession(sessionId, targetDeviceId, transportKind);
+    ? await startLocalTestSession(sessionId, targetDeviceId, transportKind)
+    : (remoteSession?.session_id ?? sessionId);
 
   let captureSourceSelection: CaptureSourceSelection | null = null;
   if (options?.captureSourceId) {
@@ -184,13 +182,18 @@ export async function launchRemoteDisplayForDevice(
     );
   }
 
-  if (options?.openWindow === false) {
+  // A secure remote request acknowledgement only means the authorization
+  // workflow was accepted. Media must not be presented as connected until
+  // the authoritative snapshot reaches `streaming`; RemoteSessionPage owns
+  // that state-driven window launch. Local display tests remain explicit.
+  if (!targetIsLocal || options?.openWindow === false) {
     const result: RemoteDisplayLaunchResult = {
       sessionId: startedSessionId,
       windowLabel: null,
       mode: "route",
     };
     if (captureSourceSelection) result.captureSourceSelection = captureSourceSelection;
+    if (remoteSession) result.remoteSession = remoteSession;
     return result;
   }
 
@@ -243,6 +246,8 @@ export async function prepareRemoteApplicationCatalogForDevice(
 
   let sources: CaptureSource[];
   try {
+    const streaming = await waitForRemoteSessionStreaming(sessionId);
+    assertRemoteApplicationSession(streaming, targetDeviceId);
     sources = await listRemoteCaptureSources(
       sessionId,
       options?.includePreviews ?? false,
@@ -286,6 +291,8 @@ export async function launchRemoteApplicationForDevice(
   let captureSourceSelection: CaptureSourceSelection;
   let windowResult: Awaited<ReturnType<typeof openRemoteDisplayWindow>>;
   try {
+    const streaming = await waitForRemoteSessionStreaming(sessionId);
+    assertRemoteApplicationSession(streaming, targetDeviceId);
     captureSourceSelection = await selectRemoteCaptureSource(sessionId, sourceId);
     const requestedProfile =
       options?.requestedProfile ?? defaultRemoteMediaProfileForTarget(options?.targetOs);
@@ -329,6 +336,21 @@ function buildRemoteApplicationCatalog(
         source.source_kind === "display" || source.source_kind === "display_shared"
     ),
   };
+}
+
+function assertRemoteApplicationSession(
+  snapshot: RemoteSessionSnapshot,
+  targetDeviceId: string,
+): void {
+  if (
+    snapshot.role !== "controller" ||
+    snapshot.peer_device_id !== targetDeviceId ||
+    snapshot.route_kind !== "lan_quic"
+  ) {
+    throw new Error(
+      "Remote application session is not bound to the requested LAN peer",
+    );
+  }
 }
 
 export async function launchLocalRemoteDisplayTest(): Promise<RemoteDisplayLaunchResult> {

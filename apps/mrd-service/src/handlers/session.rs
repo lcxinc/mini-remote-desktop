@@ -981,7 +981,7 @@ fn current_time_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Handle session start request
+/// Handle the legacy session start contract for a registered local self-test only.
 pub async fn start_session(
     app_state: &Arc<AppState>,
     session_id: SessionId,
@@ -994,6 +994,16 @@ pub async fn start_session(
         target_device_id.0,
         transport_kind
     );
+
+    let local_device_id = app_state
+        .devices
+        .lock()
+        .await
+        .get_local_device()
+        .map(|(device_id, _)| device_id.clone());
+    if local_device_id.as_ref() != Some(&target_device_id) {
+        return legacy_remote_start_error(session_id);
+    }
 
     let _authorization_security_guard = app_state.authorization_security_gate.lock().await;
     if app_state
@@ -1555,6 +1565,20 @@ fn secure_legacy_bypass_error(session_id: SessionId, operation: &str) -> IpcResp
             code: RemoteReasonCode::ProtocolDowngradeBlocked,
             message: format!("{operation} cannot mutate a secure remote session"),
             suggested_action: Some("use the secure remote-session IPC contract".to_string()),
+        },
+    }
+}
+
+fn legacy_remote_start_error(session_id: SessionId) -> IpcResponse {
+    IpcResponse::RemoteAccessError {
+        session_id: Some(session_id),
+        peer_key_id: None,
+        failure: RemoteFailure {
+            code: RemoteReasonCode::ProtocolDowngradeBlocked,
+            message: "StartSession is restricted to an explicit local self-test".to_string(),
+            suggested_action: Some(
+                "use RequestRemoteSession for every non-local device".to_string(),
+            ),
         },
     }
 }
@@ -2206,12 +2230,22 @@ mod tests {
             .expect("secure outgoing authorization");
     }
 
+    async fn register_test_local_device(app_state: &Arc<AppState>, device_id: &str) -> DeviceId {
+        let device_id = DeviceId(device_id.to_string());
+        app_state
+            .devices
+            .lock()
+            .await
+            .register(device_id.clone(), "Test Local Device".to_string());
+        device_id
+    }
+
     #[tokio::test]
     async fn start_session_creates_session_in_registry() {
         let app_state = Arc::new(AppState::new());
 
         let session_id = SessionId("test-session".to_string());
-        let target_device_id = DeviceId("agent".to_string());
+        let target_device_id = register_test_local_device(&app_state, "agent").await;
 
         let response = start_session(
             &app_state,
@@ -2240,12 +2274,13 @@ mod tests {
     async fn start_session_rejects_secure_remote_session_bypass() {
         let app_state = Arc::new(AppState::new());
         let session_id = SessionId("secure-start-session".to_string());
+        let target_device_id = register_test_local_device(&app_state, "legacy-target").await;
         begin_secure_outgoing_authorization(&app_state, session_id.clone()).await;
 
         let response = start_session(
             &app_state,
             session_id.clone(),
-            DeviceId("legacy-target".to_string()),
+            target_device_id,
             "quic".to_string(),
         )
         .await;
@@ -2257,6 +2292,80 @@ mod tests {
         } = response
         else {
             panic!("expected secure legacy bypass error");
+        };
+        assert_eq!(returned_session_id, Some(session_id.clone()));
+        assert_eq!(failure.code, RemoteReasonCode::ProtocolDowngradeBlocked);
+        assert!(app_state.sessions.lock().await.get(&session_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn start_session_rejects_registered_remote_targets_but_allows_local_self_test() {
+        let app_state = Arc::new(AppState::new());
+        app_state.devices.lock().await.register(
+            DeviceId("local-device".to_string()),
+            "Local Device".to_string(),
+        );
+
+        let remote_session_id = SessionId("legacy-remote-start".to_string());
+        let remote_response = start_session(
+            &app_state,
+            remote_session_id.clone(),
+            DeviceId("remote-device".to_string()),
+            "webrtc".to_string(),
+        )
+        .await;
+
+        let IpcResponse::RemoteAccessError {
+            session_id,
+            failure,
+            ..
+        } = remote_response
+        else {
+            panic!("expected legacy remote start to be rejected");
+        };
+        assert_eq!(session_id, Some(remote_session_id.clone()));
+        assert_eq!(failure.code, RemoteReasonCode::ProtocolDowngradeBlocked);
+        assert!(app_state
+            .sessions
+            .lock()
+            .await
+            .get(&remote_session_id)
+            .is_none());
+
+        let local_session_id = SessionId("local-self-test".to_string());
+        let local_response = start_session(
+            &app_state,
+            local_session_id.clone(),
+            DeviceId("local-device".to_string()),
+            "webrtc".to_string(),
+        )
+        .await;
+        assert!(matches!(
+            local_response,
+            IpcResponse::SessionStarted { session_id } if session_id == local_session_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn start_session_rejects_targets_when_local_identity_is_not_registered() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("unregistered-legacy-start".to_string());
+
+        let response = start_session(
+            &app_state,
+            session_id.clone(),
+            DeviceId("unverified-target".to_string()),
+            "webrtc".to_string(),
+        )
+        .await;
+
+        let IpcResponse::RemoteAccessError {
+            session_id: returned_session_id,
+            failure,
+            ..
+        } = response
+        else {
+            panic!("expected unregistered legacy start rejection");
         };
         assert_eq!(returned_session_id, Some(session_id.clone()));
         assert_eq!(failure.code, RemoteReasonCode::ProtocolDowngradeBlocked);
@@ -2426,7 +2535,7 @@ mod tests {
     async fn duplicate_start_session_returns_conflict_without_overwriting() {
         let app_state = Arc::new(AppState::new());
         let session_id = SessionId("duplicate-start-session".to_string());
-        let original_target = DeviceId("original-target".to_string());
+        let original_target = register_test_local_device(&app_state, "original-target").await;
         let _ = start_session(
             &app_state,
             session_id.clone(),
@@ -2438,7 +2547,7 @@ mod tests {
         let response = start_session(
             &app_state,
             session_id.clone(),
-            DeviceId("replacement-target".to_string()),
+            original_target.clone(),
             "webrtc".to_string(),
         )
         .await;
@@ -2595,7 +2704,7 @@ mod tests {
         let _ = start_session(
             &app_state,
             session_id.clone(),
-            DeviceId("agent".to_string()),
+            device_id.clone(),
             "quic".to_string(),
         )
         .await;
@@ -2605,13 +2714,10 @@ mod tests {
         match response {
             IpcResponse::RuntimeSnapshot { snapshot } => {
                 assert!(snapshot.is_registered);
-                assert_eq!(snapshot.device_id, Some(device_id));
+                assert_eq!(snapshot.device_id, Some(device_id.clone()));
                 assert_eq!(snapshot.sessions.len(), 1);
                 assert_eq!(snapshot.sessions[0].session_id, session_id);
-                assert_eq!(
-                    snapshot.sessions[0].peer_device_id,
-                    Some(DeviceId("agent".to_string()))
-                );
+                assert_eq!(snapshot.sessions[0].peer_device_id, Some(device_id));
             }
             other => panic!("Expected RuntimeSnapshot response, got {other:?}"),
         }
@@ -2621,12 +2727,13 @@ mod tests {
     async fn stop_session_removes_from_registry() {
         let app_state = Arc::new(AppState::new());
         let session_id = SessionId("test-session".to_string());
+        let local_device_id = register_test_local_device(&app_state, "agent").await;
 
         // First create a session
         let _ = start_session(
             &app_state,
             session_id.clone(),
-            DeviceId("agent".to_string()),
+            local_device_id,
             "quic".to_string(),
         )
         .await;
@@ -2979,11 +3086,12 @@ mod tests {
     async fn stop_session_aborts_registered_media_tasks() {
         let app_state = Arc::new(AppState::new());
         let session_id = SessionId("test-session".to_string());
+        let local_device_id = register_test_local_device(&app_state, "agent").await;
 
         let _ = start_session(
             &app_state,
             session_id.clone(),
-            DeviceId("agent".to_string()),
+            local_device_id,
             "quic".to_string(),
         )
         .await;
@@ -3010,11 +3118,12 @@ mod tests {
     async fn fail_and_recover_session_updates_lifecycle_state() {
         let app_state = Arc::new(AppState::new());
         let session_id = SessionId("test-session".to_string());
+        let local_device_id = register_test_local_device(&app_state, "agent").await;
 
         let _ = start_session(
             &app_state,
             session_id.clone(),
-            DeviceId("agent".to_string()),
+            local_device_id,
             "quic".to_string(),
         )
         .await;
@@ -3046,10 +3155,11 @@ mod tests {
     async fn recover_session_rejects_secure_remote_session_bypass() {
         let app_state = Arc::new(AppState::new());
         let session_id = SessionId("secure-recover-session".to_string());
+        let target_device_id = register_test_local_device(&app_state, "secure-peer").await;
         let _ = start_session(
             &app_state,
             session_id.clone(),
-            DeviceId("secure-peer".to_string()),
+            target_device_id,
             "quic".to_string(),
         )
         .await;

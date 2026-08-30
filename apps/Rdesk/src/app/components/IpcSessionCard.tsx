@@ -3,7 +3,7 @@ import { useTheme } from "./ThemeContext";
 import {
   registerDevice,
   listDevices,
-  startSession,
+  requestRemoteSession,
   acceptSession,
   stopSession,
   startSender,
@@ -113,9 +113,16 @@ export function IpcSessionCard({ onServiceStatusChange }: IpcSessionCardProps) {
     setLoading(true);
     setError(null);
     try {
-      const result = await startSession(sessionId, selectedDeviceId, transportKind);
-      updateStatus(`会话已启动: ${result}`);
-      await refreshSnapshot();
+      const snapshot = await requestRemoteSession(
+        sessionId,
+        selectedDeviceId,
+        transportKind,
+        undefined,
+        "auto",
+      );
+      updateStatus(
+        `安全会话请求已受理: ${snapshot.session_id} · ${snapshot.presentation_state}`,
+      );
     } catch (e) {
       setError(e instanceof Error ? e.message : "启动会话失败");
     } finally {

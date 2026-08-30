@@ -248,15 +248,26 @@ mod tests {
     use crate::handlers::session;
     use mrd_proto::DeviceId;
 
+    async fn register_local_test_device(app_state: &Arc<AppState>) -> DeviceId {
+        let device_id = DeviceId("agent".to_string());
+        app_state
+            .devices
+            .lock()
+            .await
+            .register(device_id.clone(), "Test Local Device".to_string());
+        device_id
+    }
+
     #[tokio::test]
     async fn start_sender_returns_started_response() {
         let app_state = Arc::new(AppState::new());
         let session_id = SessionId("test-session".to_string());
+        let local_device_id = register_local_test_device(&app_state).await;
 
         let _ = session::start_session(
             &app_state,
             session_id.clone(),
-            DeviceId("agent".to_string()),
+            local_device_id,
             "quic".to_string(),
         )
         .await;
@@ -297,11 +308,12 @@ mod tests {
     async fn start_receiver_returns_started_response() {
         let app_state = Arc::new(AppState::new());
         let session_id = SessionId("test-session".to_string());
+        let local_device_id = register_local_test_device(&app_state).await;
 
         let _ = session::start_session(
             &app_state,
             session_id.clone(),
-            DeviceId("agent".to_string()),
+            local_device_id,
             "webrtc".to_string(),
         )
         .await;
@@ -364,11 +376,12 @@ mod tests {
     async fn render_surface_attach_detach_updates_pipeline_snapshot() {
         let app_state = Arc::new(AppState::new());
         let session_id = SessionId("surface-session".to_string());
+        let local_device_id = register_local_test_device(&app_state).await;
 
         let _ = session::start_session(
             &app_state,
             session_id.clone(),
-            DeviceId("agent".to_string()),
+            local_device_id,
             "quic".to_string(),
         )
         .await;

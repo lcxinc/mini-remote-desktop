@@ -9,23 +9,27 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router';
 import { Monitor } from 'lucide-react';
 import { RemoteSessionPage } from './RemoteSessionPage';
 import type { Device } from './deviceData';
+import type { RemoteSessionSnapshot } from '../adapters/tauri/types';
 
 const mockNavigate = vi.hoisted(() => vi.fn());
 const mockRuntimeState = vi.hoisted(() => ({ isTauri: false }));
+const mockRouteState = vi.hoisted(() => ({ id: 'test-device-1' }));
 const mockListRemoteDisplayWindows = vi.hoisted(() => vi.fn());
 const mockOpenRemoteDisplayWindow = vi.hoisted(() => vi.fn());
+const mockCloseRemoteDisplayWindow = vi.hoisted(() => vi.fn());
 const mockGetSessionSnapshot = vi.hoisted(() => vi.fn());
 const mockGetProbeSnapshot = vi.hoisted(() => vi.fn());
 const mockStopSession = vi.hoisted(() => vi.fn());
 const mockGetDecodePolicy = vi.hoisted(() => vi.fn());
 const mockSetDecodePolicy = vi.hoisted(() => vi.fn());
 const mockFfmpegProbe = vi.hoisted(() => vi.fn());
+const mockObserveRemoteSession = vi.hoisted(() => vi.fn());
 
 // Mock fetch globally to prevent HTTP requests
 globalThis.fetch = vi.fn();
@@ -35,7 +39,7 @@ vi.mock('react-router', async (importOriginal) => {
   const actual = await importOriginal<typeof import('react-router')>();
   return {
     ...actual,
-    useParams: () => ({ id: 'test-device-1' }),
+    useParams: () => ({ id: mockRouteState.id }),
     useNavigate: () => mockNavigate,
   };
 });
@@ -97,12 +101,17 @@ vi.mock('../services/realtimeSessionService', () => ({
 vi.mock('../adapters/tauri', () => ({
   listRemoteDisplayWindows: mockListRemoteDisplayWindows,
   openRemoteDisplayWindow: mockOpenRemoteDisplayWindow,
+  closeRemoteDisplayWindow: mockCloseRemoteDisplayWindow,
 }));
 
 vi.mock('../services/ipcSessionService', () => ({
   getSessionSnapshot: mockGetSessionSnapshot,
   getProbeSnapshot: mockGetProbeSnapshot,
   stopSession: mockStopSession,
+}));
+
+vi.mock('../services/remoteSessionStateService', () => ({
+  observeRemoteSession: mockObserveRemoteSession,
 }));
 
 // Mock device service
@@ -155,6 +164,44 @@ const mockDevices: Device[] = [
   },
 ];
 
+const remoteSnapshot = (
+  presentationState: RemoteSessionSnapshot['presentation_state'],
+  failure: RemoteSessionSnapshot['failure'] = null,
+): RemoteSessionSnapshot => ({
+  session_id: 'test-device-1',
+  role: 'controller',
+  peer_device_id: 'dev-001',
+  peer_key_id: 'peer-key',
+  access_mode: 'attended',
+  authorization_state:
+    presentationState === 'streaming'
+      ? 'granted'
+      : presentationState === 'failed'
+        ? 'denied'
+        : 'authenticating',
+  route_state:
+    presentationState === 'streaming'
+      ? 'connected'
+      : presentationState === 'failed'
+        ? 'failed'
+        : 'connecting',
+  route_kind: presentationState === 'streaming' ? 'webrtc_relay' : null,
+  media_state:
+    presentationState === 'streaming'
+      ? 'streaming'
+      : presentationState === 'failed'
+        ? 'failed'
+        : 'idle',
+  presentation_state: presentationState,
+  requested_scopes: ['screen.view'],
+  granted_scopes: presentationState === 'streaming' ? ['screen.view'] : [],
+  policy_revision: '1',
+  failure,
+  created_at_ms: 1,
+  updated_at_ms: 2,
+  authorization_expires_at_ms: 60_000,
+});
+
 // Mock deviceData
 vi.mock('./deviceData', () => ({
   useDevices: () => ({
@@ -169,7 +216,9 @@ vi.mock('./deviceData', () => ({
 describe('RemoteSessionPage - Page Level Tests', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockRuntimeState.isTauri = false;
+    window.sessionStorage.clear();
+    mockRouteState.id = 'test-device-1';
+    mockRuntimeState.isTauri = true;
     mockListRemoteDisplayWindows.mockResolvedValue({ ok: true, value: [] });
     mockOpenRemoteDisplayWindow.mockResolvedValue({
       ok: true,
@@ -182,6 +231,7 @@ describe('RemoteSessionPage - Page Level Tests', () => {
         render_mode: 'd3d11_native',
       },
     });
+    mockCloseRemoteDisplayWindow.mockResolvedValue({ ok: true, value: null });
     mockGetSessionSnapshot.mockResolvedValue({
       session_id: 'test-device-1',
       state: 'streaming',
@@ -204,6 +254,13 @@ describe('RemoteSessionPage - Page Level Tests', () => {
       ffprobe_version: 'ffprobe version 8.1.1',
       reason: null,
     });
+    mockObserveRemoteSession.mockReset();
+    mockObserveRemoteSession.mockImplementation(
+      (_sessionId, observer: { onSnapshot: (snapshot: RemoteSessionSnapshot) => void }) => {
+        observer.onSnapshot(remoteSnapshot('streaming'));
+        return vi.fn();
+      },
+    );
   });
 
   // ========================================================================
@@ -211,6 +268,146 @@ describe('RemoteSessionPage - Page Level Tests', () => {
   // ========================================================================
 
   describe('successful render', () => {
+    it('keeps acknowledged native sessions in an authenticating state until streaming', async () => {
+      mockRuntimeState.isTauri = true;
+      mockObserveRemoteSession.mockImplementation(
+        (_sessionId, observer: { onSnapshot: (snapshot: RemoteSessionSnapshot) => void }) => {
+          observer.onSnapshot(remoteSnapshot('authenticating'));
+          return vi.fn();
+        },
+      );
+
+      render(
+        <MemoryRouter initialEntries={['/sessions/test-device-1']}>
+          <RemoteSessionPage />
+        </MemoryRouter>
+      );
+
+      expect(await screen.findByText('正在认证远程会话')).toBeInTheDocument();
+      expect(screen.queryByText('连接稳定')).not.toBeInTheDocument();
+      expect(mockOpenRemoteDisplayWindow).not.toHaveBeenCalled();
+    });
+
+    it('opens and presents native media only after the authoritative snapshot streams', async () => {
+      mockRuntimeState.isTauri = true;
+
+      render(
+        <MemoryRouter initialEntries={['/sessions/test-device-1']}>
+          <RemoteSessionPage />
+        </MemoryRouter>
+      );
+
+      expect(await screen.findByText('连接稳定')).toBeInTheDocument();
+      await waitFor(() => {
+        expect(mockOpenRemoteDisplayWindow).toHaveBeenCalledWith({
+          sessionId: 'test-device-1',
+        });
+      });
+    });
+
+    it('closes native media windows when authoritative streaming is revoked', async () => {
+      mockRuntimeState.isTauri = true;
+      let emitSnapshot!: (snapshot: RemoteSessionSnapshot) => void;
+      mockObserveRemoteSession.mockImplementation(
+        (_sessionId, observer: { onSnapshot: (snapshot: RemoteSessionSnapshot) => void }) => {
+          emitSnapshot = observer.onSnapshot;
+          observer.onSnapshot(remoteSnapshot('streaming'));
+          return vi.fn();
+        },
+      );
+
+      render(
+        <MemoryRouter initialEntries={['/sessions/test-device-1']}>
+          <RemoteSessionPage />
+        </MemoryRouter>
+      );
+
+      await waitFor(() => {
+        expect(mockOpenRemoteDisplayWindow).toHaveBeenCalled();
+      });
+      mockListRemoteDisplayWindows.mockResolvedValue({
+        ok: true,
+        value: [
+          {
+            label: 'web-test-device-1',
+            session_id: 'test-device-1',
+            surface_id: 'web-test-device-1',
+            role: 'primary',
+            renderer_attached: true,
+            render_mode: 'd3d11_native',
+          },
+        ],
+      });
+
+      act(() => {
+        emitSnapshot(
+          remoteSnapshot('failed', {
+            code: 'grant_expired',
+            message: 'Remote grant expired',
+            suggested_action: null,
+          }),
+        );
+      });
+
+      await waitFor(() => {
+        expect(mockCloseRemoteDisplayWindow).toHaveBeenCalledWith(
+          'web-test-device-1',
+        );
+      });
+      expect(screen.queryByText('连接稳定')).not.toBeInTheDocument();
+    });
+
+    it('renders the exact terminal remote failure instead of connected media', async () => {
+      mockRuntimeState.isTauri = true;
+      mockObserveRemoteSession.mockImplementation(
+        (_sessionId, observer: { onSnapshot: (snapshot: RemoteSessionSnapshot) => void }) => {
+          observer.onSnapshot(
+            remoteSnapshot('failed', {
+              code: 'consent_denied',
+              message: 'Target denied attended access',
+              suggested_action: 'ask the target user to approve',
+            }),
+          );
+          return vi.fn();
+        },
+      );
+
+      render(
+        <MemoryRouter initialEntries={['/sessions/test-device-1']}>
+          <RemoteSessionPage />
+        </MemoryRouter>
+      );
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        'Target denied attended access',
+      );
+      expect(screen.queryByText('连接稳定')).not.toBeInTheDocument();
+      expect(mockOpenRemoteDisplayWindow).not.toHaveBeenCalled();
+    });
+
+    it('preserves an initial service error when the route id is not a device id', async () => {
+      mockRuntimeState.isTauri = true;
+      mockRouteState.id = 'generated-session-id';
+      mockObserveRemoteSession.mockImplementation(
+        (_sessionId, observer: { onError?: (error: unknown) => void }) => {
+          observer.onError?.(new Error('Authoritative session lookup failed'));
+          return vi.fn();
+        },
+      );
+
+      render(
+        <MemoryRouter initialEntries={['/session/generated-session-id']}>
+          <RemoteSessionPage />
+        </MemoryRouter>
+      );
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        'Authoritative session lookup failed',
+      );
+      expect(screen.queryByText('设备未找到')).not.toBeInTheDocument();
+      expect(mockOpenRemoteDisplayWindow).not.toHaveBeenCalled();
+    });
+
     it('renders the remote session page with device info', async () => {
       render(
         <MemoryRouter initialEntries={['/sessions/test-device-1']}>
@@ -275,9 +472,8 @@ describe('RemoteSessionPage - Page Level Tests', () => {
   // ========================================================================
 
   describe('migration state - disabled rendering features', () => {
-    it('navigates to the route fallback when popping out outside Tauri', async () => {
-      const mockAlert = vi.fn();
-      globalThis.alert = mockAlert;
+    it('does not present a direct browser route as connected without a secure request', async () => {
+      mockRuntimeState.isTauri = false;
 
       render(
         <MemoryRouter initialEntries={['/sessions/test-device-1']}>
@@ -285,23 +481,40 @@ describe('RemoteSessionPage - Page Level Tests', () => {
         </MemoryRouter>
       );
 
-      await waitFor(() => {
-        expect(screen.getByText('独立窗口')).toBeInTheDocument();
-      });
+      expect(await screen.findByText('正在读取远程会话状态')).toBeInTheDocument();
+      expect(screen.queryByText('连接稳定')).not.toBeInTheDocument();
+      expect(screen.queryByText('独立窗口')).not.toBeInTheDocument();
+    });
 
-      // Click the "独立窗口" button
-      const popOutButtons = screen.getAllByText('独立窗口');
-      const popOutButton = popOutButtons.find((btn) => btn.tagName === 'BUTTON');
+    it('fails closed for a legacy browser peer record instead of simulating the peer', async () => {
+      mockRuntimeState.isTauri = false;
+      window.sessionStorage.setItem(
+        'rdesk_web_remote_sessions',
+        JSON.stringify({
+          'test-device-1': {
+            sessionId: 'test-device-1',
+            targetDeviceId: 'dev-001',
+            targetDeviceName: 'Test PC',
+            targetOs: 'Windows 11',
+            targetIp: '203.0.113.10',
+            transportKind: 'webrtc',
+            createdAt: 1,
+            mode: 'web_to_peer',
+          },
+        }),
+      );
 
-      if (popOutButton) {
-        await userEvent.click(popOutButton);
+      render(
+        <MemoryRouter initialEntries={['/sessions/test-device-1']}>
+          <RemoteSessionPage />
+        </MemoryRouter>
+      );
 
-        expect(mockNavigate).toHaveBeenCalledWith('/display/test-device-1');
-        expect(mockAlert).not.toHaveBeenCalled();
-      }
-
-      mockAlert.mockRestore();
-      delete (globalThis as unknown as Record<string, unknown>).alert;
+      expect(
+        await screen.findByText('Secure remote sessions require the desktop client'),
+      ).toBeInTheDocument();
+      expect(screen.queryByText('连接稳定')).not.toBeInTheDocument();
+      expect(screen.queryByText('WebRTC control channel connected')).not.toBeInTheDocument();
     });
 
     it('shows degraded state for rendering features', async () => {

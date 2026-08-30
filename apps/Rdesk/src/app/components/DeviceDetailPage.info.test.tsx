@@ -100,6 +100,11 @@ vi.mock("../utils/runtime", () => ({
 beforeEach(() => {
   deviceDataMock.devices = [device()];
   remoteDisplayLauncherMock.launchRemoteDisplayForDevice.mockReset();
+  remoteDisplayLauncherMock.launchRemoteDisplayForDevice.mockResolvedValue({
+    sessionId: "secure-session",
+    windowLabel: null,
+    mode: "route",
+  });
   remoteDisplayLauncherMock.launchRemoteApplicationForDevice.mockReset();
   remoteDisplayLauncherMock.prepareRemoteApplicationCatalogForDevice.mockReset();
   tauriAdapterMock.ipcCancelFileTransfer.mockReset();
@@ -445,6 +450,33 @@ describe("DeviceDetailPage info tab", () => {
     expect(alertSpy).not.toHaveBeenCalled();
 
     delete (window as unknown as Record<string, unknown>).alert;
+  });
+
+  it("routes an acknowledged secure request without presenting it as connected", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <MemoryRouter initialEntries={["/devices/agent-device"]}>
+        <Routes>
+          <Route path="/devices/:id" element={<DeviceDetailPage />} />
+          <Route
+            path="/session/:id"
+            element={<div data-testid="secure-session-route">authorizing</div>}
+          />
+        </Routes>
+      </MemoryRouter>
+    );
+
+    await user.click(screen.getByRole("button", { name: "发起远程连接" }));
+
+    expect(await screen.findByTestId("secure-session-route")).toHaveTextContent(
+      "authorizing",
+    );
+    expect(remoteDisplayLauncherMock.launchRemoteDisplayForDevice).toHaveBeenCalledWith(
+      "agent-device",
+      expect.objectContaining({ transportKind: "quic", lanP2P: true }),
+    );
+    expect(screen.queryByText("Native remote window active")).not.toBeInTheDocument();
   });
 
   it("does not offer non-terminal windows from the remote terminal route", async () => {

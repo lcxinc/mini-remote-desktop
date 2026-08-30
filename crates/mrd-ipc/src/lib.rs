@@ -2054,7 +2054,8 @@ mod wire {
         GetRouteEvidence { session_id: SessionId },
         /// Query durable redacted audit events by monotonic cursor.
         GetAuditEventsV2 { query: AuditEventsQueryV2 },
-        /// Start a new session as controller
+        /// Start the legacy runtime used only for a registered local self-test.
+        /// Production remote access must use `RequestRemoteSession`.
         StartSession {
             session_id: SessionId,
             target_device_id: DeviceId,

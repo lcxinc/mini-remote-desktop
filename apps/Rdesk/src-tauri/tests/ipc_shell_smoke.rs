@@ -97,7 +97,7 @@ async fn smoke_shell_full_ipc_session_flow() {
     let start_response = client
         .send_request(IpcRequest::StartSession {
             session_id: session_id.clone(),
-            target_device_id: DeviceId("agent".to_string()),
+            target_device_id: device_id.clone(),
             transport_kind: "quic".to_string(),
         })
         .await

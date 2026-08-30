@@ -33,23 +33,30 @@ import {
   type WebrtcHostSnapshot,
 } from "../services/realtimeSessionService";
 import {
+  closeRemoteDisplayWindow,
   listRemoteDisplayWindows,
   openRemoteDisplayWindow,
   type RemoteDisplayWindowContext,
 } from "../adapters/tauri";
 import {
   getProbeSnapshot,
-  getSessionSnapshot,
   stopSession,
   type ProbeSnapshot,
-  type SessionRuntimeSnapshot,
 } from "../services/ipcSessionService";
+import { observeRemoteSession } from "../services/remoteSessionStateService";
+import type {
+  RemotePresentationState,
+  RemoteSessionSnapshot,
+} from "../adapters/tauri/types";
 import { withTauriWindow } from "../utils/tauriWindow";
 import { isTauriRuntime } from "../utils/runtime";
 import {
   getWebRemoteSession,
   type WebRemoteSession,
 } from "../services/webRemoteSessionService";
+
+const BROWSER_REMOTE_UNSUPPORTED_MESSAGE =
+  "Secure remote sessions require the desktop client";
 // DEPRECATED: Rendering services removed - now managed by mrd-service
 // import {
 //   attachRenderHostSession,
@@ -134,6 +141,33 @@ function webSessionToDevice(session: WebRemoteSession): Device {
   };
 }
 
+function remotePresentationLabel(state: RemotePresentationState | undefined): string {
+  switch (state) {
+    case "incoming_approval_required":
+      return "等待目标设备确认";
+    case "authenticating":
+      return "正在认证远程会话";
+    case "connecting":
+      return "正在建立安全路由";
+    case "connected_without_media":
+      return "安全路由已连接，等待媒体";
+    case "degraded":
+      return "媒体质量下降";
+    case "reconnecting":
+      return "正在重新连接";
+    case "denied":
+      return "远程访问已拒绝";
+    case "failed":
+      return "远程会话失败";
+    case "closed":
+      return "远程会话已关闭";
+    case "streaming":
+      return "远程媒体传输中";
+    default:
+      return "正在读取远程会话状态";
+  }
+}
+
 export function RemoteSessionPage() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -141,12 +175,9 @@ export function RemoteSessionPage() {
   const { devices, loading } = useDevices();
   const routeDevice = useDeviceById(id, devices);
   const webRemoteSession = id ? getWebRemoteSession(id) : null;
-  const device = routeDevice ?? (webRemoteSession ? webSessionToDevice(webRemoteSession) : undefined);
-  const isWebRemoteSession = Boolean(webRemoteSession && !routeDevice);
+  const tauriRuntime = isTauriRuntime();
 
   const [muted, setMuted] = useState(false);
-  const [latency, setLatency] = useState(device?.ping ?? 24);
-  const [quality, setQuality] = useState(87);
   const [elapsed, setElapsed] = useState(0);
   const [isMaximized, setIsMaximized] = useState(false);
   // Rendering features disabled - now managed by mrd-service
@@ -159,12 +190,88 @@ export function RemoteSessionPage() {
   const [webRtcState, setWebRtcState] = useState<"idle" | "connecting" | "connected" | "failed">("idle");
   const [webRtcMessage, setWebRtcMessage] = useState("WebRTC waiting");
   const [displayWindows, setDisplayWindows] = useState<RemoteDisplayWindowContext[]>([]);
-  const [sessionSnapshot, setSessionSnapshot] = useState<SessionRuntimeSnapshot | null>(null);
+  const [remoteSessionSnapshot, setRemoteSessionSnapshot] =
+    useState<RemoteSessionSnapshot | null>(null);
+  const [remoteSessionError, setRemoteSessionError] = useState<string | null>(null);
   const [probeSnapshot, setProbeSnapshot] = useState<ProbeSnapshot | null>(null);
   const [displayLaunchState, setDisplayLaunchState] =
     useState<"idle" | "opening" | "open" | "failed">("idle");
   const [displayLaunchMessage, setDisplayLaunchMessage] =
     useState("原生显示窗口将承载远程画面");
+  const secureRouteDevice = remoteSessionSnapshot
+    ? devices.find(
+        (candidate) =>
+          candidate.deviceId === remoteSessionSnapshot.peer_device_id,
+      )
+    : undefined;
+  const snapshotFallbackDevice: Device | undefined = remoteSessionSnapshot
+    ? {
+        id: remoteSessionSnapshot.peer_device_id,
+        name: remoteSessionSnapshot.peer_device_id,
+        deviceId: remoteSessionSnapshot.peer_device_id,
+        os: "Remote device",
+        icon: Monitor,
+        status: "online",
+        location: remoteSessionSnapshot.route_kind ?? "secure route",
+        ping: null,
+        lastSeen: "just now",
+        cpu: null,
+        ram: null,
+        disk: null,
+        ip: "secure route",
+        group: "Secure session",
+        favorite: false,
+        discoverySources: ["server"],
+        primarySource: "server",
+        sourceLabel: "Authenticated remote session",
+        isLocal: false,
+        p2pAvailable: remoteSessionSnapshot.route_kind === "lan_quic",
+        serverAvailable: true,
+      }
+    : undefined;
+  const errorFallbackDevice: Device | undefined =
+    id && tauriRuntime && remoteSessionError
+      ? {
+          id,
+          name: "Remote session",
+          deviceId: id,
+          os: "Unknown remote device",
+          icon: Monitor,
+          status: "offline",
+          location: "secure route",
+          ping: null,
+          lastSeen: "unknown",
+          cpu: null,
+          ram: null,
+          disk: null,
+          ip: "secure route",
+          group: "Secure session",
+          favorite: false,
+          discoverySources: ["server"],
+          primarySource: "server",
+          sourceLabel: "Authoritative session unavailable",
+          isLocal: false,
+          p2pAvailable: false,
+          serverAvailable: true,
+        }
+      : undefined;
+  const device =
+    routeDevice ??
+    secureRouteDevice ??
+    snapshotFallbackDevice ??
+    errorFallbackDevice ??
+    (webRemoteSession ? webSessionToDevice(webRemoteSession) : undefined);
+  const unsupportedBrowserPeerSession = Boolean(
+    webRemoteSession?.mode === "web_to_peer" && !tauriRuntime,
+  );
+  const isWebRemoteSession = Boolean(
+    webRemoteSession?.mode === "web_to_local" && !tauriRuntime,
+  );
+  const nativeStreaming =
+    tauriRuntime && remoteSessionSnapshot?.presentation_state === "streaming";
+  const mediaConnected = isWebRemoteSession
+    ? webRtcState === "connected"
+    : nativeStreaming;
   const effectiveDisplayLaunchMessage =
     isWebRemoteSession && displayLaunchMessage === "原生显示窗口将承载远程画面"
       ? "网页渲染将承载本机 mrd-service 采集画面"
@@ -174,16 +281,58 @@ export function RemoteSessionPage() {
     'button, a, input, select, textarea, [role="button"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [data-radix-collection-item], [data-no-drag="true"]';
 
   useEffect(() => {
-    const timer = setInterval(() => {
-      setElapsed((e) => e + 1);
-      setLatency((l) => Math.max(10, Math.min(60, l + Math.floor(Math.random() * 7) - 3)));
-      setQuality((q) => Math.max(70, Math.min(98, q + Math.floor(Math.random() * 5) - 2)));
-    }, 1000);
-    return () => clearInterval(timer);
-  }, []);
+    if (!id || !tauriRuntime) return;
+    setRemoteSessionSnapshot(null);
+    setRemoteSessionError(null);
+    return observeRemoteSession(id, {
+      onSnapshot: (snapshot) => {
+        setRemoteSessionSnapshot(snapshot);
+        setRemoteSessionError(null);
+      },
+      onError: (error) => {
+        setRemoteSessionError(
+          error instanceof Error ? error.message : "读取远程会话状态失败",
+        );
+      },
+    });
+  }, [id, tauriRuntime]);
 
   useEffect(() => {
-    if (!webRemoteSession || isTauriRuntime()) return;
+    if (
+      !id ||
+      !tauriRuntime ||
+      !remoteSessionSnapshot ||
+      remoteSessionSnapshot.presentation_state === "streaming"
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    void (async () => {
+      const windows = await listRemoteDisplayWindows(id);
+      if (cancelled || !windows.ok) return;
+      await Promise.all(
+        windows.value.map((window) => closeRemoteDisplayWindow(window.label)),
+      );
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [id, remoteSessionSnapshot?.presentation_state, tauriRuntime]);
+
+  useEffect(() => {
+    if (!mediaConnected) {
+      setElapsed(0);
+      return;
+    }
+    const timer = setInterval(() => {
+      setElapsed((current) => current + 1);
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [mediaConnected]);
+
+  useEffect(() => {
+    if (!isWebRemoteSession || !webRemoteSession) return;
     if (typeof RTCPeerConnection === "undefined") {
       setWebRtcState("failed");
       setWebRtcMessage("WebRTC is not available in this browser");
@@ -251,7 +400,7 @@ export function RemoteSessionPage() {
       left.close();
       right.close();
     };
-  }, [webRemoteSession?.sessionId]);
+  }, [isWebRemoteSession, webRemoteSession?.sessionId]);
 
   useEffect(() => {
     void withTauriWindow(async (appWindow) => {
@@ -261,7 +410,11 @@ export function RemoteSessionPage() {
   }, []);
 
   useEffect(() => {
-    if (!id || !isTauriRuntime()) return;
+    if (!id || !tauriRuntime || !nativeStreaming) {
+      setDisplayWindows([]);
+      setProbeSnapshot(null);
+      return;
+    }
 
     let cancelled = false;
     const refreshNativeDisplayState = async () => {
@@ -272,13 +425,6 @@ export function RemoteSessionPage() {
           setDisplayLaunchState("open");
           setDisplayLaunchMessage("原生显示窗口已接管画面输出");
         }
-      }
-
-      try {
-        const snapshot = await getSessionSnapshot(id);
-        if (!cancelled) setSessionSnapshot(snapshot);
-      } catch {
-        if (!cancelled) setSessionSnapshot(null);
       }
 
       try {
@@ -295,10 +441,10 @@ export function RemoteSessionPage() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [id]);
+  }, [id, nativeStreaming, tauriRuntime]);
 
   useEffect(() => {
-    if (!id || !isTauriRuntime() || isWebRemoteSession) return;
+    if (!id || !tauriRuntime || isWebRemoteSession || !nativeStreaming) return;
 
     let cancelled = false;
     const openNativeDisplay = async () => {
@@ -315,7 +461,12 @@ export function RemoteSessionPage() {
       }
 
       const result = await openRemoteDisplayWindow({ sessionId: id });
-      if (cancelled) return;
+      if (cancelled) {
+        if (result.ok) {
+          await closeRemoteDisplayWindow(result.value.label);
+        }
+        return;
+      }
       if (result.ok) {
         setDisplayWindows([result.value]);
         setDisplayLaunchState("open");
@@ -330,7 +481,7 @@ export function RemoteSessionPage() {
     return () => {
       cancelled = true;
     };
-  }, [id, isWebRemoteSession]);
+  }, [id, isWebRemoteSession, nativeStreaming, tauriRuntime]);
 
   // Render host attachment disabled - now managed by mrd-service internally
   // useEffect(() => {
@@ -420,6 +571,14 @@ export function RemoteSessionPage() {
     await stopSession(id).catch((error) => {
       console.warn("[RemoteSessionPage] failed to stop session", error);
     });
+    if (tauriRuntime) {
+      const windows = await listRemoteDisplayWindows(id);
+      if (windows.ok) {
+        await Promise.all(
+          windows.value.map((window) => closeRemoteDisplayWindow(window.label)),
+        );
+      }
+    }
   };
 
   const handleDisconnect = () => {
@@ -501,7 +660,24 @@ export function RemoteSessionPage() {
   const currentWindowRole: string | null = activeDisplayWindow?.role ?? null;
   const nativeDisplayMode = activeDisplayWindow?.render_mode ?? "d3d11_native";
   const remoteFps = probeSnapshot?.current_fps ?? null;
-  const transportLabel = sessionSnapshot?.transport_kind ?? (isWebRemoteSession ? "webrtc" : "quic");
+  const latency = mediaConnected ? (device?.ping ?? null) : null;
+  const quality =
+    mediaConnected && probeSnapshot && probeSnapshot.frames_received > 0
+      ? Math.max(
+          0,
+          Math.min(
+            100,
+            Math.round(
+              ((probeSnapshot.frames_received - probeSnapshot.frames_dropped) /
+                probeSnapshot.frames_received) *
+                100,
+            ),
+          ),
+        )
+      : null;
+  const transportLabel =
+    remoteSessionSnapshot?.route_kind ??
+    (isWebRemoteSession ? "webrtc" : "pending");
 
   const handleTauriDragStart = (event: React.MouseEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
@@ -538,7 +714,10 @@ export function RemoteSessionPage() {
     })();
   };
 
-  if (loading && !webRemoteSession) {
+  if (
+    (loading && !webRemoteSession) ||
+    (tauriRuntime && id && !remoteSessionSnapshot && !remoteSessionError)
+  ) {
     return <div className="flex items-center justify-center h-screen bg-[#1a1a1a] text-gray-400">加载设备中...</div>;
   }
 
@@ -555,6 +734,77 @@ export function RemoteSessionPage() {
           >
             返回首页
           </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!mediaConnected) {
+    const failureMessage =
+      (unsupportedBrowserPeerSession
+        ? BROWSER_REMOTE_UNSUPPORTED_MESSAGE
+        : remoteSessionSnapshot?.failure?.message ?? remoteSessionError);
+    const suggestedAction =
+      remoteSessionSnapshot?.failure?.suggested_action ?? null;
+    const presentationLabel = unsupportedBrowserPeerSession
+      ? "Secure remote session unavailable"
+      : isWebRemoteSession
+        ? webRtcMessage
+        : remotePresentationLabel(remoteSessionSnapshot?.presentation_state);
+
+    return (
+      <div className="flex h-screen w-screen items-center justify-center bg-[#0b1020] px-6 text-gray-200">
+        <div className="w-full max-w-xl rounded-xl border border-white/10 bg-[#171d2d] p-6 shadow-2xl">
+          <div className="flex items-center gap-3">
+            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-500/15">
+              <Monitor className="h-5 w-5 text-blue-300" />
+            </div>
+            <div className="min-w-0">
+              <div className="truncate text-base font-semibold text-white">
+                {device.name}
+              </div>
+              <div className="mt-1 text-sm text-gray-400">
+                {presentationLabel}
+              </div>
+            </div>
+          </div>
+          <div className="mt-5 grid gap-3 sm:grid-cols-3">
+            <DisplayMetric
+              label="授权"
+              value={remoteSessionSnapshot?.authorization_state ?? "pending"}
+            />
+            <DisplayMetric
+              label="路由"
+              value={remoteSessionSnapshot?.route_state ?? "pending"}
+            />
+            <DisplayMetric
+              label="媒体"
+              value={remoteSessionSnapshot?.media_state ?? webRtcState}
+            />
+          </div>
+          {failureMessage ? (
+            <div
+              role="alert"
+              className="mt-5 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200"
+            >
+              <div>{failureMessage}</div>
+              {suggestedAction ? (
+                <div className="mt-1 text-xs text-red-200/70">{suggestedAction}</div>
+              ) : null}
+            </div>
+          ) : (
+            <div className="mt-5 h-1.5 overflow-hidden rounded-full bg-white/10">
+              <div className="h-full w-1/2 animate-pulse rounded-full bg-blue-400" />
+            </div>
+          )}
+          <div className="mt-5 flex justify-end">
+            <button
+              onClick={handleDisconnect}
+              className="rounded-md bg-red-500/15 px-3 py-2 text-sm text-red-300 hover:bg-red-500/25"
+            >
+              取消连接
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -618,11 +868,26 @@ export function RemoteSessionPage() {
         <div className="flex items-center gap-1.5 pr-1 shrink-0" style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}>
           {/* Status indicators */}
           <div className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-white/6 mr-1">
-            <Wifi style={{ width: 11, height: 11 }} className={latency < 30 ? "text-green-400" : latency < 50 ? "text-yellow-400" : "text-red-400"} />
-            <span className="text-gray-300" style={{ fontSize: 11 }}>{latency}ms</span>
+            <Wifi
+              style={{ width: 11, height: 11 }}
+              className={
+                latency === null
+                  ? "text-gray-500"
+                  : latency < 30
+                    ? "text-green-400"
+                    : latency < 50
+                      ? "text-yellow-400"
+                      : "text-red-400"
+              }
+            />
+            <span className="text-gray-300" style={{ fontSize: 11 }}>
+              {latency === null ? "—" : `${latency}ms`}
+            </span>
             <div className="w-px h-3 bg-white/10 mx-0.5" />
             <Signal style={{ width: 11, height: 11 }} className="text-blue-400" />
-            <span className="text-gray-300" style={{ fontSize: 11 }}>{quality}%</span>
+            <span className="text-gray-300" style={{ fontSize: 11 }}>
+              {quality === null ? "—" : `${quality}%`}
+            </span>
             <div className="w-px h-3 bg-white/10 mx-0.5" />
             <span className="text-gray-400" style={{ fontSize: 11 }}>{formatTime(elapsed)}</span>
           </div>

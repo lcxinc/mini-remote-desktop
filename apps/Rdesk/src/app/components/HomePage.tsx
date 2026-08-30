@@ -22,10 +22,12 @@ import {
   ChevronDown,
   Pencil,
   Clock as ClockIcon,
+  AlertCircle,
 } from "lucide-react";
 import { useTheme } from "./ThemeContext";
 import { useAccessPassword, REFRESH_OPTIONS } from "../services/accessPasswordService";
 import { useDeviceRegistration, deviceService } from "../services/deviceService";
+import { launchRemoteDisplayForDevice } from "../services/remoteDisplayLauncher";
 
 const recentConnections = [
   {
@@ -95,12 +97,13 @@ export function HomePage() {
   } = useAccessPassword(myDeviceId);
 
   const [connectId, setConnectId] = useState("");
-  const [password, setPassword] = useState("");
-  const [showPassword, setShowPassword] = useState(false);
   const [showMyPassword, setShowMyPassword] = useState(false);
   const [copied, setCopied] = useState(false);
   const [inviteCopied, setInviteCopied] = useState(false);
   const [favorites] = useState(["1", "2"]);
+  const [connectingDeviceId, setConnectingDeviceId] = useState<string | null>(null);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const connectionInFlightRef = useRef(false);
 
   // 接入密码编辑状态
   const [editingPassword, setEditingPassword] = useState(false);
@@ -276,15 +279,49 @@ https://wechat.todesk.com/invite-page?id=${inviteCode}`;
     }
   }, [showRefreshMenu]);
 
+  const launchSecureRemote = async (target: {
+    id: string;
+    name: string;
+    deviceId: string;
+    os: string;
+  }) => {
+    if (connectionInFlightRef.current) return;
+    connectionInFlightRef.current = true;
+    const targetDeviceId = target.deviceId.replace(/\s/g, "");
+    setConnectingDeviceId(target.id);
+    setConnectionError(null);
+    try {
+      const result = await launchRemoteDisplayForDevice(targetDeviceId, {
+        transportKind: "webrtc",
+        targetDeviceName: target.name,
+        targetOs: target.os,
+        routePreference: "auto",
+      });
+      navigate(`/session/${result.sessionId}`);
+    } catch (error) {
+      setConnectionError(
+        error instanceof Error ? error.message : "安全远程会话请求失败",
+      );
+    } finally {
+      connectionInFlightRef.current = false;
+      setConnectingDeviceId(null);
+    }
+  };
+
   const handleConnect = () => {
     if (!connectId.trim()) return;
     const found = recentConnections.find(
       (d) => d.deviceId.replace(/\s/g, "") === connectId.replace(/\s/g, "")
     );
     if (found) {
-      navigate(`/session/${found.id}`);
+      void launchSecureRemote(found);
     } else {
-      navigate(`/session/custom?deviceId=${connectId}`);
+      void launchSecureRemote({
+        id: "custom",
+        name: "远程设备",
+        deviceId: connectId,
+        os: "Unknown",
+      });
     }
   };
 
@@ -515,37 +552,43 @@ https://wechat.todesk.com/invite-page?id=${inviteCode}`;
                 />
               </div>
 
-              <div>
-                <label className={`block mb-1.5 ${textSecondary}`} style={{ fontSize: 12 }}>
-                  密码（可选）
-                </label>
-                <div className="relative">
-                  <input
-                    type={showPassword ? "text" : "password"}
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    placeholder="输入密码"
-                    className={`w-full px-3 py-2.5 pr-9 rounded-lg border outline-none transition-all ${inputBg}`}
-                    style={{ fontSize: 14 }}
-                  />
-                  <button
-                    onClick={() => setShowPassword(!showPassword)}
-                    className={`absolute right-2.5 top-1/2 -translate-y-1/2 ${isDark ? "text-gray-500 hover:text-gray-300" : "text-gray-400 hover:text-gray-600"}`}
-                  >
-                    {showPassword ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                  </button>
+              <div
+                className={`rounded-lg border px-3 py-2.5 ${
+                  isDark
+                    ? "border-blue-500/20 bg-blue-500/10 text-blue-200"
+                    : "border-blue-100 bg-blue-50 text-blue-700"
+                }`}
+              >
+                <div className="font-medium" style={{ fontSize: 12 }}>
+                  目标设备确认授权
+                </div>
+                <div className="mt-1 opacity-75" style={{ fontSize: 11 }}>
+                  当前安全会话仅支持目标端现场确认；不会使用密码绕过确认。
                 </div>
               </div>
 
               <button
                 onClick={handleConnect}
-                disabled={!connectId.trim()}
+                disabled={!connectId.trim() || connectingDeviceId !== null}
                 className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors shadow-sm"
                 style={{ fontSize: 14 }}
               >
                 <span>立即连接</span>
-                <ArrowRight className="w-4 h-4" />
+                {connectingDeviceId === "custom" ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <ArrowRight className="w-4 h-4" />
+                )}
               </button>
+              {connectionError ? (
+                <div
+                  role="alert"
+                  className="mt-3 flex items-start gap-2 rounded-md border border-red-500/25 bg-red-500/10 px-3 py-2 text-xs text-red-500"
+                >
+                  <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <span>{connectionError}</span>
+                </div>
+              ) : null}
             </div>
           </div>
         </div>
@@ -572,7 +615,9 @@ https://wechat.todesk.com/invite-page?id=${inviteCode}`;
                         ? "bg-[#2a2a2a]/60 hover:bg-[#333] hover:border-gray-600"
                         : "bg-gray-50/60 hover:bg-gray-100 hover:border-gray-200"
                     }`}
-                    onClick={() => device.status === "online" && navigate(`/session/${device.id}`)}
+                    onClick={() =>
+                      device.status === "online" && void launchSecureRemote(device)
+                    }
                   >
                     <div className={`relative w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${
                       device.status === "online"
@@ -613,7 +658,11 @@ https://wechat.todesk.com/invite-page?id=${inviteCode}`;
 
                       {device.status === "online" ? (
                         <button
-                          onClick={(e) => { e.stopPropagation(); navigate(`/session/${device.id}`); }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void launchSecureRemote(device);
+                          }}
+                          disabled={connectingDeviceId !== null}
                           className={`flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors opacity-0 group-hover:opacity-100 ${
                             isDark ? "bg-blue-900/30 text-blue-400 hover:bg-blue-900/50" : "bg-blue-50 text-blue-600 hover:bg-blue-100"
                           }`}

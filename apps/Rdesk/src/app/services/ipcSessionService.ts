@@ -11,7 +11,12 @@
  */
 
 import * as tauriAdapter from '../adapters/tauri';
-import type { RemoteRoutePreference } from '../adapters/tauri/types';
+import type {
+  RemoteRoutePreference,
+  RemoteSessionSnapshot,
+  SessionEventSubscription,
+  SessionEventSubscriptionQuery,
+} from '../adapters/tauri/types';
 
 // ============================================================================
 // Types
@@ -161,17 +166,19 @@ export const listDevices = async (): Promise<DeviceInfo[]> => {
 // ============================================================================
 
 /**
- * Start a new session as controller
+ * Create the legacy runtime session used exclusively by the explicit local
+ * display self-test. The service rejects this contract for registered remote
+ * targets; production remote control must use requestRemoteSession.
  */
-export const startSession = async (
+export const startLocalTestSession = async (
   sessionId: string,
-  targetDeviceId: string,
-  transportKind: TransportKind = "webrtc"
+  localDeviceId: string,
+  transportKind: TransportKind = "webrtc",
 ): Promise<string> => {
   const result = await tauriAdapter.ipcStartSession(
     sessionId,
-    targetDeviceId,
-    transportKind
+    localDeviceId,
+    transportKind,
   );
   return unwrapAdapterResult(result);
 };
@@ -183,13 +190,13 @@ export const startSession = async (
  * explicitly requires LAN; Auto may select WAN relay when no fresh LAN path
  * is available.
  */
-export const startLanRemoteSession = async (
+export const requestRemoteSession = async (
   sessionId: string,
   targetDeviceId: string,
   transportKind: TransportKind = "webrtc",
   requestedProfile?: MediaProfile,
   routePreference: RemoteRoutePreference = "auto",
-): Promise<string> => {
+): Promise<RemoteSessionSnapshot> => {
   if (routePreference === "lan" && transportKind !== "quic") {
     throw new ServiceCommandError(
       "Explicit LAN remote sessions currently require QUIC",
@@ -204,7 +211,38 @@ export const startLanRemoteSession = async (
     requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
     requested_profile: requestedProfile ?? null,
   });
-  return unwrapAdapterResult(result).session_id;
+  const snapshot = unwrapAdapterResult(result);
+  if (
+    snapshot.session_id !== sessionId ||
+    snapshot.peer_device_id !== targetDeviceId ||
+    snapshot.role !== "controller"
+  ) {
+    throw new ServiceCommandError(
+      "Remote session response binding mismatch",
+      "E_REMOTE_SESSION_BINDING",
+    );
+  }
+  return snapshot;
+};
+
+/**
+ * Read the authoritative secure remote-session projection.
+ */
+export const getRemoteSession = async (
+  sessionId: string
+): Promise<RemoteSessionSnapshot> => {
+  const result = await tauriAdapter.ipcGetRemoteSession(sessionId);
+  return unwrapAdapterResult(result);
+};
+
+/**
+ * Long-poll typed secure remote-session events.
+ */
+export const subscribeSessionEvents = async (
+  query: SessionEventSubscriptionQuery
+): Promise<SessionEventSubscription> => {
+  const result = await tauriAdapter.ipcSubscribeSessionEvents(query);
+  return unwrapAdapterResult(result);
 };
 
 /**

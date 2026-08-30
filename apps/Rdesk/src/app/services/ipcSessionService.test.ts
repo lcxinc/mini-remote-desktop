@@ -2,20 +2,51 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const adapter = vi.hoisted(() => ({
   requestRemoteSession: vi.fn(),
+  startSession: vi.fn(),
 }));
 
 vi.mock("../adapters/tauri", () => ({
   ipcRequestRemoteSession: adapter.requestRemoteSession,
+  ipcStartSession: adapter.startSession,
 }));
 
-import { startLanRemoteSession } from "./ipcSessionService";
+import {
+  requestRemoteSession,
+  startLocalTestSession,
+} from "./ipcSessionService";
 
-describe("startLanRemoteSession", () => {
+describe("startLocalTestSession", () => {
+  it("uses the legacy contract only for the explicitly named local test path", async () => {
+    adapter.startSession.mockResolvedValueOnce({
+      ok: true,
+      value: "local-test-session",
+    });
+
+    await expect(
+      startLocalTestSession(
+        "local-test-session",
+        "local-device",
+        "webrtc",
+      ),
+    ).resolves.toBe("local-test-session");
+    expect(adapter.startSession).toHaveBeenCalledWith(
+      "local-test-session",
+      "local-device",
+      "webrtc",
+    );
+  });
+});
+
+describe("requestRemoteSession", () => {
   beforeEach(() => {
     adapter.requestRemoteSession.mockReset();
     adapter.requestRemoteSession.mockResolvedValue({
       ok: true,
-      value: { session_id: "session-1" },
+      value: {
+        session_id: "session-1",
+        peer_device_id: "target-1",
+        role: "controller",
+      },
     });
   });
 
@@ -35,7 +66,12 @@ describe("startLanRemoteSession", () => {
       color_pipeline: "sdr8",
     } as const;
 
-    await startLanRemoteSession("session-1", "target-1", "quic", profile);
+    const snapshot = await requestRemoteSession(
+      "session-1",
+      "target-1",
+      "quic",
+      profile,
+    );
 
     expect(adapter.requestRemoteSession).toHaveBeenCalledWith({
       session_id: "session-1",
@@ -45,10 +81,15 @@ describe("startLanRemoteSession", () => {
       requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
       requested_profile: profile,
     });
+    expect(snapshot).toEqual({
+      session_id: "session-1",
+      peer_device_id: "target-1",
+      role: "controller",
+    });
   });
 
   it("forwards only the selected route preference enum", async () => {
-    await startLanRemoteSession(
+    await requestRemoteSession(
       "session-1",
       "target-1",
       "quic",
@@ -67,7 +108,7 @@ describe("startLanRemoteSession", () => {
   });
 
   it("allows an explicitly selected WAN relay route without LAN QUIC", async () => {
-    await startLanRemoteSession(
+    await requestRemoteSession(
       "session-1",
       "target-1",
       "webrtc",
@@ -83,5 +124,20 @@ describe("startLanRemoteSession", () => {
       requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
       requested_profile: null,
     });
+  });
+
+  it("rejects a response that is not bound to the requested session and peer", async () => {
+    adapter.requestRemoteSession.mockResolvedValueOnce({
+      ok: true,
+      value: {
+        session_id: "other-session",
+        peer_device_id: "other-target",
+        role: "controller",
+      },
+    });
+
+    await expect(
+      requestRemoteSession("session-1", "target-1", "webrtc"),
+    ).rejects.toMatchObject({ code: "E_REMOTE_SESSION_BINDING" });
   });
 });

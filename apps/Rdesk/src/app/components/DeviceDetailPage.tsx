@@ -431,14 +431,20 @@ function RemoteTab({ device }: { device: Device }) {
         targetIp: device.ip,
         lanP2P: isLanP2PRemote,
       });
+      if (result.mode === "route") {
+        navigate(`/session/${result.sessionId}`);
+        return;
+      }
       activeSessionIdRef.current = result.sessionId;
       setActiveSessionId(result.sessionId);
       setRemoteWindowLabel(result.windowLabel);
       setSessionSnapshot(null);
       setProbeSnapshot(null);
       setElapsed(0);
+      // Only the explicit local/native test path can return a window here.
+      // Secure remote requests are rendered by RemoteSessionPage after their
+      // authoritative presentation state reaches `streaming`.
       setConnected(true);
-      if (result.mode === "route") navigate(`/session/${result.sessionId}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Open remote display failed";
       setConnectionError(message);

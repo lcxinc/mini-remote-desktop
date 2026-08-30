@@ -17,6 +17,18 @@ fn create_test_server() -> IpcServer {
     IpcServer::new(app_state)
 }
 
+async fn register_local_test_device(server: &IpcServer, device_id: &str) -> DeviceId {
+    let device_id = DeviceId(device_id.to_string());
+    let response = server
+        .handle_request(IpcRequest::RegisterDevice {
+            device_id: device_id.clone(),
+            device_name: "Test Local Device".to_string(),
+        })
+        .await;
+    assert!(matches!(response, IpcResponse::DeviceRegistered { .. }));
+    device_id
+}
+
 #[tokio::test]
 async fn service_evaluates_lan_profile_and_exposes_policy_identity_telemetry() {
     let server = create_test_server();
@@ -218,7 +230,7 @@ async fn hard_cut_full_session_flow() {
 
     // Step 3: Start session as controller
     let session_id = SessionId("smoke-test-session".to_string());
-    let target_device_id = DeviceId("remote-agent".to_string());
+    let target_device_id = device_id.clone();
 
     let start_response = server
         .handle_request(IpcRequest::StartSession {
@@ -285,6 +297,48 @@ async fn hard_cut_full_session_flow() {
 }
 
 #[tokio::test]
+async fn hard_cut_rejects_legacy_remote_start_after_local_registration() {
+    let server = create_test_server();
+    let local_device_id = DeviceId("guard-local-device".to_string());
+    let _ = server
+        .handle_request(IpcRequest::RegisterDevice {
+            device_id: local_device_id,
+            device_name: "Guard Local Device".to_string(),
+        })
+        .await;
+    let session_id = SessionId("guard-legacy-remote".to_string());
+
+    let response = server
+        .handle_request(IpcRequest::StartSession {
+            session_id: session_id.clone(),
+            target_device_id: DeviceId("guard-remote-device".to_string()),
+            transport_kind: "webrtc".to_string(),
+        })
+        .await;
+
+    let IpcResponse::RemoteAccessError {
+        session_id: returned_session_id,
+        failure,
+        ..
+    } = response
+    else {
+        panic!("expected remote legacy start rejection");
+    };
+    assert_eq!(returned_session_id, Some(session_id.clone()));
+    assert_eq!(
+        failure.code,
+        mrd_ipc::RemoteReasonCode::ProtocolDowngradeBlocked
+    );
+    assert!(server
+        .app_state()
+        .sessions
+        .lock()
+        .await
+        .get(&session_id)
+        .is_none());
+}
+
+#[tokio::test]
 async fn hard_cut_session_flow_is_auditable() {
     let server = create_test_server();
 
@@ -297,7 +351,7 @@ async fn hard_cut_session_flow_is_auditable() {
         .await;
 
     let session_id = SessionId("audit-session".to_string());
-    let peer_device = DeviceId("audit-peer".to_string());
+    let peer_device = local_device.clone();
     let _ = server
         .handle_request(IpcRequest::StartSession {
             session_id: session_id.clone(),
@@ -358,7 +412,7 @@ async fn hard_cut_runtime_snapshot_aggregates_state() {
     let _ = server
         .handle_request(IpcRequest::StartSession {
             session_id: session_id.clone(),
-            target_device_id: DeviceId("agent".to_string()),
+            target_device_id: DeviceId("test-device".to_string()),
             transport_kind: "webrtc".to_string(),
         })
         .await;
@@ -385,6 +439,7 @@ async fn hard_cut_runtime_snapshot_aggregates_state() {
 #[tokio::test]
 async fn hard_cut_list_sessions_returns_active_sessions() {
     let server = create_test_server();
+    let local_device_id = register_local_test_device(&server, "agent").await;
 
     // Start two sessions
     let session1 = SessionId("list-test-1".to_string());
@@ -394,7 +449,7 @@ async fn hard_cut_list_sessions_returns_active_sessions() {
         let response = server
             .handle_request(IpcRequest::StartSession {
                 session_id: session_id.clone(),
-                target_device_id: DeviceId("agent".to_string()),
+                target_device_id: local_device_id.clone(),
                 transport_kind: "quic".to_string(),
             })
             .await;
@@ -506,10 +561,11 @@ async fn hard_cut_sender_receiver_require_existing_session() {
 
     // After creating a session, StartSender should succeed
     let valid_session = SessionId("valid-session".to_string());
+    let local_device_id = register_local_test_device(&server, "remote").await;
     let _ = server
         .handle_request(IpcRequest::StartSession {
             session_id: valid_session.clone(),
-            target_device_id: DeviceId("remote".to_string()),
+            target_device_id: local_device_id,
             transport_kind: "quic".to_string(),
         })
         .await;
@@ -545,7 +601,7 @@ async fn hard_cut_start_and_accept_session() {
 
     let session_id = SessionId("accept-test-session".to_string());
     let controller_device = DeviceId("controller".to_string());
-    let agent_device = DeviceId("agent".to_string());
+    let agent_device = register_local_test_device(&server, "agent").await;
 
     // Start session as controller
     let start_response = server
@@ -593,6 +649,7 @@ async fn hard_cut_start_and_accept_session() {
 #[tokio::test]
 async fn hard_cuted_service_owns_session_state() {
     let server = create_test_server();
+    let local_device_id = register_local_test_device(&server, "remote").await;
 
     let session_id = SessionId("ownership-test".to_string());
 
@@ -600,7 +657,7 @@ async fn hard_cuted_service_owns_session_state() {
     let _ = server
         .handle_request(IpcRequest::StartSession {
             session_id: session_id.clone(),
-            target_device_id: DeviceId("remote".to_string()),
+            target_device_id: local_device_id,
             transport_kind: "webrtc".to_string(),
         })
         .await;
@@ -628,6 +685,7 @@ async fn hard_cuted_service_owns_session_state() {
 #[tokio::test]
 async fn hard_cut_start_sender_updates_snapshot_state() {
     let server = create_test_server();
+    let local_device_id = register_local_test_device(&server, "remote").await;
 
     let session_id = SessionId("sender-state-test".to_string());
 
@@ -635,7 +693,7 @@ async fn hard_cut_start_sender_updates_snapshot_state() {
     let _ = server
         .handle_request(IpcRequest::StartSession {
             session_id: session_id.clone(),
-            target_device_id: DeviceId("remote".to_string()),
+            target_device_id: local_device_id,
             transport_kind: "quic".to_string(),
         })
         .await;
@@ -699,6 +757,7 @@ async fn hard_cut_start_sender_updates_snapshot_state() {
 #[tokio::test]
 async fn hard_cut_start_receiver_updates_snapshot_state() {
     let server = create_test_server();
+    let local_device_id = register_local_test_device(&server, "remote").await;
 
     let session_id = SessionId("receiver-state-test".to_string());
 
@@ -706,7 +765,7 @@ async fn hard_cut_start_receiver_updates_snapshot_state() {
     let _ = server
         .handle_request(IpcRequest::StartSession {
             session_id: session_id.clone(),
-            target_device_id: DeviceId("remote".to_string()),
+            target_device_id: local_device_id,
             transport_kind: "webrtc".to_string(),
         })
         .await;
