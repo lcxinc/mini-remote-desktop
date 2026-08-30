@@ -268,10 +268,12 @@ pub fn parse_windows_agent_service_command(command: &str) -> Result<PathBuf, Pla
         .split_once('"')
         .ok_or(PlatformError::PeerIdentityInvalid)?;
     let executable = PathBuf::from(executable);
-    if !is_local_drive_absolute_path(&executable)
-        || !executable
-            .file_name()
-            .is_some_and(|name| name.eq_ignore_ascii_case("mrd-relay-agent.exe"))
+    let parsed_executable =
+        WindowsAbsolutePath::parse(&executable).ok_or(PlatformError::PeerIdentityInvalid)?;
+    if !parsed_executable
+        .components
+        .last()
+        .is_some_and(|name| name.eq_ignore_ascii_case("mrd-relay-agent.exe"))
     {
         return Err(PlatformError::PeerIdentityInvalid);
     }

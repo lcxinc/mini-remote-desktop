@@ -149,6 +149,8 @@ fn relay_control_ci_covers_runtime_and_deployment_paths_and_preserves_exit_codes
         "HOME=/root",
         "$contractExitCode = $LASTEXITCODE",
         "$qualityGateExitCode = $LASTEXITCODE",
+        "shell: pwsh",
+        "$PSNativeCommandUseErrorActionPreference = $false",
     ] {
         assert!(
             yaml.contains(required),

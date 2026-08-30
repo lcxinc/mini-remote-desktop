@@ -319,6 +319,8 @@ impl IpcStream {
 mod tests {
     use super::*;
     use crate::IpcRequest;
+    #[cfg(unix)]
+    use crate::IpcResponse;
 
     #[test]
     fn frame_format_is_valid() {
