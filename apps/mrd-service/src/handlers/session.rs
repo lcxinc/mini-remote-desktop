@@ -1138,13 +1138,34 @@ pub async fn send_control_input(
 ) -> IpcResponse {
     if let Some(secure_session) = app_state.session_authorizations.snapshot(&session_id).await {
         let peer_key_id = Some(secure_session.peer_key_id);
-        return match crate::lan_discovery::request_authenticated_lan_control_input(
-            app_state,
-            &session_id,
-            event,
-        )
-        .await
-        {
+        let transport_kind = app_state
+            .session_authorizations
+            .transport_kind(&session_id)
+            .await;
+        let result = match transport_kind.as_deref() {
+            Some("webrtc_relay") => {
+                crate::wan_session::control_input::request_authenticated_wan_control_input(
+                    app_state,
+                    &session_id,
+                    event,
+                )
+                .await
+            }
+            Some("quic" | "lan_quic") => {
+                crate::lan_discovery::request_authenticated_lan_control_input(
+                    app_state,
+                    &session_id,
+                    event,
+                )
+                .await
+            }
+            _ => Err(mrd_ipc::RemoteFailure {
+                code: mrd_ipc::RemoteReasonCode::ProtocolDowngradeBlocked,
+                message: "authorized control input has no verified transport route".to_owned(),
+                suggested_action: None,
+            }),
+        };
+        return match result {
             Ok(result) => IpcResponse::ControlInputAccepted {
                 session_id,
                 lane: result.lane,

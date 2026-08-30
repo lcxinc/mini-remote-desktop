@@ -29,16 +29,27 @@ pub const AUTHENTICATED_CONTROL_INPUT_DATAGRAM_PREFIX: &[u8] = b"MRD_CTRL_INPUT_
 const AUTHENTICATED_CONTROL_ACK_DATAGRAM_PREFIX: &[u8] = b"MRD_CTRL_ACK_V2\0";
 const CONTROL_INPUT_ACK_SIGNATURE_CONTEXT: &str = "MRD_LAN_CONTROL_ACK_V2";
 const CONTROL_INPUT_REPLAY_WINDOW_WIDTH: usize = 128;
-const CONTROL_INPUT_REPLAY_SESSION_LIMIT: usize = 2_048;
+pub(crate) const CONTROL_INPUT_REPLAY_SESSION_LIMIT: usize = 2_048;
 const CONTROL_INPUT_ACK_MAX_WIRE_BYTES: usize = 4_096;
 const CONTROL_INPUT_ACK_LIFETIME_MS: u64 = 5_000;
 const CONTROL_INPUT_AUDIT_ACTION: &str = "session.control_input_decision";
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(super) struct AuthenticatedControlReplayKey {
-    pub(super) session_id: String,
-    pub(super) grant_id: [u8; 32],
-    pub(super) source_key_id: String,
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct AuthenticatedControlReplayKey {
+    pub(crate) session_id: String,
+    pub(crate) grant_id: [u8; 32],
+    pub(crate) source_key_id: String,
+}
+
+impl std::fmt::Debug for AuthenticatedControlReplayKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedControlReplayKey")
+            .field("session_id", &"OPAQUE")
+            .field("grant_id", &"SET")
+            .field("source_key_id", &"SET")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -90,8 +101,7 @@ impl AuthenticatedControlSenderState {
     }
 }
 
-#[derive(Debug)]
-pub(super) struct AuthenticatedControlReplayState {
+pub(crate) struct AuthenticatedControlReplayState {
     realtime_window: ControlSequenceWindow,
     realtime_highest_sequence: u64,
     reliable_next_sequence: u64,
@@ -101,15 +111,29 @@ pub(super) struct AuthenticatedControlReplayState {
     expires_at_ms: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum AuthenticatedControlReplayLane {
+impl std::fmt::Debug for AuthenticatedControlReplayState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedControlReplayState")
+            .field("realtime_highest_sequence", &self.realtime_highest_sequence)
+            .field("reliable_next_sequence", &self.reliable_next_sequence)
+            .field("realtime_observations", &self.realtime_window.len())
+            .field("reliable_observations", &self.reliable_observations.len())
+            .field("acknowledgement_count", &self.acknowledgements.len())
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum AuthenticatedControlReplayLane {
     Reliable,
     Cleanup,
     Realtime,
 }
 
 impl AuthenticatedControlReplayLane {
-    fn from_input_lane(lane: ControlInputLane) -> Self {
+    pub(crate) fn from_input_lane(lane: ControlInputLane) -> Self {
         match lane {
             ControlInputLane::Reliable => Self::Reliable,
             ControlInputLane::Cleanup => Self::Cleanup,
@@ -119,7 +143,7 @@ impl AuthenticatedControlReplayLane {
 }
 
 impl AuthenticatedControlReplayState {
-    fn new(expires_at_ms: u64) -> Self {
+    pub(crate) fn new(expires_at_ms: u64) -> Self {
         Self {
             realtime_window: ControlSequenceWindow::new(CONTROL_INPUT_REPLAY_WINDOW_WIDTH),
             realtime_highest_sequence: 0,
@@ -131,7 +155,11 @@ impl AuthenticatedControlReplayState {
         }
     }
 
-    fn observe(
+    pub(crate) fn is_expired(&self, now_ms: u64) -> bool {
+        now_ms > self.expires_at_ms
+    }
+
+    pub(crate) fn observe(
         &mut self,
         lane: AuthenticatedControlReplayLane,
         sequence: u64,
@@ -218,11 +246,15 @@ impl AuthenticatedControlReplayState {
         }
     }
 
-    fn cached_ack(&self, lane: AuthenticatedControlReplayLane, sequence: u64) -> Option<Vec<u8>> {
+    pub(crate) fn cached_ack(
+        &self,
+        lane: AuthenticatedControlReplayLane,
+        sequence: u64,
+    ) -> Option<Vec<u8>> {
         self.acknowledgements.get(&(lane, sequence)).cloned()
     }
 
-    fn cache_ack(
+    pub(crate) fn cache_ack(
         &mut self,
         lane: AuthenticatedControlReplayLane,
         sequence: u64,
@@ -323,15 +355,26 @@ pub(super) async fn process_authenticated_control_input_datagram(
     let local_device_id = DeviceId(super::local_device_id(app_state).await?);
     let local_identity = app_state.device_identities.machine_identity();
 
-    let validation = validate_authenticated_control_input(
-        app_state,
-        &envelope,
-        &signing_bytes,
-        &local_device_id,
-        local_identity.key_id(),
-        decision_at_ms,
-    )
-    .await;
+    let transport_kind = app_state
+        .session_authorizations
+        .transport_kind(&envelope.payload.session_id)
+        .await;
+    let validation = if matches!(transport_kind.as_deref(), Some("quic" | "lan_quic")) {
+        validate_authenticated_control_input(
+            app_state,
+            &envelope,
+            &signing_bytes,
+            &local_device_id,
+            local_identity.key_id(),
+            decision_at_ms,
+        )
+        .await
+    } else {
+        Err(control_failure(
+            RemoteReasonCode::ProtocolDowngradeBlocked,
+            "authenticated LAN control input requires a verified LAN authorization",
+        ))
+    };
     let (authorization, event, lane) = match validation {
         Ok(validated) => validated,
         Err(failure) => {
@@ -573,7 +616,7 @@ async fn terminate_terminal_control_authorization_if_present(
     }
 }
 
-async fn validate_authenticated_control_input(
+pub(crate) async fn validate_authenticated_control_input(
     app_state: &Arc<AppState>,
     envelope: &SignedControlEnvelopeV2,
     signing_bytes: &[u8],
@@ -812,7 +855,7 @@ async fn audit_control_input_denial(
         })
 }
 
-fn control_request_commitment(
+pub(crate) fn control_request_commitment(
     envelope: &SignedControlEnvelopeV2,
     signing_bytes: &[u8],
 ) -> [u8; 32] {
@@ -834,7 +877,7 @@ fn prune_authenticated_control_replays(
     cache.retain(|_, replay| now_ms <= replay.expires_at_ms);
 }
 
-fn replay_failure(error: ControlSequenceError) -> RemoteFailure {
+pub(crate) fn replay_failure(error: ControlSequenceError) -> RemoteFailure {
     let message = match error {
         ControlSequenceError::OutOfWindow => {
             "authenticated control input sequence is outside the replay window"
@@ -846,7 +889,7 @@ fn replay_failure(error: ControlSequenceError) -> RemoteFailure {
     control_failure(RemoteReasonCode::ReplayDetected, message)
 }
 
-fn control_failure(code: RemoteReasonCode, message: &str) -> RemoteFailure {
+pub(crate) fn control_failure(code: RemoteReasonCode, message: &str) -> RemoteFailure {
     RemoteFailure {
         code,
         message: message.to_string(),
@@ -854,7 +897,7 @@ fn control_failure(code: RemoteReasonCode, message: &str) -> RemoteFailure {
     }
 }
 
-fn remote_scope(scope: PermissionScope) -> RemotePermissionScope {
+pub(crate) fn remote_scope(scope: PermissionScope) -> RemotePermissionScope {
     match scope {
         PermissionScope::InputPointer => RemotePermissionScope::InputPointer,
         PermissionScope::InputKeyboard => RemotePermissionScope::InputKeyboard,
@@ -862,14 +905,16 @@ fn remote_scope(scope: PermissionScope) -> RemotePermissionScope {
     }
 }
 
-fn permission_scope(scope: AuthenticatedInputScope) -> PermissionScope {
+pub(crate) fn permission_scope(scope: AuthenticatedInputScope) -> PermissionScope {
     match scope {
         AuthenticatedInputScope::Pointer => PermissionScope::InputPointer,
         AuthenticatedInputScope::Keyboard => PermissionScope::InputKeyboard,
     }
 }
 
-fn service_control_scope(scope: PermissionScope) -> crate::control_input::ControlInputScope {
+pub(crate) fn service_control_scope(
+    scope: PermissionScope,
+) -> crate::control_input::ControlInputScope {
     match scope {
         PermissionScope::InputPointer => crate::control_input::ControlInputScope::Pointer,
         PermissionScope::InputKeyboard => crate::control_input::ControlInputScope::Keyboard,
@@ -885,7 +930,7 @@ fn permission_scope_name(scope: PermissionScope) -> &'static str {
     }
 }
 
-fn ipc_event_from_authenticated(
+pub(crate) fn ipc_event_from_authenticated(
     event: ControlEvent,
 ) -> std::result::Result<ControlInputEvent, RemoteFailure> {
     match event {
@@ -929,7 +974,7 @@ fn ipc_event_from_authenticated(
     }
 }
 
-fn authenticated_event_lane(event: &ControlInputEvent) -> ControlInputLane {
+pub(crate) fn authenticated_event_lane(event: &ControlInputEvent) -> ControlInputLane {
     match event {
         ControlInputEvent::MouseMove { .. }
         | ControlInputEvent::MouseWheel { .. }
@@ -1512,7 +1557,7 @@ fn verify_control_ack(
     }
 }
 
-fn authenticated_events_from_ipc(
+pub(crate) fn authenticated_events_from_ipc(
     event: &ControlInputEvent,
     granted_scopes: &[RemotePermissionScope],
 ) -> std::result::Result<Vec<ControlEvent>, RemoteFailure> {

@@ -1003,6 +1003,62 @@ async fn runtime_queries_reconcile_a_streaming_wan_coordinator_before_projection
         .apply(WanSessionEvent::Streaming, 1_006)
         .expect("advance coordinator authority to streaming");
     let session_id = state.identity().session_id().clone();
+    let peer_device_id = state.identity().target_device_id().clone();
+    let authorization_now = now_unix_ms();
+    let authorization_expires_at_ms = authorization_now.saturating_add(30_000);
+    app_state
+        .session_authorizations
+        .begin_outgoing(
+            mrd_service::session_authorization::VerifiedIncomingAuthorizationRequest {
+                session_id: session_id.clone(),
+                peer_device_id: peer_device_id.clone(),
+                peer_key_id: format!("pending_authenticated_peer:{}", peer_device_id.0),
+                peer_key_epoch: 1,
+                access_mode: RemoteAccessMode::Attended,
+                requested_scopes: vec![
+                    RemotePermissionScope::ScreenView,
+                    RemotePermissionScope::InputKeyboard,
+                ],
+                peer_permission_ceiling: vec![
+                    RemotePermissionScope::ScreenView,
+                    RemotePermissionScope::InputKeyboard,
+                ],
+                machine_permission_ceiling: vec![
+                    RemotePermissionScope::ScreenView,
+                    RemotePermissionScope::InputKeyboard,
+                ],
+                runtime_capabilities: vec![
+                    RemotePermissionScope::ScreenView,
+                    RemotePermissionScope::InputKeyboard,
+                ],
+                transport_kind: "webrtc_relay".to_owned(),
+                request_nonce: [93; 16],
+                created_at_ms: authorization_now,
+                expires_at_ms: authorization_expires_at_ms,
+            },
+        )
+        .await
+        .expect("begin outgoing WAN authorization");
+    app_state
+        .session_authorizations
+        .install_verified_grant(
+            mrd_service::session_authorization::VerifiedSessionGrant {
+                grant_id: format!("sha256:{}", digest("3")),
+                session_id: session_id.clone(),
+                granted_scopes: vec![
+                    RemotePermissionScope::ScreenView,
+                    RemotePermissionScope::InputKeyboard,
+                ],
+                issued_at_ms: authorization_now,
+                expires_at_ms: authorization_expires_at_ms,
+                policy_revision: 1,
+                route_constraint: "webrtc_relay".to_owned(),
+                transport_fingerprint_sha256: [0x71; 32],
+            },
+            authorization_now,
+        )
+        .await
+        .expect("install outgoing WAN grant");
     let coordinator = Arc::new(
         WanSessionCoordinator::new(
             WanSessionCoordinatorConfig::default(),
@@ -1027,6 +1083,20 @@ async fn runtime_queries_reconcile_a_streaming_wan_coordinator_before_projection
     };
     assert_eq!(snapshot.state, "streaming");
     assert_eq!(snapshot.transport_kind, "webrtc_relay");
+    let authorization = app_state
+        .session_authorizations
+        .snapshot(&session_id)
+        .await
+        .expect("streaming WAN authorization is retained");
+    assert_eq!(
+        authorization.route_state,
+        mrd_ipc::RemoteRouteState::Connected
+    );
+    assert_eq!(authorization.route_kind, Some(RemoteRouteKind::WebRtcRelay));
+    assert_eq!(
+        authorization.media_state,
+        mrd_ipc::RemoteMediaState::Streaming
+    );
 
     app_state.sessions.lock().await.remove(&session_id);
     let IpcResponse::RuntimeSnapshot { snapshot } = runtime_snapshot(&app_state).await else {

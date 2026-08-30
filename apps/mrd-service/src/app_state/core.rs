@@ -87,6 +87,9 @@ pub struct AppState {
     pub capability_snapshot: Arc<Mutex<CapabilitySnapshotRegistry>>,
     /// Service-owned keyboard and mouse injection state.
     pub control_input: Arc<Mutex<ControlInputRegistry>>,
+    /// Bounded authenticated WAN control sender, replay, and receiver ownership.
+    pub(crate) wan_control_inputs:
+        Arc<Mutex<crate::wan_session::control_input::WanControlInputRegistry>>,
     /// Service-owned file transfer task snapshots.
     pub file_transfers: Arc<Mutex<FileTransferRegistry>>,
     /// Receiver pipeline state keyed by session.
@@ -504,6 +507,9 @@ impl AppState {
             )),
             capability_snapshot: Arc::new(Mutex::new(CapabilitySnapshotRegistry::default())),
             control_input: Arc::new(Mutex::new(ControlInputRegistry::default())),
+            wan_control_inputs: Arc::new(Mutex::new(
+                crate::wan_session::control_input::WanControlInputRegistry::default(),
+            )),
             file_transfers: Arc::new(Mutex::new(FileTransferRegistry::default())),
             media_pipelines: Arc::new(Mutex::new(MediaPipelineRegistry::default())),
             #[cfg(any(windows, target_os = "macos"))]

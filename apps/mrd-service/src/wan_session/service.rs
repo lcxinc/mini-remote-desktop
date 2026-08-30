@@ -2,14 +2,17 @@
 
 use super::{
     backend::{ServiceWanSessionWorkflowBackend, WanSessionApproval, WanSessionBackend},
+    control_input::{
+        bind_verified_mux, ServiceWanControlEvidenceBarrier, ServiceWanControlInputPort,
+    },
     coordinator::{
         SystemWanSessionClock, VerifiedWanSessionGrant, VerifiedWanSessionIntent,
         WanSessionConsentPublisher, WanSessionCoordinator, WanSessionCoordinatorConfig,
         WanSessionCoordinatorError, WanSessionPortError, WanSessionWorkflowPorts,
     },
     media::{
-        start_verified_media, WanMediaActivationError, WanMediaActivationPort,
-        WanMediaActivationReceipt, WanMediaAuthority,
+        enable_input_after_control_evidence, start_verified_media, WanMediaActivationError,
+        WanMediaActivationPort, WanMediaActivationReceipt, WanMediaAuthority,
     },
     media_runtime::{start_controller_runtime, start_target_runtime},
     model::{WanSessionFailure, WanSessionPhase, WanSessionRole, WanSessionState},
@@ -194,6 +197,12 @@ pub(crate) async fn reconcile_wan_session_under_security_gate(
     if state.phase().is_terminal() {
         publish_terminal_wan_state(app_state, &state, None).await;
     } else {
+        if state.phase() == WanSessionPhase::Streaming {
+            let _ = app_state
+                .session_authorizations
+                .mark_streaming(session_id, now_unix_ms())
+                .await;
+        }
         project_wan_session_state(app_state, &state).await;
     }
     Ok(Some(state))
@@ -617,6 +626,7 @@ impl super::coordinator::WanSessionCleanup for ServiceWanSessionCleanup {
         session_id: &SessionId,
     ) -> Result<(), super::coordinator::WanSessionCoordinatorError> {
         let app_state = self.app_state()?;
+        super::control_input::clear_wan_control_input(&app_state, session_id).await;
         app_state.media_tasks.lock().await.abort_session(session_id);
         app_state.media_profiles.lock().await.remove(session_id);
         app_state.capture_sources.lock().await.remove(session_id);
@@ -880,6 +890,7 @@ impl WanMediaActivationPort for ServiceWanMediaActivationPort {
             .upgrade()
             .ok_or(WanMediaActivationError::StartupFailed)?;
         let mux = self.resolve_mux(authority).await?;
+        bind_verified_mux(&app_state, authority.clone(), Arc::clone(&mux)).await?;
         #[cfg(any(test, debug_assertions))]
         let test_synthetic_capture = self.test_mux.is_some();
         #[cfg(not(any(test, debug_assertions)))]
@@ -899,6 +910,7 @@ impl WanMediaActivationPort for ServiceWanMediaActivationPort {
             .upgrade()
             .ok_or(WanMediaActivationError::StartupFailed)?;
         let mux = self.resolve_mux(authority).await?;
+        bind_verified_mux(&app_state, authority.clone(), Arc::clone(&mux)).await?;
         start_controller_runtime(app_state, authority.clone(), mux).await
     }
 
@@ -907,6 +919,7 @@ impl WanMediaActivationPort for ServiceWanMediaActivationPort {
             .app_state
             .upgrade()
             .ok_or(WanMediaActivationError::StartupFailed)?;
+        super::control_input::clear_wan_control_input(&app_state, session_id).await;
         app_state.media_tasks.lock().await.abort_session(session_id);
         app_state.media_profiles.lock().await.remove(session_id);
         app_state.capture_sources.lock().await.remove(session_id);
@@ -1552,10 +1565,25 @@ async fn spawn_generation_zero(
                 return;
             }
             if let Ok(state) = task_coordinator.snapshot(&owned_session_id).await {
-                if start_verified_media(task_coordinator.as_ref(), &state, media.as_ref())
-                    .await
-                    .is_err()
-                {
+                let authority = WanMediaAuthority::from_relay_verified(&state);
+                let activation = async {
+                    let authority = authority?;
+                    start_verified_media(task_coordinator.as_ref(), &state, media.as_ref()).await?;
+                    reconcile_wan_session(&failure_app_state, &owned_session_id)
+                        .await
+                        .map_err(|_| WanMediaActivationError::CoordinatorFailure)?;
+                    if authority.role() == WanSessionRole::Target
+                        && (authority.allows_scope(WanPermissionScopeV3::InputPointer)
+                            || authority.allows_scope(WanPermissionScopeV3::InputKeyboard))
+                    {
+                        let input = ServiceWanControlInputPort::new(&failure_app_state);
+                        let barrier = ServiceWanControlEvidenceBarrier::new(&failure_app_state);
+                        enable_input_after_control_evidence(&authority, &barrier, &input).await?;
+                    }
+                    Ok::<(), WanMediaActivationError>(())
+                }
+                .await;
+                if activation.is_err() {
                     let _ = fail_wan_session(
                         &failure_app_state,
                         &owned_session_id,

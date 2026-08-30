@@ -2,6 +2,7 @@
 
 pub mod backend;
 pub mod config;
+pub mod control_input;
 pub mod coordinator;
 pub mod media;
 mod media_runtime;

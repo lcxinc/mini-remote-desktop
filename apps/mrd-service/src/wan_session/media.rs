@@ -195,6 +195,13 @@ pub async fn fresh_authenticated_lan_evidence(
 pub struct WanMediaAuthority {
     session_id: SessionId,
     role: WanSessionRole,
+    controller_device_id: DeviceId,
+    target_device_id: DeviceId,
+    controller_key_id: String,
+    target_key_id: String,
+    grant_id: [u8; 32],
+    policy_revision: u64,
+    expires_at_ms: u64,
     approved_scopes: Vec<WanPermissionScopeV3>,
     approved_profile: Option<WanMediaProfileV3>,
     generation: u64,
@@ -221,10 +228,23 @@ impl WanMediaAuthority {
         if state.phase() != WanSessionPhase::RelayVerified {
             return Err(WanMediaActivationError::NotRelayVerified);
         }
-        let grant = state.grant().ok_or(WanMediaActivationError::MissingGrant)?;
-        if grant.grant_commitment().is_none() {
-            return Err(WanMediaActivationError::GrantCommitmentMissing);
+        Self::from_verified_route(state)
+    }
+
+    pub(crate) fn from_streaming(state: &WanSessionState) -> Result<Self, WanMediaActivationError> {
+        if state.phase() != WanSessionPhase::Streaming {
+            return Err(WanMediaActivationError::NotRelayVerified);
         }
+        Self::from_verified_route(state)
+    }
+
+    fn from_verified_route(state: &WanSessionState) -> Result<Self, WanMediaActivationError> {
+        let grant = state.grant().ok_or(WanMediaActivationError::MissingGrant)?;
+        let grant_commitment = grant
+            .grant_commitment()
+            .ok_or(WanMediaActivationError::GrantCommitmentMissing)?;
+        let grant_id = decode_hex_digest(grant_commitment)
+            .ok_or(WanMediaActivationError::GrantCommitmentMissing)?;
         let proof = state
             .route_proof()
             .ok_or(WanMediaActivationError::MissingRouteProof)?;
@@ -234,6 +254,17 @@ impl WanMediaAuthority {
         Ok(Self {
             session_id: state.identity().session_id().clone(),
             role: state.role(),
+            controller_device_id: state.identity().controller_device_id().clone(),
+            target_device_id: state.identity().target_device_id().clone(),
+            controller_key_id: state.identity().controller_key_fingerprint().to_owned(),
+            target_key_id: state
+                .identity()
+                .target_key_fingerprint()
+                .ok_or(WanMediaActivationError::GrantCommitmentMissing)?
+                .to_owned(),
+            grant_id,
+            policy_revision: grant.policy_revision(),
+            expires_at_ms: grant.grant_expires_at_ms(),
             approved_scopes: grant.approved_scopes().to_vec(),
             approved_profile: grant.approved_profile().cloned(),
             generation: proof.access().generation(),
@@ -258,6 +289,34 @@ impl WanMediaAuthority {
 
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub(crate) fn controller_device_id(&self) -> &DeviceId {
+        &self.controller_device_id
+    }
+
+    pub(crate) fn target_device_id(&self) -> &DeviceId {
+        &self.target_device_id
+    }
+
+    pub(crate) fn controller_key_id(&self) -> &str {
+        &self.controller_key_id
+    }
+
+    pub(crate) fn target_key_id(&self) -> &str {
+        &self.target_key_id
+    }
+
+    pub(crate) const fn grant_id(&self) -> [u8; 32] {
+        self.grant_id
+    }
+
+    pub(crate) const fn policy_revision(&self) -> u64 {
+        self.policy_revision
+    }
+
+    pub(crate) const fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
     }
 
     pub fn allows_scope(&self, scope: WanPermissionScopeV3) -> bool {
@@ -320,6 +379,17 @@ impl WanMediaPlan {
     pub const fn input_frozen(&self) -> bool {
         self.input_frozen
     }
+}
+
+fn decode_hex_digest(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64 || !value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, output) in decoded.iter_mut().enumerate() {
+        *output = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(decoded)
 }
 
 /// First real codec/transport boundary crossed by one exact WAN media runtime.

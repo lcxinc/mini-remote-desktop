@@ -59,7 +59,7 @@ mod capture_sources;
 mod discovery_config;
 mod discovery_identity;
 mod dynamic_window_fps;
-mod lan_control_input;
+pub(crate) mod lan_control_input;
 mod local_network_identity;
 mod media_access_unit;
 mod media_capabilities;

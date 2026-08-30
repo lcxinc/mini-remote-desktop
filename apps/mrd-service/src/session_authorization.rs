@@ -837,8 +837,16 @@ impl SessionAuthorizationRegistry {
         if record.snapshot.authorization_state != RemoteAuthorizationState::Granted {
             return None;
         }
+        let route_kind = remote_route_kind(&record.request.transport_kind)?;
+        if record.snapshot.route_state == RemoteRouteState::Connected
+            && record.snapshot.route_kind == Some(route_kind)
+            && record.snapshot.media_state == RemoteMediaState::Streaming
+            && record.snapshot.presentation_state == RemotePresentationState::Streaming
+        {
+            return Some(record.snapshot.clone());
+        }
         record.snapshot.route_state = RemoteRouteState::Connected;
-        record.snapshot.route_kind = Some(mrd_ipc::RemoteRouteKind::LanQuic);
+        record.snapshot.route_kind = Some(route_kind);
         record.snapshot.media_state = RemoteMediaState::Streaming;
         record.snapshot.presentation_state = RemotePresentationState::Streaming;
         record.snapshot.updated_at_ms = changed_at_ms;
@@ -849,7 +857,7 @@ impl SessionAuthorizationRegistry {
             session_id.clone(),
             RemoteSessionEvent::RouteChanged {
                 state: RemoteRouteState::Connected,
-                route: Some(mrd_ipc::RemoteRouteKind::LanQuic),
+                route: Some(route_kind),
                 failure: None,
             },
         );
@@ -2129,6 +2137,38 @@ mod tests {
             snapshot.authorization_state,
             RemoteAuthorizationState::Expired
         );
+    }
+
+    #[tokio::test]
+    async fn mark_streaming_preserves_the_verified_wan_route_kind() {
+        let registry = SessionAuthorizationRegistry::default();
+        let peer_public_key = [7; 32];
+        let mut request = control_request("active-wan-control", &peer_public_key);
+        request.transport_kind = "webrtc_relay".to_string();
+        let session_id = request.session_id.clone();
+        registry
+            .begin_outgoing(request)
+            .await
+            .expect("begin outgoing WAN authorization");
+        registry
+            .bind_authenticated_peer_key(&session_id, &peer_public_key, CREATED_AT_MS + 1)
+            .await
+            .expect("bind WAN peer key");
+        let mut grant = control_grant(&session_id);
+        grant.route_constraint = "webrtc_relay".to_string();
+        registry
+            .install_verified_grant(grant, CREATED_AT_MS + 2)
+            .await
+            .expect("install verified WAN grant");
+
+        let streaming = registry
+            .mark_streaming(&session_id, CREATED_AT_MS + 3)
+            .await
+            .expect("mark WAN authorization streaming");
+
+        assert_eq!(streaming.route_kind, Some(RemoteRouteKind::WebRtcRelay));
+        assert_eq!(streaming.route_state, RemoteRouteState::Connected);
+        assert_eq!(streaming.media_state, RemoteMediaState::Streaming);
     }
 
     #[tokio::test]
