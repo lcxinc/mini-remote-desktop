@@ -14,6 +14,7 @@ from fastapi import (
     Header,
     HTTPException,
     Request,
+    Response,
     Security,
     status,
 )
@@ -483,6 +484,7 @@ async def enroll_relay_node(
 async def pickup_relay_certificate(
     enrollment_id: str,
     request: Request,
+    response: Response,
     _proxy_tls_header: Annotated[
         str | None, Header(alias="X-Rdesk-Client-TLS")
     ] = None,
@@ -515,6 +517,11 @@ async def pickup_relay_certificate(
         await _commit(db)
     except (RelayRegistryError, RelayAuthError) as error:
         _raise_domain(error)
+    if pickup.expires_at is not None:
+        response.headers["X-Relay-Renew-At"] = str(
+            int(pickup.expires_at.timestamp())
+            - settings.relay_certificate_renew_before_seconds
+        )
     return RelayEnrollmentPickupResponse(**pickup.__dict__)
 
 
@@ -613,6 +620,7 @@ async def renew_relay_certificate(
     node_id: str,
     request: Request,
     payload: RelayRenewalRequest,
+    response: Response,
     identity: RelayIdentity = Depends(get_verified_relay_renewal_node),
     _renewal_header: Annotated[
         str | None, Header(alias="X-Relay-Renewal-Id", min_length=1, max_length=128)
@@ -648,6 +656,10 @@ async def renew_relay_certificate(
         await _commit(db)
     except (RelayRegistryError, RelayAuthError) as error:
         _raise_domain(error)
+    response.headers["X-Relay-Renew-At"] = str(
+        int(renewed.certificate.expires_at.timestamp())
+        - settings.relay_certificate_renew_before_seconds
+    )
     return RelayRenewalResponse(
         renewal_id=payload.renewal_id,
         node_id=node_id,

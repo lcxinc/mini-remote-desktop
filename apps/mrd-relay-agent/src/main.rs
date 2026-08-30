@@ -29,6 +29,7 @@ use mrd_relay_agent::{
     runtime::{
         run_agent, HostPressureSnapshot, PortableRelayAgentConfig, PortableRelayAgentDeps,
         RandomJitter, RuntimeError, RuntimeStateStorePort, SystemClock, TokioSleeper,
+        CERTIFICATE_LIFETIME_RENEWAL_WINDOW_CAP,
     },
 };
 use ring::rand::{SecureRandom as _, SystemRandom};
@@ -804,7 +805,7 @@ where
         max_allocations: config.agent().max_allocations,
         max_egress_bps: config.agent().max_egress_bps,
         pressure: HostPressureSnapshot::default(),
-        renewal_window: Duration::from_secs(24 * 60 * 60),
+        renewal_window: CERTIFICATE_LIFETIME_RENEWAL_WINDOW_CAP,
         backend_backoff_cap: config.agent().backend_backoff_cap,
     };
     run_agent(dependencies, agent_config)

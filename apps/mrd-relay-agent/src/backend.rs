@@ -109,6 +109,7 @@ pub struct NodeCertificate {
     pub certificate_pem: String,
     pub ca_certificate_pem: String,
     pub expires_at_unix_seconds: i64,
+    pub renew_at_unix_seconds: Option<i64>,
 }
 
 impl std::fmt::Debug for NodeCertificate {
@@ -118,6 +119,7 @@ impl std::fmt::Debug for NodeCertificate {
             .field("certificate_pem", &"REDACTED")
             .field("ca_certificate_pem", &"REDACTED")
             .field("expires_at_unix_seconds", &self.expires_at_unix_seconds)
+            .field("renew_at_unix_seconds", &self.renew_at_unix_seconds)
             .finish()
     }
 }
@@ -1365,8 +1367,18 @@ impl RelayBackendPort for ReqwestRelayBackend {
             .map_err(|_| BackendError::Unavailable)?;
         require_success_status(response.status())?;
         require_private_no_store(&response)?;
+        let renew_at_unix_seconds = parse_renew_at_header(response.headers())?;
         let body = read_bounded_response(response).await?;
-        decode_pickup_response(&body, &expected_enrollment_id, &expected_node_id)
+        let mut certificate =
+            decode_pickup_response(&body, &expected_enrollment_id, &expected_node_id)?;
+        match certificate.as_mut() {
+            Some(certificate) => certificate.renew_at_unix_seconds = renew_at_unix_seconds,
+            None if renew_at_unix_seconds.is_some() => {
+                return Err(BackendError::ProtocolInvalid);
+            }
+            None => {}
+        }
+        Ok(certificate)
     }
 
     async fn renew(&self, request: RenewalRequest) -> Result<NodeCertificate, BackendError> {
@@ -1391,6 +1403,11 @@ impl RelayBackendPort for ReqwestRelayBackend {
             .map_err(|_| BackendError::Unavailable)?;
         let status = response.status();
         require_private_no_store(&response)?;
+        let renew_at_unix_seconds = status
+            .is_success()
+            .then(|| parse_renew_at_header(response.headers()))
+            .transpose()?
+            .flatten();
         let body = read_bounded_response(response).await?;
         if !status.is_success() {
             return Err(decode_renewal_error_response(status, &body)?);
@@ -1408,11 +1425,13 @@ impl RelayBackendPort for ReqwestRelayBackend {
         {
             return Err(BackendError::ProtocolInvalid);
         }
-        certificate_from_wire(
+        let mut certificate = certificate_from_wire(
             Some(body.certificate_pem),
             Some(body.ca_certificate_pem),
             Some(body.expires_at),
-        )
+        )?;
+        certificate.renew_at_unix_seconds = renew_at_unix_seconds;
+        Ok(certificate)
     }
 
     async fn heartbeat(&self, heartbeat: SignedHeartbeat) -> Result<NodeDirective, BackendError> {
@@ -1602,7 +1621,30 @@ fn certificate_from_wire(
         certificate_pem,
         ca_certificate_pem,
         expires_at_unix_seconds,
+        renew_at_unix_seconds: None,
     })
+}
+
+fn parse_renew_at_header(
+    headers: &reqwest::header::HeaderMap,
+) -> Result<Option<i64>, BackendError> {
+    let mut values = headers.get_all("x-relay-renew-at").iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(BackendError::ProtocolInvalid);
+    }
+    let value = value.to_str().map_err(|_| BackendError::ProtocolInvalid)?;
+    if value.is_empty() || value.len() > 19 || !value.as_bytes().iter().all(u8::is_ascii_digit) {
+        return Err(BackendError::ProtocolInvalid);
+    }
+    let value = value
+        .parse::<i64>()
+        .map_err(|_| BackendError::ProtocolInvalid)?;
+    (value > 0)
+        .then_some(Some(value))
+        .ok_or(BackendError::ProtocolInvalid)
 }
 
 fn parse_rfc3339_unix_seconds(value: &str) -> Result<i64, BackendError> {
@@ -1807,6 +1849,34 @@ mod response_security_tests {
     }
 
     #[test]
+    fn renewal_schedule_header_is_optional_single_positive_unix_timestamp() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(super::parse_renew_at_header(&headers), Ok(None));
+
+        headers.insert("x-relay-renew-at", HeaderValue::from_static("1800003000"));
+        assert_eq!(
+            super::parse_renew_at_header(&headers),
+            Ok(Some(1_800_003_000))
+        );
+
+        for invalid in ["0", "-1", "not-a-timestamp", "1800003000 "] {
+            headers.insert("x-relay-renew-at", HeaderValue::from_str(invalid).unwrap());
+            assert_eq!(
+                super::parse_renew_at_header(&headers),
+                Err(BackendError::ProtocolInvalid)
+            );
+        }
+
+        headers.remove("x-relay-renew-at");
+        headers.append("x-relay-renew-at", HeaderValue::from_static("1800003000"));
+        headers.append("x-relay-renew-at", HeaderValue::from_static("1800003001"));
+        assert_eq!(
+            super::parse_renew_at_header(&headers),
+            Err(BackendError::ProtocolInvalid)
+        );
+    }
+
+    #[test]
     fn transient_http_statuses_are_retryable_but_auth_and_protocol_fail_closed() {
         for status in [408, 425, 429, 500, 502, 503, 504] {
             assert_eq!(
@@ -1849,6 +1919,30 @@ mod response_security_tests {
                 "unexpected classification for {code}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn renew_success_carries_the_server_schedule_into_the_certificate() {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let authority = TestTlsAuthority::new("renew schedule root");
+        let body = serde_json::json!({
+            "renewal_id": "renewal-0001",
+            "node_id": "relay-hkg-1",
+            "certificate_pem": "leaf-certificate",
+            "ca_certificate_pem": "ca-certificate",
+            "fingerprint": format!("sha256:{}", "a".repeat(64)),
+            "expires_at": "2030-01-01T00:00:00Z",
+        })
+        .to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nCache-Control: private, no-store\r\nPragma: no-cache\r\nX-Relay-Renew-At: 1893455400\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .into_bytes();
+
+        let certificate = renew_against_response(&authority, response).await.unwrap();
+        assert_eq!(certificate.renew_at_unix_seconds, Some(1_893_455_400));
     }
 
     #[tokio::test]

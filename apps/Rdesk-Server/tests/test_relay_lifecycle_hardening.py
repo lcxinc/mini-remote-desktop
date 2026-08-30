@@ -34,6 +34,7 @@ from test_relay_node_api import (
     TLS_HEADERS,
     _approval_body,
     _approve,
+    _assert_server_renew_at,
     _csr,
     _enroll,
     _error_code,
@@ -248,12 +249,24 @@ def _renewal_request(
     return body, headers
 
 
+def _advance_api_to_renewal_window(
+    monkeypatch: pytest.MonkeyPatch, certificate_pem: str
+) -> None:
+    from app.api.v1 import relays as relay_module
+
+    certificate = x509.load_pem_x509_certificate(certificate_pem.encode())
+    renew_at = certificate.not_valid_after_utc - timedelta(
+        seconds=settings.relay_certificate_renew_before_seconds
+    )
+    monkeypatch.setattr(relay_module, "_now", lambda: renew_at)
+
+
 def test_renewal_fails_closed_without_consuming_rotation_state_or_sequence(
-    api: tuple[TestClient, object],
+    api: tuple[TestClient, object], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client, engine = api
     old_key, _, _ = _enroll_with_receipt(client)
-    _, old_fingerprint = _approve(client)
+    old_certificate_pem, old_fingerprint = _approve(client)
     rotated = client.post(
         f"/api/v1/relays/{NODE_ID}/rotate-secret",
         json={"credential_ttl_seconds": 300},
@@ -275,6 +288,7 @@ def test_renewal_fails_closed_without_consuming_rotation_state_or_sequence(
         )
         audit_count = session.query(RelayAuditEvent).count()
 
+    _advance_api_to_renewal_window(monkeypatch, old_certificate_pem)
     csr_pem, _ = _csr(NODE_ID)
     body, headers = _renewal_request(
         old_key,
@@ -308,13 +322,14 @@ def test_renewal_fails_closed_without_consuming_rotation_state_or_sequence(
 
 
 def test_admin_drain_survives_renewal_and_remains_authoritative_on_heartbeat(
-    api: tuple[TestClient, object],
+    api: tuple[TestClient, object], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client, engine = api
     old_key, _, _ = _enroll_with_receipt(client)
-    _, old_fingerprint = _approve(client)
+    old_certificate_pem, old_fingerprint = _approve(client)
     drained = client.post(f"/api/v1/relays/{NODE_ID}/drain")
     assert drained.status_code == 200, drained.text
+    _advance_api_to_renewal_window(monkeypatch, old_certificate_pem)
 
     csr_pem, new_key = _csr(NODE_ID)
     renewal_id = str(uuid4())
@@ -329,6 +344,7 @@ def test_admin_drain_survives_renewal_and_remains_authoritative_on_heartbeat(
         f"/api/v1/relays/{NODE_ID}/renew", content=body, headers=headers
     )
     assert renewed.status_code == 200, renewed.text
+    _assert_server_renew_at(renewed)
     assert isinstance(new_key, ed25519.Ed25519PrivateKey)
 
     with Session(engine) as session:
@@ -354,12 +370,58 @@ def test_admin_drain_survives_renewal_and_remains_authoritative_on_heartbeat(
     assert heartbeat.json()["desired"]["draining"] is True
 
 
-def test_exact_previous_epoch_renewal_retry_preserves_later_rotation_state(
+def test_routine_certificate_renewal_preserves_available_health_and_lease(
     api: tuple[TestClient, object],
 ) -> None:
     client, engine = api
     old_key, _, _ = _enroll_with_receipt(client)
     _, old_fingerprint = _approve(client)
+
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        registration = session.get(RelayNodeRegistration, NODE_ID)
+        assert node is not None
+        assert registration is not None
+        registration.certificate_expires_at = datetime.now(UTC) + timedelta(
+            seconds=settings.relay_certificate_renew_before_seconds - 1
+        )
+        node.state = "available"
+        node.healthy_heartbeat_streak = 3
+        node.lease_expires_at = datetime.now(UTC) + timedelta(seconds=30)
+        session.commit()
+        preserved_lease = node.lease_expires_at
+
+    csr_pem, _ = _csr(NODE_ID)
+    body, headers = _renewal_request(
+        old_key,
+        old_fingerprint,
+        renewal_id=str(uuid4()),
+        csr_pem=csr_pem,
+        sequence=21,
+    )
+    renewed = client.post(
+        f"/api/v1/relays/{NODE_ID}/renew", content=body, headers=headers
+    )
+    assert renewed.status_code == 200, renewed.text
+    _assert_server_renew_at(renewed)
+
+    with Session(engine) as session:
+        node = session.get(RelayNode, NODE_ID)
+        assert node is not None
+        assert node.identity_epoch == 2
+        assert node.heartbeat_sequence == 0
+        assert node.state == "available"
+        assert node.healthy_heartbeat_streak == 3
+        assert node.lease_expires_at == preserved_lease
+
+
+def test_exact_previous_epoch_renewal_retry_preserves_later_rotation_state(
+    api: tuple[TestClient, object], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, engine = api
+    old_key, _, _ = _enroll_with_receipt(client)
+    old_certificate_pem, old_fingerprint = _approve(client)
+    _advance_api_to_renewal_window(monkeypatch, old_certificate_pem)
     csr_pem, new_key = _csr(NODE_ID)
     renewal_id = str(uuid4())
     first_body, first_headers = _renewal_request(
@@ -845,11 +907,12 @@ def test_pickup_wrong_receipt_unknown_revoked_and_expired_do_not_enumerate(
 
 
 def test_renewal_lost_response_retry_rotates_once_and_old_cert_is_renew_only(
-    api: tuple[TestClient, object],
+    api: tuple[TestClient, object], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client, engine = api
     old_key, _, _ = _enroll_with_receipt(client)
     old_certificate_pem, old_fingerprint = _approve(client)
+    _advance_api_to_renewal_window(monkeypatch, old_certificate_pem)
     csr_pem, new_key = _csr(NODE_ID)
     assert isinstance(new_key, ed25519.Ed25519PrivateKey)
     renewal_id = str(uuid4())
@@ -1038,11 +1101,12 @@ def test_renewal_lost_response_retry_rotates_once_and_old_cert_is_renew_only(
 
 
 def test_renewal_revoke_conflict_and_concurrent_idempotency(
-    api: tuple[TestClient, object],
+    api: tuple[TestClient, object], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client, _ = api
     old_key, _, _ = _enroll_with_receipt(client)
-    _, fingerprint = _approve(client)
+    old_certificate_pem, fingerprint = _approve(client)
+    _advance_api_to_renewal_window(monkeypatch, old_certificate_pem)
     csr_pem, _ = _csr(NODE_ID)
     renewal_id = str(uuid4())
     body, headers = _renewal_request(

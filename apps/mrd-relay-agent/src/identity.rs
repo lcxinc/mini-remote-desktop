@@ -3,6 +3,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -91,6 +92,8 @@ struct StoredCertificate {
     certificate_pem: String,
     ca_certificate_pem: String,
     expires_at_unix_seconds: i64,
+    #[serde(default)]
+    renew_at_unix_seconds: Option<i64>,
 }
 
 impl std::fmt::Debug for StoredCertificate {
@@ -100,6 +103,7 @@ impl std::fmt::Debug for StoredCertificate {
             .field("certificate_pem", &"REDACTED")
             .field("ca_certificate_pem", &"REDACTED")
             .field("expires_at_unix_seconds", &self.expires_at_unix_seconds)
+            .field("renew_at_unix_seconds", &self.renew_at_unix_seconds)
             .finish()
     }
 }
@@ -581,7 +585,44 @@ impl<F: IdentityFsPort> CertificateState<F> {
                 certificate_pem: stored.certificate_pem.clone(),
                 ca_certificate_pem: stored.ca_certificate_pem.clone(),
                 expires_at_unix_seconds: stored.expires_at_unix_seconds,
+                renew_at_unix_seconds: stored.renew_at_unix_seconds,
             })
+    }
+
+    pub(crate) fn renewal_due_at(&self, requested_window: Duration) -> Result<i64, RuntimeError> {
+        let certificate = self
+            .identity
+            .stored
+            .certificate
+            .as_ref()
+            .ok_or(RuntimeError::EnrollmentMissing)?;
+        let (pem_remainder, pem) = parse_x509_pem(certificate.certificate_pem.as_bytes())
+            .map_err(|_| RuntimeError::CertificateInvalid)?;
+        let (der_remainder, leaf) =
+            parse_x509_certificate(&pem.contents).map_err(|_| RuntimeError::CertificateInvalid)?;
+        if !pem_remainder.iter().all(u8::is_ascii_whitespace) || !der_remainder.is_empty() {
+            return Err(RuntimeError::CertificateInvalid);
+        }
+        let not_before = leaf.validity().not_before.timestamp();
+        let not_after = leaf.validity().not_after.timestamp();
+        if not_after != certificate.expires_at_unix_seconds {
+            return Err(RuntimeError::CertificateInvalid);
+        }
+        if let Some(renew_at) = certificate.renew_at_unix_seconds {
+            return (renew_at > not_before && renew_at < not_after)
+                .then_some(renew_at)
+                .ok_or(RuntimeError::CertificateInvalid);
+        }
+        let lifetime = not_after
+            .checked_sub(not_before)
+            .filter(|value| *value >= 3)
+            .ok_or(RuntimeError::CertificateInvalid)?;
+        let requested_window = i64::try_from(requested_window.as_secs()).unwrap_or(i64::MAX);
+        let safe_window = requested_window.min(lifetime / 3).max(1);
+        not_after
+            .checked_sub(safe_window)
+            .filter(|due_at| *due_at > not_before)
+            .ok_or(RuntimeError::CertificateInvalid)
     }
 
     pub fn public_key(&self) -> Vec<u8> {
@@ -1098,6 +1139,7 @@ impl<F: IdentityFsPort> CertificateState<F> {
                 Err(RuntimeError::RenewalConflict)
             };
         }
+        validate_new_certificate_renewal_schedule(&certificate, self.clock.unix_seconds())?;
         let mut proposed = self.identity.stored.clone();
         proposed
             .pending_renewal
@@ -1215,6 +1257,7 @@ impl<F: IdentityFsPort> CertificateState<F> {
             &self.trusted_ca_der,
             self.clock.unix_seconds(),
         )?;
+        validate_new_certificate_renewal_schedule(&certificate, self.clock.unix_seconds())?;
         let mut proposed = self.identity.stored.clone();
         proposed.certificate = Some(certificate.into());
         proposed.pending_enrollment = None;
@@ -1291,6 +1334,10 @@ fn validate_node_certificate(
         || !leaf.validity().is_valid_at(now)
         || !ca.validity().is_valid_at(now)
         || certificate.expires_at_unix_seconds != leaf.validity().not_after.timestamp()
+        || certificate.renew_at_unix_seconds.is_some_and(|renew_at| {
+            renew_at <= leaf.validity().not_before.timestamp()
+                || renew_at >= certificate.expires_at_unix_seconds
+        })
         || validate_exact_common_name(leaf.subject(), node_id).is_err()
         || leaf
             .basic_constraints()
@@ -1336,6 +1383,19 @@ fn validate_node_certificate(
         .ok_or(RuntimeError::CertificateInvalid)?;
     if san.value.general_names.len() != 1
         || !matches!(&san.value.general_names[0], GeneralName::URI(uri) if *uri == expected_uri)
+    {
+        return Err(RuntimeError::CertificateInvalid);
+    }
+    Ok(())
+}
+
+fn validate_new_certificate_renewal_schedule(
+    certificate: &NodeCertificate,
+    now_unix_seconds: i64,
+) -> Result<(), RuntimeError> {
+    if certificate
+        .renew_at_unix_seconds
+        .is_some_and(|renew_at| renew_at <= now_unix_seconds)
     {
         return Err(RuntimeError::CertificateInvalid);
     }
@@ -1394,6 +1454,7 @@ impl From<NodeCertificate> for StoredCertificate {
             certificate_pem: value.certificate_pem,
             ca_certificate_pem: value.ca_certificate_pem,
             expires_at_unix_seconds: value.expires_at_unix_seconds,
+            renew_at_unix_seconds: value.renew_at_unix_seconds,
         }
     }
 }
@@ -1404,6 +1465,7 @@ impl From<&StoredCertificate> for NodeCertificate {
             certificate_pem: value.certificate_pem.clone(),
             ca_certificate_pem: value.ca_certificate_pem.clone(),
             expires_at_unix_seconds: value.expires_at_unix_seconds,
+            renew_at_unix_seconds: value.renew_at_unix_seconds,
         }
     }
 }

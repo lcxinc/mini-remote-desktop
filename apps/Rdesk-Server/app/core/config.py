@@ -83,7 +83,7 @@ class Settings(BaseSettings):
     relay_ca_private_key_password: SecretStr = SecretStr("")
     relay_certificate_validity_seconds: int = 3600
     relay_enrollment_receipt_ttl_seconds: int = 86_400
-    relay_certificate_renew_before_seconds: int = 86_400
+    relay_certificate_renew_before_seconds: int = 600
     relay_previous_auth_grace_seconds: int = 300
     relay_renewal_record_retention_seconds: int = 86_400
 
@@ -101,6 +101,18 @@ class Settings(BaseSettings):
             )
         if self.initial_admin_password and len(self.initial_admin_password) < 12:
             raise ValueError("RDESK_INITIAL_ADMIN_PASSWORD must contain at least 12 characters")
+
+        if (
+            self.relay_certificate_validity_seconds <= 0
+            or self.relay_certificate_renew_before_seconds < 300
+            or self.relay_certificate_renew_before_seconds * 2
+            >= self.relay_certificate_validity_seconds
+        ):
+            raise ValueError(
+                "RDESK_RELAY_CERTIFICATE_RENEW_BEFORE_SECONDS must be at least "
+                "300 seconds and strictly less than half of "
+                "RDESK_RELAY_CERTIFICATE_VALIDITY_SECONDS"
+            )
 
         if self.environment == "production":
             if self.db_url in {"", _DEV_DB_URL, _EXAMPLE_DB_URL}:

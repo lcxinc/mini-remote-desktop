@@ -77,6 +77,23 @@ class SecurityConfigurationCompatibilityTests(unittest.TestCase):
         self.assertIn(":9542/", configured.signaling_ws_url)
         self.assertIn(":9542/", configured.realtime_server_health_url)
 
+    def test_relay_certificate_renewal_window_is_bounded_by_leaf_validity(self) -> None:
+        configured = Settings(
+            _env_file=None,
+            relay_certificate_validity_seconds=3600,
+            relay_certificate_renew_before_seconds=600,
+        )
+        self.assertEqual(configured.relay_certificate_renew_before_seconds, 600)
+
+        for invalid_window in (0, 1800, 3600, 86_400):
+            with self.subTest(invalid_window=invalid_window):
+                with self.assertRaises(ValidationError):
+                    Settings(
+                        _env_file=None,
+                        relay_certificate_validity_seconds=3600,
+                        relay_certificate_renew_before_seconds=invalid_window,
+                    )
+
 
 class ScalarSession:
     def __init__(self, user: User) -> None:

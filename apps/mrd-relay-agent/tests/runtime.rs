@@ -1032,6 +1032,7 @@ fn invalid_certificate(serial: &str, expires_at_unix_seconds: i64) -> NodeCertif
         certificate_pem: format!("certificate-{serial}"),
         ca_certificate_pem: "ca-certificate".into(),
         expires_at_unix_seconds,
+        renew_at_unix_seconds: None,
     }
 }
 
@@ -1104,9 +1105,24 @@ impl TestCertificateAuthority {
     }
 
     fn issue(&self, csr_pem: &str, profile: LeafProfile) -> NodeCertificate {
+        self.issue_between(
+            csr_pem,
+            profile,
+            date_time_ymd(2026, 1, 1),
+            date_time_ymd(2030, 1, 1),
+        )
+    }
+
+    fn issue_between(
+        &self,
+        csr_pem: &str,
+        profile: LeafProfile,
+        not_before: time::OffsetDateTime,
+        not_after: time::OffsetDateTime,
+    ) -> NodeCertificate {
         let mut csr = CertificateSigningRequestParams::from_pem(csr_pem).unwrap();
-        csr.params.not_before = date_time_ymd(2026, 1, 1);
-        csr.params.not_after = date_time_ymd(2030, 1, 1);
+        csr.params.not_before = not_before;
+        csr.params.not_after = not_after;
         csr.params.is_ca = IsCa::ExplicitNoCa;
         csr.params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         csr.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
@@ -1135,8 +1151,152 @@ impl TestCertificateAuthority {
             certificate_pem: leaf.pem(),
             ca_certificate_pem: self.pem(),
             expires_at_unix_seconds: parsed.validity().not_after.timestamp(),
+            renew_at_unix_seconds: None,
         }
     }
+}
+
+#[tokio::test]
+async fn short_lived_certificate_is_not_renewed_immediately_after_install() {
+    let (_fs, backend, mut identity, csr) = pending_certificate_state().await;
+    let not_before = time::OffsetDateTime::from_unix_timestamp(CERT_NOW_UNIX_SECONDS - 60).unwrap();
+    let not_after =
+        time::OffsetDateTime::from_unix_timestamp(CERT_NOW_UNIX_SECONDS + 3_600).unwrap();
+    let certificate =
+        backend
+            .issuer
+            .issue_between(&csr, LeafProfile::Client, not_before, not_after);
+    backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(certificate)));
+    identity.pickup(backend.as_ref()).await.unwrap();
+
+    let initial_backend = Arc::new(FakeBackend::default());
+    let slot = SwappableRelayBackend::new(initial_backend);
+    let factory = FakeBackendFactory::new(0, backend.clone());
+    let mut lifecycle = IdentityLifecycle::new(Duration::from_secs(24 * 60 * 60)).unwrap();
+
+    let maintenance = lifecycle
+        .maintain_once(
+            &mut identity,
+            backend.as_ref(),
+            &slot,
+            &factory,
+            None,
+            CERT_NOW_UNIX_SECONDS,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        maintenance,
+        IdentityMaintenance::Ready { identity_epoch: 1 }
+    );
+    assert!(backend.renewals.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn server_renew_at_overrides_the_certificate_lifetime_fallback() {
+    let (fs, backend, mut identity, csr) = pending_certificate_state().await;
+    let not_before = time::OffsetDateTime::from_unix_timestamp(CERT_NOW_UNIX_SECONDS - 60).unwrap();
+    let not_after =
+        time::OffsetDateTime::from_unix_timestamp(CERT_NOW_UNIX_SECONDS + 3_600).unwrap();
+    let renew_at = CERT_NOW_UNIX_SECONDS + 3_000;
+    let mut certificate =
+        backend
+            .issuer
+            .issue_between(&csr, LeafProfile::Client, not_before, not_after);
+    certificate.renew_at_unix_seconds = Some(renew_at);
+    backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(certificate)));
+    identity.pickup(backend.as_ref()).await.unwrap();
+    drop(identity);
+    let mut identity = certificate_state(fs, &backend);
+
+    let initial_backend = Arc::new(FakeBackend::default());
+    let slot = SwappableRelayBackend::new(initial_backend);
+    let factory = FakeBackendFactory::new(0, backend.clone());
+    let mut lifecycle = IdentityLifecycle::new(Duration::from_secs(24 * 60 * 60)).unwrap();
+
+    let before_schedule = lifecycle
+        .maintain_once(
+            &mut identity,
+            backend.as_ref(),
+            &slot,
+            &factory,
+            None,
+            renew_at - 1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        before_schedule,
+        IdentityMaintenance::Ready { identity_epoch: 1 }
+    );
+    assert!(backend.renewals.lock().unwrap().is_empty());
+
+    let at_schedule = lifecycle
+        .maintain_once(
+            &mut identity,
+            backend.as_ref(),
+            &slot,
+            &factory,
+            None,
+            renew_at,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        at_schedule,
+        IdentityMaintenance::Renewed { identity_epoch: 2 }
+    );
+    assert_eq!(backend.renewals.lock().unwrap().len(), 1);
+
+    let after_renewal = lifecycle
+        .maintain_once(
+            &mut identity,
+            backend.as_ref(),
+            &slot,
+            &factory,
+            None,
+            renew_at,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        after_renewal,
+        IdentityMaintenance::Ready { identity_epoch: 2 }
+    );
+    assert_eq!(backend.renewals.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn pickup_rejects_a_new_certificate_with_an_already_due_server_schedule() {
+    let (_fs, backend, mut identity, csr) = pending_certificate_state().await;
+    let not_before = time::OffsetDateTime::from_unix_timestamp(CERT_NOW_UNIX_SECONDS - 60).unwrap();
+    let not_after =
+        time::OffsetDateTime::from_unix_timestamp(CERT_NOW_UNIX_SECONDS + 3_600).unwrap();
+    let mut certificate =
+        backend
+            .issuer
+            .issue_between(&csr, LeafProfile::Client, not_before, not_after);
+    certificate.renew_at_unix_seconds = Some(CERT_NOW_UNIX_SECONDS);
+    backend
+        .pickup_results
+        .lock()
+        .unwrap()
+        .push_back(Ok(Some(certificate)));
+
+    assert_eq!(
+        identity.pickup(backend.as_ref()).await,
+        Err(RuntimeError::CertificateInvalid)
+    );
+    assert!(identity.active_certificate().is_none());
 }
 
 fn certificate_state(
@@ -4163,6 +4323,7 @@ fn reqwest_backend_can_enroll_before_mtls_and_only_installs_a_matching_identity_
                 certificate_pem: certificate.pem(),
                 ca_certificate_pem: certificate.pem(),
                 expires_at_unix_seconds: 1,
+                renew_at_unix_seconds: None,
             },
             &key.serialize_der(),
         )
@@ -6264,6 +6425,7 @@ fn secret_and_error_rendering_are_always_redacted_and_reason_codes_are_stable() 
         certificate_pem: "sensitive-leaf-pem".into(),
         ca_certificate_pem: "sensitive-ca-pem".into(),
         expires_at_unix_seconds: 1_900_000_000,
+        renew_at_unix_seconds: None,
     };
     let certificate_debug = format!("{certificate:?}");
     assert!(!certificate_debug.contains("sensitive"));

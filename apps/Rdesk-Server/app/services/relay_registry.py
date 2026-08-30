@@ -793,9 +793,8 @@ class RelayRegistry:
         node.committed_rotation_challenge = None
         node.committed_probe_evidence_sha256 = None
         node.committed_proof_mac = None
-        node.healthy_heartbeat_streak = 0
-        node.state = "draining" if preserve_admin_drain else "unavailable"
-        node.lease_expires_at = None
+        if preserve_admin_drain:
+            node.state = "draining"
         node.updated_at = now
         self._audit(
             action="relay_certificate_renewed",

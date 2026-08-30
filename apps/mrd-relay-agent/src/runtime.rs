@@ -39,6 +39,7 @@ const MAX_BACKEND_BACKOFF_MS: u64 = 30_000;
 const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const LOCAL_SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
 const IDENTITY_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(1);
+pub const CERTIFICATE_LIFETIME_RENEWAL_WINDOW_CAP: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[allow(clippy::too_many_arguments)]
 fn generate_pending_rotation(
@@ -463,7 +464,7 @@ impl SharedRelayHealth {
 
 impl IdentityLifecycle {
     pub fn new(renewal_window: Duration) -> Result<Self, RuntimeError> {
-        if renewal_window.is_zero() || renewal_window > Duration::from_secs(7 * 24 * 60 * 60) {
+        if renewal_window.is_zero() || renewal_window > CERTIFICATE_LIFETIME_RENEWAL_WINDOW_CAP {
             return Err(RuntimeError::StateInvalid);
         }
         Ok(Self {
@@ -531,12 +532,7 @@ impl IdentityLifecycle {
             identity.install_active_backend(factory, slot)?;
             self.mtls_installed = true;
         }
-        let certificate = identity
-            .active_certificate()
-            .ok_or(RuntimeError::EnrollmentMissing)?;
-        let renewal_due_at = certificate
-            .expires_at_unix_seconds
-            .saturating_sub(i64::try_from(self.renewal_window.as_secs()).unwrap_or(i64::MAX));
+        let renewal_due_at = identity.renewal_due_at(self.renewal_window)?;
         if allow_renewal && now_unix_seconds >= renewal_due_at {
             let renewal_id = identity
                 .pending_renewal_id()
@@ -1147,12 +1143,7 @@ where
                     },
                 }
             } else {
-                let certificate = identity
-                    .active_certificate()
-                    .ok_or(RuntimeError::EnrollmentMissing)?;
-                let renewal_due_at = certificate.expires_at_unix_seconds.saturating_sub(
-                    i64::try_from(lifecycle.renewal_window.as_secs()).unwrap_or(i64::MAX),
-                );
+                let renewal_due_at = identity.renewal_due_at(lifecycle.renewal_window)?;
                 if runtime.clock.unix_seconds() >= renewal_due_at {
                     let renewal_id = identity
                         .pending_renewal_id()

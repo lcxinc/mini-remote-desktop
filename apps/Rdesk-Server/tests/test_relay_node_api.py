@@ -677,12 +677,19 @@ def _approve(client: TestClient, node_id: str = NODE_ID) -> tuple[str, str]:
     assert pickup.status_code == 200, pickup.text
     assert pickup.headers["cache-control"] == "no-store, private"
     assert pickup.headers["pragma"] == "no-cache"
+    _assert_server_renew_at(pickup)
     certificate_pem = pickup.json()["certificate_pem"]
     certificate = x509.load_pem_x509_certificate(certificate_pem.encode())
     fingerprint = "sha256:" + hashlib.sha256(
         certificate.public_bytes(serialization.Encoding.DER)
     ).hexdigest()
     return certificate_pem, fingerprint
+
+
+def _assert_server_renew_at(response: object) -> None:
+    expires_at = datetime.fromisoformat(response.json()["expires_at"])
+    expected = int(expires_at.timestamp()) - settings.relay_certificate_renew_before_seconds
+    assert response.headers["x-relay-renew-at"] == str(expected)
 
 
 def test_relay_routes_are_registered(api: tuple[TestClient, object]) -> None:
