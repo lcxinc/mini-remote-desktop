@@ -684,6 +684,119 @@ async def test_both_bound_participants_reuse_capacity_without_double_reserving()
 
 
 @pytest.mark.anyio
+async def test_reserved_egress_is_aggregated_and_expiry_releases_capacity():
+    engine, session, service = relay_service_fixture()
+    try:
+        relay = session.get(RelayNode, "relay-a")
+        assert relay is not None
+        relay.lease_expires_at = NOW + timedelta(minutes=5)
+        relay.max_egress_bps = 1_000_000
+        session.commit()
+
+        first = await service._repository.reserve_capacity(
+            session_id="bitrate-session-a",
+            user_id="bitrate-user-a",
+            ordered_node_ids=["relay-a"],
+            now=NOW,
+            ttl_seconds=10,
+            required_egress_bps=600_000,
+            result_limit=1,
+        )
+        second = await service._repository.reserve_capacity(
+            session_id="bitrate-session-b",
+            user_id="bitrate-user-b",
+            ordered_node_ids=["relay-a"],
+            now=NOW + timedelta(seconds=1),
+            ttl_seconds=10,
+            required_egress_bps=600_000,
+            result_limit=1,
+        )
+
+        assert len(first) == 1
+        assert first[0].reserved_egress_bps == 600_000
+        assert second == []
+
+        after_expiry = await service._repository.reserve_capacity(
+            session_id="bitrate-session-b",
+            user_id="bitrate-user-b",
+            ordered_node_ids=["relay-a"],
+            now=NOW + timedelta(seconds=11),
+            ttl_seconds=10,
+            required_egress_bps=600_000,
+            result_limit=1,
+        )
+        assert len(after_expiry) == 1
+        assert after_expiry[0].reserved_egress_bps == 600_000
+    finally:
+        session.close()
+        engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_wan_generation_overlap_reserves_old_and_new_routes_until_ttl():
+    engine, session, service = relay_service_fixture()
+    try:
+        relay = session.get(RelayNode, "relay-a")
+        assert relay is not None
+        relay.lease_expires_at = NOW + timedelta(minutes=5)
+        relay.max_egress_bps = 1_200_000
+        session.commit()
+
+        old_generation = await service._repository.reserve_capacity(
+            session_id="migration-session",
+            user_id="migration-user",
+            ordered_node_ids=["relay-a"],
+            now=NOW,
+            ttl_seconds=10,
+            directory_generation="directory-old",
+            required_egress_bps=600_000,
+            preserve_generation_overlap=True,
+            result_limit=1,
+        )
+        new_generation = await service._repository.reserve_capacity(
+            session_id="migration-session",
+            user_id="migration-user",
+            ordered_node_ids=["relay-a"],
+            now=NOW + timedelta(seconds=1),
+            ttl_seconds=20,
+            directory_generation="directory-new",
+            required_egress_bps=600_000,
+            preserve_generation_overlap=True,
+            result_limit=1,
+        )
+
+        assert len(old_generation) == len(new_generation) == 1
+        assert old_generation[0].id != new_generation[0].id
+        assert old_generation[0].superseded_at.replace(tzinfo=UTC) == (
+            NOW + timedelta(seconds=1)
+        )
+        blocked = await service._repository.reserve_capacity(
+            session_id="migration-contender",
+            user_id="migration-contender-user",
+            ordered_node_ids=["relay-a"],
+            now=NOW + timedelta(seconds=2),
+            ttl_seconds=20,
+            required_egress_bps=600_000,
+            result_limit=1,
+        )
+        assert blocked == []
+
+        admitted_after_old_ttl = await service._repository.reserve_capacity(
+            session_id="migration-contender",
+            user_id="migration-contender-user",
+            ordered_node_ids=["relay-a"],
+            now=NOW + timedelta(seconds=11),
+            ttl_seconds=20,
+            required_egress_bps=600_000,
+            result_limit=1,
+        )
+        assert len(admitted_after_old_ttl) == 1
+    finally:
+        session.close()
+        engine.dispose()
+
+
+@pytest.mark.anyio
 async def test_access_progressively_reencrypts_old_node_secret_envelopes():
     engine, session, service = relay_service_fixture()
     old_key = bytes.fromhex("31" * 32)

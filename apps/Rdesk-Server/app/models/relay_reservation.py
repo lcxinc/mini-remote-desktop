@@ -3,7 +3,16 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import DateTime, ForeignKey, Index, String, UniqueConstraint, text
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.session import Base
@@ -13,7 +22,14 @@ class RelayReservation(Base):
     __tablename__ = "relay_reservations"
     __table_args__ = (
         UniqueConstraint(
-            "session_id", "node_id", name="uq_relay_reservations_session_node"
+            "session_id",
+            "node_id",
+            "directory_generation",
+            name="uq_relay_reservations_session_node_generation",
+        ),
+        CheckConstraint(
+            "reserved_egress_bps >= 0",
+            name="ck_relay_reservations_reserved_egress",
         ),
         Index("ix_relay_reservations_session", "session_id"),
         Index("ix_relay_reservations_user", "user_id"),
@@ -45,5 +61,8 @@ class RelayReservation(Base):
     )
     directory_generation: Mapped[str] = mapped_column(
         String(64), nullable=False, default="legacy", server_default=text("'legacy'")
+    )
+    reserved_egress_bps: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

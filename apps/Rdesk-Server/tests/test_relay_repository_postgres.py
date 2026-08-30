@@ -1469,7 +1469,7 @@ async def test_migration_schema_matches_orm_and_required_indexes() -> None:
                 text("SELECT MAX(version) FROM relay_schema_migrations")
             )
         assert versions == 1
-        assert current_version == 8
+        assert current_version == 9
         columns = snapshot["nodes_columns"]
         assert str(columns["endpoints"]["type"]).upper() == "JSONB"
         assert columns["state"]["nullable"] is False
@@ -1548,37 +1548,21 @@ async def test_current_migration_ledger_runs_read_only_schema_verification() -> 
 
 
 @pytest.mark.anyio
-async def test_migration_with_only_v8_missing_executes_only_v8_step() -> None:
+async def test_migration_with_only_v9_missing_executes_only_v9_step() -> None:
     async with isolated_postgres_engine() as engine:
         async with engine.begin() as connection:
-            await insert_legacy_draining_node(
-                connection, node_id="relay-v7-draining"
-            )
             await connection.execute(
-                text("DELETE FROM relay_schema_migrations WHERE version = 8")
+                text("DELETE FROM relay_schema_migrations WHERE version = 9")
             )
             await connection.execute(
                 text(
-                    "ALTER TABLE relay_nodes "
-                    "DROP COLUMN current_ingress_bps, "
-                    "DROP COLUMN identity_epoch, "
-                    "DROP COLUMN previous_identity_sequence, "
-                    "DROP COLUMN last_boot_id, "
-                    "DROP COLUMN last_heartbeat_nonce, DROP COLUMN process_health, "
-                    "DROP COLUMN listener_health, DROP COLUMN probe_health, "
-                    "DROP COLUMN packet_loss_bps, DROP COLUMN cpu_usage_bps, "
-                    "DROP COLUMN memory_usage_bps, DROP COLUMN active_secret_version, "
-                    "DROP COLUMN applied_secret_version, DROP COLUMN desired_secret_version, "
-                    "DROP COLUMN desired_draining, DROP COLUMN secret_not_before, "
-                    "DROP COLUMN old_credential_deadline, DROP COLUMN pending_secret_version, "
-                    "DROP COLUMN pending_encrypted_turn_secret, "
-                    "DROP COLUMN pending_secret_digest, DROP COLUMN pending_rotation_id, "
-                    "DROP COLUMN pending_secret_uploaded_at, "
-                    "DROP COLUMN rotation_challenge, DROP COLUMN committed_rotation_id, "
-                    "DROP COLUMN committed_identity_epoch, "
-                    "DROP COLUMN committed_rotation_challenge, "
-                    "DROP COLUMN committed_probe_evidence_sha256, "
-                    "DROP COLUMN committed_proof_mac"
+                    "ALTER TABLE relay_reservations "
+                    "DROP CONSTRAINT ck_relay_reservations_reserved_egress, "
+                    "DROP CONSTRAINT "
+                    "uq_relay_reservations_session_node_generation, "
+                    "DROP COLUMN reserved_egress_bps, "
+                    "ADD CONSTRAINT uq_relay_reservations_session_node "
+                    "UNIQUE (session_id, node_id)"
                 )
             )
 
@@ -1607,14 +1591,17 @@ async def test_migration_with_only_v8_missing_executes_only_v8_step() -> None:
                 ("ALTER ", "CREATE ", "DELETE ", "DO ", "DROP ", "INSERT ", "UPDATE ")
             )
         ]
-        assert len(mutating) == 3, mutating
+        assert len(mutating) == 5, mutating
         assert all(
-            "RELAY_NODES" in statement
+            "RELAY_RESERVATIONS" in statement
+            or "PG_CONSTRAINT" in statement
             or "INSERT INTO RELAY_SCHEMA_MIGRATIONS" in statement
             for statement in mutating
         )
         assert [statement.split(maxsplit=1)[0] for statement in mutating] == [
             "ALTER",
+            "ALTER",
+            "DO",
             "DO",
             "INSERT",
         ]
@@ -1629,18 +1616,20 @@ async def test_migration_with_only_v8_missing_executes_only_v8_step() -> None:
                     )
                 ).scalars()
             )
-            desired_draining = await connection.scalar(
+            reserved_default = await connection.scalar(
                 text(
-                    "SELECT desired_draining FROM relay_nodes "
-                    "WHERE node_id = 'relay-v7-draining'"
+                    "SELECT column_default FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_name = 'relay_reservations' "
+                    "AND column_name = 'reserved_egress_bps'"
                 )
             )
-        assert versions == list(range(1, 9))
-        assert desired_draining is True
+        assert versions == list(range(1, 10))
+        assert reserved_default == "0"
 
 
 @pytest.mark.anyio
-async def test_v7_to_v8_failure_rolls_back_columns_constraints_and_ledger(
+async def test_v7_to_v9_failure_rolls_back_columns_constraints_and_ledger(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async with isolated_postgres_engine() as engine:
@@ -1649,7 +1638,18 @@ async def test_v7_to_v8_failure_rolls_back_columns_constraints_and_ledger(
                 connection, node_id="relay-v7-rollback-draining"
             )
             await connection.execute(
-                text("DELETE FROM relay_schema_migrations WHERE version = 8")
+                text("DELETE FROM relay_schema_migrations WHERE version >= 8")
+            )
+            await connection.execute(
+                text(
+                    "ALTER TABLE relay_reservations "
+                    "DROP CONSTRAINT ck_relay_reservations_reserved_egress, "
+                    "DROP CONSTRAINT "
+                    "uq_relay_reservations_session_node_generation, "
+                    "DROP COLUMN reserved_egress_bps, "
+                    "ADD CONSTRAINT uq_relay_reservations_session_node "
+                    "UNIQUE (session_id, node_id)"
+                )
             )
             await connection.execute(
                 text(
@@ -1677,14 +1677,14 @@ async def test_v7_to_v8_failure_rolls_back_columns_constraints_and_ledger(
             )
 
         def fail_exact_verifier(*_args: object) -> None:
-            raise relay_migration.RelaySchemaMismatchError("injected v8 verifier failure")
+            raise relay_migration.RelaySchemaMismatchError("injected v9 verifier failure")
 
         monkeypatch.setattr(
             relay_migration, "_assert_schema_conforms", fail_exact_verifier
         )
         with pytest.raises(
             relay_migration.RelaySchemaMismatchError,
-            match="injected v8 verifier failure",
+            match="injected v9 verifier failure",
         ):
             await migrate(engine)
 
@@ -1720,7 +1720,7 @@ async def test_v7_to_v8_failure_rolls_back_columns_constraints_and_ledger(
 
 
 @pytest.mark.anyio
-async def test_genuine_v6_schema_upgrades_through_v8_with_all_rotation_constraints() -> None:
+async def test_genuine_v6_schema_upgrades_through_v9_with_capacity_constraints() -> None:
     async with isolated_postgres_engine() as engine:
         async with engine.begin() as connection:
             await insert_legacy_draining_node(
@@ -1732,7 +1732,11 @@ async def test_genuine_v6_schema_upgrades_through_v8_with_all_rotation_constrain
             await connection.execute(
                 text(
                     "ALTER TABLE relay_reservations "
-                    "DROP COLUMN superseded_at, DROP COLUMN directory_generation"
+                    "DROP CONSTRAINT ck_relay_reservations_reserved_egress, "
+                    "DROP COLUMN reserved_egress_bps, "
+                    "DROP COLUMN superseded_at, DROP COLUMN directory_generation, "
+                    "ADD CONSTRAINT uq_relay_reservations_session_node "
+                    "UNIQUE (session_id, node_id)"
                 )
             )
             await connection.execute(
@@ -1794,7 +1798,7 @@ async def test_genuine_v6_schema_upgrades_through_v8_with_all_rotation_constrain
                     "WHERE node_id = 'relay-v6-draining'"
                 )
             )
-        assert versions == list(range(1, 9))
+        assert versions == list(range(1, 10))
         assert desired_draining is True
         assert "previous_identity_sequence" in columns
         assert {
@@ -2264,7 +2268,7 @@ async def test_v4_behaviorally_upgrades_v2_schema_and_serializes_concurrent_upgr
             assert "healthy_heartbeat_streak" in node_columns
             assert set(registration_v3_columns).issubset(registration_columns)
             assert set(registration_v4_columns).issubset(registration_columns)
-            assert versions == [1, 2, 3, 4, 5, 6, 7, 8]
+            assert versions == [1, 2, 3, 4, 5, 6, 7, 8, 9]
     finally:
         await first.dispose()
         await second.dispose()

@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from typing import Callable
 
 from pydantic import ValidationError
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from app.core.security import DeviceAuthSnapshot
 from app.models.device import Device
@@ -362,12 +362,27 @@ class DeviceSessionService:
                 _not_found()
             if authorization == "target" and row.target_device_id != current_device.id:
                 _deny()
+            now = _utc(self._now())
             if row.status == terminal:
+                await self._session.execute(
+                    update(RelayReservation)
+                    .where(
+                        RelayReservation.session_id == session_id,
+                        RelayReservation.expires_at > now,
+                    )
+                    .values(
+                        expires_at=now,
+                        superseded_at=func.coalesce(
+                            RelayReservation.superseded_at, now
+                        ),
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                await self._session.flush()
                 return row
             if row.status not in expected:
                 _conflict()
 
-            now = _utc(self._now())
             row.status = terminal
             if row.grant_expires_at is not None:
                 row.grant_expires_at = now
@@ -378,9 +393,11 @@ class DeviceSessionService:
                 .where(
                     RelayReservation.session_id == session_id,
                     RelayReservation.expires_at > now,
-                    RelayReservation.superseded_at.is_(None),
                 )
-                .values(superseded_at=now)
+                .values(
+                    expires_at=now,
+                    superseded_at=func.coalesce(RelayReservation.superseded_at, now),
+                )
                 .execution_options(synchronize_session=False)
             )
             self._audit(

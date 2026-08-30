@@ -8,6 +8,7 @@ from sqlalchemy import Boolean, BigInteger, DateTime, Integer, LargeBinary, Stri
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from app.db.migrate_add_relay_reserved_egress import apply_reserved_egress_upgrade
 from app.db.session import engine as default_engine
 
 
@@ -17,7 +18,7 @@ _CHECK_CAST = re.compile(
     flags=re.IGNORECASE,
 )
 _MIGRATION_LOCK_CONTEXT = b"MRD_RELAY_SCHEMA_MIGRATION_V1\x00"
-_RELAY_SCHEMA_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8)
+_RELAY_SCHEMA_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9)
 
 
 class RelaySchemaMismatchError(RuntimeError):
@@ -117,7 +118,7 @@ async def migrate(
     *,
     schema: str | None = None,
 ) -> None:
-    """Apply and verify relay schema through v8 in the caller's transaction."""
+    """Apply and verify relay schema through v9 in the caller's transaction."""
     if isinstance(bind, AsyncEngine):
         async with bind.begin() as connection:
             await _migrate_connection(connection, schema=schema)
@@ -184,8 +185,34 @@ async def _migrate_connection(
             )
             return
         if existing_versions == _RELAY_SCHEMA_VERSIONS[:-1]:
-            # v8 is one additive relay-node transaction. Keep the normal
-            # deployed v7 -> v8 path narrow and once-only.
+            # v9 adds exact per-generation egress reservations. Keep the normal
+            # deployed v8 -> v9 path narrow and once-only.
+            await connection.run_sync(
+                lambda sync_connection: _preflight_existing_schema(
+                    sync_connection, schema
+                )
+            )
+            await apply_reserved_egress_upgrade(
+                connection,
+                reservations_table=reservations,
+            )
+            await connection.run_sync(
+                lambda sync_connection: _assert_schema_conforms(
+                    sync_connection, schema
+                )
+            )
+            await connection.execute(
+                text(f"INSERT INTO {versions} (version) VALUES (9)")
+            )
+            await connection.run_sync(
+                lambda sync_connection: _assert_migration_ledger(
+                    sync_connection, schema, require_exact_versions=True
+                )
+            )
+            return
+        if existing_versions == _RELAY_SCHEMA_VERSIONS[:-2]:
+            # Preserve the narrow v7 upgrade while advancing it atomically through
+            # both currently required additive versions.
             await connection.run_sync(
                 lambda sync_connection: _preflight_existing_schema(
                     sync_connection, schema
@@ -227,13 +254,17 @@ async def _migrate_connection(
                 )
             )
             await connection.execute(text(_v8_constraints_sql(nodes)))
+            await apply_reserved_egress_upgrade(
+                connection,
+                reservations_table=reservations,
+            )
             await connection.run_sync(
                 lambda sync_connection: _assert_schema_conforms(
                     sync_connection, schema
                 )
             )
             await connection.execute(
-                text(f"INSERT INTO {versions} (version) VALUES (8)")
+                text(f"INSERT INTO {versions} (version) VALUES (8), (9)")
             )
             await connection.run_sync(
                 lambda sync_connection: _assert_migration_ledger(
@@ -402,8 +433,12 @@ async def _migrate_connection(
             expires_at TIMESTAMPTZ NOT NULL,
             superseded_at TIMESTAMPTZ,
             directory_generation VARCHAR(64) NOT NULL DEFAULT 'legacy',
+            reserved_egress_bps BIGINT NOT NULL DEFAULT 0,
             created_at TIMESTAMPTZ NOT NULL,
-            CONSTRAINT uq_relay_reservations_session_node UNIQUE (session_id, node_id)
+            CONSTRAINT uq_relay_reservations_session_node_generation
+                UNIQUE (session_id, node_id, directory_generation),
+            CONSTRAINT ck_relay_reservations_reserved_egress
+                CHECK (reserved_egress_bps >= 0)
         )
         """,
         f"""
@@ -571,6 +606,10 @@ async def _migrate_connection(
         "directory_generation VARCHAR(64) NOT NULL DEFAULT 'legacy'",
     ):
         await connection.execute(text(statement))
+    await apply_reserved_egress_upgrade(
+        connection,
+        reservations_table=reservations,
+    )
     # Generic upgrades from v1-v6 add the v8 columns individually.  Backfill
     # the legacy state in the same advisory-locked transaction before exact
     # constraints and the migration ledger are finalized.
@@ -856,6 +895,9 @@ def _preflight_existing_schema(sync_connection: object, schema: str | None) -> N
                 "committed_proof_mac",
             },
         }.get(table_name, set())
+        v9_additions = {
+            "relay_reservations": {"reserved_egress_bps"},
+        }.get(table_name, set())
         allowed = (
             expected
             | v3_additions
@@ -864,6 +906,7 @@ def _preflight_existing_schema(sync_connection: object, schema: str | None) -> N
             | v6_additions
             | v7_additions
             | v8_additions
+            | v9_additions
         )
         if not expected.issubset(actual) or not actual.issubset(allowed):
             raise RelaySchemaMismatchError(
@@ -1209,6 +1252,7 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             "expires_at": (DateTime, None, False),
             "superseded_at": (DateTime, None, True),
             "directory_generation": (String, 64, False),
+            "reserved_egress_bps": (BigInteger, None, False),
             "created_at": (DateTime, None, False),
         },
         "relay_node_registrations": {
@@ -1299,7 +1343,12 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
         elif table_name == "relay_node_registrations":
             expected_defaults["status"] = "'pending'"
         elif table_name == "relay_reservations":
-            expected_defaults["directory_generation"] = "'legacy'"
+            expected_defaults.update(
+                {
+                    "directory_generation": "'legacy'",
+                    "reserved_egress_bps": "0",
+                }
+            )
         for name, expected_default in expected_defaults.items():
             actual_default = columns[name]["default"]
             if (
@@ -1409,7 +1458,9 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             ),
         },
         "relay_enrollments": {},
-        "relay_reservations": {},
+        "relay_reservations": {
+            "ck_relay_reservations_reserved_egress": "reserved_egress_bps >= 0",
+        },
         "relay_node_registrations": {
             "ck_relay_node_registrations_status": (
                 "status = ANY (ARRAY['pending', 'approved', 'revoked'])"
@@ -1448,7 +1499,11 @@ def _assert_schema_conforms(sync_connection: object, schema: str | None) -> None
             "relay_enrollments_token_digest_key": ("token_digest",),
         },
         "relay_reservations": {
-            "uq_relay_reservations_session_node": ("session_id", "node_id"),
+            "uq_relay_reservations_session_node_generation": (
+                "session_id",
+                "node_id",
+                "directory_generation",
+            ),
         },
         "relay_node_registrations": {
             "relay_node_registrations_enrollment_id_key": ("enrollment_id",),

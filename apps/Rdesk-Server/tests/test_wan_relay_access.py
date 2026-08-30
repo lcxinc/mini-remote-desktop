@@ -232,7 +232,7 @@ def wan_relay_api(monkeypatch: pytest.MonkeyPatch):
             encrypted_turn_secret=encrypted_secret,
             max_allocations=4,
             active_allocations=0,
-            max_egress_bps=1_000_000,
+            max_egress_bps=100_000_000,
             current_egress_bps=0,
             heartbeat_sequence=3,
             healthy_heartbeat_streak=3,
@@ -944,7 +944,9 @@ def test_credential_failure_occurs_after_committed_generation_and_is_redacted(
     )
 
 
-@pytest.mark.parametrize("mutation", ["signature", "reservation", "endpoint"])
+@pytest.mark.parametrize(
+    "mutation", ["signature", "reservation", "reserved_egress", "endpoint"]
+)
 def test_persisted_generation_or_capacity_drift_fails_closed_before_credentials(
     wan_relay_api: WanRelayAPI,
     mutation: str,
@@ -963,6 +965,10 @@ def test_persisted_generation_or_capacity_drift_fails_closed_before_credentials(
         reservation = api.session.get(RelayReservation, persisted.reservation_ids[0])
         assert reservation is not None
         reservation.superseded_at = datetime.now(UTC)
+    elif mutation == "reserved_egress":
+        reservation = api.session.get(RelayReservation, persisted.reservation_ids[0])
+        assert reservation is not None
+        reservation.reserved_egress_bps = 0
     else:
         node = api.session.get(RelayNode, persisted.primary_node_id)
         assert node is not None
@@ -1037,6 +1043,65 @@ def test_refresh_serializes_next_generation_without_mutating_old_directory(
     active = _access(api, caller="target-1", generation=1)
     assert stale.status_code == 403
     assert active.status_code == 200
+
+
+def test_profile_bitrate_is_reserved_per_generation_and_close_releases_it(
+    wan_relay_api: WanRelayAPI,
+) -> None:
+    api = wan_relay_api
+    assert _create(api).status_code == 200
+    assert _approve(api).status_code == 200
+
+    generation_zero = list(
+        api.session.scalars(
+            select(RelayReservation).where(
+                RelayReservation.session_id == "wan-session-1"
+            )
+        )
+    )
+    assert len(generation_zero) == 2
+    assert {item.reserved_egress_bps for item in generation_zero} == {10_000_000}
+
+    refreshed = _access(
+        api,
+        caller="controller-1",
+        generation=0,
+        refresh=True,
+    )
+    assert refreshed.status_code == 200
+    api.session.expire_all()
+    overlapping = list(
+        api.session.scalars(
+            select(RelayReservation)
+            .where(RelayReservation.session_id == "wan-session-1")
+            .order_by(
+                RelayReservation.directory_generation,
+                RelayReservation.node_id,
+            )
+        )
+    )
+    assert len(overlapping) == 4
+    assert sum(item.reserved_egress_bps for item in overlapping) == 40_000_000
+    assert sum(item.superseded_at is None for item in overlapping) == 2
+
+    closed = api.client.post(
+        "/api/v1/device-sessions/wan-session-1/close",
+        headers=_headers(api, "controller-1"),
+        json={},
+    )
+    assert closed.status_code == 200
+    api.session.expire_all()
+    row = api.session.get(SessionRequest, "wan-session-1")
+    assert row is not None and row.grant_expires_at is not None
+    still_reserved = api.session.scalar(
+        select(func.count())
+        .select_from(RelayReservation)
+        .where(
+            RelayReservation.session_id == "wan-session-1",
+            RelayReservation.expires_at > row.grant_expires_at,
+        )
+    )
+    assert still_reserved == 0
 
 
 def test_failed_refresh_preserves_active_pointer_and_old_public_generation(

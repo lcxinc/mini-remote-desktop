@@ -528,6 +528,8 @@ class RelayRepository:
         ttl_seconds: int = 30,
         expires_at: datetime | None = None,
         directory_generation: str | None = None,
+        required_egress_bps: int = 0,
+        preserve_generation_overlap: bool = False,
         require_registration: bool = False,
         require_distinct_topology: bool = False,
         result_limit: int | None = None,
@@ -578,6 +580,23 @@ class RelayRepository:
             raise RelayRepositoryError(
                 "INVALID_DIRECTORY_GENERATION", "invalid directory generation"
             )
+        if not _integer_in_range(
+            required_egress_bps,
+            minimum=0,
+            maximum=_POSTGRES_BIGINT_MAX,
+        ):
+            raise RelayRepositoryError(
+                "INVALID_RESERVED_EGRESS", "invalid reserved egress"
+            )
+        if not isinstance(preserve_generation_overlap, bool):
+            raise RelayRepositoryError(
+                "INVALID_GENERATION_OVERLAP", "invalid generation overlap mode"
+            )
+        if preserve_generation_overlap and directory_generation is None:
+            raise RelayRepositoryError(
+                "INVALID_GENERATION_OVERLAP",
+                "generation overlap requires a directory generation",
+            )
         ordered_unique = list(dict.fromkeys(ordered_node_ids))
         if not ordered_unique:
             return []
@@ -599,6 +618,8 @@ class RelayRepository:
                 now=now,
                 expires_at=reservation_expires_at,
                 directory_generation=directory_generation,
+                required_egress_bps=required_egress_bps,
+                preserve_generation_overlap=preserve_generation_overlap,
                 require_registration=require_registration,
                 require_distinct_topology=require_distinct_topology,
                 result_limit=result_limit,
@@ -615,6 +636,8 @@ class RelayRepository:
                 now=now,
                 expires_at=reservation_expires_at,
                 directory_generation=directory_generation,
+                required_egress_bps=required_egress_bps,
+                preserve_generation_overlap=preserve_generation_overlap,
                 require_registration=require_registration,
                 require_distinct_topology=require_distinct_topology,
                 result_limit=result_limit,
@@ -629,6 +652,8 @@ class RelayRepository:
         now: datetime,
         expires_at: datetime,
         directory_generation: str | None,
+        required_egress_bps: int,
+        preserve_generation_overlap: bool,
         require_registration: bool,
         require_distinct_topology: bool,
         result_limit: int,
@@ -659,7 +684,10 @@ class RelayRepository:
             .execution_options(populate_existing=True)
         ))
         existing = {
-            reservation.node_id: reservation for reservation in active_rows
+            reservation.node_id: reservation
+            for reservation in active_rows
+            if not preserve_generation_overlap
+            or reservation.directory_generation == directory_generation
         }
         if any(
             reservation.user_id != user_id for reservation in active_rows
@@ -745,6 +773,11 @@ class RelayRepository:
                     await self._session.flush()
                 continue
             if same_session is not None:
+                if same_session.reserved_egress_bps != required_egress_bps:
+                    raise RelayRepositoryError(
+                        "RESERVATION_PROFILE_MISMATCH",
+                        "reservation egress does not match the generation",
+                    )
                 if directory_generation is not None:
                     same_session.superseded_at = None
                     same_session.directory_generation = directory_generation
@@ -760,15 +793,19 @@ class RelayRepository:
             )
             if current_count >= self._max_reservations:
                 continue
-            used = await self._session.scalar(
-                select(func.count())
-                .select_from(RelayReservation)
+            usage = await self._session.execute(
+                select(
+                    func.count(RelayReservation.id),
+                    func.coalesce(func.sum(RelayReservation.reserved_egress_bps), 0),
+                )
                 .where(
                     RelayReservation.node_id == node_id,
                     RelayReservation.expires_at > now,
                 )
             )
-            pending_reservations = int(used or 0)
+            pending_reservations, pending_egress_bps = usage.one()
+            pending_reservations = int(pending_reservations or 0)
+            pending_egress_bps = int(pending_egress_bps or 0)
             # Subtract before comparing instead of adding reported active and pending
             # counts. This is conservative for invalid/corrupt values and cannot wrap.
             if (
@@ -785,6 +822,15 @@ class RelayRepository:
             )
             if pending_reservations >= remaining_after_active:
                 continue
+            remaining_egress_after_active = (
+                node.max_egress_bps - node.current_egress_bps
+            )
+            if (
+                pending_egress_bps > remaining_egress_after_active
+                or required_egress_bps
+                > remaining_egress_after_active - pending_egress_bps
+            ):
+                continue
             reservation = RelayReservation(
                 session_id=session_id,
                 user_id=user_id,
@@ -792,6 +838,7 @@ class RelayRepository:
                 expires_at=expires_at,
                 superseded_at=None,
                 directory_generation=directory_generation or "legacy",
+                reserved_egress_bps=required_egress_bps,
                 created_at=now,
             )
             self._session.add(reservation)

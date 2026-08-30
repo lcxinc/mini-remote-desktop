@@ -166,7 +166,7 @@ async def _seed_requested_wan_session(
             encrypted_turn_secret=encrypted_secret,
             max_allocations=8,
             active_allocations=0,
-            max_egress_bps=1_000_000,
+            max_egress_bps=100_000_000,
             current_egress_bps=0,
             measured_rtt_ms=10 + index,
             recent_failure_bps=0,
@@ -516,8 +516,20 @@ async def test_concurrent_wan_refresh_expected_zero_creates_one_immutable_genera
                 _signed_directory_digest(generations[0].signed_directory)
                 == generation_zero_digest
             )
-            assert reservation_count == 2
+            assert reservation_count == 4
             assert current_reservation_count == 2
+            overlapping_reservations = list(
+                await verification.scalars(
+                    select(RelayReservation).where(
+                        RelayReservation.session_id == "wan-concurrent-session"
+                    )
+                )
+            )
+            assert sum(
+                item.directory_generation == generation_zero_directory_id
+                and item.superseded_at is not None
+                for item in overlapping_reservations
+            ) == 2
     finally:
         await engine.dispose()
         async with admin_engine.begin() as connection:
@@ -1450,6 +1462,88 @@ async def test_directory_admission_uses_canonical_node_lock_order() -> None:
             )
             for result in results
         } == {"cross-a", "cross-b"}
+    finally:
+        await engine.dispose()
+        async with admin_engine.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        await admin_engine.dispose()
+
+
+@pytest.mark.anyio
+async def test_concurrent_bitrate_reservations_never_oversubscribe_postgres():
+    assert DATABASE_URL is not None
+    schema = "relay_bitrate_capacity_" + re.sub(r"[^a-z0-9]", "", uuid4().hex)
+    admin_engine = create_async_engine(asyncpg_url(DATABASE_URL))
+    async with admin_engine.begin() as connection:
+        await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+    engine = create_async_engine(
+        asyncpg_url(DATABASE_URL),
+        connect_args={"server_settings": {"search_path": schema}},
+    )
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    cipher = AesGcmRelaySecretCipher(bytes.fromhex("91" * 32))
+    try:
+        async with engine.begin() as connection:
+            await migrate_relay_control(connection)
+            await connection.run_sync(Base.metadata.create_all)
+            await migrate_relay_access(connection)
+        async with sessions.begin() as setup:
+            setup.add(
+                RelayNode(
+                    node_id="bitrate-relay",
+                    region="ap-east",
+                    failure_domain="bitrate-rack",
+                    physical_host_id="bitrate-host",
+                    state="available",
+                    endpoints=["turn:bitrate-relay.example.test:3478?transport=udp"],
+                    certificate_fingerprint="sha256:" + "91" * 32,
+                    encrypted_turn_secret=cipher.encrypt(
+                        hashlib.sha256(b"bitrate-relay-secret").digest(),
+                        associated_data=b"bitrate-relay",
+                    ),
+                    max_allocations=8,
+                    active_allocations=0,
+                    max_egress_bps=15_000_000,
+                    current_egress_bps=0,
+                    heartbeat_sequence=3,
+                    healthy_heartbeat_streak=3,
+                    lease_expires_at=NOW + timedelta(minutes=5),
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+
+        async def reserve(session_id: str) -> list[str]:
+            async with sessions.begin() as db:
+                rows = await RelayRepository(
+                    db,
+                    enrollment_token_pepper=bytes.fromhex("92" * 32),
+                    secret_cipher=cipher,
+                    max_reservations_per_session=1,
+                ).reserve_capacity(
+                    session_id=session_id,
+                    user_id=f"user-{session_id}",
+                    ordered_node_ids=["bitrate-relay"],
+                    now=NOW,
+                    ttl_seconds=30,
+                    required_egress_bps=10_000_000,
+                    result_limit=1,
+                )
+                return [row.node_id for row in rows]
+
+        results = await asyncio.wait_for(
+            asyncio.gather(reserve("bitrate-a"), reserve("bitrate-b")),
+            timeout=10,
+        )
+        assert sum(bool(result) for result in results) == 1
+        async with sessions() as verification:
+            total = await verification.scalar(
+                select(func.sum(RelayReservation.reserved_egress_bps)).where(
+                    RelayReservation.node_id == "bitrate-relay",
+                    RelayReservation.expires_at > NOW,
+                )
+            )
+            assert total == 10_000_000
     finally:
         await engine.dispose()
         async with admin_engine.begin() as connection:

@@ -50,6 +50,10 @@ _CREDENTIAL_SCOPE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _BASIS_POINTS = 10_000
 _UNKNOWN_RTT_MS = 2**32 - 1
 _U64_MAX = 2**64 - 1
+_BITS_PER_MEGABIT = 1_000_000
+_DEFAULT_WAN_VIDEO_BITRATE_MBPS = 8
+_RELAY_EGRESS_OVERHEAD_NUMERATOR = 5
+_RELAY_EGRESS_OVERHEAD_DENOMINATOR = 4
 
 
 class RelayAccessError(Exception):
@@ -590,26 +594,43 @@ class RelayAccessService:
         )
         records = list(rows.all())
         views = [_view(node, registration) for node, registration in records]
+        required_egress_bps = _required_wan_egress_bps(grant)
         pending_rows = await self._session.execute(
-            select(RelayReservation.node_id, func.count(RelayReservation.id))
+            select(
+                RelayReservation.node_id,
+                func.count(RelayReservation.id),
+                func.coalesce(func.sum(RelayReservation.reserved_egress_bps), 0),
+            )
             .where(
                 RelayReservation.node_id.in_([node.node_id for node, _ in records]),
-                RelayReservation.session_id != grant.id,
                 RelayReservation.expires_at > now,
             )
             .group_by(RelayReservation.node_id)
         )
-        pending_by_node = {node_id: int(count) for node_id, count in pending_rows.all()}
+        pending_by_node = {
+            node_id: (int(count), int(egress_bps))
+            for node_id, count, egress_bps in pending_rows.all()
+        }
         views = [
             replace(
                 view,
                 active_allocations=(
-                    view.active_allocations + pending_by_node.get(view.node_id, 0)
+                    view.active_allocations
+                    + pending_by_node.get(view.node_id, (0, 0))[0]
+                ),
+                current_egress_bps=(
+                    view.current_egress_bps
+                    + pending_by_node.get(view.node_id, (0, 0))[1]
                 ),
             )
             for view in views
         ]
-        decision = select_relay_nodes(policy, views, now=now)
+        decision = select_relay_nodes(
+            policy,
+            views,
+            now=now,
+            required_egress_bps=required_egress_bps,
+        )
         by_id = {
             node.node_id: (node, registration, view)
             for (node, registration), view in zip(records, views, strict=True)
@@ -659,6 +680,8 @@ class RelayAccessService:
                 ttl_seconds=reservation_ttl,
                 expires_at=server_deadline,
                 directory_generation=directory_id,
+                required_egress_bps=required_egress_bps,
+                preserve_generation_overlap=True,
                 require_registration=True,
                 require_distinct_topology=True,
                 result_limit=required_count,
@@ -917,6 +940,7 @@ class RelayAccessService:
         by_id = {row.id: row for row in rows}
         if len(by_id) != len(persisted.reservation_ids):
             _deny_access()
+        required_egress_bps = _required_wan_egress_bps(grant)
         for candidate in directory.payload.candidates:
             reservation = by_id.get(candidate.reservation.reservation_id)
             if (
@@ -925,6 +949,7 @@ class RelayAccessService:
                 or reservation.user_id != grant.requester_user_id
                 or reservation.node_id != candidate.node_id
                 or reservation.directory_generation != persisted.directory_id
+                or reservation.reserved_egress_bps != required_egress_bps
                 or reservation.superseded_at is not None
                 or _utc(reservation.expires_at) != _utc(persisted.expires_at)
                 or candidate.reservation.expires_at_ms
@@ -1117,6 +1142,9 @@ class RelayAccessService:
                     select(
                         RelayReservation.node_id,
                         func.count(RelayReservation.id),
+                        func.coalesce(
+                            func.sum(RelayReservation.reserved_egress_bps), 0
+                        ),
                     )
                     .where(
                         RelayReservation.node_id.in_(
@@ -1128,14 +1156,19 @@ class RelayAccessService:
                     .group_by(RelayReservation.node_id)
                 )
                 pending_by_node = {
-                    node_id: int(count) for node_id, count in pending_rows.all()
+                    node_id: (int(count), int(egress_bps))
+                    for node_id, count, egress_bps in pending_rows.all()
                 }
                 views = [
                     replace(
                         view,
                         active_allocations=(
                             view.active_allocations
-                            + pending_by_node.get(view.node_id, 0)
+                            + pending_by_node.get(view.node_id, (0, 0))[0]
+                        ),
+                        current_egress_bps=(
+                            view.current_egress_bps
+                            + pending_by_node.get(view.node_id, (0, 0))[1]
                         ),
                     )
                     for view in views
@@ -1461,8 +1494,15 @@ def select_relay_nodes(
     nodes: Iterable[RelayNodeView],
     *,
     now: datetime,
+    required_egress_bps: int = 0,
 ) -> RelaySelectionDecision:
     now = _utc(now)
+    if (
+        not isinstance(required_egress_bps, int)
+        or isinstance(required_egress_bps, bool)
+        or required_egress_bps < 0
+    ):
+        raise ValueError("required relay egress must be a non-negative integer")
     candidates: list[RelaySelectedNode] = []
     rejections: list[RelayRejection] = []
     for node in nodes:
@@ -1471,7 +1511,13 @@ def select_relay_nodes(
             for endpoint in node.endpoints
             if endpoint_transport(endpoint) in policy.accepted_transports
         )
-        reason = _rejection_reason(policy, node, compatible, now)
+        reason = _rejection_reason(
+            policy,
+            node,
+            compatible,
+            now,
+            required_egress_bps,
+        )
         if reason is not None:
             rejections.append(RelayRejection(node.node_id, reason))
             continue
@@ -1733,6 +1779,35 @@ def _policy_from_grant(grant: SessionRequest) -> RelaySelectionPolicy:
     )
 
 
+def _required_wan_egress_bps(grant: SessionRequest) -> int:
+    scopes = grant.approved_scopes
+    if not isinstance(scopes, list) or any(
+        not isinstance(scope, str) for scope in scopes
+    ):
+        _deny_access()
+    if "screen.view" not in scopes:
+        return 0
+    profile = grant.approved_profile
+    if profile is None:
+        bitrate_mbps = _DEFAULT_WAN_VIDEO_BITRATE_MBPS
+    elif isinstance(profile, dict):
+        bitrate_mbps = profile.get("bitrate_mbps")
+    else:
+        _deny_access()
+    if (
+        not isinstance(bitrate_mbps, int)
+        or isinstance(bitrate_mbps, bool)
+        or not 1 <= bitrate_mbps <= 1_000
+    ):
+        _deny_access()
+    encoded_bps = bitrate_mbps * _BITS_PER_MEGABIT
+    return (
+        encoded_bps * _RELAY_EGRESS_OVERHEAD_NUMERATOR
+        + _RELAY_EGRESS_OVERHEAD_DENOMINATOR
+        - 1
+    ) // _RELAY_EGRESS_OVERHEAD_DENOMINATOR
+
+
 def _bounded_string_tuple(value: object, allowed_values: set[str]) -> tuple[str, ...]:
     if not isinstance(value, list) or not 1 <= len(value) <= 8:
         return ()
@@ -1857,6 +1932,7 @@ def _rejection_reason(
     node: RelayNodeView,
     compatible: tuple[str, ...],
     now: datetime,
+    required_egress_bps: int,
 ) -> str | None:
     if node.revoked_at is not None or node.state == "revoked":
         return "revoked"
@@ -1885,6 +1961,8 @@ def _rejection_reason(
         or node.max_egress_bps <= 0
         or node.current_egress_bps < 0
         or node.current_egress_bps >= node.max_egress_bps
+        or required_egress_bps
+        > node.max_egress_bps - node.current_egress_bps
     ):
         return "hard_capacity_reached"
     return None
