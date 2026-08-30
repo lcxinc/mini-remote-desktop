@@ -525,9 +525,9 @@ impl NvdecVideoDecoder {
     pub fn new_d3d11_shared() -> Result<Self, PipelineError> {
         #[cfg(not(windows))]
         {
-            return Err(PipelineError::Message(
+            Err(PipelineError::Message(
                 "nvdec d3d11 shared output is only available on Windows".to_string(),
-            ));
+            ))
         }
 
         #[cfg(windows)]
@@ -571,9 +571,9 @@ impl NvdecVideoDecoder {
     pub fn new_hevc_d3d11_shared() -> Result<Self, PipelineError> {
         #[cfg(not(windows))]
         {
-            return Err(PipelineError::Message(
+            Err(PipelineError::Message(
                 "nvdec hevc d3d11 shared output is only available on Windows".to_string(),
-            ));
+            ))
         }
 
         #[cfg(windows)]
@@ -606,9 +606,9 @@ impl NvdecVideoDecoder {
     pub fn new_hevc_main10_d3d11_shared() -> Result<Self, PipelineError> {
         #[cfg(not(windows))]
         {
-            return Err(PipelineError::Message(
+            Err(PipelineError::Message(
                 "nvdec hevc main10 d3d11 shared output is only available on Windows".to_string(),
-            ));
+            ))
         }
 
         #[cfg(windows)]
