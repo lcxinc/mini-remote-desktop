@@ -333,7 +333,7 @@ export function AuthModal({ open, onClose }: AuthModalProps) {
                     type="text"
                     value={loginAccount}
                     onChange={(e) => setLoginAccount(e.target.value)}
-                    placeholder="请输入账号（默认：admin）"
+                    placeholder="请输入账号"
                     className={`w-full pl-10 pr-3 py-2.5 rounded-lg border outline-none transition-all ${inputStyle}`}
                     style={{ fontSize: 13 }}
                   />
@@ -402,31 +402,6 @@ export function AuthModal({ open, onClose }: AuthModalProps) {
                   {authSuccess}
                 </div>
               )}
-
-              {/* 默认账户提示 */}
-              <div className={`p-3 rounded-lg border flex items-center gap-3 ${
-                isDark ? "bg-blue-900/20 border-blue-800" : "bg-blue-50 border-blue-100"
-              }`}>
-                <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
-                  isDark ? "bg-blue-900/40" : "bg-blue-100"
-                }`}>
-                  <Mail className="w-4 h-4 text-blue-600" />
-                </div>
-                <div className="flex-1">
-                  <div className={isDark ? "text-blue-400" : "text-blue-700"} style={{ fontSize: 11 }}>默认账户</div>
-                  <div className={`font-mono ${isDark ? "text-gray-300" : "text-gray-700"}`} style={{ fontSize: 12 }}>
-                    admin / admin123
-                  </div>
-                </div>
-                <button
-                  onClick={() => { setLoginAccount("admin"); setPassword("admin123"); }}
-                  className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${
-                    isDark ? "bg-blue-900/40 text-blue-400 hover:bg-blue-900/60" : "bg-blue-100 text-blue-600 hover:bg-blue-200"
-                  }`}
-                >
-                  填入
-                </button>
-              </div>
 
               {/* Divider */}
               <div className="flex items-center gap-3 py-1">

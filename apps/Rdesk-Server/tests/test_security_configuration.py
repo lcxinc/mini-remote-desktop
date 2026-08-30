@@ -274,6 +274,26 @@ def test_env_example_documents_security_controls_without_shipping_secrets() -> N
     assert "change_me_for_production" not in content
 
 
+def test_repository_has_no_fixed_admin_bootstrap_or_login_autofill() -> None:
+    server_root = Path(__file__).resolve().parents[1]
+    diagnostic = (server_root / "check_db.py").read_text(encoding="utf-8")
+    auth_modal = (
+        server_root.parent / "Rdesk" / "src" / "app" / "components" / "AuthModal.tsx"
+    ).read_text(encoding="utf-8")
+
+    fixed_password = "admin" + "123"
+    fixed_username = "username=" + '"admin"'
+    for forbidden in (fixed_password, fixed_username, "Creating admin user"):
+        assert forbidden not in diagnostic
+    for forbidden in (
+        fixed_password,
+        "默认账户",
+        'setLoginAccount("admin")',
+        "请输入账号（默认：admin）",
+    ):
+        assert forbidden not in auth_modal
+
+
 def test_jwt_issuance_requires_explicit_issuer_and_audience(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

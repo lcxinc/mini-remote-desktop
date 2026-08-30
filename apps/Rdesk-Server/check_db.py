@@ -1,38 +1,28 @@
+"""Read-only database connectivity diagnostic.
+
+Schema migrations and administrator provisioning are explicit deployment actions.
+This utility deliberately performs neither operation.
+"""
+
 import asyncio
-from sqlalchemy import select
-from app.db.session import AsyncSessionLocal, Base, engine
-from app.core.security import hash_password
+
+from sqlalchemy import func, select
+
+from app.db.session import AsyncSessionLocal, engine
 from app.models.user import User
-import app.models  # noqa: F401
 
 
-async def check_and_init_db():
-    """Check database and create initial user if needed."""
+async def check_database() -> None:
+    """Verify connectivity and report a non-sensitive aggregate."""
 
-    # Create tables
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    async with engine.connect() as connection:
+        await connection.execute(select(1))
 
-    # Check for existing users
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(User).limit(1))
-        user = result.scalar_one_or_none()
+    async with AsyncSessionLocal() as session:
+        user_count = await session.scalar(select(func.count(User.id)))
 
-        if user:
-            print(f"User exists: {user.username} (id={user.id}, role={user.role})")
-        else:
-            print("No users found. Creating admin user...")
-            admin = User(
-                username="admin",
-                email="admin@rdesk.local",
-                password_hash=hash_password("admin123"),
-                role="admin",
-            )
-            db.add(admin)
-            await db.commit()
-            await db.refresh(admin)
-            print(f"Created admin user: {admin.username} (id={admin.id})")
+    print(f"Database reachable; user_count={user_count or 0}")
 
 
 if __name__ == "__main__":
-    asyncio.run(check_and_init_db())
+    asyncio.run(check_database())
