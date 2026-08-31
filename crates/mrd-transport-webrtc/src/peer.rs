@@ -1040,6 +1040,9 @@ struct BlockingCloseInterceptorHook {
 }
 
 #[cfg(test)]
+static BLOCKING_CLOSE_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+#[cfg(test)]
 #[derive(Clone)]
 struct ShutdownAdmissionHook {
     entered: Arc<Barrier>,
@@ -4211,6 +4214,7 @@ mod tests {
 
     #[tokio::test]
     async fn pc_close_future_survives_cleanup_deadline_without_reentry() {
+        let _serial = BLOCKING_CLOSE_TEST_LOCK.lock().await;
         let supervisor = CleanupSupervisor::start_for_test(1, 2).expect("cleanup supervisor");
         let entered = Arc::new(AtomicBool::new(false));
         let gate = Arc::new(Semaphore::new(0));
@@ -4282,6 +4286,7 @@ mod tests {
 
     #[tokio::test]
     async fn capacity_one_releases_each_permit_only_after_the_same_close_future_finishes() {
+        let _serial = BLOCKING_CLOSE_TEST_LOCK.lock().await;
         const ROUNDS: usize = 16;
         let supervisor = CleanupSupervisor::start_for_test(1, 1).expect("cleanup supervisor");
 
@@ -4337,6 +4342,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_close_waits_through_the_take_to_acceptance_window() {
+        let _serial = BLOCKING_CLOSE_TEST_LOCK.lock().await;
         let supervisor = CleanupSupervisor::start_for_test(1, 1).expect("cleanup supervisor");
         let close_entered = Arc::new(AtomicBool::new(false));
         let close_gate = Arc::new(Semaphore::new(0));
@@ -4416,6 +4422,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn rejected_shutdown_admission_restores_ownership_and_wakes_a_retrying_caller() {
+        let _serial = BLOCKING_CLOSE_TEST_LOCK.lock().await;
         let supervisor = CleanupSupervisor::start_for_test(1, 1).expect("cleanup supervisor");
         let close_entered = Arc::new(AtomicBool::new(false));
         let close_gate = Arc::new(Semaphore::new(0));
@@ -4494,6 +4501,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn panicked_shutdown_admission_rolls_back_and_wakes_a_retrying_caller() {
+        let _serial = BLOCKING_CLOSE_TEST_LOCK.lock().await;
         let supervisor = CleanupSupervisor::start_for_test(1, 1).expect("cleanup supervisor");
         let close_entered = Arc::new(AtomicBool::new(false));
         let close_gate = Arc::new(Semaphore::new(0));
