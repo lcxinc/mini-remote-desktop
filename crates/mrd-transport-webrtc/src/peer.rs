@@ -644,6 +644,19 @@ impl PhysicalShutdown {
         )
     }
 
+    #[cfg(test)]
+    async fn wait_until_finished(&self) {
+        loop {
+            let notified = self.completed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_finished() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     fn complete(&self, error: Option<String>) {
         let mut lifecycle = self
             .lifecycle
@@ -2827,6 +2840,11 @@ impl WebRtcPeerConnection {
         self.shutdown.is_finished()
     }
 
+    #[cfg(test)]
+    async fn wait_for_physical_shutdown_for_test(&self) {
+        self.shutdown.wait_until_finished().await;
+    }
+
     #[cfg(not(test))]
     async fn wait_restart_validation_gate_for_test(&self) {}
 
@@ -4009,13 +4027,10 @@ mod tests {
         commit.abort();
         assert!(commit.await.unwrap_err().is_cancelled());
         gate.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !active.physical_shutdown_finished_for_test()
-                || active.restart_cleanup_failure_count() != 1
-            {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            active.wait_for_physical_shutdown_for_test(),
+        )
         .await
         .expect("old root cleanup finishes");
 
@@ -4185,11 +4200,10 @@ mod tests {
         assert!(caller.await.unwrap_err().is_cancelled());
         assert!(!peer.physical_shutdown_finished_for_test());
         gate.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !peer.physical_shutdown_finished_for_test() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            peer.wait_for_physical_shutdown_for_test(),
+        )
         .await
         .expect("detached shutdown finishes after caller cancellation");
         assert_eq!(pc.connection_state(), RTCPeerConnectionState::Closed);
@@ -4251,11 +4265,10 @@ mod tests {
         assert_eq!(supervisor.snapshot().available_admission_slots, 1);
 
         gate.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !peer.physical_shutdown_finished_for_test() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            peer.wait_for_physical_shutdown_for_test(),
+        )
         .await
         .expect("the original close future resumes after the interceptor barrier");
         assert_eq!(pc.connection_state(), RTCPeerConnectionState::Closed);
@@ -4301,11 +4314,10 @@ mod tests {
             assert_eq!(physical.pc.connection_state(), RTCPeerConnectionState::New);
 
             gate.add_permits(1);
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !peer.physical_shutdown_finished_for_test() {
-                    tokio::task::yield_now().await;
-                }
-            })
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                peer.wait_for_physical_shutdown_for_test(),
+            )
             .await
             .unwrap_or_else(|error| panic!("round {round} physical close stalled: {error}"));
             assert_eq!(
@@ -4382,11 +4394,10 @@ mod tests {
                 .expect("second close task after physical release")
                 .expect("physical release completes the old waiting caller");
         }
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !peer.physical_shutdown_finished_for_test() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            peer.wait_for_physical_shutdown_for_test(),
+        )
         .await
         .expect("same physical close eventually completes");
         assert!(close_entered.load(Ordering::Acquire));
@@ -4462,11 +4473,10 @@ mod tests {
                 .await
                 .expect("fallback cleanup after RED timeout");
         }
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !peer.physical_shutdown_finished_for_test() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            peer.wait_for_physical_shutdown_for_test(),
+        )
         .await
         .expect("retried physical cleanup completes");
         assert_eq!(pc.connection_state(), RTCPeerConnectionState::Closed);
@@ -4534,11 +4544,10 @@ mod tests {
         assert!(second_error.to_string().contains("in progress"));
 
         close_gate.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !peer.physical_shutdown_finished_for_test() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            peer.wait_for_physical_shutdown_for_test(),
+        )
         .await
         .expect("physical cleanup completes after admission panic rollback");
         assert!(close_entered.load(Ordering::Acquire));
@@ -4570,11 +4579,10 @@ mod tests {
         assert!(!timed_out.physical_shutdown_finished_for_test());
         assert_eq!(timed_out_pc.connection_state(), RTCPeerConnectionState::New);
         timeout_gate.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !timed_out.physical_shutdown_finished_for_test() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            timed_out.wait_for_physical_shutdown_for_test(),
+        )
         .await
         .expect("pre-close deadline does not cancel eventual physical teardown");
         assert_eq!(
