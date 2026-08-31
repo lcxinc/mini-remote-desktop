@@ -5,8 +5,6 @@ asyncpg==0.31.0
 pydantic==2.13.4
 pydantic-settings==2.14.2
 PyJWT==2.13.0
-# Kept for compatibility with existing token fixtures and clients.
-python-jose==3.5.0
 email-validator==2.2.0
-python-multipart==0.0.20
-cryptography==46.0.3
+python-multipart==0.0.32
+cryptography==50.0.1

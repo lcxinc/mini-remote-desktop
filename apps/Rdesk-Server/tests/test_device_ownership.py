@@ -7,11 +7,11 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import uuid4
 
+import jwt
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
-from jose import jwt
 from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session
@@ -673,7 +673,7 @@ def test_device_token_has_independent_context_and_rotation_revokes_old_token(
 
     assert rotated.status_code == 200, rotated.text
     new_token = rotated.json()["access_token"]
-    claims = jwt.get_unverified_claims(new_token)
+    claims = jwt.decode(new_token, options={"verify_signature": False})
     assert claims["aud"] == "rdesk-device"
     assert claims["token_type"] == "device"
     assert claims["device_id"] == device_api.device.device_id
@@ -702,9 +702,10 @@ def test_device_token_has_independent_context_and_rotation_revokes_old_token(
         headers={"Authorization": f"Bearer {device_api.admin_token}"},
     )
     assert admin_rotated.status_code == 200
-    assert jwt.get_unverified_claims(admin_rotated.json()["access_token"])[
-        "auth_version"
-    ] == 4
+    assert jwt.decode(
+        admin_rotated.json()["access_token"],
+        options={"verify_signature": False},
+    )["auth_version"] == 4
 
 
 def test_serial_inventory_uses_admin_post_and_registration_stores_digest_only(

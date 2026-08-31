@@ -8,11 +8,11 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import jwt
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.testclient import TestClient
-from jose import jwt
 from pydantic import SecretStr, ValidationError
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
@@ -320,7 +320,7 @@ def test_jwt_contains_pinned_context_and_bounded_lifetime(
     monkeypatch.setitem(settings.__dict__, "jwt_expire_minutes", 30)
     monkeypatch.setitem(settings.__dict__, "jwt_max_lifetime_minutes", 60)
     token = create_access_token("user-id", "user", "user")
-    claims = jwt.get_unverified_claims(token)
+    claims = jwt.decode(token, options={"verify_signature": False})
     assert claims["iss"] == "https://auth.rdesk.test"
     assert claims["aud"] == "rdesk-api"
     assert set(("sub", "role", "iat", "exp", "iss", "aud")).issubset(claims)
