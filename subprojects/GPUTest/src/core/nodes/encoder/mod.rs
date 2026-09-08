@@ -1,0 +1,64 @@
+pub mod amf;
+pub mod av1_amf;
+pub mod av1_nvenc;
+pub mod av1_qsv;
+pub mod av1_software;
+pub mod av1_vaapi;
+pub mod dnxhd_software;
+pub mod dnxhr_software;
+pub mod gpu_proto;
+pub mod h264_amf;
+pub mod h264_nvenc;
+pub mod h264_qsv;
+pub mod h264_software;
+pub mod h264_vaapi;
+pub mod hevc_amf;
+pub mod hevc_nvenc;
+pub mod hevc_qsv;
+pub mod hevc_software;
+pub mod hevc_vaapi;
+pub mod metal;
+pub mod mjpeg_software;
+pub mod nvenc;
+pub mod opencl;
+pub mod prores_software;
+pub mod qsv;
+pub mod software;
+pub mod vaapi;
+pub mod vp9_software;
+pub mod vulkan;
+
+pub fn encode_work_us(name: &str) -> Option<u64> {
+    match name {
+        "gpu_proto" => Some(gpu_proto::encode_work_us()),
+        "software" => Some(software::encode_work_us()),
+        "h264_software" => Some(h264_software::encode_work_us()),
+        "hevc_software" => Some(hevc_software::encode_work_us()),
+        "av1_software" => Some(av1_software::encode_work_us()),
+        "vp9_software" => Some(vp9_software::encode_work_us()),
+        "mjpeg_software" => Some(mjpeg_software::encode_work_us()),
+        "prores_software" => Some(prores_software::encode_work_us()),
+        "dnxhd_software" => Some(dnxhd_software::encode_work_us()),
+        "dnxhr_software" => Some(dnxhr_software::encode_work_us()),
+        "nvenc" => Some(nvenc::encode_work_us()),
+        "h264_nvenc" => Some(h264_nvenc::encode_work_us()),
+        "hevc_nvenc" => Some(hevc_nvenc::encode_work_us()),
+        "av1_nvenc" => Some(av1_nvenc::encode_work_us()),
+        "amf" => Some(amf::encode_work_us()),
+        "h264_amf" => Some(h264_amf::encode_work_us()),
+        "hevc_amf" => Some(hevc_amf::encode_work_us()),
+        "av1_amf" => Some(av1_amf::encode_work_us()),
+        "qsv" => Some(qsv::encode_work_us()),
+        "h264_qsv" => Some(h264_qsv::encode_work_us()),
+        "hevc_qsv" => Some(hevc_qsv::encode_work_us()),
+        "av1_qsv" => Some(av1_qsv::encode_work_us()),
+        "vaapi" => Some(vaapi::encode_work_us()),
+        "h264_vaapi" => Some(h264_vaapi::encode_work_us()),
+        "hevc_vaapi" => Some(hevc_vaapi::encode_work_us()),
+        "av1_vaapi" => Some(av1_vaapi::encode_work_us()),
+        "opencl" => Some(opencl::encode_work_us()),
+        "vulkan" => Some(vulkan::encode_work_us()),
+        "metal" => Some(metal::encode_work_us()),
+        _ => None,
+    }
+}

@@ -1,0 +1,56 @@
+{
+  "captures": [
+    "desktop_dup"
+  ],
+  "encoders": [
+    "h264_amf",
+    "hevc_amf",
+    "h264_qsv",
+    "hevc_qsv",
+    "h264_vaapi",
+    "hevc_vaapi",
+    "vp9_software",
+    "av1_nvenc"
+  ],
+  "transports": [
+    "srt"
+  ],
+  "decoders": [
+    "h264_software",
+    "hevc_software",
+    "vp9_software",
+    "av1_d3d12va",
+    "av1_dxva2",
+    "av1_qsv"
+  ],
+  "resolutions": [
+    "1920x1080"
+  ],
+  "fps": [
+    60
+  ],
+  "component_requirements": {
+    "h264_amf": ["amf"],
+    "hevc_amf": ["amf"],
+    "h264_qsv": ["qsv"],
+    "hevc_qsv": ["qsv"],
+    "h264_vaapi": ["vaapi"],
+    "hevc_vaapi": ["vaapi"],
+    "av1_nvenc": ["cuda"],
+    "av1_d3d12va": ["d3d12va"],
+    "av1_dxva2": ["dxva2"],
+    "av1_qsv": ["qsv"]
+  },
+  "valid_paths": [
+    { "encoder": "h264_amf", "decoder": "h264_software" },
+    { "encoder": "hevc_amf", "decoder": "hevc_software" },
+    { "encoder": "h264_qsv", "decoder": "h264_software" },
+    { "encoder": "hevc_qsv", "decoder": "hevc_software" },
+    { "encoder": "h264_vaapi", "decoder": "h264_software" },
+    { "encoder": "hevc_vaapi", "decoder": "hevc_software" },
+    { "encoder": "vp9_software", "decoder": "vp9_software" },
+    { "encoder": "av1_nvenc", "decoder": "av1_d3d12va" },
+    { "encoder": "av1_nvenc", "decoder": "av1_dxva2" },
+    { "encoder": "av1_nvenc", "decoder": "av1_qsv" }
+  ]
+}

@@ -1,0 +1,438 @@
+{
+    "captures":  [
+                     "desktop_dup",
+                     "windows_graphics_capture"
+                 ],
+    "encoders":  [
+                     "gpu_proto",
+                     "software",
+                     "h264_software",
+                     "hevc_software",
+                     "av1_software",
+                     "vp9_software",
+                     "mjpeg_software",
+                     "prores_software",
+                     "dnxhd_software",
+                     "dnxhr_software",
+                     "nvenc",
+                     "h264_nvenc",
+                     "hevc_nvenc",
+                     "av1_nvenc",
+                     "amf",
+                     "h264_amf",
+                     "hevc_amf",
+                     "av1_amf",
+                     "qsv",
+                     "h264_qsv",
+                     "hevc_qsv",
+                     "av1_qsv",
+                     "vaapi",
+                     "h264_vaapi",
+                     "hevc_vaapi",
+                     "av1_vaapi",
+                     "opencl",
+                     "vulkan",
+                     "metal"
+                 ],
+    "transports":  [
+                       "udp",
+                       "quic",
+                       "quic_datagram",
+                       "webrtc",
+                       "rtp_rtcp_srtp",
+                       "rist",
+                       "srt"
+                   ],
+    "decoders":  [
+                     "gpu_proto",
+                     "software",
+                     "h264_software",
+                     "hevc_software",
+                     "av1_software",
+                     "vp9_software",
+                     "mjpeg_software",
+                     "prores_software",
+                     "dnxhd_software",
+                     "dnxhr_software",
+                     "d3d11",
+                     "d3d11va",
+                     "h264_d3d11va",
+                     "hevc_d3d11va",
+                     "av1_d3d11va",
+                     "d3d12va",
+                     "h264_d3d12va",
+                     "hevc_d3d12va",
+                     "av1_d3d12va",
+                     "dxva2",
+                     "h264_dxva2",
+                     "hevc_dxva2",
+                     "av1_dxva2",
+                     "cuda",
+                     "h264_cuda",
+                     "hevc_cuda",
+                     "qsv",
+                     "h264_qsv",
+                     "hevc_qsv",
+                     "av1_qsv",
+                     "vaapi",
+                     "h264_vaapi",
+                     "hevc_vaapi",
+                     "opencl",
+                     "vulkan",
+                     "metal"
+                 ],
+    "resolutions":  [
+                        "1920x1080"
+                    ],
+    "fps":  [
+                60
+            ],
+    "component_requirements":  {
+                                   "windows_graphics_capture":  [
+                                                                    "d3d11va"
+                                                                ],
+                                   "nvenc":  [
+                                                 "cuda"
+                                             ],
+                                   "h264_nvenc":  [
+                                                      "cuda"
+                                                  ],
+                                   "hevc_nvenc":  [
+                                                      "cuda"
+                                                  ],
+                                   "av1_nvenc":  [
+                                                     "cuda"
+                                                 ],
+                                   "amf":  [
+                                               "amf"
+                                           ],
+                                   "h264_amf":  [
+                                                    "amf"
+                                                ],
+                                   "hevc_amf":  [
+                                                    "amf"
+                                                ],
+                                   "av1_amf":  [
+                                                   "amf"
+                                               ],
+                                   "qsv":  [
+                                               "qsv"
+                                           ],
+                                   "h264_qsv":  [
+                                                    "qsv"
+                                                ],
+                                   "hevc_qsv":  [
+                                                    "qsv"
+                                                ],
+                                   "av1_qsv":  [
+                                                   "qsv"
+                                               ],
+                                   "vaapi":  [
+                                                 "vaapi"
+                                             ],
+                                   "h264_vaapi":  [
+                                                      "vaapi"
+                                                  ],
+                                   "hevc_vaapi":  [
+                                                      "vaapi"
+                                                  ],
+                                   "av1_vaapi":  [
+                                                     "vaapi"
+                                                 ],
+                                   "opencl":  [
+                                                  "opencl"
+                                              ],
+                                   "vulkan":  [
+                                                  "vulkan"
+                                              ],
+                                   "metal":  [
+                                                 "metal"
+                                             ],
+                                   "d3d11":  [
+                                                 "d3d11va"
+                                             ],
+                                   "d3d11va":  [
+                                                   "d3d11va"
+                                               ],
+                                   "h264_d3d11va":  [
+                                                        "d3d11va"
+                                                    ],
+                                   "hevc_d3d11va":  [
+                                                        "d3d11va"
+                                                    ],
+                                   "av1_d3d11va":  [
+                                                       "d3d11va"
+                                                   ],
+                                   "d3d12va":  [
+                                                   "d3d12va"
+                                               ],
+                                   "h264_d3d12va":  [
+                                                        "d3d12va"
+                                                    ],
+                                   "hevc_d3d12va":  [
+                                                        "d3d12va"
+                                                    ],
+                                   "av1_d3d12va":  [
+                                                       "d3d12va"
+                                                   ],
+                                   "dxva2":  [
+                                                 "dxva2"
+                                             ],
+                                   "h264_dxva2":  [
+                                                      "dxva2"
+                                                  ],
+                                   "hevc_dxva2":  [
+                                                      "dxva2"
+                                                  ],
+                                   "av1_dxva2":  [
+                                                     "dxva2"
+                                                 ],
+                                   "cuda":  [
+                                                "cuda"
+                                            ],
+                                   "h264_cuda":  [
+                                                     "cuda"
+                                                 ],
+                                   "hevc_cuda":  [
+                                                     "cuda"
+                                                 ]
+                               },
+    "valid_paths":  [
+                        {
+                            "encoder":  "gpu_proto",
+                            "decoder":  "gpu_proto"
+                        },
+                        {
+                            "encoder":  "software",
+                            "decoder":  "software"
+                        },
+                        {
+                            "encoder":  "h264_software",
+                            "decoder":  "h264_software"
+                        },
+                        {
+                            "encoder":  "hevc_software",
+                            "decoder":  "hevc_software"
+                        },
+                        {
+                            "encoder":  "av1_software",
+                            "decoder":  "av1_software"
+                        },
+                        {
+                            "encoder":  "vp9_software",
+                            "decoder":  "vp9_software"
+                        },
+                        {
+                            "encoder":  "mjpeg_software",
+                            "decoder":  "mjpeg_software"
+                        },
+                        {
+                            "encoder":  "prores_software",
+                            "decoder":  "prores_software"
+                        },
+                        {
+                            "encoder":  "dnxhd_software",
+                            "decoder":  "dnxhd_software"
+                        },
+                        {
+                            "encoder":  "dnxhr_software",
+                            "decoder":  "dnxhr_software"
+                        },
+                        {
+                            "encoder":  "nvenc",
+                            "decoder":  "software"
+                        },
+                        {
+                            "encoder":  "h264_nvenc",
+                            "decoder":  "h264_software"
+                        },
+                        {
+                            "encoder":  "h264_nvenc",
+                            "decoder":  "h264_d3d11va"
+                        },
+                        {
+                            "encoder":  "h264_nvenc",
+                            "decoder":  "h264_d3d12va"
+                        },
+                        {
+                            "encoder":  "h264_nvenc",
+                            "decoder":  "h264_dxva2"
+                        },
+                        {
+                            "encoder":  "h264_nvenc",
+                            "decoder":  "h264_cuda"
+                        },
+                        {
+                            "encoder":  "h264_nvenc",
+                            "decoder":  "h264_qsv"
+                        },
+                        {
+                            "encoder":  "h264_nvenc",
+                            "decoder":  "h264_vaapi"
+                        },
+                        {
+                            "encoder":  "h264_nvenc",
+                            "decoder":  "d3d11va"
+                        },
+                        {
+                            "encoder":  "h264_nvenc",
+                            "decoder":  "d3d12va"
+                        },
+                        {
+                            "encoder":  "h264_nvenc",
+                            "decoder":  "dxva2"
+                        },
+                        {
+                            "encoder":  "h264_nvenc",
+                            "decoder":  "cuda"
+                        },
+                        {
+                            "encoder":  "hevc_nvenc",
+                            "decoder":  "hevc_software"
+                        },
+                        {
+                            "encoder":  "hevc_nvenc",
+                            "decoder":  "hevc_d3d11va"
+                        },
+                        {
+                            "encoder":  "hevc_nvenc",
+                            "decoder":  "hevc_d3d12va"
+                        },
+                        {
+                            "encoder":  "hevc_nvenc",
+                            "decoder":  "hevc_dxva2"
+                        },
+                        {
+                            "encoder":  "hevc_nvenc",
+                            "decoder":  "hevc_cuda"
+                        },
+                        {
+                            "encoder":  "hevc_nvenc",
+                            "decoder":  "hevc_qsv"
+                        },
+                        {
+                            "encoder":  "hevc_nvenc",
+                            "decoder":  "hevc_vaapi"
+                        },
+                        {
+                            "encoder":  "hevc_nvenc",
+                            "decoder":  "d3d11va"
+                        },
+                        {
+                            "encoder":  "hevc_nvenc",
+                            "decoder":  "d3d12va"
+                        },
+                        {
+                            "encoder":  "hevc_nvenc",
+                            "decoder":  "dxva2"
+                        },
+                        {
+                            "encoder":  "hevc_nvenc",
+                            "decoder":  "cuda"
+                        },
+                        {
+                            "encoder":  "av1_nvenc",
+                            "decoder":  "av1_software"
+                        },
+                        {
+                            "encoder":  "av1_nvenc",
+                            "decoder":  "av1_d3d11va"
+                        },
+                        {
+                            "encoder":  "av1_nvenc",
+                            "decoder":  "av1_d3d12va"
+                        },
+                        {
+                            "encoder":  "av1_nvenc",
+                            "decoder":  "av1_dxva2"
+                        },
+                        {
+                            "encoder":  "av1_nvenc",
+                            "decoder":  "av1_qsv"
+                        },
+                        {
+                            "encoder":  "av1_nvenc",
+                            "decoder":  "cuda"
+                        },
+                        {
+                            "encoder":  "amf",
+                            "decoder":  "software"
+                        },
+                        {
+                            "encoder":  "h264_amf",
+                            "decoder":  "h264_software"
+                        },
+                        {
+                            "encoder":  "hevc_amf",
+                            "decoder":  "hevc_software"
+                        },
+                        {
+                            "encoder":  "av1_amf",
+                            "decoder":  "av1_software"
+                        },
+                        {
+                            "encoder":  "qsv",
+                            "decoder":  "software"
+                        },
+                        {
+                            "encoder":  "h264_qsv",
+                            "decoder":  "h264_software"
+                        },
+                        {
+                            "encoder":  "h264_qsv",
+                            "decoder":  "h264_qsv"
+                        },
+                        {
+                            "encoder":  "hevc_qsv",
+                            "decoder":  "hevc_software"
+                        },
+                        {
+                            "encoder":  "hevc_qsv",
+                            "decoder":  "hevc_qsv"
+                        },
+                        {
+                            "encoder":  "av1_qsv",
+                            "decoder":  "av1_software"
+                        },
+                        {
+                            "encoder":  "av1_qsv",
+                            "decoder":  "av1_qsv"
+                        },
+                        {
+                            "encoder":  "vaapi",
+                            "decoder":  "software"
+                        },
+                        {
+                            "encoder":  "h264_vaapi",
+                            "decoder":  "h264_software"
+                        },
+                        {
+                            "encoder":  "h264_vaapi",
+                            "decoder":  "h264_vaapi"
+                        },
+                        {
+                            "encoder":  "hevc_vaapi",
+                            "decoder":  "hevc_software"
+                        },
+                        {
+                            "encoder":  "hevc_vaapi",
+                            "decoder":  "hevc_vaapi"
+                        },
+                        {
+                            "encoder":  "av1_vaapi",
+                            "decoder":  "av1_software"
+                        },
+                        {
+                            "encoder":  "opencl",
+                            "decoder":  "software"
+                        },
+                        {
+                            "encoder":  "vulkan",
+                            "decoder":  "software"
+                        },
+                        {
+                            "encoder":  "metal",
+                            "decoder":  "software"
+                        }
+                    ]
+}

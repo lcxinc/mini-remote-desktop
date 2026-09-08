@@ -1,0 +1,59 @@
+[package]
+name = "gpu-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+windows = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Dxgi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+]}
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros", "time", "sync", "io-util"] }
+quinn = "0.11.9"
+rcgen = "0.14.7"
+rustls = "0.23.37"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+srt-rs = "0.2.3"
+bytes = "1.10.1"
+webrtc = "0.11.0"
+
+[patch.crates-io]
+libsrt-sys = { path = "vendor/libsrt-sys-1.4.13" }
+
+[[bin]]
+name = "d3d11-test"
+path = "src/d3d11_main.rs"
+
+[[bin]]
+name = "desktop-zero-copy-poc"
+path = "src/desktop_zero_copy_poc.rs"
+
+[[bin]]
+name = "core-probe"
+path = "src/core_probe.rs"
+
+[[bin]]
+name = "core-bench"
+path = "src/core_bench.rs"
+
+[[bin]]
+name = "core-agent"
+path = "src/core_agent.rs"
+
+[[bin]]
+name = "core-controller"
+path = "src/core_controller.rs"
+
+[profile.dev]
+opt-level = 1

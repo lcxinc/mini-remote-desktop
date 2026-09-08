@@ -1,0 +1,46 @@
+{
+  "captures": [
+    "desktop_dup"
+  ],
+  "encoders": [
+    "h264_software",
+    "hevc_software",
+    "av1_software",
+    "h264_nvenc",
+    "hevc_nvenc",
+    "av1_nvenc"
+  ],
+  "transports": [
+    "srt"
+  ],
+  "decoders": [
+    "h264_software",
+    "hevc_software",
+    "av1_software"
+  ],
+  "resolutions": [
+    "1920x1080"
+  ],
+  "fps": [
+    60
+  ],
+  "component_requirements": {
+    "h264_nvenc": [
+      "cuda"
+    ],
+    "hevc_nvenc": [
+      "cuda"
+    ],
+    "av1_nvenc": [
+      "cuda"
+    ]
+  },
+  "valid_paths": [
+    { "encoder": "h264_software", "decoder": "h264_software" },
+    { "encoder": "hevc_software", "decoder": "hevc_software" },
+    { "encoder": "av1_software", "decoder": "av1_software" },
+    { "encoder": "h264_nvenc", "decoder": "h264_software" },
+    { "encoder": "hevc_nvenc", "decoder": "hevc_software" },
+    { "encoder": "av1_nvenc", "decoder": "av1_software" }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "captures": [
+    "desktop_dup"
+  ],
+  "encoders": [
+    "software"
+  ],
+  "transports": [
+    "srt"
+  ],
+  "decoders": [
+    "software"
+  ],
+  "renders": [
+    "metal"
+  ],
+  "resolutions": [
+    "1920x1080"
+  ],
+  "fps": [
+    60
+  ],
+  "component_requirements": {
+    "metal": [
+      "metal"
+    ]
+  },
+  "valid_paths": [
+    { "encoder": "software", "decoder": "software" }
+  ]
+}

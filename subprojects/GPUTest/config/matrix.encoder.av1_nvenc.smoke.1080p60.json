@@ -1,0 +1,28 @@
+{
+  "captures": [
+    "desktop_dup"
+  ],
+  "encoders": [
+    "av1_nvenc"
+  ],
+  "transports": [
+    "srt"
+  ],
+  "decoders": [
+    "software"
+  ],
+  "resolutions": [
+    "1920x1080"
+  ],
+  "fps": [
+    60
+  ],
+  "component_requirements": {
+    "av1_nvenc": [
+      "cuda"
+    ]
+  },
+  "valid_paths": [
+    { "encoder": "av1_nvenc", "decoder": "software" }
+  ]
+}
