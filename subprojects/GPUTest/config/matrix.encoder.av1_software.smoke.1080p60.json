@@ -1,0 +1,24 @@
+{
+  "captures": [
+    "desktop_dup"
+  ],
+  "encoders": [
+    "av1_software"
+  ],
+  "transports": [
+    "srt"
+  ],
+  "decoders": [
+    "software"
+  ],
+  "resolutions": [
+    "1920x1080"
+  ],
+  "fps": [
+    60
+  ],
+  "component_requirements": {},
+  "valid_paths": [
+    { "encoder": "av1_software", "decoder": "software" }
+  ]
+}

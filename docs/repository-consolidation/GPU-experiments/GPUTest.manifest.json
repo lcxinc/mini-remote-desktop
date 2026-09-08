@@ -1,0 +1,2916 @@
+{
+  "source_repository": "lcxinc/GPUTest",
+  "source_commit": "2923f64a877e0a1ee7141f3e2e36a415688bff4c",
+  "source_tree": "c3510356fe144f1d256ea7baf012d03d581966e9",
+  "consumer_base_commit": "9d7e5987b83759db65eb815182eb83e9daf9b116",
+  "scope": "Exact pinned source snapshot except generated screen captures/logs and documented workspace isolation.",
+  "files": [
+    {
+      "source_path": ".gitignore",
+      "source_mode": "100644",
+      "source_git_blob": "a71eb26f57a353f166eef77bc6654539c7eceba1",
+      "consumer_path": "subprojects/GPUTest/.gitignore",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "Cargo.lock",
+      "source_mode": "100644",
+      "source_git_blob": "cb0d976e4c14e2048000b6bf46a45828b2a8b3e6",
+      "consumer_path": "subprojects/GPUTest/Cargo.lock",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "Cargo.toml",
+      "source_mode": "100644",
+      "source_git_blob": "3ca5ea59e5a3efc5a82640e1afa4bcb260d2f285",
+      "consumer_path": "subprojects/GPUTest/Cargo.toml",
+      "disposition": "workspace_isolation",
+      "original_archive_path": "docs/repository-consolidation/GPU-experiments/GPUTest.Cargo.toml.source.txt",
+      "consumer_git_blob": "0648ed7df5458a4bac8a09e50ec5185e8fbc3ef3"
+    },
+    {
+      "source_path": "config/matrix.capture.desktop_dup.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "3d14fb8946c8f5157552ae67b3be20757a2f2d90",
+      "consumer_path": "subprojects/GPUTest/config/matrix.capture.desktop_dup.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.capture.wgc.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "ef1e0e64c0c442769e333aad227b65f7e828df14",
+      "consumer_path": "subprojects/GPUTest/config/matrix.capture.wgc.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.codec.family.decoder_alias.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "48d3673d9daf189851c48f69a1275dab8b6ba489",
+      "consumer_path": "subprojects/GPUTest/config/matrix.codec.family.decoder_alias.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.codec.family.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "44291b0f41ccd78f75a08aa5f0de993b73fc4436",
+      "consumer_path": "subprojects/GPUTest/config/matrix.codec.family.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.decoder.d3d11.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "ceb9fc2eb7e2674ec8ad106ce17e7edd732fd865",
+      "consumer_path": "subprojects/GPUTest/config/matrix.decoder.d3d11.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.decoder.d3d12va.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "804d9a4aac0c27dc510ab13f9bd6d53110fa367b",
+      "consumer_path": "subprojects/GPUTest/config/matrix.decoder.d3d12va.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.decoder.metal.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "4618c6042494a17454b4b4cc6b0b0b1e4eb7e328",
+      "consumer_path": "subprojects/GPUTest/config/matrix.decoder.metal.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.decoder.opencl.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "f934b396b9472495a17373c534a04c705bac81a8",
+      "consumer_path": "subprojects/GPUTest/config/matrix.decoder.opencl.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.decoder.vaapi.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "e10718694716d5f4323ce88baa1aaf6ebc2fcd7b",
+      "consumer_path": "subprojects/GPUTest/config/matrix.decoder.vaapi.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.decoder.vulkan.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "3d9f6c981bd68b0205b6ff9af9d35bb2b7def863",
+      "consumer_path": "subprojects/GPUTest/config/matrix.decoder.vulkan.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.decoder_codec_split.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "0d296294c469d1fcadaab4aca6e12a166e1693b4",
+      "consumer_path": "subprojects/GPUTest/config/matrix.decoder_codec_split.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.encoder.av1_amf.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "f6df94b823fd4fe886d6b9a6b8cf4eecec59841c",
+      "consumer_path": "subprojects/GPUTest/config/matrix.encoder.av1_amf.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.encoder.av1_nvenc.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "43c298b95d90b1caeeb4500c034bac2265dbf670",
+      "consumer_path": "subprojects/GPUTest/config/matrix.encoder.av1_nvenc.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.encoder.av1_qsv.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "f663a8a09c70a2daa781349038a1a31b2f1560dd",
+      "consumer_path": "subprojects/GPUTest/config/matrix.encoder.av1_qsv.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.encoder.av1_software.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "ca482d293d1b6acafb2f9fb0fad018e062298cc3",
+      "consumer_path": "subprojects/GPUTest/config/matrix.encoder.av1_software.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.encoder.fillup.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "21540c626c7564781e768bfe6956f441861598f0",
+      "consumer_path": "subprojects/GPUTest/config/matrix.encoder.fillup.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.encoder.hevc_nvenc.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "cd31d053982466400a20f5b3e86a52391ba0e0dc",
+      "consumer_path": "subprojects/GPUTest/config/matrix.encoder.hevc_nvenc.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.encoder_codec_split.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "7f9a5d4d9cbcbc6d4077ec94928ea7a631ec14ab",
+      "consumer_path": "subprojects/GPUTest/config/matrix.encoder_codec_split.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.full.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "b1a3dceb673d00d23d98e0fdaed7bda215d75f2f",
+      "consumer_path": "subprojects/GPUTest/config/matrix.full.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.high_priority.fillup.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "9bc1a2f16b1905c325f6468942ee245306ecfbcd",
+      "consumer_path": "subprojects/GPUTest/config/matrix.high_priority.fillup.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.mid_priority.fillup.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "1e83676843d938c265cae9a84a451988925253df",
+      "consumer_path": "subprojects/GPUTest/config/matrix.mid_priority.fillup.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.new_encoders.one_path.quick.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "998c4d9f101e8f1e137f01b2ef74895517cc0842",
+      "consumer_path": "subprojects/GPUTest/config/matrix.new_encoders.one_path.quick.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.new_nodes.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "ce024aef438587e85b029960dcb164fcf6a4f364",
+      "consumer_path": "subprojects/GPUTest/config/matrix.new_nodes.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.new_nodes_srt_only.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "a1484a00f4f11d40d1998cbdfb0ee7b5efaf9f54",
+      "consumer_path": "subprojects/GPUTest/config/matrix.new_nodes_srt_only.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.new_nodes_with_srt.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "ff60ae46a030e53d651d632a1578fa35febf69b7",
+      "consumer_path": "subprojects/GPUTest/config/matrix.new_nodes_with_srt.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.render.d3d11.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "1eee801ab2bd491fcc8de7fa88bfaedcf85ace84",
+      "consumer_path": "subprojects/GPUTest/config/matrix.render.d3d11.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.render.d3d12.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "e61286e94677993534e20c4b833e7e57ebec5cd9",
+      "consumer_path": "subprojects/GPUTest/config/matrix.render.d3d12.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.render.layer.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "09324ea69c073d3a06c7abc96cac20595e5e3927",
+      "consumer_path": "subprojects/GPUTest/config/matrix.render.layer.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.render.metal.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "19d7473f91acd58b871a8eef9a0e5ddb45081406",
+      "consumer_path": "subprojects/GPUTest/config/matrix.render.metal.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.render.opencl.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "13f48a5474ab5adf7a6e8f009c017612928d010f",
+      "consumer_path": "subprojects/GPUTest/config/matrix.render.opencl.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.render.vulkan.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "4dbfc61c6f29f1cec144b082a03947a05888cee1",
+      "consumer_path": "subprojects/GPUTest/config/matrix.render.vulkan.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.single.4k120.60s.visual.json",
+      "source_mode": "100644",
+      "source_git_blob": "e76a3d2eb3662949ed8519c94ce8c744b10340ff",
+      "consumer_path": "subprojects/GPUTest/config/matrix.single.4k120.60s.visual.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.srt.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "18e9f9d070a68cb5eb87e4cc6cc48e11cad31045",
+      "consumer_path": "subprojects/GPUTest/config/matrix.srt.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.transport.quic_datagram_rist.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "65e6265ba324db7b1f471938d83322c4dbec83a4",
+      "consumer_path": "subprojects/GPUTest/config/matrix.transport.quic_datagram_rist.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.transport.webrtc_rtp_srtp.smoke.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "6eabf49058bca8e9178afc907ccc60c4926689a1",
+      "consumer_path": "subprojects/GPUTest/config/matrix.transport.webrtc_rtp_srtp.smoke.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.windows.fullcart.1080p60.json",
+      "source_mode": "100644",
+      "source_git_blob": "11a9687dd284872c5cb119d9197431a142d3b944",
+      "consumer_path": "subprojects/GPUTest/config/matrix.windows.fullcart.1080p60.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.windows.fullcart.720_1080_1440.30_60_120.json",
+      "source_mode": "100644",
+      "source_git_blob": "5739fc1469d0e4526c1595f73369ddd116fa4fd3",
+      "consumer_path": "subprojects/GPUTest/config/matrix.windows.fullcart.720_1080_1440.30_60_120.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/matrix.windows.json",
+      "source_mode": "100644",
+      "source_git_blob": "2b03234519136e93d62653a7deab38d339f91621",
+      "consumer_path": "subprojects/GPUTest/config/matrix.windows.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/tmp_20260306_133923_case1_gpu_proto.json",
+      "source_mode": "100644",
+      "source_git_blob": "4afc0ff216dba19ee1cc47e68f034a2e003a37b4",
+      "consumer_path": "subprojects/GPUTest/config/tmp_20260306_133923_case1_gpu_proto.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/tmp_20260306_133947_case1_gpu_proto.json",
+      "source_mode": "100644",
+      "source_git_blob": "4afc0ff216dba19ee1cc47e68f034a2e003a37b4",
+      "consumer_path": "subprojects/GPUTest/config/tmp_20260306_133947_case1_gpu_proto.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/tmp_20260306_134020_case1_gpu_proto.json",
+      "source_mode": "100644",
+      "source_git_blob": "4afc0ff216dba19ee1cc47e68f034a2e003a37b4",
+      "consumer_path": "subprojects/GPUTest/config/tmp_20260306_134020_case1_gpu_proto.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/tmp_20260306_134059_case1_gpu_proto.json",
+      "source_mode": "100644",
+      "source_git_blob": "4252d67da565f81fae0fbbc6b373ed5d3af413a3",
+      "consumer_path": "subprojects/GPUTest/config/tmp_20260306_134059_case1_gpu_proto.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/tmp_20260306_134059_case2_software.json",
+      "source_mode": "100644",
+      "source_git_blob": "b8b3948e550d0a6b2e8f5a7505ded8050f82be49",
+      "consumer_path": "subprojects/GPUTest/config/tmp_20260306_134059_case2_software.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/tmp_20260306_134059_case3_h264_nvenc.json",
+      "source_mode": "100644",
+      "source_git_blob": "2d4042e53559be667e9df80e60a7d9b1beb187d8",
+      "consumer_path": "subprojects/GPUTest/config/tmp_20260306_134059_case3_h264_nvenc.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/tmp_20260306_134059_case4_hevc_nvenc.json",
+      "source_mode": "100644",
+      "source_git_blob": "95ddc6103a38920f1c3bd4f35a2c940d586d69fe",
+      "consumer_path": "subprojects/GPUTest/config/tmp_20260306_134059_case4_hevc_nvenc.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/tmp_20260306_134059_case5_av1_nvenc.json",
+      "source_mode": "100644",
+      "source_git_blob": "38afa550306d20ca2e5be5d6eb5fcb12d1454b96",
+      "consumer_path": "subprojects/GPUTest/config/tmp_20260306_134059_case5_av1_nvenc.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/tmp_20260306_135253_case1_gpu_proto.json",
+      "source_mode": "100644",
+      "source_git_blob": "03d74dbf3caa1a4c6b5e4499b5528fc1357d5cc0",
+      "consumer_path": "subprojects/GPUTest/config/tmp_20260306_135253_case1_gpu_proto.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/tmp_20260306_135253_case2_software.json",
+      "source_mode": "100644",
+      "source_git_blob": "550e349a8d8afea9ef3bde84b19fa1c61b24186d",
+      "consumer_path": "subprojects/GPUTest/config/tmp_20260306_135253_case2_software.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/tmp_20260306_135253_case3_h264_nvenc.json",
+      "source_mode": "100644",
+      "source_git_blob": "58628383403cdc012f1c15af4b074f3d3cd2ed38",
+      "consumer_path": "subprojects/GPUTest/config/tmp_20260306_135253_case3_h264_nvenc.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/tmp_20260306_135253_case4_hevc_nvenc.json",
+      "source_mode": "100644",
+      "source_git_blob": "b203efc18622d252853f2a010827d0028cb6c260",
+      "consumer_path": "subprojects/GPUTest/config/tmp_20260306_135253_case4_hevc_nvenc.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/tmp_20260306_135253_case5_av1_nvenc.json",
+      "source_mode": "100644",
+      "source_git_blob": "b30e83bc89ca6e2609c99293ceabba2f99389d48",
+      "consumer_path": "subprojects/GPUTest/config/tmp_20260306_135253_case5_av1_nvenc.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/tmp_single_gpu_4k120_10s_20260306_141511.json",
+      "source_mode": "100644",
+      "source_git_blob": "b2715d573817ddbffe7e4d2c1796018fe25a6c7f",
+      "consumer_path": "subprojects/GPUTest/config/tmp_single_gpu_4k120_10s_20260306_141511.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/tmp_single_gpu_4k360_10s_20260306_141639.json",
+      "source_mode": "100644",
+      "source_git_blob": "44325e44e244f6700e6038c0dd67b8a1f39acece",
+      "consumer_path": "subprojects/GPUTest/config/tmp_single_gpu_4k360_10s_20260306_141639.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "config/tmp_single_software_4k360_10s_20260306_141639.json",
+      "source_mode": "100644",
+      "source_git_blob": "d51f39d2a2d214b9755f257b1f63818aef71519c",
+      "consumer_path": "subprojects/GPUTest/config/tmp_single_software_4k360_10s_20260306_141639.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "docs/HARDWARE_ADAPTATION.md",
+      "source_mode": "100644",
+      "source_git_blob": "e65a1119d89ca3670efbd53aeabf15dde1a71614",
+      "consumer_path": "subprojects/GPUTest/docs/HARDWARE_ADAPTATION.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "docs/PERF_COMPARISON_BY_HW.md",
+      "source_mode": "100644",
+      "source_git_blob": "4c799365681170a8cd6d62ee80829b42ac9a937d",
+      "consumer_path": "subprojects/GPUTest/docs/PERF_COMPARISON_BY_HW.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "docs/core_agent_controller_demo.md",
+      "source_mode": "100644",
+      "source_git_blob": "75206470ae1a810941ad3b3ca3e4682d315ae128",
+      "consumer_path": "subprojects/GPUTest/docs/core_agent_controller_demo.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "docs/core_agent_controller_matrix_compare.md",
+      "source_mode": "100644",
+      "source_git_blob": "340ecd02dc588be82374030519757788eba328c8",
+      "consumer_path": "subprojects/GPUTest/docs/core_agent_controller_matrix_compare.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "scripts/core_agent_controller_demo.ps1",
+      "source_mode": "100644",
+      "source_git_blob": "6dded0d26f2cde6a63a3e7f8bf5979f143ab17c0",
+      "consumer_path": "subprojects/GPUTest/scripts/core_agent_controller_demo.ps1",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "scripts/core_agent_controller_matrix_compare.ps1",
+      "source_mode": "100644",
+      "source_git_blob": "4ee86a11511944c7ce4b1a5fb15d6aa2f7074ab9",
+      "consumer_path": "subprojects/GPUTest/scripts/core_agent_controller_matrix_compare.ps1",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/bench.rs",
+      "source_mode": "100644",
+      "source_git_blob": "ab230b2d847cd244f8ef979e6b35e68140cbf891",
+      "consumer_path": "subprojects/GPUTest/src/core/bench.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/csv_out.rs",
+      "source_mode": "100644",
+      "source_git_blob": "a5b56ff712c78eda146cb83469fce74c4e4e437d",
+      "consumer_path": "subprojects/GPUTest/src/core/csv_out.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/integration.rs",
+      "source_mode": "100644",
+      "source_git_blob": "c65566c08295f22731aef70f4b6e11aa8c1b5f91",
+      "consumer_path": "subprojects/GPUTest/src/core/integration.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/matrix.rs",
+      "source_mode": "100644",
+      "source_git_blob": "73f06176af66abac1a95b3d021d0db647784144a",
+      "consumer_path": "subprojects/GPUTest/src/core/matrix.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/metrics.rs",
+      "source_mode": "100644",
+      "source_git_blob": "ecb41536400fb1dd939e353d07ebe8298896f77e",
+      "consumer_path": "subprojects/GPUTest/src/core/metrics.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/mod.rs",
+      "source_mode": "100644",
+      "source_git_blob": "a424222ad2421e2d98ec30bfa40e951fb1beb1f1",
+      "consumer_path": "subprojects/GPUTest/src/core/mod.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/capture/desktop_dup.rs",
+      "source_mode": "100644",
+      "source_git_blob": "1afbbb8988fa3687d72128b9f68fc94907063649",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/capture/desktop_dup.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/capture/mod.rs",
+      "source_mode": "100644",
+      "source_git_blob": "6f2f0e90cbe360dd68c788cdaf0a44d4969530f3",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/capture/mod.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/capture/windows_graphics_capture.rs",
+      "source_mode": "100644",
+      "source_git_blob": "3078734e749e95933245376771652e750300f6ef",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/capture/windows_graphics_capture.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/av1_d3d11va.rs",
+      "source_mode": "100644",
+      "source_git_blob": "c274946091fdeca571dde436e02aa8d92adb8f8f",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/av1_d3d11va.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/av1_d3d12va.rs",
+      "source_mode": "100644",
+      "source_git_blob": "dc780fbef41ddbfee8f7fab1190b71f3485dfefe",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/av1_d3d12va.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/av1_dxva2.rs",
+      "source_mode": "100644",
+      "source_git_blob": "83bce972f76c98d568bb1fc722a7e513c7609ce1",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/av1_dxva2.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/av1_qsv.rs",
+      "source_mode": "100644",
+      "source_git_blob": "359fbd64bd525beed0976552506613cc8600e01d",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/av1_qsv.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/av1_software.rs",
+      "source_mode": "100644",
+      "source_git_blob": "05874cd9c10e447284f559b58ca72b3b75d3fe7a",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/av1_software.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/cuda.rs",
+      "source_mode": "100644",
+      "source_git_blob": "0d9ee4fd8eda4273335750e4c666ccd5e2bfb2ce",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/cuda.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/d3d11.rs",
+      "source_mode": "100644",
+      "source_git_blob": "6cfc7cb3a96238612cb6fe2c669018e33b47286f",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/d3d11.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/d3d11va.rs",
+      "source_mode": "100644",
+      "source_git_blob": "64b45d0a625ffe010030a6b5bdcdd58928d9dbe4",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/d3d11va.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/d3d12va.rs",
+      "source_mode": "100644",
+      "source_git_blob": "ccc4a1f3429dd5c5ec1792b8fba930d1ed8f2e30",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/d3d12va.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/dnxhd_software.rs",
+      "source_mode": "100644",
+      "source_git_blob": "e087509eae859bd559af18b00ef65f6acc4b06a6",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/dnxhd_software.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/dnxhr_software.rs",
+      "source_mode": "100644",
+      "source_git_blob": "027df9d7ad96413bcb90366ce53e68740bdf63ae",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/dnxhr_software.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/dxva2.rs",
+      "source_mode": "100644",
+      "source_git_blob": "f30ffc25c25f9a3331d959f64f902a77245291bd",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/dxva2.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/gpu_proto.rs",
+      "source_mode": "100644",
+      "source_git_blob": "9c4ed0a08df288ea2cab0a4694e30309ddd10e79",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/gpu_proto.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/h264_cuda.rs",
+      "source_mode": "100644",
+      "source_git_blob": "756f8565ad70ef0b6f9513bcc6d1d787387cb116",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/h264_cuda.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/h264_d3d11va.rs",
+      "source_mode": "100644",
+      "source_git_blob": "58a0938624099157708a76f65b3aecf85d063bfa",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/h264_d3d11va.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/h264_d3d12va.rs",
+      "source_mode": "100644",
+      "source_git_blob": "68c3936009dc855ef77a00fc859a79e64427482b",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/h264_d3d12va.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/h264_dxva2.rs",
+      "source_mode": "100644",
+      "source_git_blob": "a16f592f50f58ab55cefce920cdbc88e16982b2f",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/h264_dxva2.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/h264_qsv.rs",
+      "source_mode": "100644",
+      "source_git_blob": "f30ffc25c25f9a3331d959f64f902a77245291bd",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/h264_qsv.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/h264_software.rs",
+      "source_mode": "100644",
+      "source_git_blob": "cd206a5e390ac64b90d91635cf530890884af203",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/h264_software.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/h264_vaapi.rs",
+      "source_mode": "100644",
+      "source_git_blob": "2eafed033e0c2b2d51402b0c272d12e03e74d1f4",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/h264_vaapi.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/hevc_cuda.rs",
+      "source_mode": "100644",
+      "source_git_blob": "64b45d0a625ffe010030a6b5bdcdd58928d9dbe4",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/hevc_cuda.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/hevc_d3d11va.rs",
+      "source_mode": "100644",
+      "source_git_blob": "c15494e327d4786a538358596b06f4b040876230",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/hevc_d3d11va.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/hevc_d3d12va.rs",
+      "source_mode": "100644",
+      "source_git_blob": "9cdac3793b9e256d7dac00db4b8fb8d3eb89a059",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/hevc_d3d12va.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/hevc_dxva2.rs",
+      "source_mode": "100644",
+      "source_git_blob": "c15e4aa1a7f208e140059c42fe5e12700bd32132",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/hevc_dxva2.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/hevc_qsv.rs",
+      "source_mode": "100644",
+      "source_git_blob": "2eafed033e0c2b2d51402b0c272d12e03e74d1f4",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/hevc_qsv.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/hevc_software.rs",
+      "source_mode": "100644",
+      "source_git_blob": "53e7241ab9b6fd6a2066f08de1783225c63e0c60",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/hevc_software.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/hevc_vaapi.rs",
+      "source_mode": "100644",
+      "source_git_blob": "b1c1d6450ad1cea0f4195fa113253826bad52125",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/hevc_vaapi.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/metal.rs",
+      "source_mode": "100644",
+      "source_git_blob": "cef081d4eda4a01dd6e9a216bda4c15fcfc6100f",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/metal.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/mjpeg_software.rs",
+      "source_mode": "100644",
+      "source_git_blob": "5d41b8d273a6415ca9b9c9c251733ef2d723a04f",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/mjpeg_software.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/mod.rs",
+      "source_mode": "100644",
+      "source_git_blob": "dd4eefee8bb1593486e90e6a7cbb5edd508790fd",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/mod.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/opencl.rs",
+      "source_mode": "100644",
+      "source_git_blob": "fb7277629f562b2e10d036d16490e1606508d4ce",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/opencl.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/prores_software.rs",
+      "source_mode": "100644",
+      "source_git_blob": "4fdaecf5ac6c10eab1a5b3b18a27643c8d45a4ad",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/prores_software.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/qsv.rs",
+      "source_mode": "100644",
+      "source_git_blob": "9cdac3793b9e256d7dac00db4b8fb8d3eb89a059",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/qsv.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/software.rs",
+      "source_mode": "100644",
+      "source_git_blob": "da9fb4258433e0fa6a97e35520b05b4a243d69f9",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/software.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/vaapi.rs",
+      "source_mode": "100644",
+      "source_git_blob": "a464ee9b731c0c34d703f68479e2fe76f3ccca54",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/vaapi.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/vp9_software.rs",
+      "source_mode": "100644",
+      "source_git_blob": "1d436f0e871280650b398ba9968dade95bfb0aa5",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/vp9_software.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/decoder/vulkan.rs",
+      "source_mode": "100644",
+      "source_git_blob": "21bdae906dcf48f190927a28f8cf9f37fab59bea",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/decoder/vulkan.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/amf.rs",
+      "source_mode": "100644",
+      "source_git_blob": "ba6d91697b7f035d309412f084faca0ef855c278",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/amf.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/av1_amf.rs",
+      "source_mode": "100644",
+      "source_git_blob": "73c9daeaf1002233d0b301dc012732ec584b8c79",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/av1_amf.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/av1_nvenc.rs",
+      "source_mode": "100644",
+      "source_git_blob": "972c37b9555087e9c07d49fff3c200132dec8352",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/av1_nvenc.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/av1_qsv.rs",
+      "source_mode": "100644",
+      "source_git_blob": "0df1915eaa12d1d774ebd2394ad1952146fa3c92",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/av1_qsv.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/av1_software.rs",
+      "source_mode": "100644",
+      "source_git_blob": "11ae9086629ccab9de5cc26b521b51fe33a1f3e6",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/av1_software.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/av1_vaapi.rs",
+      "source_mode": "100644",
+      "source_git_blob": "5d6f2af20aabe8aa3df81fd17edaf4670223bb3c",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/av1_vaapi.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/dnxhd_software.rs",
+      "source_mode": "100644",
+      "source_git_blob": "8bb6b3a2eb23ee80df460177d282ab6140602a49",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/dnxhd_software.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/dnxhr_software.rs",
+      "source_mode": "100644",
+      "source_git_blob": "1062a1e1801310deea85083e55614efdb8c1097b",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/dnxhr_software.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/gpu_proto.rs",
+      "source_mode": "100644",
+      "source_git_blob": "b1290ab21160907e3137c580c5480019c6635081",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/gpu_proto.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/h264_amf.rs",
+      "source_mode": "100644",
+      "source_git_blob": "972c37b9555087e9c07d49fff3c200132dec8352",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/h264_amf.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/h264_nvenc.rs",
+      "source_mode": "100644",
+      "source_git_blob": "ae6fe0f1fa3aa257a36d197440325a75eff33e13",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/h264_nvenc.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/h264_qsv.rs",
+      "source_mode": "100644",
+      "source_git_blob": "662079c7504657ae5e78dc9f54b17646d0b47402",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/h264_qsv.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/h264_software.rs",
+      "source_mode": "100644",
+      "source_git_blob": "8d2f300d553be64a831e8ed685bf710f005b09bb",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/h264_software.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/h264_vaapi.rs",
+      "source_mode": "100644",
+      "source_git_blob": "0df1915eaa12d1d774ebd2394ad1952146fa3c92",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/h264_vaapi.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/hevc_amf.rs",
+      "source_mode": "100644",
+      "source_git_blob": "5d6f2af20aabe8aa3df81fd17edaf4670223bb3c",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/hevc_amf.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/hevc_nvenc.rs",
+      "source_mode": "100644",
+      "source_git_blob": "686eb1626abc03491b8335faf16fac8a0f2c4952",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/hevc_nvenc.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/hevc_qsv.rs",
+      "source_mode": "100644",
+      "source_git_blob": "71b4c8bb6717634a7805e743308b476c0c8108ef",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/hevc_qsv.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/hevc_software.rs",
+      "source_mode": "100644",
+      "source_git_blob": "11ae9086629ccab9de5cc26b521b51fe33a1f3e6",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/hevc_software.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/hevc_vaapi.rs",
+      "source_mode": "100644",
+      "source_git_blob": "bb4c2294b5dd6bbccbee1c0342582599619c86de",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/hevc_vaapi.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/metal.rs",
+      "source_mode": "100644",
+      "source_git_blob": "1a73268312868359f8bc3b4d4001d4f8914d8918",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/metal.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/mjpeg_software.rs",
+      "source_mode": "100644",
+      "source_git_blob": "1e935d3cd6b8c83ca4a8b21a94df5b1069294237",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/mjpeg_software.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/mod.rs",
+      "source_mode": "100644",
+      "source_git_blob": "86d45f9d8871eb8b4c26ace6313d1ee0675aa9c0",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/mod.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/nvenc.rs",
+      "source_mode": "100644",
+      "source_git_blob": "ff492aa237efb63768e2bd4660f81d0b3b5f4ee4",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/nvenc.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/opencl.rs",
+      "source_mode": "100644",
+      "source_git_blob": "d5467651b88d8220296fba0cf1134623dcfcf376",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/opencl.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/prores_software.rs",
+      "source_mode": "100644",
+      "source_git_blob": "00148438b55d6cf9210509f93b2f3d7cc0d2daba",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/prores_software.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/qsv.rs",
+      "source_mode": "100644",
+      "source_git_blob": "14bdf92462faaf4e6a3c09dc41eca4374ade1479",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/qsv.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/software.rs",
+      "source_mode": "100644",
+      "source_git_blob": "47918de0cc30c1a0e6d4a90c9ac5bd5633132c12",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/software.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/vaapi.rs",
+      "source_mode": "100644",
+      "source_git_blob": "81a80ef779de3b88e6bf2e157db58db5b275b7a6",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/vaapi.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/vp9_software.rs",
+      "source_mode": "100644",
+      "source_git_blob": "b8576ba1be96377016eda70c97f4ea79a0a1ff24",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/vp9_software.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/encoder/vulkan.rs",
+      "source_mode": "100644",
+      "source_git_blob": "4be73e858421649fc70acc616b33473eab690ee4",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/encoder/vulkan.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/mod.rs",
+      "source_mode": "100644",
+      "source_git_blob": "ada2427deb72d42796e0b0f683f056f714c328b1",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/mod.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/render/cpu_upload.rs",
+      "source_mode": "100644",
+      "source_git_blob": "3c5a9167f2803a2c6f81f332227f80b00485bdf7",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/render/cpu_upload.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/render/d3d11.rs",
+      "source_mode": "100644",
+      "source_git_blob": "b626d78578959e646b32e2d92c9e9b900b52e1f5",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/render/d3d11.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/render/d3d12.rs",
+      "source_mode": "100644",
+      "source_git_blob": "eb503ad2dcc834a2aeec4727c1ab3500ad16c00b",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/render/d3d12.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/render/gpu_present.rs",
+      "source_mode": "100644",
+      "source_git_blob": "9c81465379379e71642ce9b78a8ed0bf92070dcc",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/render/gpu_present.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/render/metal.rs",
+      "source_mode": "100644",
+      "source_git_blob": "3ed916493c8dbc8c53539d975e41a369ca4549c6",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/render/metal.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/render/mod.rs",
+      "source_mode": "100644",
+      "source_git_blob": "8f8d84a572e06bfb35644896ef82af08db416429",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/render/mod.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/render/opencl.rs",
+      "source_mode": "100644",
+      "source_git_blob": "c3c6cb39e775256fb0e015f6d7e1a704f604281c",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/render/opencl.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/render/visual_probe.rs",
+      "source_mode": "100644",
+      "source_git_blob": "fa0807bef8a5e7e62ba9859c8b60e0a99955cb16",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/render/visual_probe.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/render/vulkan.rs",
+      "source_mode": "100644",
+      "source_git_blob": "274ece1cb505607eb8ed8c882fbb17b4ae572623",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/render/vulkan.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/transport/mod.rs",
+      "source_mode": "100644",
+      "source_git_blob": "f2deffaab900e03b4eec90bb0a1132a9580bacb8",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/transport/mod.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/transport/quic.rs",
+      "source_mode": "100644",
+      "source_git_blob": "3cbcb77314518e6a7a9bc3f79ac793936c82cb2c",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/transport/quic.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/transport/quic_datagram.rs",
+      "source_mode": "100644",
+      "source_git_blob": "0b05b7f346eeecfeb6a2b49011ff59a6c1679f9a",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/transport/quic_datagram.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/transport/rist.rs",
+      "source_mode": "100644",
+      "source_git_blob": "4ee7cf06178a43a5f9f2b394ef67fa26f77a8f27",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/transport/rist.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/transport/rtp_rtcp_srtp.rs",
+      "source_mode": "100644",
+      "source_git_blob": "4a4bf42fd8d32ec799bb92bfb156de7aa8fda24f",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/transport/rtp_rtcp_srtp.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/transport/srt.rs",
+      "source_mode": "100644",
+      "source_git_blob": "56304e8c611566b70839fb82077b8ddffc9512be",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/transport/srt.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/transport/udp.rs",
+      "source_mode": "100644",
+      "source_git_blob": "4533517bdb6172f3e1f181d994c9d24a70fa0b89",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/transport/udp.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/nodes/transport/webrtc.rs",
+      "source_mode": "100644",
+      "source_git_blob": "2a49204c303bc9f4e7c569c38782150b93d0460b",
+      "consumer_path": "subprojects/GPUTest/src/core/nodes/transport/webrtc.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/pipeline_quic.rs",
+      "source_mode": "100644",
+      "source_git_blob": "feec8d8f445340fc1de2a7daa009fe4671a67e17",
+      "consumer_path": "subprojects/GPUTest/src/core/pipeline_quic.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/pipeline_quic_datagram.rs",
+      "source_mode": "100644",
+      "source_git_blob": "026cabb334f93014992bd0102aff62bca4956f24",
+      "consumer_path": "subprojects/GPUTest/src/core/pipeline_quic_datagram.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/pipeline_rist.rs",
+      "source_mode": "100644",
+      "source_git_blob": "87e3e455138772360461c0d1240b9bf6b49fe01e",
+      "consumer_path": "subprojects/GPUTest/src/core/pipeline_rist.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/pipeline_rtp_rtcp_srtp.rs",
+      "source_mode": "100644",
+      "source_git_blob": "5f262e08bc4d341a68d6cbf83111765879aee720",
+      "consumer_path": "subprojects/GPUTest/src/core/pipeline_rtp_rtcp_srtp.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/pipeline_srt.rs",
+      "source_mode": "100644",
+      "source_git_blob": "6c422ffa9ae0339a43cb8ebf76e7d627b2ef41da",
+      "consumer_path": "subprojects/GPUTest/src/core/pipeline_srt.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/pipeline_udp.rs",
+      "source_mode": "100644",
+      "source_git_blob": "578f60354b88e0a1bf5477bfb48af5ce6ed62f3c",
+      "consumer_path": "subprojects/GPUTest/src/core/pipeline_udp.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/pipeline_webrtc.rs",
+      "source_mode": "100644",
+      "source_git_blob": "b21d644b49291f21caed594f0c4ddd2631d4775b",
+      "consumer_path": "subprojects/GPUTest/src/core/pipeline_webrtc.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core/probe.rs",
+      "source_mode": "100644",
+      "source_git_blob": "7d00cbc243d055d6df7c499134149e63d16ac4c3",
+      "consumer_path": "subprojects/GPUTest/src/core/probe.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core_agent.rs",
+      "source_mode": "100644",
+      "source_git_blob": "d0125e33c556d982400c2295494df6ed442598d4",
+      "consumer_path": "subprojects/GPUTest/src/core_agent.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core_bench.rs",
+      "source_mode": "100644",
+      "source_git_blob": "893a59220a2c61760733d662c39fe61c05d94c1e",
+      "consumer_path": "subprojects/GPUTest/src/core_bench.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core_controller.rs",
+      "source_mode": "100644",
+      "source_git_blob": "477a6ceecb35afe474a94c28494ac3606bfebad6",
+      "consumer_path": "subprojects/GPUTest/src/core_controller.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/core_probe.rs",
+      "source_mode": "100644",
+      "source_git_blob": "0ee4075c2fde9c2c201e64c4bc191c23951e990e",
+      "consumer_path": "subprojects/GPUTest/src/core_probe.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/d3d11_main.rs",
+      "source_mode": "100644",
+      "source_git_blob": "82524f7e721d3b0545f3135cef5da2f70f88f89f",
+      "consumer_path": "subprojects/GPUTest/src/d3d11_main.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/desktop_zero_copy_poc.rs",
+      "source_mode": "100644",
+      "source_git_blob": "4e8c9c2b1a68a4cbcc8817f89ac4aa68c4e704b5",
+      "consumer_path": "subprojects/GPUTest/src/desktop_zero_copy_poc.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/lib.rs",
+      "source_mode": "100644",
+      "source_git_blob": "5a7ca06a4f39f89be94816332aaf95ea2f162b1a",
+      "consumer_path": "subprojects/GPUTest/src/lib.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/main.rs",
+      "source_mode": "100644",
+      "source_git_blob": "d103dd03e71e51be968c4441fea2d5846ce37a95",
+      "consumer_path": "subprojects/GPUTest/src/main.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/.cargo-ok",
+      "source_mode": "100644",
+      "source_git_blob": "5f8b795830acbab5961c1a28c76a7916c9631493",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/.cargo-ok",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/.cargo_vcs_info.json",
+      "source_mode": "100644",
+      "source_git_blob": "cae86fffeed05b3f03eb02aec40b1e8610c8884c",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/.cargo_vcs_info.json",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/Cargo.toml",
+      "source_mode": "100644",
+      "source_git_blob": "3f393448863a0e9c1618e6ea1694666f36f92c44",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/Cargo.toml",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/Cargo.toml.orig",
+      "source_mode": "100644",
+      "source_git_blob": "64ecf13d6058370de0d97ef2e3228b47924613b6",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/Cargo.toml.orig",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/build.rs",
+      "source_mode": "100644",
+      "source_git_blob": "0144c628dddbaea8bb1eec7fed9af73d93c1bc65",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/build.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/.appveyor.yml",
+      "source_mode": "100644",
+      "source_git_blob": "fca159933c8c9c27136c6b33cbb40e23a5fa1f09",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/.appveyor.yml",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/.clang-format",
+      "source_mode": "100644",
+      "source_git_blob": "387de5ce643353e64fe8e66d8410055534d5fa9e",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/.clang-format",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/.github/ISSUE_TEMPLATE/bug_report.md",
+      "source_mode": "100644",
+      "source_git_blob": "23af8c7296e8794fc731a127c676ad6cb1caa7ca",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/.github/ISSUE_TEMPLATE/bug_report.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/.github/ISSUE_TEMPLATE/feature_request.md",
+      "source_mode": "100644",
+      "source_git_blob": "e24ef0068a22efaa6beafdaabeacaf4e8f091236",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/.github/ISSUE_TEMPLATE/feature_request.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/.github/ISSUE_TEMPLATE/question.md",
+      "source_mode": "100644",
+      "source_git_blob": "1496e85269a4fd218be18b3a50159b534aface6b",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/.github/ISSUE_TEMPLATE/question.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/.github/workflows/cxx11-macos.yaml",
+      "source_mode": "100644",
+      "source_git_blob": "fb80fb9e0711268be1f3d331d9eeb96d89409afa",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/.github/workflows/cxx11-macos.yaml",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/.github/workflows/cxx11-ubuntu.yaml",
+      "source_mode": "100644",
+      "source_git_blob": "df4f7f2cd58dfc5f110c4d80c129fb0ec7e2e442",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/.github/workflows/cxx11-ubuntu.yaml",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/.github/workflows/cxx11-win.yaml",
+      "source_mode": "100644",
+      "source_git_blob": "1fb74a77fd425855f7508db8e2da40532e337d10",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/.github/workflows/cxx11-win.yaml",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/.gitignore",
+      "source_mode": "100644",
+      "source_git_blob": "e179ad1463d34291c1b9d085d86ad2eaf7f91cc4",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/.gitignore",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/.travis.yml",
+      "source_mode": "100644",
+      "source_git_blob": "8a2f9687ea8546aed15f44181c3ab9efc6dd4f21",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/.travis.yml",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/CMakeLists.txt",
+      "source_mode": "100644",
+      "source_git_blob": "ed6e60313d424a6c455721dffa797d430e1992a2",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/CMakeLists.txt",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/CONTRIBUTING.md",
+      "source_mode": "100644",
+      "source_git_blob": "b6f226602675021d62c2bfb0df17af53747146ba",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/CONTRIBUTING.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/LICENSE",
+      "source_mode": "100644",
+      "source_git_blob": "14e2f777f6c395e7e04ab4aa306bbcc4b0c1120e",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/LICENSE",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/README.md",
+      "source_mode": "100644",
+      "source_git_blob": "edd28a1e6b85aac0e9be7350b8f63bda5cd862f0",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/README.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/apps/apputil.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "8541ad8fef89ce2b03380523f2754d24cbd43ec9",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/apps/apputil.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/apps/apputil.hpp",
+      "source_mode": "100644",
+      "source_git_blob": "1c8f4a0bbffb3a1848820b0f0dd559eebd2e8a9d",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/apps/apputil.hpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/apps/logsupport.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "573cbb97a1ed4dddc4cfcf23fa465bb5c96044f4",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/apps/logsupport.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/apps/logsupport.hpp",
+      "source_mode": "100644",
+      "source_git_blob": "63e7325602b968793edbfae477c4a35651111030",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/apps/logsupport.hpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/apps/logsupport_appdefs.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "ace72bcd025ceb8ca043cc58f28e7216d94dad0c",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/apps/logsupport_appdefs.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/apps/socketoptions.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "31825ecb6b0e137f768ef6b15cd979d6a3139237",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/apps/socketoptions.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/apps/socketoptions.hpp",
+      "source_mode": "100644",
+      "source_git_blob": "6f6305b4c56a42825d7167c6856283ed8b4fc43e",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/apps/socketoptions.hpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/apps/srt-file-transmit.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "521060cb5ba42a7fb11159938dc0a1ccbe2e2feb",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/apps/srt-file-transmit.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/apps/srt-live-transmit.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "b907240a1ff3aa1bf9e37ae922d03e1abbd2d71b",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/apps/srt-live-transmit.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/apps/srt-tunnel.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "8ced46c8f932a2f3726f8c747c6e8ea2e003414b",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/apps/srt-tunnel.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/apps/support.maf",
+      "source_mode": "100644",
+      "source_git_blob": "19ac894b4a9d0bb7a9892faf5390ad9f27affd2e",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/apps/support.maf",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/apps/transmitbase.hpp",
+      "source_mode": "100644",
+      "source_git_blob": "3b3c7d0b93867f00996bc07a55a6fb94ed8faef5",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/apps/transmitbase.hpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/apps/transmitmedia.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "7ab167c9fe1cae3ada31c18301d45434c1e02d26",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/apps/transmitmedia.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/apps/transmitmedia.hpp",
+      "source_mode": "100644",
+      "source_git_blob": "604a8dfbad7f949375da8dde3f36ce8707c4dd2e",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/apps/transmitmedia.hpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/apps/uriparser.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "4dae60a8b1cf99a1a08d2ca982bbc4cc26d3283e",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/apps/uriparser.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/apps/uriparser.hpp",
+      "source_mode": "100644",
+      "source_git_blob": "78219750a7a82842d6e74392697f1e8648ba21b5",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/apps/uriparser.hpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/apps/verbose.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "58cf83fbec28bb87f31f0cf89e838deb2eba14c2",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/apps/verbose.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/apps/verbose.hpp",
+      "source_mode": "100644",
+      "source_git_blob": "ec0276c12380f5c7cd59bc50a8f21304860604aa",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/apps/verbose.hpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/cmake_object_lib_support.c",
+      "source_mode": "100644",
+      "source_git_blob": "dd1d890389555ec9928b607dba76de5bb461e781",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/cmake_object_lib_support.c",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/common/filelist_win32.maf",
+      "source_mode": "100644",
+      "source_git_blob": "2762c6554750170c49737787869941a875e17736",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/common/filelist_win32.maf",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/common/win/syslog_defs.h",
+      "source_mode": "100644",
+      "source_git_blob": "7d83126412fc3e46a92c153256e3e0c86d5d6116",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/common/win/syslog_defs.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/common/win/unistd.h",
+      "source_mode": "100644",
+      "source_git_blob": "9c61cad8aa1d5ec306db4b8101bbe703e4f87ba1",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/common/win/unistd.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/common/win/wintime.h",
+      "source_mode": "100644",
+      "source_git_blob": "ff1bc65de63573a120b45130f929695b567c055d",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/common/win/wintime.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/common/win_time.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "2778cea7970b9375537508990128a9cb0b283ce6",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/common/win_time.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/configure",
+      "source_mode": "100644",
+      "source_git_blob": "796e0a1511b62aa00c850ca40243da55268fd504",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/configure",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/configure-data.tcl",
+      "source_mode": "100644",
+      "source_git_blob": "66902324a556f8cbd1047950d298ba111051fd00",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/configure-data.tcl",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/API-functions.md",
+      "source_mode": "100644",
+      "source_git_blob": "ae986bc57817d263c04aacd8cc99b3d84ab8a736",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/API-functions.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/API.md",
+      "source_mode": "100644",
+      "source_git_blob": "182ecc41a291fb9dcf652112b86836353ce61cf3",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/API.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/APISocketOptions.md",
+      "source_mode": "100644",
+      "source_git_blob": "8776286fcbb86a36f65f06221bc0bb94c5cd10f1",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/APISocketOptions.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/AccessControl.md",
+      "source_mode": "100644",
+      "source_git_blob": "df35e662c13dcf5b0b91697f02ce07397ecdfe74",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/AccessControl.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/Android/Compiling.md",
+      "source_mode": "100644",
+      "source_git_blob": "da109a66cd48f2bc26fefc6780432a9f2f0145bb",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/Android/Compiling.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/Android/mkall",
+      "source_mode": "100644",
+      "source_git_blob": "5e19209d6b61b1f4ea6a748f3a74f666240bc3f4",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/Android/mkall",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/Android/mksrt",
+      "source_mode": "100644",
+      "source_git_blob": "fa74470f6245cfa3aead11908b8e010d35c4ec3e",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/Android/mksrt",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/Android/mkssl",
+      "source_mode": "100644",
+      "source_git_blob": "7b47703f240112c439e47c0ef46854b6c209b9ba",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/Android/mkssl",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/Android/packjni",
+      "source_mode": "100644",
+      "source_git_blob": "a0ca77a1d7ca7da0e9ec71434ee8cf4f7ad45ea1",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/Android/packjni",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/Android/prepare_build",
+      "source_mode": "100644",
+      "source_git_blob": "bcc1162db986366378c4e97108ce00f2640ba65a",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/Android/prepare_build",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/BuildOptions.md",
+      "source_mode": "100644",
+      "source_git_blob": "2e1ec0b12816b3b16205869816863a6d420dac1d",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/BuildOptions.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/DevelopersGuide.md",
+      "source_mode": "100644",
+      "source_git_blob": "3114f4f9e1b45eee0c980089071290c716598536",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/DevelopersGuide.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/SRT-Multiplex.md",
+      "source_mode": "100644",
+      "source_git_blob": "80dbd0411cac85a67daa44b975dbdd528856b2ed",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/SRT-Multiplex.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/bonding-intro.md",
+      "source_mode": "100644",
+      "source_git_blob": "4db2cb4985d81e59816a36a2440ad0ebc16cb480",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/bonding-intro.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/build-win.md",
+      "source_mode": "100644",
+      "source_git_blob": "1e950be0d44b08e2903556fb2ac51da926e55d8c",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/build-win.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/build_iOS.md",
+      "source_mode": "100644",
+      "source_git_blob": "1ab7ac75a52e70284a51eff3eb67e84f98f6356c",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/build_iOS.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/encryption.md",
+      "source_mode": "100644",
+      "source_git_blob": "614a11303ecf5d18f1c30aedff649be50b843149",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/encryption.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/gstreamer.md",
+      "source_mode": "100644",
+      "source_git_blob": "f02086e5f868e9168fbe598cbe7d36ac222467ac",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/gstreamer.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/handshake.md",
+      "source_mode": "100644",
+      "source_git_blob": "5c16d07e7dbacae525766e77610ab0d582a18ca6",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/handshake.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/images/SRT_History_Good_Signal.png",
+      "source_mode": "100644",
+      "source_git_blob": "ff2acf217c4fae0a67a64cc0af9f06480525a830",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/images/SRT_History_Good_Signal.png",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/images/SRT_Transmission_Bad_Signal.png",
+      "source_mode": "100644",
+      "source_git_blob": "5a6d2fe00bb464daf50e98afa2a1798a7f82e605",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/images/SRT_Transmission_Bad_Signal.png",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/images/block-aligned-5rx10c.png",
+      "source_mode": "100644",
+      "source_git_blob": "604ad0580cc1fbeb0d820627022761190c9f10b7",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/images/block-aligned-5rx10c.png",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/images/block-aligned.png",
+      "source_mode": "100644",
+      "source_git_blob": "25d076913d46c63d3fb64a906ca625a85f5bc0dc",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/images/block-aligned.png",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/images/non-block-aligned-5rx10c-deleted-packets.png",
+      "source_mode": "100644",
+      "source_git_blob": "9860eaf7375f7357521656b4a4b4543b34f8d007",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/images/non-block-aligned-5rx10c-deleted-packets.png",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/images/non-block-aligned-5rx10c.png",
+      "source_mode": "100644",
+      "source_git_blob": "080d30fe211968f442945c5700f78648176d1a90",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/images/non-block-aligned-5rx10c.png",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/images/non-block-aligned.png",
+      "source_mode": "100644",
+      "source_git_blob": "82ac668d32492eaee0afcd882c584abf3505260d",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/images/non-block-aligned.png",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/images/packet-filter-mechanism.png",
+      "source_mode": "100644",
+      "source_git_blob": "a8060c6532d12e13cebdf835217ae00e7b1bd604",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/images/packet-filter-mechanism.png",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/images/rebuild-missing-sequence.png",
+      "source_mode": "100644",
+      "source_git_blob": "6a8b44640bd1d083135a3ce36e8d273da94639ed",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/images/rebuild-missing-sequence.png",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/images/srt-encryption-1.png",
+      "source_mode": "100644",
+      "source_git_blob": "2cfe05da7c57d38ca622ce2d48f62e30107185dd",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/images/srt-encryption-1.png",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/images/srt-encryption-2.png",
+      "source_mode": "100644",
+      "source_git_blob": "57f2c4d2dae9cff41d2b55ca514219a65de417e5",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/images/srt-encryption-2.png",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/images/staircase-pattern-5rx10c.png",
+      "source_mode": "100644",
+      "source_git_blob": "9bc05532bfde35a5fd5b2065ba4a5088d739c3a6",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/images/staircase-pattern-5rx10c.png",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/live-streaming.md",
+      "source_mode": "100644",
+      "source_git_blob": "1ee552cc25635542271f927ff4d17be8f49f443b",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/live-streaming.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/packet-filtering-and-fec.md",
+      "source_mode": "100644",
+      "source_git_blob": "acb12405dd70615ec6efe18668b3678bc32a49bd",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/packet-filtering-and-fec.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/reporting.md",
+      "source_mode": "100644",
+      "source_git_blob": "6cf6d4e586f9dc6c2374af7b414d02b56e0d8d16",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/reporting.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/socket-groups.md",
+      "source_mode": "100644",
+      "source_git_blob": "415dc9ff390ebfd32961e5d3b76637a5640db46c",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/socket-groups.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/srt-live-transmit.md",
+      "source_mode": "100644",
+      "source_git_blob": "cec097a95fd63ee465219e5116e1ef687cbf744c",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/srt-live-transmit.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/srt-tunnel.md",
+      "source_mode": "100644",
+      "source_git_blob": "b38c80038e59cec338e26babad92b5c1e1c2eca5",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/srt-tunnel.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/statistics.md",
+      "source_mode": "100644",
+      "source_git_blob": "62a37bcbff32e4062c71594b5436decb304561a2",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/statistics.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/docs/why-srt-was-created.md",
+      "source_mode": "100644",
+      "source_git_blob": "0d3e35e23f4c67b7c7414da3debca0c018195192",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/docs/why-srt-was-created.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/examples/recvfile.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "f732d131eb8c8e0586d0fb50e04ba18e3f2de5c9",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/examples/recvfile.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/examples/recvlive.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "b2a026d03ae48671c853fab22744acce372381bb",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/examples/recvlive.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/examples/sendfile.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "e9b8712559586612b7c5db95a01dd7a08d2e547c",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/examples/sendfile.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/examples/test-c-client-bonding.c",
+      "source_mode": "100644",
+      "source_git_blob": "f35c01ceeb98ab9f7b61a7c0fe983314325d95a8",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/examples/test-c-client-bonding.c",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/examples/test-c-client.c",
+      "source_mode": "100644",
+      "source_git_blob": "5134585ef43392ed974fcc51ed3bfcdce2512296",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/examples/test-c-client.c",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/examples/test-c-server-bonding.c",
+      "source_mode": "100644",
+      "source_git_blob": "60748df127f025dd4f73ad9bd2b8ea2c3dae928d",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/examples/test-c-server-bonding.c",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/examples/test-c-server.c",
+      "source_mode": "100644",
+      "source_git_blob": "d1480b0b14e827b7a7ead5075a2ad04bfde12075",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/examples/test-c-server.c",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/examples/testcapi-connect.c",
+      "source_mode": "100644",
+      "source_git_blob": "f9037e9572789e9ee991e05f551b6a2178d80f2c",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/examples/testcapi-connect.c",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/cryspr-config.h",
+      "source_mode": "100644",
+      "source_git_blob": "e90377884083910a3cd0b2d3c441b24ec9099102",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/cryspr-config.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/cryspr-gnutls.c",
+      "source_mode": "100644",
+      "source_git_blob": "217a70e8ac4df0073f431c8a2c0f825bb7056262",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/cryspr-gnutls.c",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/cryspr-gnutls.h",
+      "source_mode": "100644",
+      "source_git_blob": "78f7c86ec931b61f993d7770c8d1f74d050ec135",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/cryspr-gnutls.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/cryspr-mbedtls.c",
+      "source_mode": "100644",
+      "source_git_blob": "c10727a0aa69eaf4bcd33019c14abdedb9926bc2",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/cryspr-mbedtls.c",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/cryspr-mbedtls.h",
+      "source_mode": "100644",
+      "source_git_blob": "aa10da8743f45e93240c4ad6c3c34ac924190c6d",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/cryspr-mbedtls.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/cryspr-openssl.c",
+      "source_mode": "100644",
+      "source_git_blob": "a5d50ac6510a50713243f335fc79dc5f9dcb25d8",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/cryspr-openssl.c",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/cryspr-openssl.h",
+      "source_mode": "100644",
+      "source_git_blob": "75a52518f37f63f9706352f749aceccbfdb60128",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/cryspr-openssl.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/cryspr.c",
+      "source_mode": "100644",
+      "source_git_blob": "522d27cfedb5fff2b963ead70c9ae10631842148",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/cryspr.c",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/cryspr.h",
+      "source_mode": "100644",
+      "source_git_blob": "45a300feff354f8f542995fb2faf4cfd74df4eca",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/cryspr.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/filelist-gnutls.maf",
+      "source_mode": "100644",
+      "source_git_blob": "b0f78346b3e4a83a87ebb9dcca22da1606581111",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/filelist-gnutls.maf",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/filelist-mbedtls.maf",
+      "source_mode": "100644",
+      "source_git_blob": "ac6d383ca71b1aa47985077875c05b18ded8d502",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/filelist-mbedtls.maf",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/filelist-openssl.maf",
+      "source_mode": "100644",
+      "source_git_blob": "0179042c4935107a253922724a297c7ef5cb1f16",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/filelist-openssl.maf",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/haicrypt.h",
+      "source_mode": "100644",
+      "source_git_blob": "04eb18b76799fb171c18024c483fdc22af36d2c8",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/haicrypt.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/haicrypt_log.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "e09f1aeffba870eceee5f769a245e07c120049ef",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/haicrypt_log.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/haicrypt_log.h",
+      "source_mode": "100644",
+      "source_git_blob": "9655f722b68a9d39477dcb5d72dcfea63d17134d",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/haicrypt_log.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt.c",
+      "source_mode": "100644",
+      "source_git_blob": "a94bd9af7532430584c302f58095ab637a429d27",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt.c",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt.h",
+      "source_mode": "100644",
+      "source_git_blob": "c4fbf87f91197e492caf3d1d9d96f854efe71422",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt_ctx.h",
+      "source_mode": "100644",
+      "source_git_blob": "9c60c0854ccb50eae0f5d8824c9304e0e56fd5dc",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt_ctx.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt_ctx_rx.c",
+      "source_mode": "100644",
+      "source_git_blob": "9bd8a8e6392061a656cd6e147bb1a95b229abfa9",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt_ctx_rx.c",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt_ctx_tx.c",
+      "source_mode": "100644",
+      "source_git_blob": "e518f51386a3ea910e4bfb738d129c63498c61d2",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt_ctx_tx.c",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt_msg.h",
+      "source_mode": "100644",
+      "source_git_blob": "a915c2fa0264c587f6e6f6a557a049a1a14161ea",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt_msg.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt_rx.c",
+      "source_mode": "100644",
+      "source_git_blob": "e77c73b355b0a998e0460fd1af8ef6bc4641e694",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt_rx.c",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt_sa.c",
+      "source_mode": "100644",
+      "source_git_blob": "995334d81aa1184beee028d6c7c63e49a17162ae",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt_sa.c",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt_tx.c",
+      "source_mode": "100644",
+      "source_git_blob": "85fc798cbe7517655f56cb77c623042f263d91ea",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt_tx.c",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt_ut.c",
+      "source_mode": "100644",
+      "source_git_blob": "b07ca09f65809519c540e90e5fe484e1b6811d98",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt_ut.c",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt_xpt_srt.c",
+      "source_mode": "100644",
+      "source_git_blob": "2a2f5a3cd7da58c7c59a2f200be11057a81f4a74",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/haicrypt/hcrypt_xpt_srt.c",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/nuget.config",
+      "source_mode": "100644",
+      "source_git_blob": "9178fe083be3dc5cf204ec532ce521cf893bb358",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/nuget.config",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/FindMbedTLS.cmake",
+      "source_mode": "100644",
+      "source_git_blob": "7dca6e47e2308019389d849b8b89913f66dd824e",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/FindMbedTLS.cmake",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/build-windows.bat",
+      "source_mode": "100644",
+      "source_git_blob": "78a926cb53f94b27474e1dfc8a0613653ecedf7e",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/build-windows.bat",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/build-windows.ps1",
+      "source_mode": "100644",
+      "source_git_blob": "c651a77a9a6c558ca58ee6dd8e0f7463711670a3",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/build-windows.ps1",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/changelog/README.md",
+      "source_mode": "100644",
+      "source_git_blob": "22d5d0be339d943dff9372b05ba95d847cc963aa",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/changelog/README.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/changelog/changelog.py",
+      "source_mode": "100644",
+      "source_git_blob": "fe41d5878e6e143b8c78812c9a85cd488d0d7e04",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/changelog/changelog.py",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/changelog/requirements.txt",
+      "source_mode": "100644",
+      "source_git_blob": "898c1f7d0cf3554417708cee1180cab4196b38e2",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/changelog/requirements.txt",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/check-deps",
+      "source_mode": "100644",
+      "source_git_blob": "4e5f3d3b125f9a68070d4ec9b036e0542ab6d0d0",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/check-deps",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/collect-gcov.sh",
+      "source_mode": "100644",
+      "source_git_blob": "7b458e6c1ae53e18bddf2247c1d2a4869068178b",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/collect-gcov.sh",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/gather-package.bat",
+      "source_mode": "100644",
+      "source_git_blob": "a0221cc0546074abe6e0b7393bbd92350e29240b",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/gather-package.bat",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/generate-configure-options.tcl",
+      "source_mode": "100644",
+      "source_git_blob": "647a06772a72c510cc73d28fb8d8d341580eb583",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/generate-configure-options.tcl",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/generate-logging-defs.tcl",
+      "source_mode": "100644",
+      "source_git_blob": "a86ab9a62bae57b75d18cb66e602e928b131c315",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/generate-logging-defs.tcl",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/googletest-download.cmake",
+      "source_mode": "100644",
+      "source_git_blob": "55f2c5a55edee0de830360f425b81c3cd1acf576",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/googletest-download.cmake",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/googletest.cmake",
+      "source_mode": "100644",
+      "source_git_blob": "57e5c937a52695baab9444d7947dba3f8410f629",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/googletest.cmake",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/haiUtil.cmake",
+      "source_mode": "100644",
+      "source_git_blob": "e161f1e5b7c7943b59aafe9123e51ecf0fa6217c",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/haiUtil.cmake",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/iOS.cmake",
+      "source_mode": "100644",
+      "source_git_blob": "73544a29b5fc231edff895ac35dcba559a1222a1",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/iOS.cmake",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/maf.vim",
+      "source_mode": "100644",
+      "source_git_blob": "2ae97b260b79365305705b8b43138c2db8378dcf",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/maf.vim",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/mafread.tcl",
+      "source_mode": "100644",
+      "source_git_blob": "e5e1239fe9377024b44c0d5b2ef87b0d5f11f200",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/mafread.tcl",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/set-version-metadata.ps1",
+      "source_mode": "100644",
+      "source_git_blob": "cd36cc37de960c47381b49da138159682cb444b5",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/set-version-metadata.ps1",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/srt-dev.lua",
+      "source_mode": "100644",
+      "source_git_blob": "92b5fca1a86801f0f8ed388ace5e9df2040ad114",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/srt-dev.lua",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/srt-ffplay",
+      "source_mode": "100644",
+      "source_git_blob": "b12a2bcb1b6c1ac64ea4a9c9a39437ced65d3430",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/srt-ffplay",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/srt.pc.in",
+      "source_mode": "100644",
+      "source_git_blob": "98d1e099790c56d39131a68dddf55972d8091898",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/srt.pc.in",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/tcp-echo-client.tcl",
+      "source_mode": "100644",
+      "source_git_blob": "f141b0fbdf409c93a8f5a1dddbdb105a05f4dee1",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/tcp-echo-client.tcl",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/scripts/tcp-echo-server.tcl",
+      "source_mode": "100644",
+      "source_git_blob": "8bee4d73d71f3d5e3db61f02443fc46be76a419d",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/scripts/tcp-echo-server.tcl",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/sonar-project.properties",
+      "source_mode": "100644",
+      "source_git_blob": "22b16d5490ef213709d37da914bfb720bbd1082a",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/sonar-project.properties",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srt-ffplay",
+      "source_mode": "100644",
+      "source_git_blob": "b12a2bcb1b6c1ac64ea4a9c9a39437ced65d3430",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srt-ffplay",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/README.md",
+      "source_mode": "100644",
+      "source_git_blob": "4a5d582734d25e126efe61eb61eb31b83b23da37",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/README.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/access_control.h",
+      "source_mode": "100644",
+      "source_git_blob": "97a1104a83c87c3deda3ba49fad9a22e0c737a8c",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/access_control.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/api.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "b61b720ffc9d18ad3a3d4db735feecafd0a21bcf",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/api.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/api.h",
+      "source_mode": "100644",
+      "source_git_blob": "6f0c042f65e048f6e3bc00ecfd1b87d7ccf95b6d",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/api.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/buffer.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "cab03ffd5ca8a03f66688d3431b4a1777a71988c",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/buffer.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/buffer.h",
+      "source_mode": "100644",
+      "source_git_blob": "7436ca035db109f7d1ef32d6c89405bbffc0c5e3",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/buffer.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/cache.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "56d327cab368540e52814f6262957549811a99e7",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/cache.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/cache.h",
+      "source_mode": "100644",
+      "source_git_blob": "afaa404e0cc52b49f88ccccb85b2c506392907ba",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/cache.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/channel.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "3473e7579ef01773f566c16c0a702d4a4cf769c2",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/channel.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/channel.h",
+      "source_mode": "100644",
+      "source_git_blob": "52508e47fd6d064aac469db711e5b6473e84adc5",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/channel.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/common.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "66e913d0898ebf65469f9e3f3c19eb11a36250d5",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/common.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/common.h",
+      "source_mode": "100644",
+      "source_git_blob": "2116647e0d33a8e8f5789bc603aef61e726e97bc",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/common.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/congctl.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "003763394b9418b748a312724b25d9b71c1860bf",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/congctl.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/congctl.h",
+      "source_mode": "100644",
+      "source_git_blob": "cc44f02c92ea162215d61c160b39c97e4a7b7d9d",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/congctl.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/core.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "7abcad3ecf75c40b1a57b535a331b225bc5208e8",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/core.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/core.h",
+      "source_mode": "100644",
+      "source_git_blob": "d74ac9bb6c9ec301e63b09376392089f7e4f5a4a",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/core.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/crypto.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "4c6c02bb7a45a14451f8338f34f0ac674acfd093",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/crypto.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/crypto.h",
+      "source_mode": "100644",
+      "source_git_blob": "c327d228d4eab85c7d3a87e0a881ec8ab806b6a0",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/crypto.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/epoll.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "80302b62d9612102c5a2f3a316b148f1c7c4514c",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/epoll.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/epoll.h",
+      "source_mode": "100644",
+      "source_git_blob": "d9f0286e0d23b8ee99d55218b0c45f9f89d9b141",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/epoll.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/fec.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "ba266263a2215250877760aa63c848a01332cd8e",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/fec.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/fec.h",
+      "source_mode": "100644",
+      "source_git_blob": "1fa158fff2d82abdeb48ab3475fc0909d2afb26b",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/fec.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/filelist.maf",
+      "source_mode": "100644",
+      "source_git_blob": "74759f515616c541bbcb9d0f0fd88519674e9b26",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/filelist.maf",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/group.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "06a92b01246c8081e12425fdbba87b54cbc6ea37",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/group.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/group.h",
+      "source_mode": "100644",
+      "source_git_blob": "34fc3a52889913aa28efff521b4b0d8c4026cb6d",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/group.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/handshake.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "e3726ea9ee9b79331fa0e08fd0dac192d6ae54db",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/handshake.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/handshake.h",
+      "source_mode": "100644",
+      "source_git_blob": "e674fce33539794a3698e5b0b4cc3deb5756445a",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/handshake.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/list.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "a2ef99345e953d589951cd95447a01b62d0e5903",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/list.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/list.h",
+      "source_mode": "100644",
+      "source_git_blob": "19b300f30110f98b657aa6be2ae67a99a0d91569",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/list.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/logger_default.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "fa7e73b3175557099329c85b7153f240e308b676",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/logger_default.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/logger_defs.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "041f6c8a79064e03355f6e2a6eab22237c9ed293",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/logger_defs.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/logger_defs.h",
+      "source_mode": "100644",
+      "source_git_blob": "63a4caf3e2c17f1e155caa450a9f58c0693a5a32",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/logger_defs.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/logging.h",
+      "source_mode": "100644",
+      "source_git_blob": "bfdfb375e7e58f8d744d774cf03f06397c4da2f5",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/logging.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/logging_api.h",
+      "source_mode": "100644",
+      "source_git_blob": "4fc3b812bb0fee548b34fb7db106a8cf8ef002b7",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/logging_api.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/md5.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "9d01025f46fa2d0d6521fff63223996d6e9d99e7",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/md5.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/md5.h",
+      "source_mode": "100644",
+      "source_git_blob": "f7402e7e2699f3edb670854354da48036715267f",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/md5.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/netinet_any.h",
+      "source_mode": "100644",
+      "source_git_blob": "3a17e228f8dbdde5f2975f90d636719356212925",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/netinet_any.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/packet.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "5b8bada834b6254f38de1ea0c8a2b6f7fb9d4a68",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/packet.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/packet.h",
+      "source_mode": "100644",
+      "source_git_blob": "31dbda411aa92277a9a1d5492c6fe6f560d903d1",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/packet.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/packetfilter.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "85fc584d509de185f7b41ac382c3a4832c6f6970",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/packetfilter.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/packetfilter.h",
+      "source_mode": "100644",
+      "source_git_blob": "9527bce26a6370ca8b8f259908befd3fe24a9e45",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/packetfilter.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/packetfilter_api.h",
+      "source_mode": "100644",
+      "source_git_blob": "1f5d7ff23dbf0038c5a849e602e09a52a710691b",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/packetfilter_api.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/packetfilter_builtin.h",
+      "source_mode": "100644",
+      "source_git_blob": "80983250a5c3cc84145776f50d853a1b2d4f85df",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/packetfilter_builtin.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/platform_sys.h",
+      "source_mode": "100644",
+      "source_git_blob": "7bdce267dda179ae70f101b58e80b1298ce02eb4",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/platform_sys.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/queue.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "3f9cdf01a60a4f360929c919e70c795ab48b915b",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/queue.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/queue.h",
+      "source_mode": "100644",
+      "source_git_blob": "d14b8728a8866ff6c738d2ba6924b28113a30495",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/queue.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/srt.h",
+      "source_mode": "100644",
+      "source_git_blob": "f3a5becdcced890d2f62ee12007253f89baafbf9",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/srt.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/srt_c_api.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "1763198ed000205342dfa6cd6a625e47698a05a4",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/srt_c_api.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/srt_compat.c",
+      "source_mode": "100644",
+      "source_git_blob": "3db4a486bdce024c64247908baa989f893f42954",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/srt_compat.c",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/srt_compat.h",
+      "source_mode": "100644",
+      "source_git_blob": "f7d072393524d33d0c4477a896664e88c386bea3",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/srt_compat.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/srt_shared.rc",
+      "source_mode": "100644",
+      "source_git_blob": "448192878136ed0bfa18607dded0d5cb49745533",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/srt_shared.rc",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/sync.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "a97a458e3ef61c004eaf69703e7d451a124705d7",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/sync.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/sync.h",
+      "source_mode": "100644",
+      "source_git_blob": "fee33b864e42eda0c23176c2006e4e7e267c9e98",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/sync.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/sync_cxx11.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "a6ded7144c76c7ad8d204c7aaff56764fcc6689d",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/sync_cxx11.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/sync_posix.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "e852a33f8f6865ee1ebd883672ab6a283ef7fc8d",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/sync_posix.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/threadname.h",
+      "source_mode": "100644",
+      "source_git_blob": "38fea471b085acabc75b0a7f56eb472c356f5fc3",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/threadname.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/udt.h",
+      "source_mode": "100644",
+      "source_git_blob": "1bcc889cadf1769fd6eb86741639f8c3ccb71c5b",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/udt.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/utilities.h",
+      "source_mode": "100644",
+      "source_git_blob": "c81e5ba45df7c2a6c5be1f5af15be005c7f64eac",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/utilities.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/version.h.in",
+      "source_mode": "100644",
+      "source_git_blob": "72ce89bcb22711e63ae43206204358437b9bf8cb",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/version.h.in",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/window.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "6e03b5d0bf1907304dfdd67054b6d29810ae892a",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/window.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/srtcore/window.h",
+      "source_mode": "100644",
+      "source_git_blob": "20b2374dc5fa4be92a9ad922a90569b6ec068bff",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/srtcore/window.h",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/test/filelist.maf",
+      "source_mode": "100644",
+      "source_git_blob": "884f88c39970cb6649880bfdbcb989d30e021bfd",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/test/filelist.maf",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/test/test_buffer.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "795a6d52f9818ec4278fc525526919c3f454f9c7",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/test/test_buffer.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/test/test_connection_timeout.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "bbd87e145ac0c17f4e7a717514fe29b90b1a3bfb",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/test/test_connection_timeout.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/test/test_cryspr.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "3a54aaf4fa963257a83ec4a11c118bfdb8e8a1ba",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/test/test_cryspr.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/test/test_enforced_encryption.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "32729fb5aa69b4667e68175d5626a8cb2c32d620",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/test/test_enforced_encryption.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/test/test_epoll.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "ebeb0d73a931d95b359845a0a9d1169a0f806b5e",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/test/test_epoll.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/test/test_fec_rebuilding.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "8651a341e02a798956e5ef27eec84aa531d6eb83",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/test/test_fec_rebuilding.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/test/test_file_transmission.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "790555eb7bd50828f2aa096a606382f7faf7407d",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/test/test_file_transmission.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/test/test_list.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "72164a5e5254b147d236cdfd5aeecf0dd5c06c08",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/test/test_list.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/test/test_listen_callback.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "f9222536ef0145d02e1465aa7aea5a6b963ae8a9",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/test/test_listen_callback.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/test/test_many_connections.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "cca42ecf0c8b6de17a424b19da3a71c5259ab19f",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/test/test_many_connections.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/test/test_muxer.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "f7efc85175c913a48573d329260db320b2cd403c",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/test/test_muxer.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/test/test_seqno.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "aa187288866e240a19e863a3b304e9dbd8f0b6a7",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/test/test_seqno.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/test/test_socket_options.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "705db5a0918d4d130bc3b8f162b2d97245267b1f",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/test/test_socket_options.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/test/test_sync.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "cffb58563f6175e1f8e897d2f8d9d2ce4458b260",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/test/test_sync.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/test/test_timer.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "df2fc2e48aa19a3c5392c9f8b0e40571de8aeb89",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/test/test_timer.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/test/test_unitqueue.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "f9010b9e7f2111cc5951662009505b3521cf25f0",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/test/test_unitqueue.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/test/test_utilities.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "42c761d637869251d28190fd4700f4ae43e15e59",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/test/test_utilities.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/testing/README.md",
+      "source_mode": "100644",
+      "source_git_blob": "86f95e6878e529b7847c19c32387c23e3baf09e1",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/testing/README.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/testing/srt-test-file.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "aafeef4b202e2861b8c086c018a8df48a23ffd85",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/testing/srt-test-file.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/testing/srt-test-file.maf",
+      "source_mode": "100644",
+      "source_git_blob": "337415225a443e46204e3af0764d6448299ac6cc",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/testing/srt-test-file.maf",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/testing/srt-test-live.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "6ee386d07c242be0afee1c2d72dbff84ba86c0cc",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/testing/srt-test-live.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/testing/srt-test-live.maf",
+      "source_mode": "100644",
+      "source_git_blob": "17368a660cbbdbdcbdc3727a7eaced35ff5ce062",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/testing/srt-test-live.maf",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/testing/srt-test-mpbond.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "c68d73b97bba0d44e34f7a32323db29d54d6dda9",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/testing/srt-test-mpbond.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/testing/srt-test-mpbond.maf",
+      "source_mode": "100644",
+      "source_git_blob": "e2609b1b0eb81c611bc29e442b1dc4253bc69ed5",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/testing/srt-test-mpbond.maf",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/testing/srt-test-multiplex.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "2b6b2b2afe6be83b1f76d9bd22d03d54220e7c39",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/testing/srt-test-multiplex.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/testing/srt-test-multiplex.maf",
+      "source_mode": "100644",
+      "source_git_blob": "5e7cd8507b2fd949e62f78b684e32d720d857c63",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/testing/srt-test-multiplex.maf",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/testing/srt-test-relay.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "141bb8e83f8b2da12f0c7368dd42e078babd9231",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/testing/srt-test-relay.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/testing/srt-test-relay.maf",
+      "source_mode": "100644",
+      "source_git_blob": "b1b22afb2d47335631d11433cb7defa08d7d74f5",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/testing/srt-test-relay.maf",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/testing/testmedia.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "b6449ed2b05c262f4fea5928c4772685ff0eba7d",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/testing/testmedia.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/testing/testmedia.hpp",
+      "source_mode": "100644",
+      "source_git_blob": "ad70f6967af592f67b31ede91255032e799fbfe7",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/testing/testmedia.hpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/testing/testmediabase.hpp",
+      "source_mode": "100644",
+      "source_git_blob": "445c8968fd0657bf45cd6ffdc23cea2f60858a34",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/testing/testmediabase.hpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/testing/uriparser-test.maf",
+      "source_mode": "100644",
+      "source_git_blob": "e800a43e7990eb186bb1f63d5ac30a65cb88f050",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/testing/uriparser-test.maf",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/testing/utility-test.cpp",
+      "source_mode": "100644",
+      "source_git_blob": "69d696255e11e5935f8327da53df63e8d831cc03",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/testing/utility-test.cpp",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/libsrt/testing/utility-test.maf",
+      "source_mode": "100644",
+      "source_git_blob": "fefc7327405788acf33061002edd7fb5030a01fa",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/testing/utility-test.maf",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/src/lib.rs",
+      "source_mode": "100644",
+      "source_git_blob": "a38a13a81db48ec3451d59a24f2680c9f0193fd3",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/src/lib.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "vendor/libsrt-sys-1.4.13/wrapper.h",
+      "source_mode": "100644",
+      "source_git_blob": "90b075005068c13ac8c94ae3dbe6c7787a172e48",
+      "consumer_path": "subprojects/GPUTest/vendor/libsrt-sys-1.4.13/wrapper.h",
+      "disposition": "copied_exactly"
+    }
+  ]
+}

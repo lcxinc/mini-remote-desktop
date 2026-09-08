@@ -1,0 +1,12 @@
+{
+  "captures": ["desktop_dup"],
+  "encoders": ["software"],
+  "transports": ["rtp_rtcp_srtp"],
+  "decoders": ["software"],
+  "resolutions": ["3840x2160"],
+  "fps": [120],
+  "component_requirements": {},
+  "valid_paths": [
+    { "encoder": "software", "decoder": "software" }
+  ]
+}

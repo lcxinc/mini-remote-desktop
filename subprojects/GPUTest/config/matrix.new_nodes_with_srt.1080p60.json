@@ -1,0 +1,103 @@
+{
+    "captures":  [
+                     "desktop_dup",
+                     "windows_graphics_capture"
+                 ],
+    "encoders":  [
+                     "software",
+                     "nvenc",
+                     "amf",
+                     "qsv"
+                 ],
+    "transports":  [
+                       "udp",
+                       "quic",
+                       "srt"
+                   ],
+    "decoders":  [
+                     "software",
+                     "d3d11va",
+                     "dxva2",
+                     "cuda",
+                     "qsv"
+                 ],
+    "resolutions":  [
+                        "1920x1080"
+                    ],
+    "fps":  [
+                60
+            ],
+    "component_requirements":  {
+                                   "windows_graphics_capture":  [
+                                                                    "d3d11va"
+                                                                ],
+                                   "nvenc":  [
+                                                 "cuda"
+                                             ],
+                                   "amf":  [
+                                               "amf"
+                                           ],
+                                   "qsv":  [
+                                               "qsv"
+                                           ],
+                                   "d3d11va":  [
+                                                   "d3d11va"
+                                               ],
+                                   "dxva2":  [
+                                                 "dxva2"
+                                             ],
+                                   "cuda":  [
+                                                "cuda"
+                                            ]
+                               },
+    "valid_paths":  [
+                        {
+                            "encoder":  "gpu_proto",
+                            "decoder":  "gpu_proto"
+                        },
+                        {
+                            "encoder":  "software",
+                            "decoder":  "software"
+                        },
+                        {
+                            "encoder":  "nvenc",
+                            "decoder":  "software"
+                        },
+                        {
+                            "encoder":  "nvenc",
+                            "decoder":  "d3d11va"
+                        },
+                        {
+                            "encoder":  "nvenc",
+                            "decoder":  "dxva2"
+                        },
+                        {
+                            "encoder":  "nvenc",
+                            "decoder":  "cuda"
+                        },
+                        {
+                            "encoder":  "amf",
+                            "decoder":  "software"
+                        },
+                        {
+                            "encoder":  "amf",
+                            "decoder":  "d3d11va"
+                        },
+                        {
+                            "encoder":  "amf",
+                            "decoder":  "dxva2"
+                        },
+                        {
+                            "encoder":  "qsv",
+                            "decoder":  "software"
+                        },
+                        {
+                            "encoder":  "qsv",
+                            "decoder":  "d3d11va"
+                        },
+                        {
+                            "encoder":  "qsv",
+                            "decoder":  "qsv"
+                        }
+                    ]
+}

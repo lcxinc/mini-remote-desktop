@@ -1,0 +1,32 @@
+{
+    "transports":  [
+                       "rtp_rtcp_srtp"
+                   ],
+    "renders":  [
+                    "gpu_present"
+                ],
+    "captures":  [
+                     "desktop_dup"
+                 ],
+    "fps":  [
+                360
+            ],
+    "resolutions":  [
+                        "3840x2160"
+                    ],
+    "encoders":  [
+                     "gpu_proto"
+                 ],
+    "component_requirements":  {
+
+                               },
+    "decoders":  [
+                     "gpu_proto"
+                 ],
+    "valid_paths":  [
+                        {
+                            "encoder":  "gpu_proto",
+                            "decoder":  "gpu_proto"
+                        }
+                    ]
+}

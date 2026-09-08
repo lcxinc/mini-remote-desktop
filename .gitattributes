@@ -1,2 +1,9 @@
 *.ps1 text eol=lf
 *.sh text eol=lf
+
+# Preserve exact upstream experiment bytes and historical whitespace.
+/subprojects/GPUTest/** -text -whitespace
+/subprojects/GPU_Test_2/** -text -whitespace
+/docs/repository-consolidation/GPU-experiments/*.source.txt -text -whitespace
+# Upstream Setext heading has seven '=' characters, not a merge conflict.
+/subprojects/GPUTest/vendor/libsrt-sys-1.4.13/libsrt/testing/README.md conflict-marker-size=32

@@ -1,0 +1,40 @@
+﻿{
+    "transports":  [
+                       "quic"
+                   ],
+    "renders":  [
+                    "gpu_present"
+                ],
+    "captures":  [
+                     "desktop_dup"
+                 ],
+    "fps":  [
+                60
+            ],
+    "resolutions":  [
+                        "1920x1080"
+                    ],
+    "encoders":  [
+                     "gpu_proto"
+                 ],
+    "component_requirements":  {
+                                   "hevc_nvenc":  [
+                                                      "cuda"
+                                                  ],
+                                   "av1_nvenc":  [
+                                                     "cuda"
+                                                 ],
+                                   "h264_nvenc":  [
+                                                      "cuda"
+                                                  ]
+                               },
+    "decoders":  [
+                     "gpu_proto"
+                 ],
+    "valid_paths":  [
+                        {
+                            "encoder":  "gpu_proto",
+                            "decoder":  "gpu_proto"
+                        }
+                    ]
+}

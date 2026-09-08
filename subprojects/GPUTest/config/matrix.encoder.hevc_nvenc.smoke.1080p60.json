@@ -1,0 +1,28 @@
+{
+  "captures": [
+    "desktop_dup"
+  ],
+  "encoders": [
+    "hevc_nvenc"
+  ],
+  "transports": [
+    "srt"
+  ],
+  "decoders": [
+    "software"
+  ],
+  "resolutions": [
+    "1920x1080"
+  ],
+  "fps": [
+    60
+  ],
+  "component_requirements": {
+    "hevc_nvenc": [
+      "cuda"
+    ]
+  },
+  "valid_paths": [
+    { "encoder": "hevc_nvenc", "decoder": "software" }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "captures": ["desktop_dup"],
+  "encoders": [
+    "h264_amf",
+    "h264_qsv",
+    "h264_vaapi",
+    "hevc_amf",
+    "hevc_qsv",
+    "hevc_vaapi",
+    "vp9_software"
+  ],
+  "transports": ["srt"],
+  "decoders": ["h264_software", "hevc_software", "vp9_software"],
+  "resolutions": ["1920x1080"],
+  "fps": [60],
+  "component_requirements": {
+    "h264_amf": ["amf"],
+    "h264_qsv": ["qsv"],
+    "h264_vaapi": ["vaapi"],
+    "hevc_amf": ["amf"],
+    "hevc_qsv": ["qsv"],
+    "hevc_vaapi": ["vaapi"]
+  },
+  "valid_paths": [
+    { "encoder": "h264_amf", "decoder": "h264_software" },
+    { "encoder": "h264_qsv", "decoder": "h264_software" },
+    { "encoder": "h264_vaapi", "decoder": "h264_software" },
+    { "encoder": "hevc_amf", "decoder": "hevc_software" },
+    { "encoder": "hevc_qsv", "decoder": "hevc_software" },
+    { "encoder": "hevc_vaapi", "decoder": "hevc_software" },
+    { "encoder": "vp9_software", "decoder": "vp9_software" }
+  ]
+}

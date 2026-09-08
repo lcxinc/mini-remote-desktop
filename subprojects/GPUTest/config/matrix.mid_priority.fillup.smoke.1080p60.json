@@ -1,0 +1,25 @@
+{
+  "captures": ["desktop_dup"],
+  "encoders": [
+    "mjpeg_software",
+    "prores_software",
+    "dnxhd_software",
+    "dnxhr_software"
+  ],
+  "transports": ["udp"],
+  "decoders": [
+    "mjpeg_software",
+    "prores_software",
+    "dnxhd_software",
+    "dnxhr_software"
+  ],
+  "resolutions": ["1920x1080"],
+  "fps": [60],
+  "component_requirements": {},
+  "valid_paths": [
+    { "encoder": "mjpeg_software", "decoder": "mjpeg_software" },
+    { "encoder": "prores_software", "decoder": "prores_software" },
+    { "encoder": "dnxhd_software", "decoder": "dnxhd_software" },
+    { "encoder": "dnxhr_software", "decoder": "dnxhr_software" }
+  ]
+}

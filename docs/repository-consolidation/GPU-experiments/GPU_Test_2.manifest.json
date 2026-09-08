@@ -1,0 +1,405 @@
+{
+  "source_repository": "lcxinc/GPU_Test_2",
+  "source_commit": "9cb3453b9f67b304a1acd9d97af7528bb950be46",
+  "source_tree": "6e863c7fbe335a33bba9c6dfa90236a4007b5ca3",
+  "consumer_base_commit": "9d7e5987b83759db65eb815182eb83e9daf9b116",
+  "scope": "Exact pinned source snapshot except generated screen captures/logs and documented workspace isolation.",
+  "files": [
+    {
+      "source_path": ".gitignore",
+      "source_mode": "100644",
+      "source_git_blob": "82b9848d1a3875fd615bac10c719fc9c78474ae5",
+      "consumer_path": "subprojects/GPU_Test_2/.gitignore",
+      "disposition": "generated_output_ignore",
+      "original_archive_path": "docs/repository-consolidation/GPU-experiments/GPU_Test_2.gitignore.source.txt",
+      "consumer_git_blob": "d542278287212f8a4b037cfd77b5a757bd743152"
+    },
+    {
+      "source_path": "Cargo.toml",
+      "source_mode": "100644",
+      "source_git_blob": "52185184fd5a22faf5ba074bba4cc7a66f9de5c9",
+      "consumer_path": "subprojects/GPU_Test_2/Cargo.toml",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "README.md",
+      "source_mode": "100644",
+      "source_git_blob": "4727c11884fbbe34bbc71356eaf816ab6dca5e64",
+      "consumer_path": "subprojects/GPU_Test_2/README.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "debug_capture.ppm",
+      "source_mode": "100644",
+      "source_git_blob": "09a8cca8d5f2124ae2d325dfbfcd3f546a677980",
+      "consumer_path": "subprojects/GPU_Test_2/debug_capture.ppm",
+      "disposition": "excluded_generated_capture_or_log",
+      "reason": "Generated desktop captures and run logs are not build inputs. Retained in the original local source checkout; not published."
+    },
+    {
+      "source_path": "debug_capture.raw",
+      "source_mode": "100644",
+      "source_git_blob": "9b3cb514f94bfd5a2f22d4074d40f5cd48881162",
+      "consumer_path": "subprojects/GPU_Test_2/debug_capture.raw",
+      "disposition": "excluded_generated_capture_or_log",
+      "reason": "Generated desktop captures and run logs are not build inputs. Retained in the original local source checkout; not published."
+    },
+    {
+      "source_path": "debug_scaled.ppm",
+      "source_mode": "100644",
+      "source_git_blob": "929fac3560d912b4826398d567eb76de897d1ebc",
+      "consumer_path": "subprojects/GPU_Test_2/debug_scaled.ppm",
+      "disposition": "excluded_generated_capture_or_log",
+      "reason": "Generated desktop captures and run logs are not build inputs. Retained in the original local source checkout; not published."
+    },
+    {
+      "source_path": "debug_scaled.raw",
+      "source_mode": "100644",
+      "source_git_blob": "d68bcf33e45efd22a2ad842ddb47d50e158901a2",
+      "consumer_path": "subprojects/GPU_Test_2/debug_scaled.raw",
+      "disposition": "excluded_generated_capture_or_log",
+      "reason": "Generated desktop captures and run logs are not build inputs. Retained in the original local source checkout; not published."
+    },
+    {
+      "source_path": "docs/plans/2026-03-20-low-latency-streaming.md",
+      "source_mode": "100644",
+      "source_git_blob": "c60da26506e9cf4c6421d3f06127c4325c2e5dd5",
+      "consumer_path": "subprojects/GPU_Test_2/docs/plans/2026-03-20-low-latency-streaming.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "docs/plans/2026-03-20-nvenc-resource-reuse.md",
+      "source_mode": "100644",
+      "source_git_blob": "fcf67d62aad321767807a67f381af7e8491d333f",
+      "consumer_path": "subprojects/GPU_Test_2/docs/plans/2026-03-20-nvenc-resource-reuse.md",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "examples/desktop_render_test.rs",
+      "source_mode": "100644",
+      "source_git_blob": "6304fcc083687633334a54e9963dd53b7e1c0794",
+      "consumer_path": "subprojects/GPU_Test_2/examples/desktop_render_test.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "examples/dxgi_quic_client.rs",
+      "source_mode": "100644",
+      "source_git_blob": "c5c41e147df7370b653aee2a4b212fc5811c1612",
+      "consumer_path": "subprojects/GPU_Test_2/examples/dxgi_quic_client.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "examples/dxgi_quic_server.rs",
+      "source_mode": "100644",
+      "source_git_blob": "3dae0fdb463726e63d7487e0e6076e3a75ce0746",
+      "consumer_path": "subprojects/GPU_Test_2/examples/dxgi_quic_server.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "examples/full_desktop_latency.rs",
+      "source_mode": "100644",
+      "source_git_blob": "062ad3eb00848c7252a45d5117e07802dfbefdd1",
+      "consumer_path": "subprojects/GPU_Test_2/examples/full_desktop_latency.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "examples/full_desktop_with_render.rs",
+      "source_mode": "100644",
+      "source_git_blob": "480e2f03f80370a632e2031c062240765bd57d18",
+      "consumer_path": "subprojects/GPU_Test_2/examples/full_desktop_with_render.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "examples/full_latency.rs",
+      "source_mode": "100644",
+      "source_git_blob": "7b0db7a9ca0cc36574e9dbb53cdc79bd3a2917d5",
+      "consumer_path": "subprojects/GPU_Test_2/examples/full_latency.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "examples/full_pipeline.rs",
+      "source_mode": "100644",
+      "source_git_blob": "7bb9cff8b4047e74da1b54bbc445c18c750a7a3a",
+      "consumer_path": "subprojects/GPU_Test_2/examples/full_pipeline.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "examples/full_pipeline_test.rs",
+      "source_mode": "100644",
+      "source_git_blob": "ae8fdad0c9a1549fe15cb363379c0f55c3036526",
+      "consumer_path": "subprojects/GPU_Test_2/examples/full_pipeline_test.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "examples/h264_bandwidth.rs",
+      "source_mode": "100644",
+      "source_git_blob": "3ae61165a25ebb736d3c54a2d2c9b85493ec67c4",
+      "consumer_path": "subprojects/GPU_Test_2/examples/h264_bandwidth.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "examples/h264_latency.rs",
+      "source_mode": "100644",
+      "source_git_blob": "0d791594837d5a5e74a9921d1a1d32f5d0d4f2a2",
+      "consumer_path": "subprojects/GPU_Test_2/examples/h264_latency.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "examples/h264_quic.rs",
+      "source_mode": "100644",
+      "source_git_blob": "33b4276632fd4cd2d0d0e383c960b9c57907f45f",
+      "consumer_path": "subprojects/GPU_Test_2/examples/h264_quic.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "examples/high_fps.rs",
+      "source_mode": "100644",
+      "source_git_blob": "336675e1afd43bfc1a22cd8e052491a56e52e759",
+      "consumer_path": "subprojects/GPU_Test_2/examples/high_fps.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "examples/high_fps_with_bandwidth.rs",
+      "source_mode": "100644",
+      "source_git_blob": "971e4558de8e8ac4b199b9cb48c41ac7c33be64a",
+      "consumer_path": "subprojects/GPU_Test_2/examples/high_fps_with_bandwidth.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "examples/nvenc_quic_receiver.rs",
+      "source_mode": "100644",
+      "source_git_blob": "967f33cc2fc30116d5bf4d626fe6ef4b84d5fbef",
+      "consumer_path": "subprojects/GPU_Test_2/examples/nvenc_quic_receiver.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "examples/nvenc_quic_sender_parallel.rs",
+      "source_mode": "100644",
+      "source_git_blob": "df27f9fa3f55ec540e70cb520a7a935200c63673",
+      "consumer_path": "subprojects/GPU_Test_2/examples/nvenc_quic_sender_parallel.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "examples/nvenc_quic_sender_serial.rs",
+      "source_mode": "100644",
+      "source_git_blob": "fffe23fa44852fb664ab79879523169ff8fc7c0e",
+      "consumer_path": "subprojects/GPU_Test_2/examples/nvenc_quic_sender_serial.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "examples/pipeline_latency_test.rs",
+      "source_mode": "100644",
+      "source_git_blob": "c3e505bd133402e3b75009b890ecebbf83ce1db9",
+      "consumer_path": "subprojects/GPU_Test_2/examples/pipeline_latency_test.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "examples/quic_client.rs",
+      "source_mode": "100644",
+      "source_git_blob": "ab65ea2ba1984393a984162c22f5ac4f26fb6b4c",
+      "consumer_path": "subprojects/GPU_Test_2/examples/quic_client.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "examples/quic_server.rs",
+      "source_mode": "100644",
+      "source_git_blob": "c3ce75cd5990bebe3fa1e74244879dde3bab079d",
+      "consumer_path": "subprojects/GPU_Test_2/examples/quic_server.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "examples/simple_render_test.rs",
+      "source_mode": "100644",
+      "source_git_blob": "4a983d4b1eb0f28767455af5cd4b5b0ed41b21b7",
+      "consumer_path": "subprojects/GPU_Test_2/examples/simple_render_test.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "receiver.err.log",
+      "source_mode": "100644",
+      "source_git_blob": "9767f16b455a5cb7cf75d206a24833bebdf8f671",
+      "consumer_path": "subprojects/GPU_Test_2/receiver.err.log",
+      "disposition": "excluded_generated_capture_or_log",
+      "reason": "Generated desktop captures and run logs are not build inputs. Retained in the original local source checkout; not published."
+    },
+    {
+      "source_path": "receiver.out.log",
+      "source_mode": "100644",
+      "source_git_blob": "5adc6825a268eeffbaf4570480a4bcdd6c2c56bf",
+      "consumer_path": "subprojects/GPU_Test_2/receiver.out.log",
+      "disposition": "excluded_generated_capture_or_log",
+      "reason": "Generated desktop captures and run logs are not build inputs. Retained in the original local source checkout; not published."
+    },
+    {
+      "source_path": "receiver_test.err.log",
+      "source_mode": "100644",
+      "source_git_blob": "50122fa9488e08aca74001d96d7b7916f8376ed8",
+      "consumer_path": "subprojects/GPU_Test_2/receiver_test.err.log",
+      "disposition": "excluded_generated_capture_or_log",
+      "reason": "Generated desktop captures and run logs are not build inputs. Retained in the original local source checkout; not published."
+    },
+    {
+      "source_path": "receiver_test.out.log",
+      "source_mode": "100644",
+      "source_git_blob": "21e7f7c18a0d1d8d8480d01e716091fc16d6f27d",
+      "consumer_path": "subprojects/GPU_Test_2/receiver_test.out.log",
+      "disposition": "excluded_generated_capture_or_log",
+      "reason": "Generated desktop captures and run logs are not build inputs. Retained in the original local source checkout; not published."
+    },
+    {
+      "source_path": "sender_test.out.log",
+      "source_mode": "100644",
+      "source_git_blob": "ce10ea0810bdc38152921182ecd988903a9bb160",
+      "consumer_path": "subprojects/GPU_Test_2/sender_test.out.log",
+      "disposition": "excluded_generated_capture_or_log",
+      "reason": "Generated desktop captures and run logs are not build inputs. Retained in the original local source checkout; not published."
+    },
+    {
+      "source_path": "src/artifacts.rs",
+      "source_mode": "100644",
+      "source_git_blob": "92cc9d28ff30f0eb49dc767ee083e4bb402c899d",
+      "consumer_path": "subprojects/GPU_Test_2/src/artifacts.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/capture.rs",
+      "source_mode": "100644",
+      "source_git_blob": "1a15f1ba465b8d5fcfa6aafe896d66b271b1b64c",
+      "consumer_path": "subprojects/GPU_Test_2/src/capture.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/decode.rs",
+      "source_mode": "100644",
+      "source_git_blob": "23cc81853210f4172a9ca4cc9ef7524fd2d7fe2d",
+      "consumer_path": "subprojects/GPU_Test_2/src/decode.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/encoder.rs",
+      "source_mode": "100644",
+      "source_git_blob": "f49fdd7e54bfaf7098687aa05db8dfa193a6178b",
+      "consumer_path": "subprojects/GPU_Test_2/src/encoder.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/latency.rs",
+      "source_mode": "100644",
+      "source_git_blob": "9d3ed5199005ebb60958bd448fcf7c5e9c4cbbcc",
+      "consumer_path": "subprojects/GPU_Test_2/src/latency.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/latest.rs",
+      "source_mode": "100644",
+      "source_git_blob": "6b575869d643a9337cc1111f8fe9c32a1d1224f0",
+      "consumer_path": "subprojects/GPU_Test_2/src/latest.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/lib.rs",
+      "source_mode": "100644",
+      "source_git_blob": "040098ee11b10a84a02ce76b4b1e77053164ae44",
+      "consumer_path": "subprojects/GPU_Test_2/src/lib.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/main.rs",
+      "source_mode": "100644",
+      "source_git_blob": "33bcddd4729419eb06c7efc01b3c1dd4831d0026",
+      "consumer_path": "subprojects/GPU_Test_2/src/main.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/protocol.rs",
+      "source_mode": "100644",
+      "source_git_blob": "01847d2b1b7608cb84069064dc3e47a0c13ccd04",
+      "consumer_path": "subprojects/GPU_Test_2/src/protocol.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/telemetry.rs",
+      "source_mode": "100644",
+      "source_git_blob": "cd774b4e26efc8aa42c89566935d44275e5b1d51",
+      "consumer_path": "subprojects/GPU_Test_2/src/telemetry.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "src/transport.rs",
+      "source_mode": "100644",
+      "source_git_blob": "bfcd3bcb7da95f19ecb59468d21e1c2e9203bc06",
+      "consumer_path": "subprojects/GPU_Test_2/src/transport.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "tests/captured_frame_layout.rs",
+      "source_mode": "100644",
+      "source_git_blob": "314ffc3ba769ceb01664f1fb4577d52a7b920e3c",
+      "consumer_path": "subprojects/GPU_Test_2/tests/captured_frame_layout.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "tests/decoder_errors.rs",
+      "source_mode": "100644",
+      "source_git_blob": "b31085c60bcf5fc3a79d681e1b2cc3518ad7d615",
+      "consumer_path": "subprojects/GPU_Test_2/tests/decoder_errors.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "tests/encoded_frame_metadata.rs",
+      "source_mode": "100644",
+      "source_git_blob": "fd3d2c60dac6a31afc7215621bf165ee2254c835",
+      "consumer_path": "subprojects/GPU_Test_2/tests/encoded_frame_metadata.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "tests/encoder_color_conversion.rs",
+      "source_mode": "100644",
+      "source_git_blob": "fec066663f19dc8a2343f21a326eb75ed171cf17",
+      "consumer_path": "subprojects/GPU_Test_2/tests/encoder_color_conversion.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "tests/frame_message_io.rs",
+      "source_mode": "100644",
+      "source_git_blob": "636ff2f39d19af7f57da2096b3d0bc661957a99e",
+      "consumer_path": "subprojects/GPU_Test_2/tests/frame_message_io.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "tests/frame_stream_io.rs",
+      "source_mode": "100644",
+      "source_git_blob": "4a12b213080768820fec30c87935375a27bce152",
+      "consumer_path": "subprojects/GPU_Test_2/tests/frame_stream_io.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "tests/latest_frame_slot.rs",
+      "source_mode": "100644",
+      "source_git_blob": "bef46153388c398c7c62852da0a9236a07d2d491",
+      "consumer_path": "subprojects/GPU_Test_2/tests/latest_frame_slot.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "tests/ppm_writer.rs",
+      "source_mode": "100644",
+      "source_git_blob": "765c02cbadaa41f0eac710d3b8105396db1a345b",
+      "consumer_path": "subprojects/GPU_Test_2/tests/ppm_writer.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "tests/protocol_roundtrip.rs",
+      "source_mode": "100644",
+      "source_git_blob": "b846ad2feded5440f1a1fdb0ee96cafca50dbe3c",
+      "consumer_path": "subprojects/GPU_Test_2/tests/protocol_roundtrip.rs",
+      "disposition": "copied_exactly"
+    },
+    {
+      "source_path": "tests/telemetry_stats.rs",
+      "source_mode": "100644",
+      "source_git_blob": "6cda9a6cb01ddaa316bb907dd51ee8e7dcc62f06",
+      "consumer_path": "subprojects/GPU_Test_2/tests/telemetry_stats.rs",
+      "disposition": "copied_exactly"
+    }
+  ]
+}

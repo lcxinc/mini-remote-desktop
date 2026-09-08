@@ -1,15 +1,3 @@
-[submodule "Rdesk"]
-	path = Rdesk
-	url = https://github.com/a1112/Rdesk
-[submodule "subprojects/GPU_Test_2"]
-	path = subprojects/GPU_Test_2
-	url = https://github.com/a1112/GPU_Test_2
-[submodule "subprojects/GPUTest"]
-	path = subprojects/GPUTest
-	url = https://github.com/a1112/GPUTest
-[submodule "subprojects/P2P_Test"]
-	path = subprojects/P2P_Test
-	url = https://github.com/a1112/P2P_Test
 [submodule "refs/projects/rustdesk"]
 	path = refs/projects/rustdesk
 	url = https://github.com/rustdesk/rustdesk.git

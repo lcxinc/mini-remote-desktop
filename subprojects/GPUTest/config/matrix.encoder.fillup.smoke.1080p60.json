@@ -1,0 +1,48 @@
+{
+  "captures": [
+    "desktop_dup"
+  ],
+  "encoders": [
+    "vaapi",
+    "av1_vaapi",
+    "opencl",
+    "vulkan",
+    "metal"
+  ],
+  "transports": [
+    "srt"
+  ],
+  "decoders": [
+    "software"
+  ],
+  "resolutions": [
+    "1920x1080"
+  ],
+  "fps": [
+    60
+  ],
+  "component_requirements": {
+    "vaapi": [
+      "vaapi"
+    ],
+    "av1_vaapi": [
+      "vaapi"
+    ],
+    "opencl": [
+      "opencl"
+    ],
+    "vulkan": [
+      "vulkan"
+    ],
+    "metal": [
+      "metal"
+    ]
+  },
+  "valid_paths": [
+    { "encoder": "vaapi", "decoder": "software" },
+    { "encoder": "av1_vaapi", "decoder": "software" },
+    { "encoder": "opencl", "decoder": "software" },
+    { "encoder": "vulkan", "decoder": "software" },
+    { "encoder": "metal", "decoder": "software" }
+  ]
+}

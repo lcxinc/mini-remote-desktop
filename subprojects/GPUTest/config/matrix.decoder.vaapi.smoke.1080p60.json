@@ -1,0 +1,31 @@
+{
+  "captures": [
+    "desktop_dup"
+  ],
+  "encoders": [
+    "nvenc"
+  ],
+  "transports": [
+    "srt"
+  ],
+  "decoders": [
+    "vaapi"
+  ],
+  "resolutions": [
+    "1920x1080"
+  ],
+  "fps": [
+    60
+  ],
+  "component_requirements": {
+    "nvenc": [
+      "cuda"
+    ],
+    "vaapi": [
+      "vaapi"
+    ]
+  },
+  "valid_paths": [
+    { "encoder": "nvenc", "decoder": "vaapi" }
+  ]
+}

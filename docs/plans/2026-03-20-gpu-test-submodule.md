@@ -1,5 +1,9 @@
 # GPU_Test_2 Submodule Implementation Plan
 
+> Historical plan, superseded on 2026-09-08: GPU_Test_2 is now imported as ordinary
+> source at the same path. Do not rerun the submodule-add steps below. See
+> [repository consolidation](../repository-consolidation.md) for current status.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Add `GPU_Test_2` to the `mini-remote-desktop` repository as a git submodule at `subprojects/GPU_Test_2`.

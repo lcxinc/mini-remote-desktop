@@ -1,0 +1,12 @@
+{
+  "captures": ["desktop_dup"],
+  "encoders": ["software"],
+  "transports": ["quic_datagram", "rist"],
+  "decoders": ["software"],
+  "resolutions": ["1920x1080"],
+  "fps": [60],
+  "component_requirements": {},
+  "valid_paths": [
+    { "encoder": "software", "decoder": "software" }
+  ]
+}

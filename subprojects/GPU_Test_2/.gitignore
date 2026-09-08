@@ -1,0 +1,13 @@
+/target/
+Cargo.lock
+*.exe
+*.pdb
+.worktrees/
+artifacts/
+*.h264
+*.ppm
+
+# Generated desktop captures and run logs stay local.
+/debug_*.raw
+/debug_*.ppm
+/*.log
