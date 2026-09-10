@@ -1,5 +1,9 @@
 # Mini Remote Desktop
 
+## UI design reference
+
+The independent [Rdesk prototype](prototypes/rdesk/README.md) preserves the earlier mock interface.
+
 ## Rebuild Notice
 
 This repository now uses a product-oriented mainline layout.
