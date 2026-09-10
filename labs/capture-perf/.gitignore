@@ -1,0 +1,10 @@
+cpp/build/
+cpp/build_codex/
+cpp/out/
+cpp/viewer_build/
+rust/target/
+rust/*/target/
+results/*.csv
+results/*.json
+results/*.png
+!results/.gitkeep
