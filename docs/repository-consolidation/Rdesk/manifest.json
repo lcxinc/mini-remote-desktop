@@ -1,0 +1,652 @@
+{
+  "source_repository": "lcxinc/Rdesk",
+  "source_commit": "3a92e48a38f797a5b88de883d8f955d203adf25a",
+  "consumer_repository": "lcxinc/mini-remote-desktop",
+  "consumer_base_commit": "aff613462fa6b885a27f2f0c38c68ed90bf01c8d",
+  "scope": "Default-branch tracked snapshot; no full history or hosted records.",
+  "files": [
+    {
+      "source_path": "ATTRIBUTIONS.md",
+      "source_mode": "100644",
+      "source_git_blob": "5df5c40c9aae0365002db6ac826623f2febb7d26",
+      "target_path": "prototypes/rdesk/ATTRIBUTIONS.md",
+      "target_git_blob": "5df5c40c9aae0365002db6ac826623f2febb7d26",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "README.md",
+      "source_mode": "100644",
+      "source_git_blob": "ee551fc69e43c9064f3368fd10d013257dc8c983",
+      "target_path": "prototypes/rdesk/README.md",
+      "target_git_blob": "3cfab3562bab56cf3cd3bcaf25fa0e64ddee431c",
+      "disposition": "migrated_with_adjustment",
+      "archive_path": "docs/repository-consolidation/Rdesk/originals/README.md.source.txt"
+    },
+    {
+      "source_path": "guidelines/Guidelines.md",
+      "source_mode": "100644",
+      "source_git_blob": "110f1178839508ea2207abba3a8dd2a794ed36db",
+      "target_path": "prototypes/rdesk/guidelines/Guidelines.md",
+      "target_git_blob": "110f1178839508ea2207abba3a8dd2a794ed36db",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "index.html",
+      "source_mode": "100644",
+      "source_git_blob": "09df455a54793162ba34aa4066d0db785f2afc2e",
+      "target_path": "prototypes/rdesk/index.html",
+      "target_git_blob": "09df455a54793162ba34aa4066d0db785f2afc2e",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "package.json",
+      "source_mode": "100644",
+      "source_git_blob": "c36df6f6cf281889bb97155d45a2b55fe4eea878",
+      "target_path": "prototypes/rdesk/package.json",
+      "target_git_blob": "0d785cd9b1dac822e351557347a3b1534b0a86fa",
+      "disposition": "migrated_with_adjustment",
+      "archive_path": "docs/repository-consolidation/Rdesk/originals/package.json.source.txt"
+    },
+    {
+      "source_path": "postcss.config.mjs",
+      "source_mode": "100644",
+      "source_git_blob": "531dbecdad58a2ecaad9b45b5eefced747424c4f",
+      "target_path": "prototypes/rdesk/postcss.config.mjs",
+      "target_git_blob": "531dbecdad58a2ecaad9b45b5eefced747424c4f",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/App.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "811e1ed3f7a243314e6a25ebdbeff648c63f1a24",
+      "target_path": "prototypes/rdesk/src/app/App.tsx",
+      "target_git_blob": "811e1ed3f7a243314e6a25ebdbeff648c63f1a24",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/AuthModal.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "72ae29ec58c26f650038c5bee51ac27106f42090",
+      "target_path": "prototypes/rdesk/src/app/components/AuthModal.tsx",
+      "target_git_blob": "72ae29ec58c26f650038c5bee51ac27106f42090",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ConnectionsModal.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "5b5486ea28909c2f9cc45232361766d3303c882e",
+      "target_path": "prototypes/rdesk/src/app/components/ConnectionsModal.tsx",
+      "target_git_blob": "5b5486ea28909c2f9cc45232361766d3303c882e",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ConnectionsPage.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "cbb031167d10aa97a8f18829af01844992cb717d",
+      "target_path": "prototypes/rdesk/src/app/components/ConnectionsPage.tsx",
+      "target_git_blob": "cbb031167d10aa97a8f18829af01844992cb717d",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/DetailBarContext.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "7075e462d59d3b4cdc1657b1da365f97bce4eb0a",
+      "target_path": "prototypes/rdesk/src/app/components/DetailBarContext.tsx",
+      "target_git_blob": "7075e462d59d3b4cdc1657b1da365f97bce4eb0a",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/DeviceDetailPage.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "18d78970897d66fb0643802ed341f50f5c1e6dff",
+      "target_path": "prototypes/rdesk/src/app/components/DeviceDetailPage.tsx",
+      "target_git_blob": "18d78970897d66fb0643802ed341f50f5c1e6dff",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/DevicesPage.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "69d55ccf9aa256b317011bee114e5bb0b109d4d3",
+      "target_path": "prototypes/rdesk/src/app/components/DevicesPage.tsx",
+      "target_git_blob": "69d55ccf9aa256b317011bee114e5bb0b109d4d3",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/FileTransferPage.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "4bb3162b54300d055ec27e1586eefe4c8cf2ce7c",
+      "target_path": "prototypes/rdesk/src/app/components/FileTransferPage.tsx",
+      "target_git_blob": "4bb3162b54300d055ec27e1586eefe4c8cf2ce7c",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/HomePage.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "9d330c555ab50c00ba64bf11c368ffcf4b5903a3",
+      "target_path": "prototypes/rdesk/src/app/components/HomePage.tsx",
+      "target_git_blob": "9d330c555ab50c00ba64bf11c368ffcf4b5903a3",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/Layout.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "0cb37a60e202eca0a88825767f06100d996184a1",
+      "target_path": "prototypes/rdesk/src/app/components/Layout.tsx",
+      "target_git_blob": "0cb37a60e202eca0a88825767f06100d996184a1",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/RemoteSessionModal.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "7961b24337361af9521901834298226da7fc66a1",
+      "target_path": "prototypes/rdesk/src/app/components/RemoteSessionModal.tsx",
+      "target_git_blob": "7961b24337361af9521901834298226da7fc66a1",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/RemoteSessionPage.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "ccff930376798ebd6ad1e5b569c1f710c36049d0",
+      "target_path": "prototypes/rdesk/src/app/components/RemoteSessionPage.tsx",
+      "target_git_blob": "ccff930376798ebd6ad1e5b569c1f710c36049d0",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/SettingsModal.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "49783558bec019adf6365b573b943bbc207ee067",
+      "target_path": "prototypes/rdesk/src/app/components/SettingsModal.tsx",
+      "target_git_blob": "49783558bec019adf6365b573b943bbc207ee067",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/SettingsPage.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "ab33fc4081dc146b27d85ad9539ca6d0e747963e",
+      "target_path": "prototypes/rdesk/src/app/components/SettingsPage.tsx",
+      "target_git_blob": "ab33fc4081dc146b27d85ad9539ca6d0e747963e",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/Sidebar.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "6078045b70fa4a7210cb15fd0411f58535390a7a",
+      "target_path": "prototypes/rdesk/src/app/components/Sidebar.tsx",
+      "target_git_blob": "6078045b70fa4a7210cb15fd0411f58535390a7a",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ThemeContext.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "7c35d016d28fadcc136dd8708d579ebb82164b79",
+      "target_path": "prototypes/rdesk/src/app/components/ThemeContext.tsx",
+      "target_git_blob": "7c35d016d28fadcc136dd8708d579ebb82164b79",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/TitleBar.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "40162489fa591edd240f90d98bb91de67c2d784b",
+      "target_path": "prototypes/rdesk/src/app/components/TitleBar.tsx",
+      "target_git_blob": "40162489fa591edd240f90d98bb91de67c2d784b",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/deviceData.ts",
+      "source_mode": "100644",
+      "source_git_blob": "20edea519c38c703aa706a867e846cd08f947e6e",
+      "target_path": "prototypes/rdesk/src/app/components/deviceData.ts",
+      "target_git_blob": "20edea519c38c703aa706a867e846cd08f947e6e",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/figma/ImageWithFallback.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "0e26139bea20f0f26f899190b21161e44510e740",
+      "target_path": "prototypes/rdesk/src/app/components/figma/ImageWithFallback.tsx",
+      "target_git_blob": "0e26139bea20f0f26f899190b21161e44510e740",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/accordion.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "bd6b1e3351323c2ccca3460dee3fd37b1101eba2",
+      "target_path": "prototypes/rdesk/src/app/components/ui/accordion.tsx",
+      "target_git_blob": "bd6b1e3351323c2ccca3460dee3fd37b1101eba2",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/alert-dialog.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "875b8df4de0231047736dcb04c5d81287d88ae42",
+      "target_path": "prototypes/rdesk/src/app/components/ui/alert-dialog.tsx",
+      "target_git_blob": "875b8df4de0231047736dcb04c5d81287d88ae42",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/alert.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "9c35976c714d89ae0497f599d3a1fd707dd75fd8",
+      "target_path": "prototypes/rdesk/src/app/components/ui/alert.tsx",
+      "target_git_blob": "9c35976c714d89ae0497f599d3a1fd707dd75fd8",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/aspect-ratio.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "c16d6bcb917ec490aa9c468afcbd5c829086b080",
+      "target_path": "prototypes/rdesk/src/app/components/ui/aspect-ratio.tsx",
+      "target_git_blob": "c16d6bcb917ec490aa9c468afcbd5c829086b080",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/avatar.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "c9904518548717b6bbfe9bdf1857e483bbe35d78",
+      "target_path": "prototypes/rdesk/src/app/components/ui/avatar.tsx",
+      "target_git_blob": "c9904518548717b6bbfe9bdf1857e483bbe35d78",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/badge.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "2ccc2c444051b79c7e9fe5ef2e07f7eebd09c8d3",
+      "target_path": "prototypes/rdesk/src/app/components/ui/badge.tsx",
+      "target_git_blob": "2ccc2c444051b79c7e9fe5ef2e07f7eebd09c8d3",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/breadcrumb.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "8f84d7e9fe4dcfdec34819e5af802a80d44e3fdf",
+      "target_path": "prototypes/rdesk/src/app/components/ui/breadcrumb.tsx",
+      "target_git_blob": "8f84d7e9fe4dcfdec34819e5af802a80d44e3fdf",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/button.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "40ef7aa92edca00d4a993d1b965faf7a00afee77",
+      "target_path": "prototypes/rdesk/src/app/components/ui/button.tsx",
+      "target_git_blob": "40ef7aa92edca00d4a993d1b965faf7a00afee77",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/calendar.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "ee7b73f3ed7c54d1df263e41ae6c1f7d5b38cf97",
+      "target_path": "prototypes/rdesk/src/app/components/ui/calendar.tsx",
+      "target_git_blob": "ee7b73f3ed7c54d1df263e41ae6c1f7d5b38cf97",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/card.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "5f9d58a566782b3bd04c13e9e4aa31eca7d6e9f7",
+      "target_path": "prototypes/rdesk/src/app/components/ui/card.tsx",
+      "target_git_blob": "5f9d58a566782b3bd04c13e9e4aa31eca7d6e9f7",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/carousel.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "bb5ab133f332fcc910986a7d5619c87d648cbebd",
+      "target_path": "prototypes/rdesk/src/app/components/ui/carousel.tsx",
+      "target_git_blob": "bb5ab133f332fcc910986a7d5619c87d648cbebd",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/chart.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "b49bc3662e9b5f680e6aa910b863534f06d1bb4d",
+      "target_path": "prototypes/rdesk/src/app/components/ui/chart.tsx",
+      "target_git_blob": "b49bc3662e9b5f680e6aa910b863534f06d1bb4d",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/checkbox.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "c81696bfd79434d047d6a5bbffb7209899582d20",
+      "target_path": "prototypes/rdesk/src/app/components/ui/checkbox.tsx",
+      "target_git_blob": "c81696bfd79434d047d6a5bbffb7209899582d20",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/collapsible.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "90935c6b23f26cbeb3f93f2fbfdc688cc16847d4",
+      "target_path": "prototypes/rdesk/src/app/components/ui/collapsible.tsx",
+      "target_git_blob": "90935c6b23f26cbeb3f93f2fbfdc688cc16847d4",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/command.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "1705ee03e85178e2f96000ad24c8b3e20ed6d56f",
+      "target_path": "prototypes/rdesk/src/app/components/ui/command.tsx",
+      "target_git_blob": "1705ee03e85178e2f96000ad24c8b3e20ed6d56f",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/context-menu.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "aeb213ac6317175966257144814a27c1ed9fdc0c",
+      "target_path": "prototypes/rdesk/src/app/components/ui/context-menu.tsx",
+      "target_git_blob": "aeb213ac6317175966257144814a27c1ed9fdc0c",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/dialog.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "e79d88e61264a4e67e5bdaed185da2917f2a744c",
+      "target_path": "prototypes/rdesk/src/app/components/ui/dialog.tsx",
+      "target_git_blob": "e79d88e61264a4e67e5bdaed185da2917f2a744c",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/drawer.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "bdcf0484e17058a418d807f606ec1c20c8a75f55",
+      "target_path": "prototypes/rdesk/src/app/components/ui/drawer.tsx",
+      "target_git_blob": "bdcf0484e17058a418d807f606ec1c20c8a75f55",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/dropdown-menu.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "d287f98e03938f8812d15e01bdff936c03317d0a",
+      "target_path": "prototypes/rdesk/src/app/components/ui/dropdown-menu.tsx",
+      "target_git_blob": "d287f98e03938f8812d15e01bdff936c03317d0a",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/form.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "504f0cc438bba96f725a44130289df10029937c7",
+      "target_path": "prototypes/rdesk/src/app/components/ui/form.tsx",
+      "target_git_blob": "504f0cc438bba96f725a44130289df10029937c7",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/hover-card.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "0a3803aca7dfaae1a0588d41c880144271467411",
+      "target_path": "prototypes/rdesk/src/app/components/ui/hover-card.tsx",
+      "target_git_blob": "0a3803aca7dfaae1a0588d41c880144271467411",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/input-otp.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "892bb826db6b13507871f7e0d4ab4c9b1f4aceee",
+      "target_path": "prototypes/rdesk/src/app/components/ui/input-otp.tsx",
+      "target_git_blob": "892bb826db6b13507871f7e0d4ab4c9b1f4aceee",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/input.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "19b0c619d2d682e229a682724c89577e697c3105",
+      "target_path": "prototypes/rdesk/src/app/components/ui/input.tsx",
+      "target_git_blob": "19b0c619d2d682e229a682724c89577e697c3105",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/label.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "af250e577524cc91b594d808092098dc02c5e036",
+      "target_path": "prototypes/rdesk/src/app/components/ui/label.tsx",
+      "target_git_blob": "af250e577524cc91b594d808092098dc02c5e036",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/menubar.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "7d7ac86fffd656b1c7a99f22ebbd43490ade8f5d",
+      "target_path": "prototypes/rdesk/src/app/components/ui/menubar.tsx",
+      "target_git_blob": "7d7ac86fffd656b1c7a99f22ebbd43490ade8f5d",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/navigation-menu.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "6a8d6f252038cf9524eca627523294bef8e8f9fd",
+      "target_path": "prototypes/rdesk/src/app/components/ui/navigation-menu.tsx",
+      "target_git_blob": "6a8d6f252038cf9524eca627523294bef8e8f9fd",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/pagination.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "a23239db5fb8c5cdcff1f7a61b5ec82a535e4c4c",
+      "target_path": "prototypes/rdesk/src/app/components/ui/pagination.tsx",
+      "target_git_blob": "a23239db5fb8c5cdcff1f7a61b5ec82a535e4c4c",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/popover.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "65fcff04245f528d5c618dd0bf082ec380e5a72a",
+      "target_path": "prototypes/rdesk/src/app/components/ui/popover.tsx",
+      "target_git_blob": "65fcff04245f528d5c618dd0bf082ec380e5a72a",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/progress.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "db29f342c7d9550a2da71f8a84abbec39a9c548b",
+      "target_path": "prototypes/rdesk/src/app/components/ui/progress.tsx",
+      "target_git_blob": "db29f342c7d9550a2da71f8a84abbec39a9c548b",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/radio-group.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "2a4f598f710fcd9e7753f95d5f55a9e08abde910",
+      "target_path": "prototypes/rdesk/src/app/components/ui/radio-group.tsx",
+      "target_git_blob": "2a4f598f710fcd9e7753f95d5f55a9e08abde910",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/resizable.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "3e293c3381656b07f141e6df547fd51320a6fff2",
+      "target_path": "prototypes/rdesk/src/app/components/ui/resizable.tsx",
+      "target_git_blob": "3e293c3381656b07f141e6df547fd51320a6fff2",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/scroll-area.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "f79172535a4d593bae5fc9f1ed5345dd81ac7bce",
+      "target_path": "prototypes/rdesk/src/app/components/ui/scroll-area.tsx",
+      "target_git_blob": "f79172535a4d593bae5fc9f1ed5345dd81ac7bce",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/select.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "e0652125e3b644afb89477d4fbee7c3e8125c740",
+      "target_path": "prototypes/rdesk/src/app/components/ui/select.tsx",
+      "target_git_blob": "e0652125e3b644afb89477d4fbee7c3e8125c740",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/separator.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "b04d93239c37f10b6f10f7d128cffd31cb84cd08",
+      "target_path": "prototypes/rdesk/src/app/components/ui/separator.tsx",
+      "target_git_blob": "b04d93239c37f10b6f10f7d128cffd31cb84cd08",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/sheet.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "68a0327c79723fe1344e8b90be2f0f66146b0317",
+      "target_path": "prototypes/rdesk/src/app/components/ui/sheet.tsx",
+      "target_git_blob": "68a0327c79723fe1344e8b90be2f0f66146b0317",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/sidebar.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "01c915eeeba10e2f2db1e2e1d94d2ed8833b8eba",
+      "target_path": "prototypes/rdesk/src/app/components/ui/sidebar.tsx",
+      "target_git_blob": "01c915eeeba10e2f2db1e2e1d94d2ed8833b8eba",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/skeleton.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "e5a04d690c165526869feace9be346ea398187e7",
+      "target_path": "prototypes/rdesk/src/app/components/ui/skeleton.tsx",
+      "target_git_blob": "e5a04d690c165526869feace9be346ea398187e7",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/slider.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "c7c856e095f186cb01647283df675243b7662e82",
+      "target_path": "prototypes/rdesk/src/app/components/ui/slider.tsx",
+      "target_git_blob": "c7c856e095f186cb01647283df675243b7662e82",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/sonner.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "f1259836afad9ea3e9bab623792bb95f2e6654c6",
+      "target_path": "prototypes/rdesk/src/app/components/ui/sonner.tsx",
+      "target_git_blob": "f1259836afad9ea3e9bab623792bb95f2e6654c6",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/switch.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "19803863eb05080a38eda57f76e82e7a67bb9ae9",
+      "target_path": "prototypes/rdesk/src/app/components/ui/switch.tsx",
+      "target_git_blob": "19803863eb05080a38eda57f76e82e7a67bb9ae9",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/table.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "59e4dcc54deb8ebac1a675677eed827f628cd85d",
+      "target_path": "prototypes/rdesk/src/app/components/ui/table.tsx",
+      "target_git_blob": "59e4dcc54deb8ebac1a675677eed827f628cd85d",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/tabs.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "b51110977530ead8988fe31ffac7400aa06c4116",
+      "target_path": "prototypes/rdesk/src/app/components/ui/tabs.tsx",
+      "target_git_blob": "b51110977530ead8988fe31ffac7400aa06c4116",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/textarea.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "8f1810e1fb21e4be88d8ca0488939d27dd72d78d",
+      "target_path": "prototypes/rdesk/src/app/components/ui/textarea.tsx",
+      "target_git_blob": "8f1810e1fb21e4be88d8ca0488939d27dd72d78d",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/toggle-group.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "8d4b5f15b51e070940796f3f73eeb28e1584bd31",
+      "target_path": "prototypes/rdesk/src/app/components/ui/toggle-group.tsx",
+      "target_git_blob": "8d4b5f15b51e070940796f3f73eeb28e1584bd31",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/toggle.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "533c73f87ce579d1a918dba040f9bb8af49a56dc",
+      "target_path": "prototypes/rdesk/src/app/components/ui/toggle.tsx",
+      "target_git_blob": "533c73f87ce579d1a918dba040f9bb8af49a56dc",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/tooltip.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "94f84d03a0934f76a1c70a17f4259ee470d825c1",
+      "target_path": "prototypes/rdesk/src/app/components/ui/tooltip.tsx",
+      "target_git_blob": "94f84d03a0934f76a1c70a17f4259ee470d825c1",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/use-mobile.ts",
+      "source_mode": "100644",
+      "source_git_blob": "a93d58393804b4dcda698e6a6e475f65a6889356",
+      "target_path": "prototypes/rdesk/src/app/components/ui/use-mobile.ts",
+      "target_git_blob": "a93d58393804b4dcda698e6a6e475f65a6889356",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/components/ui/utils.ts",
+      "source_mode": "100644",
+      "source_git_blob": "a5ef193506d07d0459fec4f187af08283094d7c8",
+      "target_path": "prototypes/rdesk/src/app/components/ui/utils.ts",
+      "target_git_blob": "a5ef193506d07d0459fec4f187af08283094d7c8",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/app/routes.ts",
+      "source_mode": "100644",
+      "source_git_blob": "829cba72fd7a9f36b79131c4b25f52b536902158",
+      "target_path": "prototypes/rdesk/src/app/routes.ts",
+      "target_git_blob": "829cba72fd7a9f36b79131c4b25f52b536902158",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/main.tsx",
+      "source_mode": "100644",
+      "source_git_blob": "eb07ffbc338e5ccb4d1e09d8ac8327720f43fe17",
+      "target_path": "prototypes/rdesk/src/main.tsx",
+      "target_git_blob": "eb07ffbc338e5ccb4d1e09d8ac8327720f43fe17",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/styles/fonts.css",
+      "source_mode": "100644",
+      "source_git_blob": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "target_path": "prototypes/rdesk/src/styles/fonts.css",
+      "target_git_blob": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/styles/index.css",
+      "source_mode": "100644",
+      "source_git_blob": "01e7b259a92c0d183a5b0db591606c9874388b4c",
+      "target_path": "prototypes/rdesk/src/styles/index.css",
+      "target_git_blob": "01e7b259a92c0d183a5b0db591606c9874388b4c",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/styles/tailwind.css",
+      "source_mode": "100644",
+      "source_git_blob": "e2a61bbad057ee206d7f63f9f39721aefee06b5d",
+      "target_path": "prototypes/rdesk/src/styles/tailwind.css",
+      "target_git_blob": "e2a61bbad057ee206d7f63f9f39721aefee06b5d",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "src/styles/theme.css",
+      "source_mode": "100644",
+      "source_git_blob": "92d08a058cd4f60cd018caecb5141ad317366c65",
+      "target_path": "prototypes/rdesk/src/styles/theme.css",
+      "target_git_blob": "92d08a058cd4f60cd018caecb5141ad317366c65",
+      "disposition": "migrated"
+    },
+    {
+      "source_path": "vite.config.ts",
+      "source_mode": "100644",
+      "source_git_blob": "4ccceb000baacaa3b6a08c0800202a6455747730",
+      "target_path": "prototypes/rdesk/vite.config.ts",
+      "target_git_blob": "c8d5d98f1df3c309b9a4bf6f698b5812e8fc4a9b",
+      "disposition": "migrated_with_adjustment",
+      "archive_path": "docs/repository-consolidation/Rdesk/originals/vite.config.ts.source.txt"
+    }
+  ]
+}
