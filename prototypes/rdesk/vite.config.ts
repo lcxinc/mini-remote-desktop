@@ -4,6 +4,7 @@ import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
 
 export default defineConfig({
+  preview: { port: 17016, strictPort: true },
   server: { host: '127.0.0.1', port: 4323, strictPort: true },
   plugins: [
     // The React and Tailwind plugins are both required for Make, even if

@@ -29,6 +29,7 @@ export default defineConfig({
     __APP_VERSION__: JSON.stringify(tauriConfig.version ?? '0.0.0'),
   },
 
+  preview: { port: 17014, strictPort: true },
   server: {
     port: 9531,
     strictPort: true,
